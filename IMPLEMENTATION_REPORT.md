@@ -8,6 +8,15 @@ Known Limitations rather than being glossed over.
 Environment: Linux 6.18, Intel Xeon 2.10 GHz ×4, 15 GiB RAM, Node 22.22.2,
 Rust 1.94.1, FFmpeg 6.1.1. Date 2026-09-19.
 
+> **This document covers the implementation phase.** A subsequent
+> release-candidate verification phase tested the built application against a
+> real RTMP endpoint and found four further defects, including one critical
+> one (stall detection was dead code, so a network outage that blocked rather
+> than killed FFmpeg left the app showing LIVE forever). Current status, the
+> measured results and the remaining release blockers are in
+> **[RELEASE_CANDIDATE_REPORT.md](RELEASE_CANDIDATE_REPORT.md)**, which
+> supersedes the performance figures below.
+
 ---
 
 ## 1. Implemented
