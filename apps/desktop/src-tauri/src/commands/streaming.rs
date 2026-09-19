@@ -40,7 +40,9 @@ pub fn run_preflight(
             rtmps_url: &url,
             ffmpeg_ok: state.tools.is_some(),
             ffmpeg_version: version.as_deref(),
-            ffmpeg_can_broadcast: state.ffmpeg_caps.as_ref().is_none_or(|c| c.can_broadcast()),
+            // No probe result at all means FFmpeg itself is missing, which
+            // `ffmpeg_ok` above already fails on — so this must not fail twice.
+            ffmpeg_can_broadcast: state.ffmpeg_caps.as_ref().map(|c| c.can_broadcast()).unwrap_or(true),
             ffmpeg_problems: &ffmpeg_problems,
             license_allows_broadcast: state.license_state().status.allows_broadcast(),
             dry_run,
