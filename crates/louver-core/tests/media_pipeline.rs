@@ -550,3 +550,144 @@ fn compatibility_mode_transcodes_the_same_playlist() {
     assert_eq!(stream_field(&tools, &out, "v:0", "codec_name"), "h264");
     assert!((format_duration(&tools, &out) - 6.0).abs() < 0.5);
 }
+
+// ---------------------------------------------------------------------------
+// §14 — an optimized file is never optimized again
+// ---------------------------------------------------------------------------
+
+/// Re-optimizing must reuse the cache, and only a changed source may invalidate it.
+///
+/// This matters for real users: a 100-video library takes hours to optimize,
+/// and silently redoing that work on every launch would make the product
+/// unusable. Proven by file identity, not by trusting the status field.
+#[test]
+fn an_optimized_video_is_not_re_encoded_and_only_a_changed_source_invalidates_it() {
+    let tools = require_ffmpeg!();
+    let b = builder(tools.clone(), PROFILE);
+    let work = tempfile::tempdir().unwrap();
+    let cache = MediaCache::new(work.path().join("cache"));
+
+    // A source that genuinely needs optimizing.
+    let src = work.path().join("source.mp4");
+    let make_source = |path: &std::path::Path, pattern: &str| {
+        let st = std::process::Command::new(&tools.ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("{pattern}=size=640x480:rate=24:duration=3"),
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=3",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-shortest",
+            ])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(st.success());
+    };
+    make_source(&src, "testsrc2");
+
+    let hash1 = louver_core::media::cache::media_hash(&src).unwrap();
+    let info = probe(&b, &src).unwrap();
+
+    // First pass: a real encode.
+    let first = normalize_one(&b, &cache, &src, &hash1, &info, PROFILE, &CancelToken::new(), |_| {}).unwrap();
+    assert!(!first.from_cache, "the first pass must actually encode");
+    let produced = first.output_path.clone();
+    let stamp1 = std::fs::metadata(&produced).unwrap().modified().unwrap();
+    let bytes1 = std::fs::metadata(&produced).unwrap().len();
+
+    // Second pass: must be a cache hit, with the file untouched.
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // mtime granularity
+    let second =
+        normalize_one(&b, &cache, &src, &hash1, &info, PROFILE, &CancelToken::new(), |_| {}).unwrap();
+    assert!(second.from_cache, "an already-optimized video was re-encoded (§14)");
+    assert_eq!(second.output_path, produced);
+    assert_eq!(second.duration_secs, first.duration_secs);
+    let stamp2 = std::fs::metadata(&produced).unwrap().modified().unwrap();
+    assert_eq!(stamp1, stamp2, "the cached file was rewritten instead of reused");
+    assert_eq!(bytes1, std::fs::metadata(&produced).unwrap().len());
+
+    // Replacing the source changes its identity, which invalidates the cache.
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    make_source(&src, "smptebars");
+    let hash2 = louver_core::media::cache::media_hash(&src).unwrap();
+    assert_ne!(hash1, hash2, "a replaced source must change its cache identity");
+    assert!(cache.lookup(&hash2, PROFILE).is_none(), "the new content must miss the cache");
+    // ...while the old entry is still a hit for the old identity.
+    assert!(cache.lookup(&hash1, PROFILE).is_some());
+
+    let info2 = probe(&b, &src).unwrap();
+    let third =
+        normalize_one(&b, &cache, &src, &hash2, &info2, PROFILE, &CancelToken::new(), |_| {}).unwrap();
+    assert!(!third.from_cache, "a changed source must be re-encoded");
+    assert_ne!(third.output_path, produced, "the new encode must be a separate cache entry");
+
+    // A different profile is a separate entry too, not a spurious re-encode.
+    assert!(cache.lookup(&hash2, OutputProfile::P1080p30).is_none());
+}
+
+/// Merely reading a file must not invalidate its cache.
+#[test]
+fn touching_a_source_without_changing_it_keeps_the_cache_valid() {
+    let tools = require_ffmpeg!();
+    let b = builder(tools.clone(), PROFILE);
+    let work = tempfile::tempdir().unwrap();
+    let cache = MediaCache::new(work.path().join("cache"));
+
+    let src = work.path().join("stable.mp4");
+    std::process::Command::new(&tools.ffmpeg)
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=24:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=44100:duration=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-shortest",
+        ])
+        .arg(&src)
+        .status()
+        .unwrap();
+
+    let hash = louver_core::media::cache::media_hash(&src).unwrap();
+    let info = probe(&b, &src).unwrap();
+    normalize_one(&b, &cache, &src, &hash, &info, PROFILE, &CancelToken::new(), |_| {}).unwrap();
+
+    // Read it, the way probing or playback would.
+    let _ = std::fs::read(&src).unwrap();
+    assert_eq!(
+        louver_core::media::cache::media_hash(&src).unwrap(),
+        hash,
+        "reading a file must not change its cache identity"
+    );
+    assert!(cache.lookup(&hash, PROFILE).is_some());
+}

@@ -88,6 +88,10 @@ describe('status labels', () => {
   it('only treats compatible and normalized media as broadcastable', () => {
     expect(isBroadcastReady('normalized')).toBe(true)
     expect(isBroadcastReady('compatible')).toBe(true)
+    // §14: a file that needs no further work says so in the same words,
+    // whether it was optimized or was already compliant.
+    expect(mediaStatusLabel('normalized')).toBe('송출 준비 완료')
+    expect(mediaStatusLabel('compatible')).toBe('송출 준비 완료')
     for (const s of ['imported', 'optimization_required', 'missing', 'failed'] as const) {
       expect(isBroadcastReady(s)).toBe(false)
       expect(mediaStatusLabel(s)).toBeTruthy()

@@ -26,6 +26,7 @@ pub enum ErrorCode {
     StreamAlreadyRunning,
     StreamInvalidTransition,
     StreamNoStreamKey,
+    StreamKeyRejected,
     // LL-NETWORK-0xx
     NetworkUnreachable,
     NetworkRtmpRejected,
@@ -72,6 +73,7 @@ impl ErrorCode {
             StreamAlreadyRunning => "LL-STREAM-005",
             StreamInvalidTransition => "LL-STREAM-006",
             StreamNoStreamKey => "LL-STREAM-007",
+            StreamKeyRejected => "LL-STREAM-008",
             NetworkUnreachable => "LL-NETWORK-001",
             NetworkRtmpRejected => "LL-NETWORK-002",
             StorageInsufficientSpace => "LL-STORAGE-001",
@@ -113,6 +115,9 @@ impl ErrorCode {
             StreamAlreadyRunning => "이미 방송이 진행 중입니다.",
             StreamInvalidTransition => "현재 상태에서는 요청한 동작을 수행할 수 없습니다.",
             StreamNoStreamKey => "스트림 키가 없습니다. 설정에서 YouTube 스트림 키를 입력해주세요.",
+            StreamKeyRejected => {
+                "YouTube가 스트림 키를 거부했습니다. 설정에서 스트림 키를 다시 확인해주세요."
+            }
             NetworkUnreachable => "인터넷에 연결할 수 없습니다. 네트워크 연결을 확인해주세요.",
             NetworkRtmpRejected => {
                 "유튜브 서버에 연결하지 못했습니다. 스트림 키와 인터넷 연결을 확인해주세요."
@@ -224,6 +229,7 @@ pub const ALL_ERROR_CODES: &[ErrorCode] = {
         StreamAlreadyRunning,
         StreamInvalidTransition,
         StreamNoStreamKey,
+        StreamKeyRejected,
         NetworkUnreachable,
         NetworkRtmpRejected,
         StorageInsufficientSpace,

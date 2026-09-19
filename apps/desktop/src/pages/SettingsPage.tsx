@@ -3,6 +3,7 @@ import { Eye, FolderOpen, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react'
 import { useAppStore } from '@/stores/useAppStore'
 import { api, pickLicenseFile, revealPath } from '@/services/ipc'
 import { Badge, Button, Card, Field, Input, Modal, Select, Toggle } from '@/components/ui'
+import type { StreamDiagnostics } from '@/types'
 
 /** Settings (§45), including the stream key and licence panels. */
 export function SettingsPage() {
@@ -216,23 +217,26 @@ export function SettingsPage() {
           onChange={setFlag('developer_mode')}
         />
         {s.developer_mode && (
-          <div className="mt-2 flex flex-wrap gap-2 rounded border border-ink-700 p-3">
-            <Button
-              size="sm"
-              onClick={async () => {
-                try {
-                  await api.simulateCrash()
-                  toast({ kind: 'info', message: 'FFmpeg를 강제 종료했습니다. 자동 복구를 확인하세요.' })
-                } catch (e) { reportError(e) }
-              }}
-            >
-              FFmpeg 크래시 시뮬레이션
-            </Button>
-            <Toggle
-              label="장치 바인딩 강제"
-              checked={s.enforce_device_binding}
-              onChange={setFlag('enforce_device_binding')}
-            />
+          <div className="mt-2 space-y-3 rounded border border-ink-700 p-3">
+            <StreamDiagnosticsPanel />
+            <div className="flex flex-wrap items-center gap-2 border-t border-ink-800 pt-3">
+              <Button
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await api.simulateCrash()
+                    toast({ kind: 'info', message: 'FFmpeg를 강제 종료했습니다. 자동 복구를 확인하세요.' })
+                  } catch (e) { reportError(e) }
+                }}
+              >
+                FFmpeg 크래시 시뮬레이션
+              </Button>
+              <Toggle
+                label="장치 바인딩 강제"
+                checked={s.enforce_device_binding}
+                onChange={setFlag('enforce_device_binding')}
+              />
+            </div>
           </div>
         )}
       </Card>
@@ -297,6 +301,76 @@ export function SettingsPage() {
           <p>최적화된 영상 캐시를 모두 삭제합니다. 원본 파일은 삭제되지 않습니다.</p>
         )}
       </Modal>
+    </div>
+  )
+}
+
+/**
+ * Shows what the live FFmpeg process is actually doing (§13).
+ *
+ * The dashboard badge reflects configuration. This reflects the real argv, so
+ * "is this session actually stream copy?" can be answered from evidence — the
+ * first thing to check when CPU is higher than expected.
+ */
+function StreamDiagnosticsPanel() {
+  const { reportError } = useAppStore()
+  const [d, setD] = useState<StreamDiagnostics | null>(null)
+  const [showCommand, setShowCommand] = useState(false)
+
+  useEffect(() => {
+    const load = () => api.streamDiagnostics().then(setD).catch(reportError)
+    void load()
+    const t = setInterval(load, 3000)
+    return () => clearInterval(t)
+  }, [reportError])
+
+  if (!d) return <p className="text-xs text-ink-500">진단 정보를 불러오는 중…</p>
+
+  const ok = d.argv_is_stream_copy && !d.mismatch
+  return (
+    <div>
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <span className="text-xs uppercase tracking-wider text-ink-500">Streaming Mode</span>
+        <Badge tone={d.masked_command.length === 0 ? 'default' : ok ? 'ok' : 'warn'}>
+          {d.masked_command.length === 0
+            ? '—'
+            : d.argv_is_stream_copy
+              ? 'STREAM COPY'
+              : 'COMPATIBILITY MODE'}
+        </Badge>
+        {d.ffmpeg_pid != null && (
+          <span className="font-mono text-[11px] text-ink-500">
+            pid {d.ffmpeg_pid} · CPU {d.ffmpeg_cpu_percent.toFixed(1)}%
+          </span>
+        )}
+      </div>
+
+      <p className={`text-xs ${d.mismatch ? 'text-live' : 'text-ink-400'}`}>{d.verdict}</p>
+
+      {d.video_encoder_args.length > 0 && (
+        <p className="mt-1 font-mono text-[11px] text-warn">
+          영상 인코더 인자: {d.video_encoder_args.join(' ')}
+        </p>
+      )}
+
+      {d.masked_command.length > 0 && (
+        <>
+          <button
+            onClick={() => setShowCommand((v) => !v)}
+            className="mt-2 text-[11px] text-ink-400 underline-offset-2 hover:underline"
+          >
+            {showCommand ? '실행 중인 명령 숨기기' : '실행 중인 명령 보기'}
+          </button>
+          {showCommand && (
+            <pre
+              data-selectable
+              className="mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-ink-950 p-2 font-mono text-[10px] text-ink-500"
+            >
+              {d.masked_command.join(' ')}
+            </pre>
+          )}
+        </>
+      )}
     </div>
   )
 }

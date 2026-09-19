@@ -393,6 +393,29 @@ export function createMockBackend(opts: MockOptions = {}) {
       return status
     },
     stop_broadcast: () => { stopBroadcast(); return status },
+    stream_diagnostics: () => {
+      const live = status.supervisor.state === 'LIVE'
+      const copy = (settings.get('stream_mode') ?? 'stream_copy') === 'stream_copy'
+      return {
+        state: status.supervisor.state,
+        configured_mode: copy ? 'stream_copy' : 'compatibility_encode',
+        argv_is_stream_copy: copy,
+        mismatch: null,
+        video_encoder_args: copy ? [] : ['-c:v', '-b:v'],
+        masked_command: live
+          ? ['-re', '-stream_loop', '-1', '-f', 'concat', '-i', 'manifest.txt',
+             ...(copy ? ['-c', 'copy'] : ['-c:v', 'libx264']),
+             '-f', 'flv', 'rtmps://a.rtmps.youtube.com/live2/••••••••']
+          : [],
+        ffmpeg_pid: live ? 4242 : null,
+        ffmpeg_cpu_percent: live && copy ? 1.6 : live ? 61.2 : 0,
+        verdict: !live
+          ? '방송 중이 아닙니다'
+          : copy
+            ? 'STREAM COPY: 영상 재인코딩 없음 (CPU 사용량이 낮아야 정상입니다)'
+            : 'COMPATIBILITY MODE: 실시간 재인코딩 중 (CPU 사용량이 높습니다)',
+      }
+    },
     stream_mode_label: () => (settings.get('stream_mode') === 'compatibility_encode' ? 'COMPATIBILITY ENCODE' : 'STREAM COPY'),
     simulate_ffmpeg_crash: () => {
       setStatus({}, { state: 'RECONNECTING', reconnect_count: status.supervisor.reconnect_count + 1, next_retry_in_secs: 2 })

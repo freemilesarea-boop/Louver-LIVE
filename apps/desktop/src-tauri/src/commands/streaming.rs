@@ -4,7 +4,7 @@ use super::CmdResult;
 use crate::state::AppState;
 use louver_core::config::StreamMode;
 use louver_core::error::{ErrorCode, LouverError};
-use louver_core::runtime::{RuntimeStatus, StartOptions, StartReason};
+use louver_core::runtime::{RuntimeStatus, StartOptions, StartReason, StreamDiagnostics};
 use louver_core::streaming::preflight::{self, PreflightInput, PreflightReport};
 use tauri::State;
 
@@ -106,6 +106,19 @@ pub fn stream_mode_label(state: State<'_, AppState>) -> CmdResult<String> {
         _ => StreamMode::StreamCopy,
     };
     Ok(m.label().to_string())
+}
+
+/// Inspect the command FFmpeg is actually running (§13).
+///
+/// The dashboard badge shows the configured mode; this shows what is really
+/// executing, which is the first thing to check when CPU is unexpectedly high.
+#[tauri::command]
+pub fn stream_diagnostics(state: State<'_, AppState>) -> CmdResult<StreamDiagnostics> {
+    let mut d = state.runtime.lock().unwrap().diagnostics();
+    if let Some(pid) = d.ffmpeg_pid {
+        d.ffmpeg_cpu_percent = state.metrics.lock().unwrap().sample(Some(pid)).ffmpeg_cpu_percent;
+    }
+    Ok(d)
 }
 
 /// Developer tool: kill FFmpeg to watch the supervisor recover (§59).

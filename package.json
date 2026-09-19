@@ -20,7 +20,12 @@
     "test:media": "cargo test -p louver-core --test media_pipeline --test supervisor_recovery --test runtime_scheduling -- --nocapture",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "soak": "node scripts/soak-test.mjs",
-    "verify": "node scripts/verify.mjs"
+    "verify": "node scripts/verify.mjs",
+    "rc:fixtures": "node scripts/make-rc-fixtures.mjs",
+    "rc:sink": "node scripts/rtmp-sink.mjs",
+    "rc:boundaries": "node scripts/analyse-boundaries.mjs",
+    "secret-scan": "node scripts/secret-scan.mjs",
+    "ffmpeg:manifest": "node scripts/ffmpeg-manifest.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

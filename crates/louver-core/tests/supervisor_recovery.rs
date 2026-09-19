@@ -171,7 +171,10 @@ fn an_ffmpeg_that_fails_to_start_is_retried_not_treated_as_a_clean_exit() {
     }
     assert_eq!(sup.state(), StreamState::Reconnecting);
     let err = sup.last_error().expect("an error should be recorded for the UI");
-    assert_eq!(err.code_str, "LL-STREAM-002");
+    // The failure here is a missing input file, and §18 asks for the specific
+    // diagnosis rather than a generic "the broadcast stopped".
+    assert_eq!(err.code_str, "LL-MEDIA-003", "detail was: {:?}", err.detail);
+    assert!(err.message.contains("영상 파일을 찾을 수 없습니다"));
 }
 
 #[test]

@@ -13,7 +13,7 @@
 import type {
   DashboardMetrics, DiskEstimate, ImportResult, LicenseState, LouverError,
   Media, Playlist, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
-  SettingsView, StreamEvent,
+  SettingsView, StreamDiagnostics, StreamEvent,
 } from '@/types'
 
 export type MockBackend = (cmd: string, args: Record<string, unknown>) => unknown | Promise<unknown>
@@ -116,6 +116,7 @@ export const api = {
   stopBroadcast: () => call<RuntimeStatus>('stop_broadcast'),
   startDryRun: (playlistId: number) => call<RuntimeStatus>('start_dry_run', { playlistId }),
   streamModeLabel: () => call<string>('stream_mode_label'),
+  streamDiagnostics: () => call<StreamDiagnostics>('stream_diagnostics'),
   simulateCrash: () => call<void>('simulate_ffmpeg_crash'),
 
   // settings

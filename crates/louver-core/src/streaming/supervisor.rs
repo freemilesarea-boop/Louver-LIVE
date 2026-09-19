@@ -6,7 +6,7 @@
 
 use crate::config::StreamMode;
 use crate::error::{ErrorCode, LouverError, Result};
-use crate::streaming::ffmpeg::{mask_argv, mask_secrets};
+use crate::streaming::ffmpeg::{error_from_ffmpeg, mask_argv, mask_secrets};
 use crate::streaming::state::{StateMachine, StreamState};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
@@ -177,7 +177,7 @@ impl StreamSupervisor {
             pid: self.child.as_ref().and_then(|c| c.pid()),
             restart_count: self.restart_count,
             reconnect_count: self.reconnect_count,
-            seconds_since_data: self.last_data_at.map(|t| t.elapsed().as_secs()),
+            seconds_since_data: self.seconds_since_progress(),
             progress: self.progress(),
             last_error: self.last_error.clone(),
             next_retry_in_secs: (self.machine.state() == StreamState::Reconnecting)
@@ -221,9 +221,42 @@ impl StreamSupervisor {
     }
 
     /// True when FFmpeg is alive but has stopped producing output.
+    ///
+    /// This is the only thing that catches a *blocked* FFmpeg, which is what a
+    /// real network outage produces: dropped packets do not kill the process,
+    /// they make it hang on the socket while TCP retransmits for minutes. The
+    /// process never exits, so exit-code handling never fires.
+    ///
+    /// It is therefore driven by the progress clock the reader thread stamps
+    /// on each real progress line. It must never be driven by a "has ever
+    /// produced output" flag, which stays true forever and would silently
+    /// disable stall detection altogether.
     pub fn is_stalled(&self) -> bool {
-        self.machine.state() == StreamState::Live
-            && self.last_data_at.map(|t| t.elapsed() > self.stall_timeout).unwrap_or(false)
+        if self.machine.state() != StreamState::Live {
+            return false;
+        }
+        match self.since_progress() {
+            Some(d) => d > self.stall_timeout,
+            None => false,
+        }
+    }
+
+    /// Time since FFmpeg last reported progress, from the reader thread's
+    /// clock where available and from attach time before the first line.
+    ///
+    /// Kept at millisecond precision: truncating to whole seconds would make
+    /// any sub-second stall timeout impossible to reach.
+    pub fn since_progress(&self) -> Option<Duration> {
+        let epoch = self.data_epoch_ms.load(Ordering::SeqCst);
+        if epoch > 0 {
+            return Some(Duration::from_millis(now_ms().saturating_sub(epoch)));
+        }
+        self.last_data_at.map(|t| t.elapsed())
+    }
+
+    /// Whole seconds since the last progress, for the dashboard.
+    pub fn seconds_since_progress(&self) -> Option<u64> {
+        self.since_progress().map(|d| d.as_secs())
     }
 
     /// The user pressed Stop. Terminates FFmpeg and blocks all reconnection (§17).
@@ -282,11 +315,15 @@ impl StreamSupervisor {
                 self.restart_count += 1;
                 self.reconnect_count += 1;
                 if self.last_error.is_none() {
+                    // Classify from the whole captured tail, not just the last
+                    // line: the root cause is usually the first line of the
+                    // failure and the rest is FFmpeg unwinding (§18).
                     let tail = self.stderr_tail();
-                    self.last_error = Some(LouverError::with_detail(
-                        ErrorCode::StreamFfmpegExit,
-                        tail.last().cloned().unwrap_or_else(|| "ffmpeg exited".into()),
-                    ));
+                    self.last_error = Some(if tail.is_empty() {
+                        LouverError::with_detail(ErrorCode::StreamFfmpegExit, "ffmpeg exited")
+                    } else {
+                        error_from_ffmpeg(&tail.join("\n"))
+                    });
                 }
                 SupervisorAction::RestartAfter(Duration::from_secs(reconnect_delay_secs(
                     self.reconnect_count,
@@ -724,5 +761,134 @@ mod tests {
         let _ = s.poll();
         assert_eq!(s.status().next_retry_in_secs, Some(2));
         assert_eq!(s.status().state, StreamState::Reconnecting);
+    }
+}
+
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    /// The regression this guards: a network outage blocks FFmpeg on the
+    /// socket instead of killing it, so only stall detection notices. A sticky
+    /// "has produced output" flag used as the liveness signal would keep the
+    /// broadcast in LIVE forever with nothing reaching YouTube.
+    #[test]
+    fn a_blocked_ffmpeg_is_detected_even_though_it_never_exits() {
+        struct NeverExits(Arc<AtomicBool>);
+        impl ProcessHandle for NeverExits {
+            fn try_exited(&mut self) -> Option<bool> {
+                None // a hung process, exactly like one blocked on a socket
+            }
+            fn terminate(&mut self) -> Result<()> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn pid(&self) -> Option<u32> {
+                Some(4242)
+            }
+        }
+
+        let killed = Arc::new(AtomicBool::new(false));
+        let mut s =
+            StreamSupervisor::new(StreamMode::StreamCopy).with_stall_timeout(Duration::from_millis(200));
+        s.begin().unwrap();
+        s.attach(Box::new(NeverExits(Arc::clone(&killed)))).unwrap();
+
+        // Progress arrives, so it goes live and is healthy.
+        s.data_epoch_ms.store(now_ms(), Ordering::SeqCst);
+        s.saw_data.store(true, Ordering::SeqCst);
+        s.mark_live().unwrap();
+        assert!(!s.is_stalled());
+        assert_eq!(s.poll(), SupervisorAction::Running);
+
+        // Progress stops, but the process stays alive and the sticky flag
+        // stays true — which is precisely the situation that used to hide.
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(s.has_produced_output(), "the sticky flag is still set, as it always will be");
+        assert!(s.is_stalled(), "a hung ffmpeg must be detected as stalled");
+
+        match s.poll() {
+            SupervisorAction::RestartAfter(_) => {}
+            other => panic!("a stalled process must be restarted, got {other:?}"),
+        }
+        assert!(killed.load(Ordering::SeqCst), "the hung process must be terminated");
+        assert_eq!(s.state(), StreamState::Reconnecting);
+    }
+
+    #[test]
+    fn continuing_progress_keeps_a_healthy_stream_out_of_reconnect() {
+        let mut s =
+            StreamSupervisor::new(StreamMode::StreamCopy).with_stall_timeout(Duration::from_millis(300));
+        s.begin().unwrap();
+        struct Alive;
+        impl ProcessHandle for Alive {
+            fn try_exited(&mut self) -> Option<bool> {
+                None
+            }
+            fn terminate(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn pid(&self) -> Option<u32> {
+                Some(1)
+            }
+        }
+        s.attach(Box::new(Alive)).unwrap();
+        s.data_epoch_ms.store(now_ms(), Ordering::SeqCst);
+        s.mark_live().unwrap();
+
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(120));
+            // The reader thread stamps the clock on each progress line.
+            s.data_epoch_ms.store(now_ms(), Ordering::SeqCst);
+            assert!(!s.is_stalled());
+            assert_eq!(s.poll(), SupervisorAction::Running);
+        }
+    }
+
+    #[test]
+    fn seconds_since_progress_is_reported_for_the_dashboard() {
+        let mut s = StreamSupervisor::new(StreamMode::StreamCopy);
+        assert_eq!(s.seconds_since_progress(), None, "nothing attached yet");
+        s.begin().unwrap();
+        struct Alive;
+        impl ProcessHandle for Alive {
+            fn try_exited(&mut self) -> Option<bool> {
+                None
+            }
+            fn terminate(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn pid(&self) -> Option<u32> {
+                Some(1)
+            }
+        }
+        s.attach(Box::new(Alive)).unwrap();
+        assert_eq!(s.seconds_since_progress(), Some(0), "falls back to attach time");
+        s.data_epoch_ms.store(now_ms() - 5_000, Ordering::SeqCst);
+        assert_eq!(s.seconds_since_progress(), Some(5));
+        assert_eq!(s.status().seconds_since_data, Some(5));
+    }
+
+    #[test]
+    fn a_stall_cannot_be_reported_before_the_stream_is_live() {
+        let mut s =
+            StreamSupervisor::new(StreamMode::StreamCopy).with_stall_timeout(Duration::from_millis(50));
+        s.begin().unwrap();
+        struct Alive;
+        impl ProcessHandle for Alive {
+            fn try_exited(&mut self) -> Option<bool> {
+                None
+            }
+            fn terminate(&mut self) -> Result<()> {
+                Ok(())
+            }
+            fn pid(&self) -> Option<u32> {
+                Some(1)
+            }
+        }
+        s.attach(Box::new(Alive)).unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        // Still CONNECTING: a slow handshake is not a stall.
+        assert!(!s.is_stalled());
     }
 }

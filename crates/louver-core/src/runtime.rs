@@ -97,6 +97,47 @@ impl RuntimeStatus {
     }
 }
 
+/// What the live FFmpeg process is actually doing (§13, §41).
+///
+/// The dashboard badge reflects the *configured* mode. This reflects the argv
+/// of the process that is really running, so "is this session stream copy?"
+/// can be answered from evidence rather than from configuration — which is the
+/// first thing to check when CPU is unexpectedly high.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamDiagnostics {
+    pub state: StreamState,
+    /// Mode the session was configured with.
+    pub configured_mode: StreamMode,
+    /// True when the running argv contains no video encoder at all.
+    pub argv_is_stream_copy: bool,
+    /// Set when the configured mode and the real command disagree.
+    pub mismatch: Option<String>,
+    /// Any video-encoder arguments found in the live command.
+    pub video_encoder_args: Vec<String>,
+    /// The live command, masked so it is safe to display and copy (§34).
+    pub masked_command: Vec<String>,
+    pub ffmpeg_pid: Option<u32>,
+    pub ffmpeg_cpu_percent: f32,
+    /// Plain-language verdict for the developer panel.
+    pub verdict: String,
+}
+
+/// Video-encoder arguments that must never appear in a stream-copy command.
+const VIDEO_ENCODER_MARKERS: &[&str] = &[
+    "-c:v",
+    "-vcodec",
+    "-b:v",
+    "-crf",
+    "-preset",
+    "-x264-params",
+    "libx264",
+    "libx265",
+    "h264_nvenc",
+    "h264_qsv",
+    "h264_amf",
+    "h264_videotoolbox",
+];
+
 /// Options for one broadcast.
 #[derive(Debug, Clone)]
 pub struct StartOptions {
@@ -474,14 +515,17 @@ impl BroadcastRuntime {
         }
 
         // CONNECTING becomes LIVE as soon as FFmpeg pushes real bytes.
-        if self.supervisor.state() == StreamState::Connecting && self.supervisor.has_produced_output() {
-            if self.supervisor.mark_live().is_ok() {
-                self.supervisor.note_reconnect_success();
-                self.log(EventLevel::Info, "방송이 시작되었습니다");
-            }
-        } else if self.supervisor.state() == StreamState::Live && self.supervisor.has_produced_output() {
-            self.supervisor.note_data();
+        if self.supervisor.state() == StreamState::Connecting
+            && self.supervisor.has_produced_output()
+            && self.supervisor.mark_live().is_ok()
+        {
+            self.supervisor.note_reconnect_success();
+            self.log(EventLevel::Info, "방송이 시작되었습니다");
         }
+        // Nothing here refreshes the stall timer. `has_produced_output` is
+        // sticky, so calling `note_data` on it would reset the timer on every
+        // tick and a hung FFmpeg would stay LIVE forever. Liveness is tracked
+        // by the progress reader thread instead.
 
         match self.supervisor.poll() {
             SupervisorAction::RestartAfter(d) => {
@@ -603,6 +647,54 @@ impl BroadcastRuntime {
 
     pub fn profile(&self) -> OutputProfile {
         self.builder.profile()
+    }
+
+    /// Inspect the command that is actually running (§13).
+    pub fn diagnostics(&self) -> StreamDiagnostics {
+        let status = self.supervisor.status();
+        let argv = &self.last_args;
+
+        let found: Vec<String> = VIDEO_ENCODER_MARKERS
+            .iter()
+            .filter(|m| argv.iter().any(|a| a == *m))
+            .map(|m| (*m).to_string())
+            .collect();
+        let is_copy = found.is_empty() && argv.windows(2).any(|w| w == ["-c", "copy"]);
+
+        let configured = status.mode;
+        let mismatch = match (configured, is_copy, argv.is_empty()) {
+            (_, _, true) => None, // nothing running
+            (StreamMode::StreamCopy, false, _) => Some(format!(
+                "설정은 STREAM COPY이지만 실제 명령에 영상 인코더가 있습니다: {}",
+                found.join(", ")
+            )),
+            (StreamMode::CompatibilityEncode, true, _) => {
+                Some("설정은 호환 모드이지만 실제 명령은 재인코딩하지 않습니다".into())
+            }
+            _ => None,
+        };
+
+        let verdict = if argv.is_empty() {
+            "방송 중이 아닙니다".to_string()
+        } else if let Some(m) = &mismatch {
+            m.clone()
+        } else if is_copy {
+            "STREAM COPY: 영상 재인코딩 없음 (CPU 사용량이 낮아야 정상입니다)".to_string()
+        } else {
+            "COMPATIBILITY MODE: 실시간 재인코딩 중 (CPU 사용량이 높습니다)".to_string()
+        };
+
+        StreamDiagnostics {
+            state: status.state,
+            configured_mode: configured,
+            argv_is_stream_copy: is_copy,
+            mismatch,
+            video_encoder_args: found,
+            masked_command: crate::streaming::ffmpeg::mask_argv(argv),
+            ffmpeg_pid: status.pid,
+            ffmpeg_cpu_percent: 0.0, // filled in by the caller, which owns the sampler
+            verdict,
+        }
     }
 
     /// Move CONNECTING -> LIVE without waiting for FFmpeg's first progress line.

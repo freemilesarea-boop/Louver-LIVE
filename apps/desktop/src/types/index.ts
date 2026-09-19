@@ -122,6 +122,18 @@ export interface RuntimeStatus {
   cycle_duration_secs: number
 }
 
+export interface StreamDiagnostics {
+  state: StreamState
+  configured_mode: StreamMode
+  argv_is_stream_copy: boolean
+  mismatch?: string | null
+  video_encoder_args: string[]
+  masked_command: string[]
+  ffmpeg_pid?: number | null
+  ffmpeg_cpu_percent: number
+  verdict: string
+}
+
 export interface CheckResult {
   id: string
   label: string

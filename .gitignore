@@ -17,3 +17,5 @@ soak-results/
 *.pem
 private_key*
 license-signing-key*
+rc-results/
+tests/fixtures/rc/

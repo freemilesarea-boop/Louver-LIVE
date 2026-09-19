@@ -99,7 +99,7 @@ describe('the main journey', () => {
     await waitFor(() => {
       expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument()
     })
-    expect(await screen.findAllByText('최적화 완료')).toHaveLength(3)
+    expect(await screen.findAllByText('송출 준비 완료')).toHaveLength(3)
     // Three ~1h clips, so the total is reported in hours (§25).
     expect(screen.getByTestId('playlist-total')).toHaveTextContent(/^\d+시간 \d\d분 \d\d초$/)
   })
@@ -376,5 +376,55 @@ describe('logs', () => {
     const events = await screen.findByTestId('recent-events')
     expect(within(events).getByText(/방송 시작: Night Jazz/)).toBeInTheDocument()
     expect(screen.getByText(/스트림 키는 로그에 기록되지 않습니다/)).toBeInTheDocument()
+  })
+})
+
+describe('developer diagnostics', () => {
+  it('shows what the live FFmpeg command is actually doing', async () => {
+    const user = userEvent.setup()
+    mount({ seedSettings: { first_run_complete: 'true', developer_mode: 'true' } })
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
+    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
+    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
+    await gotoPage(user, '대시보드')
+    await user.click(await screen.findByRole('button', { name: /로컬 테스트/ }))
+    await waitFor(() => expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE'))
+
+    await gotoPage(user, '설정')
+    // §13: the panel reports the running command, not just the setting.
+    expect(await screen.findByText('Streaming Mode')).toBeInTheDocument()
+    expect(await screen.findByText(/영상 재인코딩 없음/)).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '실행 중인 명령 보기' }))
+    const cmd = await screen.findByText(/-f concat/)
+    expect(cmd).toHaveTextContent('-c copy')
+    // And the displayed command carries no stream key.
+    expect(cmd.textContent).not.toMatch(/[a-z0-9]{4}(-[a-z0-9]{4}){3}/i)
+    expect(cmd).toHaveTextContent('••••••••')
+  })
+
+  it('explains a high-CPU session as compatibility mode rather than leaving it a mystery', async () => {
+    const user = userEvent.setup()
+    mount({
+      seedSettings: {
+        first_run_complete: 'true',
+        developer_mode: 'true',
+        stream_mode: 'compatibility_encode',
+      },
+    })
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
+    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
+    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
+    await gotoPage(user, '대시보드')
+    await user.click(await screen.findByRole('button', { name: /로컬 테스트/ }))
+    await waitFor(() => expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE'))
+
+    await gotoPage(user, '설정')
+    expect(await screen.findByText(/실시간 재인코딩 중/)).toBeInTheDocument()
+    expect(screen.getByText(/영상 인코더 인자/)).toBeInTheDocument()
   })
 })

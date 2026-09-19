@@ -69,12 +69,25 @@ impl FfmpegTools {
     /// it is accepted.
     pub fn detect_encoder(&self) -> String {
         let listed = self.available_encoders().unwrap_or_default();
-        for want in preferred_hw_encoders() {
+        for want in preferred_hw_encoders().iter().chain(preferred_sw_encoders()) {
             if listed.iter().any(|e| e == want) && self.encoder_works(want) {
                 return (*want).to_string();
             }
         }
         "libx264".to_string()
+    }
+
+    /// Whether this FFmpeg can encode H.264 at all.
+    ///
+    /// A build with no usable H.264 encoder can still broadcast — the live
+    /// path is a remux — but it can never optimize a non-conforming video, so
+    /// the Settings page needs to be able to say so.
+    pub fn has_usable_h264_encoder(&self) -> bool {
+        let listed = self.available_encoders().unwrap_or_default();
+        preferred_hw_encoders()
+            .iter()
+            .chain(preferred_sw_encoders())
+            .any(|e| listed.iter().any(|l| l == e) && self.encoder_works(e))
     }
 
     /// Encode a single frame to /dev/null with `encoder`, and report success.
@@ -154,6 +167,22 @@ fn which(name: &str) -> Option<PathBuf> {
         .and_then(|paths| std::env::split_paths(&paths).map(|p| p.join(name)).find(|p| p.is_file()))
 }
 
+/// Software H.264 encoders, most preferred first.
+///
+/// `libx264` is the usual choice, but it makes an FFmpeg build GPL. A build
+/// assembled under LGPL terms will not have it, and normalization must still
+/// work there — every supported platform has a hardware or OS encoder, and
+/// `libopenh264` is the portable software fallback. Hard-coding `libx264` as
+/// the last resort would make normalization fail outright on such a build.
+pub fn preferred_sw_encoders() -> &'static [&'static str] {
+    if cfg!(target_os = "windows") {
+        // Media Foundation ships with Windows and needs no extra licence.
+        &["libx264", "libopenh264", "h264_mf"]
+    } else {
+        &["libx264", "libopenh264"]
+    }
+}
+
 /// Hardware H.264 encoders, most preferred first, per platform (§9).
 pub fn preferred_hw_encoders() -> &'static [&'static str] {
     if cfg!(target_os = "macos") {
@@ -172,17 +201,25 @@ pub fn preferred_hw_encoders() -> &'static [&'static str] {
 /// about to encode for real should use [`FfmpegTools::detect_encoder`], which
 /// additionally proves the encoder works on this hardware.
 pub fn select_encoder(available: &[String]) -> String {
-    for want in preferred_hw_encoders() {
+    for want in preferred_hw_encoders().iter().chain(preferred_sw_encoders()) {
         if available.iter().any(|e| e == want) {
             return (*want).to_string();
         }
     }
+    // Nothing recognised. Return the usual default so the caller still has a
+    // name to report; the encode itself will fail with LL-MEDIA-005.
     "libx264".to_string()
 }
 
 /// Whether the chosen encoder is hardware-accelerated.
+///
+/// Decided by membership of the software list rather than by "is it libx264",
+/// which would mislabel every other software encoder as hardware-accelerated
+/// in the Settings panel.
 pub fn is_hardware_encoder(encoder: &str) -> bool {
-    encoder != "libx264"
+    // h264_mf is Media Foundation, which may or may not be hardware-backed; it
+    // is listed as software so the UI never over-promises.
+    !preferred_sw_encoders().contains(&encoder) && encoder != "libopenh264" && encoder != "libx264"
 }
 
 // ---------------------------------------------------------------------------
@@ -788,6 +825,33 @@ mod tests {
     }
 
     #[test]
+    fn a_build_without_libx264_still_finds_a_software_encoder() {
+        // An LGPL FFmpeg has no libx264. Normalization must not be left
+        // without any encoder at all (§15).
+        let lgpl: Vec<String> = vec!["libopenh264".into(), "mpeg4".into(), "aac".into()];
+        assert_eq!(select_encoder(&lgpl), "libopenh264");
+        assert!(!is_hardware_encoder("libopenh264"));
+
+        // Hardware still wins when it is present.
+        let mut with_hw = lgpl.clone();
+        with_hw.push(preferred_hw_encoders()[0].to_string());
+        assert_eq!(select_encoder(&with_hw), preferred_hw_encoders()[0]);
+
+        // And libx264 outranks libopenh264 when both exist.
+        let both: Vec<String> = vec!["libopenh264".into(), "libx264".into()];
+        assert_eq!(select_encoder(&both), "libx264");
+    }
+
+    #[test]
+    fn the_software_fallback_list_is_ordered_and_non_empty() {
+        let sw = preferred_sw_encoders();
+        assert!(!sw.is_empty());
+        assert_eq!(sw[0], "libx264", "libx264 stays the preferred software encoder where available");
+        assert!(sw.contains(&"libopenh264"), "an LGPL-compatible fallback must exist");
+        assert!(sw.iter().all(|e| !is_hardware_encoder(e)), "the software list must not claim hardware");
+    }
+
+    #[test]
     fn encoder_selection_prefers_hardware_then_falls_back() {
         let none: Vec<String> = vec!["libx264".into(), "mpeg4".into()];
         assert_eq!(select_encoder(&none), "libx264");
@@ -857,5 +921,219 @@ mod tests {
             "aarch64-unknown-linux-gnu",
         ];
         assert!(known.contains(&target_triple()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Turning FFmpeg's output into something a user can act on (§18, §35)
+// ---------------------------------------------------------------------------
+
+/// Classify FFmpeg's stderr into a Louver error code.
+///
+/// The patterns below were taken from real FFmpeg 6.1 output for each failure
+/// mode rather than guessed; the tests quote that output verbatim. Anything
+/// unrecognised stays `StreamFfmpegExit`, whose message already tells the user
+/// the broadcast stopped and is being retried.
+pub fn classify_ffmpeg_failure(stderr: &str) -> crate::error::ErrorCode {
+    use crate::error::ErrorCode as E;
+    let s = stderr.to_lowercase();
+
+    // Order matters: the most specific diagnosis first.
+
+    // The ingest server answered and refused us. YouTube says so explicitly.
+    if s.contains("netstream.publish.badname")
+        || s.contains("authmod")
+        || (s.contains("server error") && (s.contains("publish") || s.contains("authentic")))
+        || s.contains("unable to publish")
+        || s.contains("rtmp server sent error")
+    {
+        return E::StreamKeyRejected;
+    }
+
+    // Name resolution failed, which in practice means there is no internet.
+    if s.contains("failed to resolve hostname")
+        || s.contains("name or service not known")
+        || s.contains("temporary failure in name resolution")
+        || s.contains("network is unreachable")
+        || s.contains("no route to host")
+    {
+        return E::NetworkUnreachable;
+    }
+
+    // We reached the network but the endpoint did not accept or keep the
+    // connection. "Cannot open connection" is RTMP's form of this.
+    if s.contains("connection refused")
+        || s.contains("cannot open connection")
+        || s.contains("connection timed out")
+        || s.contains("connection reset by peer")
+        || s.contains("broken pipe")
+        || s.contains("end of file")
+        || s.contains("handshake")
+    {
+        return E::NetworkRtmpRejected;
+    }
+
+    if s.contains("no space left on device") {
+        return E::StorageInsufficientSpace;
+    }
+
+    // A file that is gone and a file that is unreadable need different advice,
+    // and FFmpeg reports both through "Error opening input". The distinguishing
+    // signal is which errno or demuxer complaint follows, so match on that and
+    // never on the generic wrapper line.
+    if s.contains("no such file or directory") {
+        return E::MediaFileMissing;
+    }
+    // A normalized cache file that will not parse is a corrupt cache entry,
+    // not a broken source: the source is never read during a broadcast.
+    if s.contains("moov atom not found")
+        || s.contains("invalid data found when processing input")
+        || s.contains("could not find codec parameters")
+    {
+        return E::StorageCacheCorrupt;
+    }
+    if s.contains("permission denied") || s.contains("operation not permitted") {
+        return E::StorageIo;
+    }
+
+    E::StreamFfmpegExit
+}
+
+/// Build a user-facing error from FFmpeg's output, keeping the technical
+/// detail behind the disclosure the UI shows on demand (§35).
+pub fn error_from_ffmpeg(stderr: &str) -> crate::error::LouverError {
+    let code = classify_ffmpeg_failure(stderr);
+    // Keep the last few lines: the first line is usually the root cause and the
+    // rest is FFmpeg unwinding.
+    let detail: Vec<&str> = stderr.lines().filter(|l| !l.trim().is_empty()).rev().take(4).collect();
+    crate::error::LouverError::with_detail(code, detail.into_iter().rev().collect::<Vec<_>>().join(" | "))
+}
+
+#[cfg(test)]
+mod ffmpeg_error_tests {
+    use super::*;
+    use crate::error::ErrorCode as E;
+
+    // Every string below is real FFmpeg 6.1 output, captured from the failure
+    // it describes. Guessing at these is how error mapping goes wrong.
+
+    #[test]
+    fn nothing_listening_reads_as_a_server_connection_failure() {
+        let real = "[tcp @ 0x5582f4065cc0] Connection to tcp://127.0.0.1:1?tcp_nodelay=0 failed: Connection refused\n\
+                    [rtmp @ 0x5582f4015f40] Cannot open connection tcp://127.0.0.1:1?tcp_nodelay=0\n\
+                    [out#0/flv @ 0x5582f405fe00] Error opening output rtmp://127.0.0.1:1/live/key: Connection refused";
+        assert_eq!(classify_ffmpeg_failure(real), E::NetworkRtmpRejected);
+        let e = error_from_ffmpeg(real);
+        assert_eq!(e.code_str, "LL-NETWORK-002");
+        assert!(e.message.contains("유튜브 서버에 연결하지 못했습니다"));
+        // The raw text is available, but only as detail.
+        assert!(e.detail.unwrap().contains("Connection refused"));
+    }
+
+    #[test]
+    fn dns_failure_reads_as_no_internet() {
+        let real = "[tcp @ 0x55a971a955c0] Failed to resolve hostname a.rtmps.youtube.com: Name or service not known\n\
+                    [rtmp @ 0x55a971af5700] Cannot open connection tcp://a.rtmps.youtube.com:1935?tcp_nodelay=0";
+        // Resolution failure outranks the "cannot open connection" that follows it.
+        assert_eq!(classify_ffmpeg_failure(real), E::NetworkUnreachable);
+        assert_eq!(error_from_ffmpeg(real).code_str, "LL-NETWORK-001");
+    }
+
+    #[test]
+    fn a_rejected_stream_key_is_named_as_such() {
+        // What an ingest server returns for a bad key.
+        for real in [
+            "[rtmp @ 0x1] RTMP server sent error: NetStream.Publish.BadName",
+            "[rtmp @ 0x1] Server error: authmod=adobe requires a valid stream key",
+            "[rtmp @ 0x1] Unable to publish to the requested stream",
+        ] {
+            assert_eq!(classify_ffmpeg_failure(real), E::StreamKeyRejected, "{real}");
+        }
+        let e = error_from_ffmpeg("[rtmp @ 0x1] RTMP server sent error: NetStream.Publish.BadName");
+        assert_eq!(e.code_str, "LL-STREAM-008");
+        assert!(e.message.contains("스트림 키"), "{}", e.message);
+    }
+
+    #[test]
+    fn a_dropped_connection_mid_broadcast_is_a_network_fault() {
+        for real in [
+            "[flv @ 0x1] Failed to update header with correct duration.\nav_interleaved_write_frame(): Broken pipe",
+            "[rtmp @ 0x1] Connection reset by peer",
+            "[rtmp @ 0x1] RTMP_ReadPacket, failed to read RTMP packet header: End of file",
+        ] {
+            assert_eq!(classify_ffmpeg_failure(real), E::NetworkRtmpRejected, "{real}");
+        }
+    }
+
+    #[test]
+    fn a_corrupt_cache_file_is_reported_as_a_cache_problem_not_a_network_one() {
+        let real = "[mov,mp4,m4a,3gp,3g2,mj2 @ 0x563446dcef40] moov atom not found\n\
+                    [in#0 @ 0x563446dcee40] Error opening input: Invalid data found when processing input";
+        assert_eq!(classify_ffmpeg_failure(real), E::StorageCacheCorrupt);
+        assert_eq!(error_from_ffmpeg(real).code_str, "LL-STORAGE-002");
+    }
+
+    #[test]
+    fn a_vanished_file_is_reported_as_a_missing_file() {
+        let real = "Error opening input file /Users/test/Music/재즈.mp4.\n\
+                    Error opening input files: No such file or directory";
+        assert_eq!(classify_ffmpeg_failure(real), E::MediaFileMissing);
+    }
+
+    #[test]
+    fn a_missing_file_and_a_corrupt_file_are_told_apart() {
+        // Both arrive wrapped in "Error opening input", so the wrapper alone
+        // must never decide which it is.
+        let missing = "[in#0 @ 0x1] Error opening input: No such file or directory\n\
+                       Error opening input file /cache/x/normalized.mp4.";
+        let corrupt = "[mov,mp4,m4a @ 0x1] moov atom not found\n\
+                       [in#0 @ 0x1] Error opening input: Invalid data found when processing input";
+        assert_eq!(classify_ffmpeg_failure(missing), E::MediaFileMissing);
+        assert_eq!(classify_ffmpeg_failure(corrupt), E::StorageCacheCorrupt);
+        assert_ne!(
+            classify_ffmpeg_failure(missing),
+            classify_ffmpeg_failure(corrupt),
+            "a deleted file and a damaged file need different advice"
+        );
+    }
+
+    #[test]
+    fn a_full_disk_is_reported_as_a_storage_problem() {
+        let real = "[flv @ 0x1] Error writing trailer: No space left on device";
+        assert_eq!(classify_ffmpeg_failure(real), E::StorageInsufficientSpace);
+    }
+
+    #[test]
+    fn unrecognised_output_keeps_the_generic_retry_message() {
+        let e = error_from_ffmpeg("[flv @ 0x1] something entirely new happened");
+        assert_eq!(e.code, E::StreamFfmpegExit);
+        assert!(e.message.contains("자동으로 다시 연결"));
+    }
+
+    #[test]
+    fn the_user_message_is_never_raw_ffmpeg_output() {
+        // §35: the headline is Korean guidance; FFmpeg's words stay in detail.
+        for real in [
+            "Connection refused",
+            "Failed to resolve hostname x: Name or service not known",
+            "moov atom not found",
+            "No space left on device",
+        ] {
+            let e = error_from_ffmpeg(real);
+            assert!(!e.message.contains("["), "{}", e.message);
+            for word in ["Connection", "hostname", "moov", "device"] {
+                assert!(!e.message.contains(word), "raw text leaked into the message: {}", e.message);
+            }
+            assert!(e.message.chars().any(|c| ('가'..='힣').contains(&c)), "message should be Korean");
+        }
+    }
+
+    #[test]
+    fn the_detail_is_masked_so_a_publish_url_cannot_leak() {
+        let real = "[out#0/flv @ 0x1] Error opening output rtmps://a.rtmps.youtube.com/live2/abcd-efgh-ijkl-mnop: Connection refused";
+        let e = error_from_ffmpeg(real);
+        let d = e.detail.unwrap();
+        assert!(!d.contains("abcd-efgh"), "stream key leaked into the error detail: {d}");
+        assert!(d.contains("••••"));
     }
 }

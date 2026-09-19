@@ -133,13 +133,34 @@ fn verifying_key() -> Result<VerifyingKey> {
         .map_err(|e| LouverError::with_detail(ErrorCode::LicenseMalformed, e.to_string()))
 }
 
-/// Verify a licence file's signature and validity window.
+/// True when the development licence escape hatch is compiled in (§46).
+///
+/// It follows `debug_assertions`, so a release build can never enable it. The
+/// release test suite asserts this returns false.
+pub fn dev_license_enabled() -> bool {
+    cfg!(debug_assertions)
+}
+
+/// Verify a licence file against the public key compiled into this build.
 pub fn verify(
     file: &LicenseFile,
     now: chrono::DateTime<chrono::Utc>,
     enforce_device_binding: bool,
 ) -> Result<LicensePayload> {
-    let key = verifying_key()?;
+    verify_with_key(&verifying_key()?, file, now, enforce_device_binding)
+}
+
+/// Verify against an explicit key.
+///
+/// Split out so the verification rules can be tested against a real keypair:
+/// the compiled-in key is a placeholder until a release build supplies the
+/// production one through `LOUVER_LICENSE_PUBLIC_KEY`.
+pub fn verify_with_key(
+    key: &VerifyingKey,
+    file: &LicenseFile,
+    now: chrono::DateTime<chrono::Utc>,
+    enforce_device_binding: bool,
+) -> Result<LicensePayload> {
     let sig_bytes = base64::engine::general_purpose::STANDARD
         .decode(&file.signature)
         .map_err(|e| LouverError::with_detail(ErrorCode::LicenseMalformed, e.to_string()))?;

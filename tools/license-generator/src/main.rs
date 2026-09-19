@@ -29,6 +29,7 @@ fn main() {
         "keygen" => keygen(&flags),
         "issue" => issue(&flags),
         "verify" => verify_cmd(&flags),
+        "verify-build" => verify_build(&flags),
         _ => {
             eprintln!(
                 "louver license-generator
@@ -41,6 +42,15 @@ fn main() {
         [--expires <RFC3339>] [--max-devices 2] [--out license.json]
 
   verify --pub <base64> <license.json>
+      Verify a licence against an explicit public key.
+
+  verify-build <license.json>
+      Verify using the public key COMPILED INTO this binary. Build it with
+      LOUVER_LICENSE_PUBLIC_KEY set to confirm a release will accept the
+      licences you issue:
+
+        LOUVER_LICENSE_PUBLIC_KEY=<pub> cargo run -p license-generator -- \\
+          verify-build license.json
 "
             );
             std::process::exit(2);
@@ -131,6 +141,30 @@ fn issue(flags: &HashMap<String, String>) -> CliResult {
     std::fs::write(&out, json).map_err(|e| format!("cannot write {out}: {e}"))?;
     println!("issued {} -> {out}", file.payload.license_id);
     Ok(())
+}
+
+/// Verify through the exact path a shipped build uses (§16).
+fn verify_build(flags: &HashMap<String, String>) -> CliResult {
+    let path = flags.get("_positional").cloned().unwrap_or_else(|| "license.json".into());
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    let file: LicenseFile =
+        serde_json::from_str(&raw).map_err(|e| format!("{path} is not a licence file: {e}"))?;
+
+    if louver_core::license::LICENSE_PUBLIC_KEY_B64.starts_with("AAAAAAAA") {
+        return Err("this binary was built with the placeholder public key; rebuild with \
+             LOUVER_LICENSE_PUBLIC_KEY=<your public key>"
+            .into());
+    }
+    match louver_core::license::verify(&file, chrono::Utc::now(), false) {
+        Ok(p) => {
+            println!("VALID   {} · {} (verified with the compiled-in key)", p.license_id, p.edition);
+            Ok(())
+        }
+        Err(e) => {
+            println!("INVALID {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn verify_cmd(flags: &HashMap<String, String>) -> CliResult {

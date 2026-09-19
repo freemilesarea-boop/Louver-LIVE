@@ -4,62 +4,121 @@
 
 Proprietary. Copyright © Louver Live.
 
-## FFmpeg
+---
+
+## FFmpeg — distribution decision (§15)
 
 Louver Live bundles `ffmpeg` and `ffprobe` as Tauri sidecars. They are separate
-programs, executed as child processes; no FFmpeg code is linked into the
-application.
+programs, executed as child processes with an argv vector; no FFmpeg code is
+linked into the application.
 
-`scripts/fetch-ffmpeg.mjs` downloads them per platform:
+**Every shipped binary must be recorded here and verified by**
+`node scripts/ffmpeg-manifest.mjs --check`, which reads the version, provider,
+licence, linkage, encoders and protocol support out of the binary itself and
+fails the build if anything is unfit. A binary whose licence is not certain is
+not shipped.
 
-| Platform | Source | License |
+### What the product actually needs
+
+This drives the whole decision, so it is worth stating precisely:
+
+| Path | When | Needs an H.264 **encoder**? |
 | --- | --- | --- |
-| Windows x64 | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) release-essentials | GPL v3 |
+| Live broadcast | every second the app is on air | **No** — it is a remux (`-c copy`) |
+| Normalization | once per video, at import | Yes |
+| Compatibility mode | only when stream copy is unsuitable | Yes |
+
+Because the live path never encodes, the encoder requirement applies only to
+import-time optimization — which every supported platform can satisfy with an
+OS or hardware encoder.
+
+### Option A — GPL build (default, chosen for v1.0)
+
+| | |
+| --- | --- |
+| Licence | **GPL v3** (or GPL v2-or-later, depending on build flags) |
+| Encoders | `libx264` plus whatever hardware the machine has |
+| Linkage | static |
+| Why | libx264 is the highest-quality software H.264 encoder and works everywhere, including machines with no usable hardware encoder |
+
+Sources `scripts/fetch-ffmpeg.mjs` downloads:
+
+| Platform | Provider | Licence |
+| --- | --- | --- |
+| Windows x64 | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) `release-essentials` | GPL v3 |
 | macOS Intel | [evermeet.cx](https://evermeet.cx/ffmpeg/) | GPL v3 |
 | macOS Apple Silicon | [osxexperts.net](https://www.osxexperts.net/) | GPL v3 |
 | Linux x64 / arm64 | [johnvansickle.com](https://johnvansickle.com/ffmpeg/) static | GPL v3 |
 
-The exact URL used for a build is recorded in
-`apps/desktop/src-tauri/binaries/SOURCE-<target-triple>.txt`.
+**Obligations when shipping a GPL build:**
 
-### Obligations
+1. Ship this notice with the application.
+2. Make the corresponding FFmpeg source available. These are unmodified
+   upstream releases, so linking to the matching release tag at
+   <https://git.ffmpeg.org/ffmpeg.git> satisfies it.
+3. Do not remove FFmpeg's own copyright notices.
+4. Be aware that GPL v3 is widely read as incompatible with the Apple App
+   Store's terms. Direct `.dmg` distribution is unaffected; App Store
+   distribution would require Option B.
 
-These builds are **GPL v3**. Distributing them alongside a proprietary
-application is permissible because they are unmodified, separately-licensed
-programs invoked as subprocesses rather than linked libraries — the same basis
-on which other applications ship FFmpeg. Distribution nonetheless requires:
+### Option B — LGPL build (available, not chosen)
 
-1. Shipping this notice with the application.
-2. Making the corresponding FFmpeg source available. The builds above are
-   unmodified upstream releases; linking to the corresponding release tag on
-   <https://git.ffmpeg.org/ffmpeg.git> satisfies this.
-3. Not removing FFmpeg's own copyright notices.
+| | |
+| --- | --- |
+| Licence | LGPL v2.1-or-later |
+| Build flags | `--disable-gpl --disable-nonfree`, **without** libx264/libx265 |
+| Encoders | `h264_videotoolbox` (macOS), `h264_mf` / `h264_nvenc` / `h264_qsv` / `h264_amf` (Windows), `libopenh264` as the portable software fallback |
+| Trade-off | Slightly lower quality-per-bit at the same bitrate, and normalization quality then varies with the user's hardware |
 
-> **Before shipping commercially, have this reviewed by counsel.** If the
-> conclusion is that GPL v3 is unacceptable, the fix is to build FFmpeg from
-> source with LGPL-compatible options only (`--disable-gpl --disable-nonfree`,
-> without `libx264`) and use the platform hardware encoders plus
-> `mpeg4`/`openh264` instead. The `SOURCE-*.txt` files and this table are the
-> places to update.
+This option is genuinely viable here because the live path needs no encoder at
+all. The code supports it: the encoder chain prefers hardware, then falls back
+through `libx264` → `libopenh264` → `h264_mf`, and each candidate is proved by
+encoding a frame before it is used. An LGPL build simply never reaches
+`libx264`.
 
-### Development builds
+`libopenh264` is BSD-licensed; Cisco publishes a binary release that covers the
+H.264 patent royalties for redistributors who ship that binary unmodified.
+Confirm that arrangement applies before relying on it.
 
-Running `scripts/fetch-ffmpeg.mjs` on a machine that cannot reach those hosts
-falls back to copying the system's `ffmpeg`/`ffprobe`. That fallback is for
-development only — its `SOURCE-*.txt` says so explicitly. Release builds must
-use `--require-download`, which fails rather than falling back.
+### Decision
+
+**v1.0 ships Option A (GPL v3).** Direct download distribution only; not the
+Mac App Store. This is recorded as a release blocker requiring sign-off by
+someone qualified — see RELEASE_CANDIDATE_REPORT.md. If the answer is that
+GPL v3 is unacceptable, switch to Option B, rebuild the sidecars, re-run
+`scripts/ffmpeg-manifest.mjs --check`, and re-measure normalization throughput
+in BENCHMARK.md, since the encoder changes.
+
+### The development fallback is never shipped
+
+If `fetch-ffmpeg.mjs` cannot reach the download hosts it copies the machine's
+own `ffmpeg`/`ffprobe` so development and tests can proceed, and writes
+`DEVELOPMENT ONLY` into the accompanying `SOURCE-*.txt`. Release builds use
+`--require-download`, which fails rather than falling back, and
+`ffmpeg-manifest.mjs --check` rejects any fallback binary it finds.
+
+The binary used while developing this release candidate was, for the record:
+
+```
+ffmpeg 6.1.1-3ubuntu5   (Ubuntu system package)
+licence   GPL-2.0-or-later  (--enable-gpl, libx264, libx265)
+linkage   DYNAMIC — 215 shared libraries
+verdict   UNFIT TO SHIP (dynamically linked; would not run on a user's machine)
+```
+
+---
 
 ## Third-party Rust crates
 
-Licences are MIT or Apache-2.0 unless noted. Generate the full manifest with:
+MIT or Apache-2.0 unless noted. Generate the full manifest with:
 
 ```bash
 cargo install cargo-about && cargo about generate about.hbs
 ```
 
-Principal dependencies: `tauri` (MIT/Apache-2.0), `rusqlite` + bundled SQLite
-(MIT / public domain), `serde`, `chrono`, `sysinfo`, `rand`, `sha2`, `hex`,
-`base64`, `uuid`, `thiserror` (MIT/Apache-2.0), `ed25519-dalek`
+Principal dependencies: `tauri` (MIT/Apache-2.0), `rusqlite` with bundled
+SQLite (MIT / public domain), `serde`, `chrono`, `sysinfo`, `rand`, `sha2`,
+`hex`, `base64`, `uuid`, `thiserror` (MIT/Apache-2.0), `ed25519-dalek`
 (BSD-3-Clause), `keyring` (MIT/Apache-2.0).
 
 ## Third-party JavaScript packages
@@ -67,10 +126,10 @@ Principal dependencies: `tauri` (MIT/Apache-2.0), `rusqlite` + bundled SQLite
 All MIT: `react`, `react-dom`, `zustand`, `lucide-react`, `@tauri-apps/api`,
 `tailwindcss`, `vite`, `vitest`, `typescript`, `eslint`.
 
-Run `npx license-checker --summary` for the full list.
+Run `npx license-checker --summary` for the full list. Note that the
+development toolchain (Vite, Vitest, esbuild) is not shipped.
 
 ## Test fixtures
 
-No copyrighted media is committed to this repository. Every test video is
-generated at test time by FFmpeg's `testsrc2`, `smptebars`, `color` and `sine`
-sources.
+No copyrighted media is committed. Every test video is generated at test time
+from FFmpeg's `testsrc2`, `smptebars`, `color` and `sine` sources.

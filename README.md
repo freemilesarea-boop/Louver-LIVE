@@ -149,7 +149,8 @@ SQLite, JSON, 로그 파일 어디에도 평문으로 저장되지 않습니다.
 | --- | --- | --- |
 | `LL-STREAM-003` | 최적화되지 않은 영상이 있음 | 플레이리스트에서 `방송용으로 최적화` 실행 |
 | `LL-STREAM-004` | 플레이리스트가 비어 있음 | 영상 추가 |
-| `LL-STREAM-007` | 스트림 키 없음 | 설정에서 입력 |
+| `LL-STREAM-007` | 스트림 키 없음 |
+| `LL-STREAM-008` | YouTube가 스트림 키를 거부함 | 설정에서 입력 |
 | `LL-NETWORK-001` | 인터넷 연결 없음 | 네트워크 확인 |
 | `LL-CONFIG-002` | FFmpeg 사이드카 없음 | 재설치, 또는 `npm run sidecar` |
 | `LL-LICENSE-001` | 라이선스 없음 | 설정 → 라이선스에서 등록 |
@@ -215,6 +216,7 @@ SQLite, JSON, 로그 파일 어디에도 평문으로 저장되지 않습니다.
 | `LL-STREAM-005` | 이미 방송 중 |
 | `LL-STREAM-006` | 허용되지 않는 상태 전환 |
 | `LL-STREAM-007` | 스트림 키 없음 |
+| `LL-STREAM-008` | YouTube가 스트림 키를 거부함 |
 | `LL-NETWORK-001` | 인터넷 연결 없음 |
 | `LL-NETWORK-002` | RTMPS 서버 연결 실패 |
 | `LL-STORAGE-001` | 저장 공간 부족 |

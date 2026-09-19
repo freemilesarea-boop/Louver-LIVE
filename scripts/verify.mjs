@@ -15,6 +15,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 const STEPS = [
   { name: 'ffmpeg sidecar', cmd: 'node', args: ['scripts/fetch-ffmpeg.mjs'] },
+  // A committed key is the one failure that cannot be undone after release.
+  { name: 'secret scan', cmd: 'node', args: ['scripts/secret-scan.mjs'] },
   { name: 'frontend typecheck', cmd: 'npm', args: ['run', '--silent', 'typecheck'] },
   { name: 'frontend lint', cmd: 'npm', args: ['run', '--silent', 'lint'] },
   { name: 'frontend tests', cmd: 'npx', args: ['vitest', 'run'] },

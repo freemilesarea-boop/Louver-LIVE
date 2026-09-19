@@ -60,6 +60,7 @@ pub fn run() {
             commands::streaming::stop_broadcast,
             commands::streaming::start_dry_run,
             commands::streaming::stream_mode_label,
+            commands::streaming::stream_diagnostics,
             commands::streaming::simulate_ffmpeg_crash,
             // settings
             commands::settings::get_settings,
