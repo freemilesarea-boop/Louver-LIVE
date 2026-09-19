@@ -108,16 +108,24 @@ const log = spawnSync('git', ['log', '--all', '-p', '--no-color'], {
   cwd: ROOT, encoding: 'utf8', maxBuffer: 512 * 1024 * 1024,
 })
 if (log.status === 0) {
-  // History cannot be allowlisted by path, but a committed PEM or token is
-  // unambiguous, and fixture-shaped keys are filtered by the same refinement.
-  const historyFindings = []
-  for (const rule of RULES) {
-    if (rule.id === 'youtube-stream-key') continue // fixtures legitimately contain these
-    for (const m of log.stdout.matchAll(rule.re)) {
-      historyFindings.push({ rule: rule.id, why: rule.why, where: 'git history', sample: mask(m[0]) })
-    }
+  // Split the diff into per-file chunks so the same path allowlist applies to
+  // history. Without this the scanner flags its own committed patterns, and
+  // test fixtures that deliberately contain fake keys.
+  const chunks = log.stdout.split(/^diff --git a\/(\S+) b\/\S+$/m)
+  // chunks = [preamble, path1, body1, path2, body2, …]
+  for (let i = 1; i < chunks.length; i += 2) {
+    const path = chunks[i]
+    const body = chunks[i + 1] ?? ''
+    if (path === 'scripts/secret-scan.mjs') continue // its own rule definitions
+    const allowlisted = ALLOWLIST.some((re) => re.test(path))
+    // Only added lines matter; a removed secret is still a leak, so include
+    // those too, but skip the surrounding context.
+    const changed = body
+      .split('\n')
+      .filter((l) => (l.startsWith('+') || l.startsWith('-')) && !l.startsWith('+++') && !l.startsWith('---'))
+      .join('\n')
+    scan(`git history: ${path}`, changed, { allowlisted })
   }
-  findings.push(...historyFindings)
 } else {
   console.log('  (no git history available)')
 }

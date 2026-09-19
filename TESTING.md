@@ -136,10 +136,97 @@ summary includes a `paced_like_a_broadcast` verdict so a lost flag is caught.
 The leak verdict uses **steady-state** growth (second half of the run), because
 FFmpeg's buffer warm-up over the first ~30s otherwise looks like a leak.
 
+## Release-candidate harness
+
+These are `#[ignore]`d or script-driven: they take minutes to hours and need an
+ingest endpoint, so they never run in `npm run verify`. They exist to answer
+the questions a release has to answer, and they are the same harness whether
+the endpoint is a local RTMP server or real YouTube.
+
+### A local RTMP endpoint
+
+```bash
+npm run rc:sink -- --port 1935 --out rc-results/ingest
+```
+
+A persistent RTMP server that goes back to listening after each disconnect,
+which is what makes reconnect testing possible. The app performs a real RTMP
+handshake over a real socket, so the stream can be analysed at the *receiving*
+end rather than trusting the sender's own account of itself.
+
+### A broadcast run
+
+```bash
+# 30 minutes against the local endpoint
+LOUVER_RC_DURATION_SECS=1800 \
+  cargo test -p louver-core --test rc_live -- --ignored --nocapture rc_broadcast
+
+# the same run against real YouTube, no code change (§4)
+LOUVER_TEST_RTMPS_URL=rtmps://a.rtmps.youtube.com/live2 \
+LOUVER_TEST_STREAM_KEY=… LOUVER_RC_DURATION_SECS=1800 \
+  cargo test -p louver-core --test rc_live -- --ignored --nocapture rc_broadcast
+```
+
+It drives the real `BroadcastRuntime`, supervisor and playlist engine, samples
+both processes, and writes a CSV plus a JSON summary. The stream key is read
+from the environment into the in-memory secret store and is masked everywhere
+it is reported — including in the harness's own console output.
+
+Other runs in the same file:
+
+| Test | What it does |
+| --- | --- |
+| `rc_network_interruption` | Blackholes the ingest port with `iptables -j DROP` for 60s. A DROP, not a stopped server: dropped packets *block* FFmpeg rather than killing it, and only that reveals whether stall detection works. |
+| `rc_ffmpeg_crash_recovery` | Kills the live FFmpeg three times and checks each recovery, that the backoff resets, and that an explicit Stop is still honoured. |
+| `rc_application_restart_recovery` | Drops the owning process mid-broadcast, then starts a fresh runtime on the same data directory — inside the window it must resume with the same play order, outside it must not. |
+
+### Boundary analysis
+
+```bash
+npm run rc:boundaries -- rc-results/ingest/session-001.flv
+```
+
+Takes a captured broadcast and measures, at every playlist transition, what a
+viewer would actually experience: inter-frame gap, frame luminance (black
+frames), audio peak level (dropouts), audio gap, and timestamp continuity —
+plus whole-stream frame count, A/V skew drift and keyframe cadence.
+
+### Long runs
+
+```bash
+npm run soak -- --duration 6h
+npm run soak -- --duration 24h --profile 1080p30
+npm run soak -- --duration 24h --destination rtmps://a.rtmps.youtube.com/live2 --stream-key <key>
+```
+
+One command: it stands up the endpoint, runs the real runtime, samples both
+processes every five minutes, and writes everything to
+`soak-results/<label>/` — `samples.csv`, `summary.json`, `runtime.log`,
+`ffmpeg.log`, `console.log`, `ingest/sink-events.log`.
+
+The leak verdict uses **steady-state** growth (second half of the run) because
+FFmpeg's buffer warm-up over the first ~30s otherwise reads as a leak. The
+summary also carries a `paced_like_a_broadcast` verdict: an early version of
+this harness ran unpaced and reported 145 % CPU, which measured the disk rather
+than the product.
+
+### Supply-chain and secret checks
+
+```bash
+npm run secret-scan                    # working tree + full git history
+npm run secret-scan -- --runtime       # also the app's data directory
+npm run ffmpeg:manifest                # what the sidecars actually are
+npm run ffmpeg:manifest -- --check     # fail if they are unfit to ship
+```
+
+`secret-scan` runs as part of `npm run verify`. It was proved to fire by
+planting a stream key and a PEM block, both of which it caught.
+
 ## What is not tested here
 
-- **Real YouTube ingest.** `LOUVER_TEST_RTMPS_URL` is the hook; when it is
-  unset the real-ingest test is skipped. Nothing prints the key.
+- **Real YouTube ingest.** Every broadcast test runs against a real RTMP
+  endpoint, but a local one. Set `LOUVER_TEST_RTMPS_URL` and
+  `LOUVER_TEST_STREAM_KEY` to point the identical harness at YouTube.
 - **Windows and macOS specifics.** The keychain, sleep prevention and autostart
   implementations are compiled for those targets but were not executed on them
   in this environment; the traits they implement are exercised through the
