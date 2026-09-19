@@ -180,7 +180,32 @@ fn verify_cmd(flags: &HashMap<String, String>) -> CliResult {
 
     match vk.verify(&canonical_bytes(&file.payload), &ed25519_dalek::Signature::from_bytes(&sig)) {
         Ok(()) => {
-            println!("VALID   {} · {}", file.payload.license_id, file.payload.edition);
+            // A good signature is not the same as a usable licence. Reporting
+            // only the signature here printed VALID for an expired licence,
+            // which is exactly the wrong answer to give someone checking a
+            // licence before sending it to a customer.
+            match &file.payload.expires_at {
+                Some(exp) => match chrono::DateTime::parse_from_rfc3339(exp) {
+                    Ok(when) if when.with_timezone(&chrono::Utc) < chrono::Utc::now() => {
+                        println!(
+                            "EXPIRED {} · {} · signature is good, but it expired {exp}",
+                            file.payload.license_id, file.payload.edition
+                        );
+                        std::process::exit(1);
+                    }
+                    Ok(_) => println!(
+                        "VALID   {} · {} · expires {exp}",
+                        file.payload.license_id, file.payload.edition
+                    ),
+                    Err(e) => {
+                        println!("INVALID {} · expires_at is not a date: {e}", file.payload.license_id);
+                        std::process::exit(1);
+                    }
+                },
+                None => {
+                    println!("VALID   {} · {} · perpetual", file.payload.license_id, file.payload.edition)
+                }
+            }
             Ok(())
         }
         Err(_) => {
