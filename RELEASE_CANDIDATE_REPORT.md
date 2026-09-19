@@ -46,9 +46,11 @@ not YouTube, and this report never claims otherwise.
 | 7 | Application restart recovery | **PASS** — real processes, real RTMP |
 | 8 | Machine restart + autostart + schedule recovery | **PARTIAL** — scheduler fires at launch; OS autostart and reboot NOT TESTED |
 | 9 | 6-hour soak | *(see §9 below)* |
-| 10 | FFmpeg distribution / licence | **BLOCKER** — decision documented, not executed |
-| 11 | Production licence verification | **PASS** |
+| 10 | FFmpeg distribution / licence | **BLOCKER** — decision documented and gated in CI, not yet executed |
+| 11 | Production licence verification | **PASS** — rules proved on four real cases; the production key itself is **NOT GENERATED** (see §16.4) |
 | 12 | Stream key security | **PASS** |
+| 13 | macOS installer | **BUILD READY** — `.github/workflows/release.yml`, never run on macOS hardware |
+| 14 | Windows installer | **BUILD READY** — same workflow, never run on Windows hardware |
 
 ---
 
@@ -327,16 +329,25 @@ server came straight back; a soak that ran unpaced and measured the disk.
 
 Ordered by what retires the most risk.
 
-1. **Run one real YouTube broadcast.** Enter a key, broadcast to a private or
-   unlisted stream for 30 minutes, then pull the network cable. The harness
-   needs no code change:
+1. **Run one real YouTube broadcast.** Enter a key in the app's settings
+   screen, broadcast to a private or unlisted stream for 30 minutes, then pull
+   the network cable. **No code change is needed** — the same harness that ran
+   every figure in this report points at YouTube through two environment
+   variables:
    ```bash
-   npm run soak -- --duration 30m \
-     --destination rtmps://a.rtmps.youtube.com/live2 --stream-key <key>
+   LOUVER_TEST_RTMPS_URL=rtmps://a.rtmps.youtube.com/live2 \
+   LOUVER_TEST_STREAM_KEY=<your key> \
+   LOUVER_RC_DURATION_SECS=1800 \
+     cargo test -p louver-core --test rc_live -- --ignored --nocapture rc_broadcast
    ```
-2. **Verify on macOS and Windows.** Work through `MACOS_QA.md` and
-   `WINDOWS_QA.md` on real hardware. The keychain paths are the highest risk:
-   they have never run anywhere.
+   The key is read from the environment straight into the in-memory secret
+   store; it is masked in every log line and never written to the CSV, the
+   summary or the database. `crates/louver-core/tests/rc_security.rs` asserts
+   that against a real broadcast attempt.
+2. **Verify on macOS and Windows.** `MACOS_RELEASE_TEST.md` is the ordered
+   eighteen-step path that decides whether a build ships; `MACOS_QA.md` and
+   `WINDOWS_QA.md` are the wider checklists. The keychain paths are the highest
+   risk: they have never run anywhere.
 3. **Settle the FFmpeg distribution.** `LICENSES.md` documents both options
    with the trade-offs and recommends GPL v3 for direct download. It needs
    sign-off from someone qualified, then:
@@ -344,10 +355,18 @@ Ordered by what retires the most risk.
    node scripts/fetch-ffmpeg.mjs --require-download --force
    node scripts/ffmpeg-manifest.mjs --check   # must pass
    ```
-   Note GPL v3 is generally read as incompatible with the Mac App Store.
+   The check is wired into `.github/workflows/release.yml` ahead of the build,
+   so an unfit binary cannot reach an artifact. It currently **fails** here, as
+   it should: this machine has only the dynamically linked development
+   fallback. Note GPL v3 is generally read as incompatible with the Mac App
+   Store.
 4. **Generate the production keys** — the Ed25519 licence keypair and the Tauri
-   updater keypair — and add them to CI as secrets. The private licence key
-   stays offline.
+   updater keypair — and add them to CI as secrets. `SIGNING.md` has the
+   procedure. The private licence key is generated on your own machine and
+   stays offline; this repository neither creates nor stores one, and
+   `npm run secret-scan` fails the build if one appears. Until then
+   `license-generator verify-build` correctly reports that the build carries
+   the placeholder public key.
 
 Not blockers, but do them before shipping: code-sign and notarize both
 platforms, and run a 24-hour soak on target-class hardware.

@@ -7,6 +7,14 @@ executed and no Windows claim appears in the release report.
 Target: Windows 10 and 11, x64. Run on both if possible, and on at least one
 machine with no NVIDIA GPU so the encoder fallback is exercised.
 
+**Getting a build without a Windows machine:** the `Release artifacts`
+workflow (`.github/workflows/release.yml`) builds the `.msi` and NSIS `.exe`
+on a `windows-latest` runner, fetching licence-cleared static sidecars and
+failing if the manifest check does not pass. The build path is therefore
+**BUILD READY**; it has never been run, and the artifact has never been
+launched on Windows, so everything below stays **NOT TESTED** until someone
+does it.
+
 ## Build
 
 ```powershell

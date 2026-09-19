@@ -11,6 +11,15 @@ run. They must be executed on real hardware before release.
 
 Run this on both an Apple Silicon and, if supported, an Intel Mac.
 
+**For the decision about whether a build ships, use
+`MACOS_RELEASE_TEST.md`** — eighteen ordered steps with a results table. This
+file is the wider checklist to work through once that path passes.
+
+**Getting a build without a Mac:** the `Release artifacts` workflow
+(`.github/workflows/release.yml`) builds the `.app` and `.dmg` on a `macos-14`
+Apple Silicon runner. The build path is **BUILD READY**; nothing has been run
+on macOS hardware, so everything below stays **NOT TESTED**.
+
 ## Build
 
 ```bash
