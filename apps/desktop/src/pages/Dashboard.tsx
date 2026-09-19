@@ -114,7 +114,9 @@ export function Dashboard() {
               {status?.playlist_name ?? activePlaylist?.playlist.name ?? '선택되지 않음'}
             </div>
             <div className="mt-1 text-xs text-ink-500">
-              {status?.item_count ?? activePlaylist?.items.length ?? 0}개 영상
+              {/* item_count is 0 while idle, so `??` would keep the zero. The
+                  selected playlist is the right source when nothing is live. */}
+              {(isLive ? status?.item_count : activePlaylist?.items.length) ?? 0}개 영상
               {status?.dry_run && <span className="ml-2 text-warn">· 로컬 테스트 모드</span>}
             </div>
           </div>

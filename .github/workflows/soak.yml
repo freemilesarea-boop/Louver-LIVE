@@ -1,0 +1,38 @@
+name: Soak
+
+# Long-running stability check (§55). Never part of CI: it is run on demand,
+# and on a real machine when validating a release.
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'How long to run (e.g. 30m, 1h, 6h)'
+        required: true
+        default: '30m'
+      profile:
+        description: 'Output profile'
+        required: true
+        default: '1080p30'
+        type: choice
+        options: ['1080p30', '720p30']
+
+jobs:
+  soak:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 420
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - uses: FedericoCarboni/setup-ffmpeg@v3
+      - run: npm ci
+      - run: node scripts/fetch-ffmpeg.mjs
+      - run: node scripts/soak-test.mjs --duration ${{ inputs.duration }} --profile ${{ inputs.profile }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: soak-${{ inputs.duration }}-${{ inputs.profile }}
+          path: soak-results/
+          retention-days: 30

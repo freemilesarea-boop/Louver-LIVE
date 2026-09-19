@@ -10,7 +10,7 @@ use louver_core::media::cache::MediaCache;
 use louver_core::runtime::{BroadcastRuntime, FfmpegLauncher, RuntimeEvents, RuntimeStatus, StreamLauncher};
 use louver_core::security::StreamKeyStore;
 use louver_core::session::SessionStore;
-use louver_core::streaming::ffmpeg::{select_encoder, FfmpegCommandBuilder, FfmpegTools};
+use louver_core::streaming::ffmpeg::{FfmpegCommandBuilder, FfmpegTools};
 use louver_core::system::{MetricsCollector, SleepPreventer, TcpNetworkChecker};
 use louver_core::{settings_keys, AppPaths};
 use std::sync::{Arc, Mutex};
@@ -78,11 +78,8 @@ impl AppState {
         let profile = OutputProfile::from_id(&db.get_setting_or(settings_keys::OUTPUT_PROFILE, "1080p30"))
             .unwrap_or_default();
 
-        let encoder = tools
-            .as_ref()
-            .and_then(|t| t.available_encoders().ok())
-            .map(|e| select_encoder(&e))
-            .unwrap_or_else(|| "libx264".to_string());
+        // Proves the encoder on this hardware rather than trusting the list.
+        let encoder = tools.as_ref().map(|t| t.detect_encoder()).unwrap_or_else(|| "libx264".to_string());
         logger.info(LogTarget::App, &format!("최적화 인코더: {encoder}"));
 
         let fallback = FfmpegTools::new("ffmpeg", "ffprobe");

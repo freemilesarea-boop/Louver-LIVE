@@ -101,8 +101,9 @@ export const useAppStore = create<AppState>((set, get) => ({
     // a restart).
     const { settings, playlists, activePlaylistId } = get()
     if (activePlaylistId == null) {
-      const saved = settings ? Number((settings as unknown as Record<string, unknown>).active_playlist) : NaN
-      const id = Number.isFinite(saved) && saved > 0 ? saved : playlists[0]?.id ?? null
+      const saved = settings?.active_playlist ?? null
+      const stillExists = saved != null && playlists.some((p) => p.id === saved)
+      const id = stillExists ? saved : playlists[0]?.id ?? null
       if (id != null) await get().setActivePlaylist(id)
     }
     const notice = await api.takeStartupNotice().catch(() => null)

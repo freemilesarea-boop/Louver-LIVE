@@ -22,9 +22,10 @@ fn b64() -> base64::engine::general_purpose::GeneralPurpose {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("help");
-    let flags = parse_flags(&args);
+    // The subcommand is not a positional argument.
+    let flags = parse_flags(args.get(1..).unwrap_or_default());
 
-    match cmd {
+    let result = match cmd {
         "keygen" => keygen(&flags),
         "issue" => issue(&flags),
         "verify" => verify_cmd(&flags),
@@ -44,7 +45,25 @@ fn main() {
             );
             std::process::exit(2);
         }
+    };
+
+    if let Err(e) = result {
+        eprintln!("error: {e}");
+        std::process::exit(1);
     }
+}
+
+/// A plain message; this tool is operated by a human at a terminal, so a
+/// sentence beats a panic backtrace.
+type CliResult = Result<(), String>;
+
+fn decode_b64(what: &str, s: &str) -> Result<Vec<u8>, String> {
+    b64().decode(s.trim()).map_err(|e| format!("{what} is not valid base64: {e}"))
+}
+
+fn fixed<const N: usize>(what: &str, v: Vec<u8>) -> Result<[u8; N], String> {
+    let n = v.len();
+    v.try_into().map_err(|_| format!("{what} must be {N} bytes, got {n}"))
 }
 
 fn parse_flags(args: &[String]) -> HashMap<String, String> {
@@ -63,14 +82,15 @@ fn parse_flags(args: &[String]) -> HashMap<String, String> {
     m
 }
 
-fn keygen(flags: &HashMap<String, String>) {
+fn keygen(flags: &HashMap<String, String>) -> CliResult {
     let dir = flags.get("out").cloned().unwrap_or_else(|| ".".into());
     let sk = SigningKey::generate(&mut rand::rngs::OsRng);
     let priv_b64 = b64().encode(sk.to_bytes());
     let pub_b64 = b64().encode(sk.verifying_key().to_bytes());
 
     let path = std::path::Path::new(&dir).join("license-signing-key.txt");
-    std::fs::write(&path, format!("{priv_b64}\n")).expect("failed to write the private key");
+    std::fs::write(&path, format!("{priv_b64}\n"))
+        .map_err(|e| format!("cannot write the private key to {}: {e}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -82,17 +102,14 @@ fn keygen(flags: &HashMap<String, String>) {
     println!();
     println!("Build the app with this public key embedded:");
     println!("  LOUVER_LICENSE_PUBLIC_KEY={pub_b64} cargo build --release");
+    Ok(())
 }
 
-fn issue(flags: &HashMap<String, String>) {
-    let key_path = flags.get("key").expect("--key <private key file> is required");
-    let raw = std::fs::read_to_string(key_path).expect("cannot read the private key");
-    let bytes: [u8; 32] = b64()
-        .decode(raw.trim())
-        .expect("private key is not valid base64")
-        .try_into()
-        .expect("private key must be 32 bytes");
-    let sk = SigningKey::from_bytes(&bytes);
+fn issue(flags: &HashMap<String, String>) -> CliResult {
+    let key_path = flags.get("key").ok_or("--key <private key file> is required")?;
+    let raw = std::fs::read_to_string(key_path)
+        .map_err(|e| format!("cannot read the private key {key_path}: {e}"))?;
+    let sk = SigningKey::from_bytes(&fixed::<32>("private key", decode_b64("private key", &raw)?)?);
 
     let payload = LicensePayload {
         license_id: flags
@@ -110,27 +127,28 @@ fn issue(flags: &HashMap<String, String>) {
     let file =
         LicenseFile { signature: b64().encode(sk.sign(&canonical_bytes(&payload)).to_bytes()), payload };
     let out = flags.get("out").cloned().unwrap_or_else(|| "license.json".into());
-    std::fs::write(&out, serde_json::to_vec_pretty(&file).unwrap()).expect("failed to write the licence");
+    let json = serde_json::to_vec_pretty(&file).map_err(|e| e.to_string())?;
+    std::fs::write(&out, json).map_err(|e| format!("cannot write {out}: {e}"))?;
     println!("issued {} -> {out}", file.payload.license_id);
+    Ok(())
 }
 
-fn verify_cmd(flags: &HashMap<String, String>) {
-    let pub_b64 = flags.get("pub").expect("--pub <base64 public key> is required");
+fn verify_cmd(flags: &HashMap<String, String>) -> CliResult {
+    let pub_b64 = flags.get("pub").ok_or("--pub <base64 public key> is required")?;
     let path = flags.get("_positional").cloned().unwrap_or_else(|| "license.json".into());
 
-    let vk_bytes: [u8; 32] = b64().decode(pub_b64).expect("bad base64").try_into().expect("32 bytes");
-    let vk = VerifyingKey::from_bytes(&vk_bytes).expect("invalid public key");
+    let vk = VerifyingKey::from_bytes(&fixed::<32>("public key", decode_b64("public key", pub_b64)?)?)
+        .map_err(|e| format!("invalid public key: {e}"))?;
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let file: LicenseFile =
-        serde_json::from_str(&std::fs::read_to_string(&path).expect("cannot read the licence"))
-            .expect("bad licence json");
-    let sig: [u8; 64] = b64()
-        .decode(&file.signature)
-        .expect("bad signature base64")
-        .try_into()
-        .expect("signature must be 64 bytes");
+        serde_json::from_str(&raw).map_err(|e| format!("{path} is not a licence file: {e}"))?;
+    let sig = fixed::<64>("signature", decode_b64("signature", &file.signature)?)?;
 
     match vk.verify(&canonical_bytes(&file.payload), &ed25519_dalek::Signature::from_bytes(&sig)) {
-        Ok(()) => println!("VALID   {} · {}", file.payload.license_id, file.payload.edition),
+        Ok(()) => {
+            println!("VALID   {} · {}", file.payload.license_id, file.payload.edition);
+            Ok(())
+        }
         Err(_) => {
             println!("INVALID signature does not match");
             std::process::exit(1);

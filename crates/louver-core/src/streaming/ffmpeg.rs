@@ -8,7 +8,7 @@
 use crate::config::{OutputProfile, StreamMode};
 use crate::error::{ErrorCode, LouverError, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Locations of the bundled FFmpeg/ffprobe sidecar binaries.
 #[derive(Debug, Clone)]
@@ -58,6 +58,51 @@ impl FfmpegTools {
             .output()
             .map_err(|e| LouverError::with_detail(ErrorCode::FfmpegNotFound, e.to_string()))?;
         Ok(String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or_default().to_string())
+    }
+
+    /// Choose an encoder that this machine can actually use (§9).
+    ///
+    /// Being listed is not enough: a distribution build commonly advertises
+    /// `h264_nvenc` whether or not an NVIDIA card is present, and picking it
+    /// would make every optimization fail at the point the user presses the
+    /// button. Each candidate is therefore proved by encoding one frame before
+    /// it is accepted.
+    pub fn detect_encoder(&self) -> String {
+        let listed = self.available_encoders().unwrap_or_default();
+        for want in preferred_hw_encoders() {
+            if listed.iter().any(|e| e == want) && self.encoder_works(want) {
+                return (*want).to_string();
+            }
+        }
+        "libx264".to_string()
+    }
+
+    /// Encode a single frame to /dev/null with `encoder`, and report success.
+    pub fn encoder_works(&self, encoder: &str) -> bool {
+        Command::new(&self.ffmpeg)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=black:size=320x240:rate=30:duration=0.1",
+                "-c:v",
+                encoder,
+                "-frames:v",
+                "1",
+                "-f",
+                "null",
+                "-",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
     }
 
     /// Video encoders FFmpeg reports as available, used for hardware detection (§9).
@@ -120,7 +165,12 @@ pub fn preferred_hw_encoders() -> &'static [&'static str] {
     }
 }
 
-/// Pick the best available encoder for normalization, falling back to libx264 (§9).
+/// Pick the best *listed* encoder, falling back to libx264 (§9).
+///
+/// This only consults FFmpeg's compiled-in encoder list. A build can advertise
+/// `h264_nvenc` on a machine with no NVIDIA GPU at all, so callers that are
+/// about to encode for real should use [`FfmpegTools::detect_encoder`], which
+/// additionally proves the encoder works on this hardware.
 pub fn select_encoder(available: &[String]) -> String {
     for want in preferred_hw_encoders() {
         if available.iter().any(|e| e == want) {
@@ -430,6 +480,12 @@ impl FfmpegCommandBuilder {
             "warning".into(),
             "-progress".into(),
             "pipe:1".into(),
+            // Overwrite without asking. Irrelevant for an RTMPS URL, but
+            // essential when the destination is a file: on a reconnect the
+            // previous run's output already exists, and with `-nostdin`
+            // FFmpeg refuses the overwrite prompt and exits at once — every
+            // retry would fail and a dry run could never recover.
+            "-y".into(),
             // Feed the muxer at wall-clock speed; without this FFmpeg would
             // push the whole playlist to YouTube as fast as it can read it.
             "-re".into(),
@@ -480,6 +536,9 @@ impl FfmpegCommandBuilder {
     }
 
     /// Dry run: identical pipeline, local file sink instead of RTMPS (§30).
+    ///
+    /// `-y` already comes from [`Self::build_stream_args`], so a restart
+    /// overwrites the previous output rather than stalling on a prompt.
     pub fn build_dry_run_args(
         &self,
         manifest: &Path,
@@ -590,6 +649,27 @@ mod tests {
     }
 
     #[test]
+    fn the_stream_command_overwrites_its_output_so_a_reconnect_can_succeed() {
+        // Without -y, a dry run that reconnects hits FFmpeg's overwrite prompt
+        // and, with -nostdin, dies instantly on every retry.
+        for mode in [StreamMode::StreamCopy, StreamMode::CompatibilityEncode] {
+            let live = builder().build_stream_args(Path::new("/tmp/m.txt"), "/tmp/out.flv", mode, true);
+            assert!(live.contains(&"-y".to_string()), "{mode:?} stream args missing -y");
+            let dry = builder().build_dry_run_args(
+                Path::new("/tmp/m.txt"),
+                Path::new("/tmp/out.flv"),
+                mode,
+                None,
+                true,
+            );
+            assert!(dry.contains(&"-y".to_string()), "{mode:?} dry-run args missing -y");
+            // -y must come before the output, like every other global flag.
+            let y = dry.iter().position(|x| x == "-y").unwrap();
+            assert!(y < dry.len() - 1);
+        }
+    }
+
+    #[test]
     fn non_looping_stream_omits_stream_loop() {
         let a = builder().build_stream_args(
             Path::new("/tmp/m.txt"),
@@ -682,6 +762,30 @@ mod tests {
     }
 
     // --- encoder selection (§9) -------------------------------------------
+
+    #[test]
+    fn a_listed_encoder_that_does_not_run_is_not_chosen() {
+        // The bug this guards: a distro FFmpeg lists h264_nvenc on a machine
+        // with no NVIDIA GPU, and every optimization then fails.
+        let Ok(tools) = FfmpegTools::discover(None) else {
+            eprintln!("SKIP: no ffmpeg on PATH");
+            return;
+        };
+        let listed = tools.available_encoders().unwrap_or_default();
+        let chosen = tools.detect_encoder();
+        assert!(
+            chosen == "libx264" || tools.encoder_works(&chosen),
+            "detect_encoder chose {chosen}, which cannot actually encode here"
+        );
+        // libx264 must always work, or normalization has no fallback at all.
+        assert!(tools.encoder_works("libx264"), "libx264 is the last resort and must work");
+        assert!(!tools.encoder_works("definitely_not_an_encoder"));
+        // And a listed-but-unusable encoder really is filtered out, not just
+        // absent from the list.
+        if listed.iter().any(|e| e == "h264_nvenc") && !tools.encoder_works("h264_nvenc") {
+            assert_ne!(chosen, "h264_nvenc", "picked a listed encoder that does not run");
+        }
+    }
 
     #[test]
     fn encoder_selection_prefers_hardware_then_falls_back() {

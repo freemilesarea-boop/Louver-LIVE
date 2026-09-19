@@ -21,6 +21,8 @@ pub struct SettingsView {
     pub developer_mode: bool,
     pub enforce_device_binding: bool,
     pub first_run_complete: bool,
+    /// Playlist the user last worked with, restored on the next launch.
+    pub active_playlist: Option<i64>,
     pub cache_location: String,
     pub cache_size_bytes: u64,
     pub cache_size_label: String,
@@ -62,6 +64,11 @@ pub fn get_settings(state: State<'_, AppState>) -> CmdResult<SettingsView> {
         developer_mode: state.developer_mode(),
         enforce_device_binding: flag(settings_keys::ENFORCE_DEVICE_BINDING, "false"),
         first_run_complete: flag(settings_keys::FIRST_RUN_COMPLETE, "false"),
+        active_playlist: db
+            .get_setting(settings_keys::ACTIVE_PLAYLIST)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse().ok()),
         cache_location: state.cache.root().to_string_lossy().into_owned(),
         cache_size_bytes: state.cache.total_size(),
         cache_size_label: format_bytes(state.cache.total_size()),

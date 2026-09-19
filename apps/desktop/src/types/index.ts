@@ -178,6 +178,7 @@ export interface SettingsView {
   developer_mode: boolean
   enforce_device_binding: boolean
   first_run_complete: boolean
+  active_playlist?: number | null
   cache_location: string
   cache_size_bytes: number
   cache_size_label: string

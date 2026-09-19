@@ -178,6 +178,7 @@ export function createMockBackend(opts: MockOptions = {}) {
       developer_mode: flag('developer_mode'),
       enforce_device_binding: flag('enforce_device_binding'),
       first_run_complete: flag('first_run_complete'),
+      active_playlist: settings.has('active_playlist') ? Number(settings.get('active_playlist')) : null,
       cache_location: '/data/LouverLive/cache',
       cache_size_bytes: 1024 * 1024 * 512,
       cache_size_label: '512.0 MB',

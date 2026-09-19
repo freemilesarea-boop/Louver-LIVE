@@ -37,8 +37,15 @@ pub trait ProcessHandle: Send {
 }
 
 /// Live progress scraped from `-progress pipe:1` (§28, §40).
+///
+/// Note which fields are meaningful in which mode. In stream-copy mode FFmpeg
+/// emits **no `frame=` field at all** — it counts encoded frames, and nothing
+/// is being encoded — so `frames` stays 0 for a perfectly healthy broadcast.
+/// Liveness must therefore be judged from `total_bytes` / `out_time_ms`, which
+/// is what [`StreamSupervisor::has_produced_output`] does.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StreamProgress {
+    /// Encoded frames. Always 0 in stream-copy mode; see the type docs.
     pub frames: u64,
     pub fps: f64,
     /// Output bitrate in kbit/s as reported by FFmpeg.
@@ -355,6 +362,9 @@ impl StreamSupervisor {
 
     /// True once FFmpeg has actually pushed bytes, which is how the session
     /// knows CONNECTING became LIVE.
+    ///
+    /// Deliberately byte-based rather than frame-based: a stream-copy
+    /// broadcast never reports a frame count.
     pub fn has_produced_output(&self) -> bool {
         self.saw_data.load(Ordering::SeqCst)
     }
@@ -663,6 +673,37 @@ mod tests {
         assert_eq!(p.out_time_ms, 60_000); // µs -> ms
         assert_eq!(p.speed, 1.0);
         assert!(apply_progress_line(&mut p, "progress=end"));
+    }
+
+    #[test]
+    fn stream_copy_progress_has_no_frame_field_and_is_still_recognised_as_alive() {
+        // The exact shape FFmpeg emits with `-c copy`: no `frame=` line.
+        let mut p = StreamProgress::default();
+        for line in [
+            "bitrate=4108.0kbits/s",
+            "total_size=524288",
+            "out_time_ms=1021000",
+            "dup_frames=0",
+            "drop_frames=0",
+            "speed=2.03x",
+            "progress=continue",
+        ] {
+            apply_progress_line(&mut p, line);
+        }
+        assert_eq!(p.frames, 0, "stream copy reports no frames, and that is healthy");
+        assert_eq!(p.total_bytes, 524_288);
+        assert_eq!(p.out_time_ms, 1021, "out_time_ms is microseconds in ffmpeg's output");
+        assert!(p.bitrate_kbps > 4000.0);
+        // Liveness is byte-based, so this must read as "producing output".
+        assert!(p.total_bytes > 0 || p.frames > 0);
+    }
+
+    #[test]
+    fn a_negative_out_time_at_startup_is_ignored() {
+        // FFmpeg briefly reports a negative out_time before the first packet.
+        let mut p = StreamProgress { out_time_ms: 500, ..Default::default() };
+        apply_progress_line(&mut p, "out_time_ms=-45667");
+        assert_eq!(p.out_time_ms, 500, "a negative reading must not clobber progress");
     }
 
     #[test]
