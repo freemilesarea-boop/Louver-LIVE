@@ -1,0 +1,256 @@
+//! Typed errors with stable, user-facing error codes.
+//!
+//! Every error that can reach the UI carries an `LL-<DOMAIN>-<NNN>` code, a
+//! Korean user-facing message, and optionally a technical detail string that the
+//! UI keeps behind a "상세정보" disclosure. Raw FFmpeg output is never shown as
+//! the primary message (§35).
+
+use std::fmt;
+
+/// Stable error codes. The numeric suffix is part of the public contract and is
+/// documented in README.md; never renumber an existing variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ErrorCode {
+    // LL-MEDIA-0xx
+    MediaProbeFailed,
+    MediaUnsupported,
+    MediaFileMissing,
+    MediaNoVideoStream,
+    MediaNormalizeFailed,
+    MediaNormalizeCancelled,
+    // LL-STREAM-0xx
+    StreamFfmpegSpawn,
+    StreamFfmpegExit,
+    StreamNotNormalized,
+    StreamEmptyPlaylist,
+    StreamAlreadyRunning,
+    StreamInvalidTransition,
+    StreamNoStreamKey,
+    // LL-NETWORK-0xx
+    NetworkUnreachable,
+    NetworkRtmpRejected,
+    // LL-STORAGE-0xx
+    StorageInsufficientSpace,
+    StorageCacheCorrupt,
+    StorageIo,
+    // LL-DB-0xx
+    DbOpen,
+    DbMigration,
+    DbQuery,
+    // LL-SEC-0xx
+    SecretStoreUnavailable,
+    SecretNotFound,
+    // LL-LICENSE-0xx
+    LicenseMissing,
+    LicenseInvalidSignature,
+    LicenseMalformed,
+    LicenseExpired,
+    LicenseDeviceMismatch,
+    // LL-SCHED-0xx
+    ScheduleInvalidTime,
+    ScheduleNoDays,
+    // LL-CONFIG-0xx
+    ConfigInvalid,
+    FfmpegNotFound,
+}
+
+impl ErrorCode {
+    /// The stable wire/UI representation, e.g. `LL-STREAM-001`.
+    pub fn as_str(self) -> &'static str {
+        use ErrorCode::*;
+        match self {
+            MediaProbeFailed => "LL-MEDIA-001",
+            MediaUnsupported => "LL-MEDIA-002",
+            MediaFileMissing => "LL-MEDIA-003",
+            MediaNoVideoStream => "LL-MEDIA-004",
+            MediaNormalizeFailed => "LL-MEDIA-005",
+            MediaNormalizeCancelled => "LL-MEDIA-006",
+            StreamFfmpegSpawn => "LL-STREAM-001",
+            StreamFfmpegExit => "LL-STREAM-002",
+            StreamNotNormalized => "LL-STREAM-003",
+            StreamEmptyPlaylist => "LL-STREAM-004",
+            StreamAlreadyRunning => "LL-STREAM-005",
+            StreamInvalidTransition => "LL-STREAM-006",
+            StreamNoStreamKey => "LL-STREAM-007",
+            NetworkUnreachable => "LL-NETWORK-001",
+            NetworkRtmpRejected => "LL-NETWORK-002",
+            StorageInsufficientSpace => "LL-STORAGE-001",
+            StorageCacheCorrupt => "LL-STORAGE-002",
+            StorageIo => "LL-STORAGE-003",
+            DbOpen => "LL-DB-001",
+            DbMigration => "LL-DB-002",
+            DbQuery => "LL-DB-003",
+            SecretStoreUnavailable => "LL-SEC-001",
+            SecretNotFound => "LL-SEC-002",
+            LicenseMissing => "LL-LICENSE-001",
+            LicenseInvalidSignature => "LL-LICENSE-002",
+            LicenseMalformed => "LL-LICENSE-003",
+            LicenseExpired => "LL-LICENSE-004",
+            LicenseDeviceMismatch => "LL-LICENSE-005",
+            ScheduleInvalidTime => "LL-SCHED-001",
+            ScheduleNoDays => "LL-SCHED-002",
+            ConfigInvalid => "LL-CONFIG-001",
+            FfmpegNotFound => "LL-CONFIG-002",
+        }
+    }
+
+    /// Korean message shown directly to the user. Never contains FFmpeg output.
+    pub fn user_message(self) -> &'static str {
+        use ErrorCode::*;
+        match self {
+            MediaProbeFailed => "영상 정보를 읽지 못했습니다. 파일이 손상되었을 수 있습니다.",
+            MediaUnsupported => "지원하지 않는 영상 형식입니다. MP4, MOV, MKV 파일을 사용해주세요.",
+            MediaFileMissing => "영상 파일을 찾을 수 없습니다. 파일이 이동되었거나 삭제되었습니다.",
+            MediaNoVideoStream => "이 파일에는 영상 트랙이 없습니다.",
+            MediaNormalizeFailed => "방송용 최적화에 실패했습니다. 원본 파일을 확인해주세요.",
+            MediaNormalizeCancelled => "최적화가 취소되었습니다.",
+            StreamFfmpegSpawn => "방송 엔진을 시작하지 못했습니다. 프로그램을 다시 설치해주세요.",
+            StreamFfmpegExit => "방송이 예기치 않게 중단되었습니다. 자동으로 다시 연결합니다.",
+            StreamNotNormalized => "아직 방송용으로 최적화되지 않은 영상이 있습니다. 먼저 최적화를 완료해주세요.",
+            StreamEmptyPlaylist => "플레이리스트가 비어 있습니다. 영상을 먼저 추가해주세요.",
+            StreamAlreadyRunning => "이미 방송이 진행 중입니다.",
+            StreamInvalidTransition => "현재 상태에서는 요청한 동작을 수행할 수 없습니다.",
+            StreamNoStreamKey => "스트림 키가 없습니다. 설정에서 YouTube 스트림 키를 입력해주세요.",
+            NetworkUnreachable => "인터넷에 연결할 수 없습니다. 네트워크 연결을 확인해주세요.",
+            NetworkRtmpRejected => "유튜브 서버에 연결하지 못했습니다. 스트림 키와 인터넷 연결을 확인해주세요.",
+            StorageInsufficientSpace => "저장 공간이 부족합니다. 공간을 확보한 뒤 다시 시도해주세요.",
+            StorageCacheCorrupt => "최적화 캐시가 손상되었습니다. 해당 영상을 다시 최적화합니다.",
+            StorageIo => "파일을 읽거나 쓰지 못했습니다. 디스크 상태를 확인해주세요.",
+            DbOpen => "데이터베이스를 열지 못했습니다.",
+            DbMigration => "데이터베이스 업그레이드에 실패했습니다.",
+            DbQuery => "데이터를 저장하거나 불러오지 못했습니다.",
+            SecretStoreUnavailable => "이 컴퓨터의 보안 저장소를 사용할 수 없습니다.",
+            SecretNotFound => "저장된 스트림 키가 없습니다.",
+            LicenseMissing => "라이선스가 없습니다. 방송을 시작하려면 라이선스를 등록해주세요.",
+            LicenseInvalidSignature => "라이선스 파일이 올바르지 않습니다.",
+            LicenseMalformed => "라이선스 파일을 읽을 수 없습니다.",
+            LicenseExpired => "라이선스가 만료되었습니다.",
+            LicenseDeviceMismatch => "이 라이선스는 다른 컴퓨터에 등록되어 있습니다.",
+            ScheduleInvalidTime => "예약 시간이 올바르지 않습니다.",
+            ScheduleNoDays => "반복할 요일을 하나 이상 선택해주세요.",
+            ConfigInvalid => "설정 값이 올바르지 않습니다.",
+            FfmpegNotFound => "방송 엔진(FFmpeg)을 찾을 수 없습니다. 프로그램을 다시 설치해주세요.",
+        }
+    }
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The single error type crossing the core boundary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct LouverError {
+    pub code: ErrorCode,
+    /// Stable code string, duplicated so the frontend does not need the enum.
+    pub code_str: String,
+    /// Korean, user-facing.
+    pub message: String,
+    /// Technical detail shown only behind a disclosure. Already key-masked.
+    pub detail: Option<String>,
+}
+
+impl LouverError {
+    pub fn new(code: ErrorCode) -> Self {
+        Self {
+            code,
+            code_str: code.as_str().to_string(),
+            message: code.user_message().to_string(),
+            detail: None,
+        }
+    }
+
+    /// Attach technical detail. The detail is masked for secrets before storage,
+    /// so it is always safe to log or display.
+    pub fn with_detail(code: ErrorCode, detail: impl AsRef<str>) -> Self {
+        let mut e = Self::new(code);
+        e.detail = Some(crate::streaming::ffmpeg::mask_secrets(detail.as_ref()));
+        e
+    }
+}
+
+impl fmt::Display for LouverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "[{}] {}", self.code_str, self.message)?;
+        if let Some(d) = &self.detail {
+            write!(f, " ({d})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for LouverError {}
+
+impl From<std::io::Error> for LouverError {
+    fn from(e: std::io::Error) -> Self {
+        LouverError::with_detail(ErrorCode::StorageIo, e.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for LouverError {
+    fn from(e: rusqlite::Error) -> Self {
+        LouverError::with_detail(ErrorCode::DbQuery, e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for LouverError {
+    fn from(e: serde_json::Error) -> Self {
+        LouverError::with_detail(ErrorCode::ConfigInvalid, e.to_string())
+    }
+}
+
+pub type Result<T> = std::result::Result<T, LouverError>;
+
+/// Every code, for the README table and for the docs test that keeps them in sync.
+pub const ALL_ERROR_CODES: &[ErrorCode] = {
+    use ErrorCode::*;
+    &[
+        MediaProbeFailed, MediaUnsupported, MediaFileMissing, MediaNoVideoStream,
+        MediaNormalizeFailed, MediaNormalizeCancelled,
+        StreamFfmpegSpawn, StreamFfmpegExit, StreamNotNormalized, StreamEmptyPlaylist,
+        StreamAlreadyRunning, StreamInvalidTransition, StreamNoStreamKey,
+        NetworkUnreachable, NetworkRtmpRejected,
+        StorageInsufficientSpace, StorageCacheCorrupt, StorageIo,
+        DbOpen, DbMigration, DbQuery,
+        SecretStoreUnavailable, SecretNotFound,
+        LicenseMissing, LicenseInvalidSignature, LicenseMalformed, LicenseExpired,
+        LicenseDeviceMismatch,
+        ScheduleInvalidTime, ScheduleNoDays,
+        ConfigInvalid, FfmpegNotFound,
+    ]
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn error_codes_are_unique() {
+        let set: HashSet<&str> = ALL_ERROR_CODES.iter().map(|c| c.as_str()).collect();
+        assert_eq!(set.len(), ALL_ERROR_CODES.len(), "duplicate error code string");
+    }
+
+    #[test]
+    fn every_code_has_korean_message_and_ll_prefix() {
+        for c in ALL_ERROR_CODES {
+            assert!(c.as_str().starts_with("LL-"), "{c} missing LL- prefix");
+            assert_eq!(c.as_str().split('-').count(), 3, "{c} malformed");
+            assert!(!c.user_message().is_empty());
+            // must not leak raw technical jargon as the primary message
+            assert!(!c.user_message().contains("ffmpeg"));
+        }
+    }
+
+    #[test]
+    fn detail_is_masked_on_construction() {
+        let e = LouverError::with_detail(
+            ErrorCode::StreamFfmpegExit,
+            "rtmps://a.rtmp.youtube.com/live2/abcd-efgh-ijkl-mnop-qrst failed",
+        );
+        let d = e.detail.unwrap();
+        assert!(!d.contains("abcd-efgh"), "stream key leaked into detail: {d}");
+    }
+}
