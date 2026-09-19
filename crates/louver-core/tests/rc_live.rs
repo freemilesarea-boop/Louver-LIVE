@@ -595,13 +595,16 @@ fn rc_broadcast() {
         "the broadcast was not LIVE at the end of the run"
     );
     assert_eq!(errors, 0, "FFmpeg reported {errors} error(s); see {label}-ffmpeg.log");
+    // Growth, not change: memory settling back down over a long run is not a
+    // leak, and failing a 13-hour run because its buffers shrank would be
+    // nonsense.
     assert!(
-        steady_growth_pct(&ff_rss).abs() < 2.0,
+        steady_growth_pct(&ff_rss) < 2.0,
         "FFmpeg memory grew {:.2}% in steady state",
         steady_growth_pct(&ff_rss)
     );
     assert!(
-        steady_growth_pct(&app_rss).abs() < 5.0,
+        steady_growth_pct(&app_rss) < 5.0,
         "the runtime's memory grew {:.2}% in steady state",
         steady_growth_pct(&app_rss)
     );

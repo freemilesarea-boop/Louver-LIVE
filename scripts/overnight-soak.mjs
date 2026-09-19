@@ -176,6 +176,8 @@ function incident(kind, detail) {
 
 let harnessExit = null
 let harnessEndedEarly = false
+/** Set before the scaffolding is torn down, so our own SIGTERM is not an incident. */
+let shuttingDown = false
 const harnessDone = new Promise((r) => {
   harness.on('exit', (code, signal) => {
     harnessExit = { code, signal }
@@ -190,7 +192,7 @@ const harnessDone = new Promise((r) => {
   })
 })
 sink.on('exit', (code) => {
-  if (Date.now() < deadline - 60_000) incident('sink-exited-early', `code=${code}`)
+  if (!shuttingDown && Date.now() < deadline - 60_000) incident('sink-exited-early', `code=${code}`)
 })
 
 // A heartbeat, so a stalled overnight run is visible in the log without
@@ -213,6 +215,7 @@ say(`harness exited: ${JSON.stringify(harnessExit)}`)
 // --- shutdown --------------------------------------------------------------
 // The harness already went through the app's own Stop path. What is left is
 // the test scaffolding.
+shuttingDown = true
 try { sink.kill('SIGTERM') } catch { /* gone */ }
 if (shell) { try { shell.kill('SIGTERM') } catch { /* gone */ } }
 await new Promise((r) => setTimeout(r, 5000))
@@ -347,9 +350,11 @@ if (rowsCsv.length === 0) {
     `${analysis.samples_not_live} of ${rowsCsv.length} samples not LIVE`)
   passFail(analysis.restarts === 0, 'no unexpected process restarts', `${analysis.restarts} restart(s)`)
   passFail(analysis.ffmpeg_errors === 0, 'no FFmpeg stream errors', `${analysis.ffmpeg_errors} error line(s)`)
-  passFail(Math.abs(analysis.ffmpeg_rss_growth_pct) < 2, 'no FFmpeg memory leak',
+  // A leak is memory that keeps climbing. A negative figure means it came
+  // back down, which is the opposite of the thing being tested for.
+  passFail(analysis.ffmpeg_rss_growth_pct < 2, 'no FFmpeg memory leak',
     `${analysis.ffmpeg_rss_growth_pct}% steady-state growth`)
-  passFail(Math.abs(analysis.app_rss_growth_pct) < 2, 'no runtime memory leak',
+  passFail(analysis.app_rss_growth_pct < 2, 'no runtime memory leak',
     `${analysis.app_rss_growth_pct}% steady-state growth`)
   passFail(analysis.playlist_loops >= 1, 'playlist looped',
     `${analysis.playlist_loops} cycles, ${analysis.media_boundaries} media boundaries`)
