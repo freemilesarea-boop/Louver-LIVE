@@ -66,10 +66,7 @@ pub fn detect_hdr(color_transfer: &str, color_primaries: &str, pix_fmt: &str) ->
 /// Run ffprobe and turn its JSON into a [`MediaInfo`].
 pub fn probe(builder: &FfmpegCommandBuilder, path: &Path) -> Result<MediaInfo> {
     if !path.is_file() {
-        return Err(LouverError::with_detail(
-            ErrorCode::MediaFileMissing,
-            path.display().to_string(),
-        ));
+        return Err(LouverError::with_detail(ErrorCode::MediaFileMissing, path.display().to_string()));
     }
     let args = builder.build_probe_args(path);
     let out = builder
@@ -80,7 +77,7 @@ pub fn probe(builder: &FfmpegCommandBuilder, path: &Path) -> Result<MediaInfo> {
     if !out.status.success() {
         return Err(LouverError::with_detail(
             ErrorCode::MediaProbeFailed,
-            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).trim(),
         ));
     }
     let json = String::from_utf8_lossy(&out.stdout);
@@ -143,9 +140,7 @@ pub fn parse_probe_json(json: &str) -> Result<MediaInfo> {
         rotation,
         has_audio: audio.is_some(),
         audio_codec: audio.and_then(|a| a["codec_name"].as_str()).map(str::to_string),
-        audio_sample_rate: audio
-            .and_then(|a| a["sample_rate"].as_str())
-            .and_then(|s| s.parse().ok()),
+        audio_sample_rate: audio.and_then(|a| a["sample_rate"].as_str()).and_then(|s| s.parse().ok()),
         audio_channels: audio.and_then(|a| a["channels"].as_u64()).map(|c| c as u32),
         audio_bitrate: audio.and_then(|a| a["bit_rate"].as_str()).and_then(|s| s.parse().ok()),
         file_size: 0,
@@ -188,7 +183,10 @@ pub fn check_compatibility(info: &MediaInfo, profile: OutputProfile) -> Compatib
     if info.width != profile.width() || info.height != profile.height() {
         r.push(format!(
             "해상도가 {}x{}가 아닙니다 ({}x{})",
-            profile.width(), profile.height(), info.width, info.height
+            profile.width(),
+            profile.height(),
+            info.width,
+            info.height
         ));
     }
     if (info.fps - f64::from(profile.fps())).abs() > 0.01 {
@@ -274,9 +272,16 @@ mod tests {
 
     #[test]
     fn each_mismatch_is_reported_with_a_reason() {
-        let cases: Vec<(&str, Box<dyn Fn(&mut MediaInfo)>)> = vec![
+        type Mutate = Box<dyn Fn(&mut MediaInfo)>;
+        let cases: Vec<(&str, Mutate)> = vec![
             ("codec", Box::new(|i: &mut MediaInfo| i.video_codec = "hevc".into())),
-            ("resolution", Box::new(|i: &mut MediaInfo| { i.width = 1280; i.height = 720; })),
+            (
+                "resolution",
+                Box::new(|i: &mut MediaInfo| {
+                    i.width = 1280;
+                    i.height = 720;
+                }),
+            ),
             ("fps", Box::new(|i: &mut MediaInfo| i.fps = 29.97)),
             ("pix_fmt", Box::new(|i: &mut MediaInfo| i.pixel_format = "yuv422p".into())),
             ("hdr", Box::new(|i: &mut MediaInfo| i.is_hdr = true)),
@@ -285,7 +290,13 @@ mod tests {
             ("audio codec", Box::new(|i: &mut MediaInfo| i.audio_codec = Some("mp3".into()))),
             ("audio rate", Box::new(|i: &mut MediaInfo| i.audio_sample_rate = Some(44_100))),
             ("audio channels", Box::new(|i: &mut MediaInfo| i.audio_channels = Some(1))),
-            ("no audio", Box::new(|i: &mut MediaInfo| { i.audio_codec = None; i.has_audio = false; })),
+            (
+                "no audio",
+                Box::new(|i: &mut MediaInfo| {
+                    i.audio_codec = None;
+                    i.has_audio = false;
+                }),
+            ),
         ];
         for (label, mutate) in cases {
             let mut i = perfect();
@@ -378,10 +389,7 @@ mod tests {
     #[test]
     fn a_file_with_no_video_stream_is_an_error() {
         let json = r#"{"streams":[{"codec_type":"audio","codec_name":"aac"}],"format":{}}"#;
-        assert_eq!(
-            parse_probe_json(json).unwrap_err().code,
-            ErrorCode::MediaNoVideoStream
-        );
+        assert_eq!(parse_probe_json(json).unwrap_err().code, ErrorCode::MediaNoVideoStream);
     }
 
     #[test]

@@ -118,11 +118,7 @@ pub fn engine_for(mode: PlaybackMode) -> Box<dyn PlaylistOrderEngine> {
 }
 
 /// Filter to the items that will actually be broadcast, then order them.
-pub fn resolve_play_order(
-    items: &[PlaylistItem],
-    mode: PlaybackMode,
-    seed: u64,
-) -> Vec<PlaylistItem> {
+pub fn resolve_play_order(items: &[PlaylistItem], mode: PlaybackMode, seed: u64) -> Vec<PlaylistItem> {
     let enabled: Vec<PlaylistItem> = items.iter().filter(|i| i.enabled).cloned().collect();
     engine_for(mode).resolve(&enabled, seed)
 }
@@ -201,10 +197,19 @@ mod tests {
 
     #[test]
     fn shuffle_actually_reorders_for_some_seed() {
-        let v = items(&[(1, 10, true), (2, 20, true), (3, 30, true), (4, 40, true), (5, 50, true), (6, 60, true)]);
-        let seq: Vec<i64> = resolve_play_order(&v, PlaybackMode::Sequential, 0).iter().map(|i| i.media_id).collect();
+        let v = items(&[
+            (1, 10, true),
+            (2, 20, true),
+            (3, 30, true),
+            (4, 40, true),
+            (5, 50, true),
+            (6, 60, true),
+        ]);
+        let seq: Vec<i64> =
+            resolve_play_order(&v, PlaybackMode::Sequential, 0).iter().map(|i| i.media_id).collect();
         let differs = (0..50u64).any(|s| {
-            let sh: Vec<i64> = resolve_play_order(&v, PlaybackMode::ShuffleOnce, s).iter().map(|i| i.media_id).collect();
+            let sh: Vec<i64> =
+                resolve_play_order(&v, PlaybackMode::ShuffleOnce, s).iter().map(|i| i.media_id).collect();
             sh != seq
         });
         assert!(differs, "shuffle never changed the order across 50 seeds");
@@ -214,9 +219,14 @@ mod tests {
     fn shuffle_never_repeats_a_video_back_to_back_including_the_loop_seam() {
         // Duplicated media ids are the hard case: 10 appears three times.
         let v = items(&[
-            (1, 10, true), (2, 10, true), (3, 10, true),
-            (4, 20, true), (5, 30, true), (6, 40, true),
-            (7, 50, true), (8, 60, true),
+            (1, 10, true),
+            (2, 10, true),
+            (3, 10, true),
+            (4, 20, true),
+            (5, 30, true),
+            (6, 40, true),
+            (7, 50, true),
+            (8, 60, true),
         ]);
         for seed in 0..200u64 {
             let out = resolve_play_order(&v, PlaybackMode::ShuffleOnce, seed);
@@ -224,7 +234,8 @@ mod tests {
             for i in 0..n {
                 let j = (i + 1) % n; // wraps: the loop seam matters
                 assert_ne!(
-                    out[i].media_id, out[j].media_id,
+                    out[i].media_id,
+                    out[j].media_id,
                     "seed {seed}: media {} repeats at {i}->{j} in {:?}",
                     out[i].media_id,
                     out.iter().map(|x| x.media_id).collect::<Vec<_>>()

@@ -27,10 +27,7 @@ pub fn validate(s: &Schedule) -> Result<()> {
     }
     let (start, end) = (parse_time(&s.start_time)?, parse_time(&s.end_time)?);
     if start == end {
-        return Err(LouverError::with_detail(
-            ErrorCode::ScheduleInvalidTime,
-            "start and end are identical",
-        ));
+        return Err(LouverError::with_detail(ErrorCode::ScheduleInvalidTime, "start and end are identical"));
     }
     Ok(())
 }
@@ -151,21 +148,13 @@ impl<C: Clock> Scheduler<C> {
         let active = running
             .filter(|o| o.contains(now))
             .cloned()
-            .or_else(|| {
-                schedules
-                    .iter()
-                    .filter_map(|s| active_occurrence(s, now))
-                    .min_by_key(|o| o.start)
-            });
+            .or_else(|| schedules.iter().filter_map(|s| active_occurrence(s, now)).min_by_key(|o| o.start));
 
         match (active, running) {
             (Some(o), _) => ScheduleDecision::ShouldBroadcast { occurrence: o },
             (None, Some(r)) => ScheduleDecision::ShouldStop { occurrence: r.clone() },
             (None, None) => ScheduleDecision::Idle {
-                next: schedules
-                    .iter()
-                    .filter_map(|s| next_occurrence(s, now))
-                    .min_by_key(|o| o.start),
+                next: schedules.iter().filter_map(|s| next_occurrence(s, now)).min_by_key(|o| o.start),
             },
         }
     }
@@ -196,14 +185,22 @@ pub fn format_days(d: DaysOfWeek) -> String {
     }
     const NAMES: [&str; 7] = ["월", "화", "수", "목", "금", "토", "일"];
     let v: Vec<&str> = (0..7).filter(|i| d.contains_index(*i)).map(|i| NAMES[i as usize]).collect();
-    if v.is_empty() { "없음".into() } else { v.join(" ") }
+    if v.is_empty() {
+        "없음".into()
+    } else {
+        v.join(" ")
+    }
 }
 
 /// Human-readable window length, handling the midnight case.
 pub fn window_duration_secs(start: NaiveTime, end: NaiveTime) -> i64 {
     let s = start.num_seconds_from_midnight() as i64;
     let e = end.num_seconds_from_midnight() as i64;
-    if crosses_midnight(start, end) { 86_400 - s + e } else { e - s }
+    if crosses_midnight(start, end) {
+        86_400 - s + e
+    } else {
+        e - s
+    }
 }
 
 #[cfg(test)]
@@ -416,10 +413,7 @@ mod tests {
 
         // Mid-window it keeps running.
         clock.advance_minutes(300);
-        assert!(matches!(
-            sc.evaluate(&s, Some(&running)),
-            ScheduleDecision::ShouldBroadcast { .. }
-        ));
+        assert!(matches!(sc.evaluate(&s, Some(&running)), ScheduleDecision::ShouldBroadcast { .. }));
 
         // End time: stop.
         clock.set_str(&format!("{MON} 18:00:00"));

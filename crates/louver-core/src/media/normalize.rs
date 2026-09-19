@@ -90,10 +90,7 @@ pub fn normalize_one(
         });
     }
     if !source.is_file() {
-        return Err(LouverError::with_detail(
-            ErrorCode::MediaFileMissing,
-            source.display().to_string(),
-        ));
+        return Err(LouverError::with_detail(ErrorCode::MediaFileMissing, source.display().to_string()));
     }
 
     cache.prepare_entry(media_hash, profile)?;
@@ -146,9 +143,8 @@ pub fn normalize_one(
         }
     }
 
-    let status = child
-        .wait()
-        .map_err(|e| LouverError::with_detail(ErrorCode::MediaNormalizeFailed, e.to_string()))?;
+    let status =
+        child.wait().map_err(|e| LouverError::with_detail(ErrorCode::MediaNormalizeFailed, e.to_string()))?;
 
     if cancel.is_cancelled() {
         let _ = std::fs::remove_file(&tmp_path);
@@ -224,8 +220,14 @@ mod tests {
             OutputProfile::P1080p30,
         );
         let err = normalize_one(
-            &b, &cache, Path::new("/no/such/file.mp4"), "h", &MediaInfo::default(),
-            OutputProfile::P1080p30, &CancelToken::new(), |_| {},
+            &b,
+            &cache,
+            Path::new("/no/such/file.mp4"),
+            "h",
+            &MediaInfo::default(),
+            OutputProfile::P1080p30,
+            &CancelToken::new(),
+            |_| {},
         )
         .unwrap_err();
         assert_eq!(err.code, ErrorCode::MediaFileMissing);
@@ -241,9 +243,13 @@ mod tests {
         cache
             .write_metadata(
                 &CacheMetadata {
-                    media_hash: "hh".into(), source_path: "/v/a.mp4".into(),
-                    profile: prof.id().into(), duration_secs: 42.0,
-                    created_at: String::new(), encoder: "libx264".into(), app_version: "1".into(),
+                    media_hash: "hh".into(),
+                    source_path: "/v/a.mp4".into(),
+                    profile: prof.id().into(),
+                    duration_secs: 42.0,
+                    created_at: String::new(),
+                    encoder: "libx264".into(),
+                    app_version: "1".into(),
                 },
                 prof,
             )
@@ -256,8 +262,14 @@ mod tests {
         );
         let mut last = 0.0;
         let out = normalize_one(
-            &b, &cache, Path::new("/no/such/file.mp4"), "hh", &MediaInfo::default(),
-            prof, &CancelToken::new(), |p| last = p,
+            &b,
+            &cache,
+            Path::new("/no/such/file.mp4"),
+            "hh",
+            &MediaInfo::default(),
+            prof,
+            &CancelToken::new(),
+            |p| last = p,
         )
         .expect("cache hit should succeed without ffmpeg");
         assert!(out.from_cache);

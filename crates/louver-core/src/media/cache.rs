@@ -95,8 +95,7 @@ impl MediaCache {
             return None;
         }
         let meta: CacheMetadata =
-            serde_json::from_str(&fs::read_to_string(self.metadata_path(media_hash, profile)).ok()?)
-                .ok()?;
+            serde_json::from_str(&fs::read_to_string(self.metadata_path(media_hash, profile)).ok()?).ok()?;
         (meta.media_hash == media_hash && meta.profile == profile.id()).then_some(meta)
     }
 
@@ -179,11 +178,7 @@ pub struct DiskEstimate {
 /// Keep 2 GB free beyond the estimate so the OS never hits a full disk.
 pub const DISK_SAFETY_MARGIN: u64 = 2 * 1024 * 1024 * 1024;
 
-pub fn estimate_disk(
-    durations: &[f64],
-    profile: OutputProfile,
-    available_bytes: u64,
-) -> DiskEstimate {
+pub fn estimate_disk(durations: &[f64], profile: OutputProfile, available_bytes: u64) -> DiskEstimate {
     let total: f64 = durations.iter().sum();
     let estimated = (total * profile.bytes_per_second() as f64) as u64;
     DiskEstimate {
@@ -286,12 +281,17 @@ mod tests {
         fs::write(c.normalized_path("abc", OutputProfile::P1080p30), b"x").unwrap();
         c.write_metadata(
             &CacheMetadata {
-                media_hash: "abc".into(), source_path: "/a".into(),
-                profile: OutputProfile::P1080p30.id().into(), duration_secs: 1.0,
-                created_at: String::new(), encoder: "libx264".into(), app_version: "1".into(),
+                media_hash: "abc".into(),
+                source_path: "/a".into(),
+                profile: OutputProfile::P1080p30.id().into(),
+                duration_secs: 1.0,
+                created_at: String::new(),
+                encoder: "libx264".into(),
+                app_version: "1".into(),
             },
             OutputProfile::P1080p30,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(c.lookup("abc", OutputProfile::P1080p30).is_some());
         assert!(c.lookup("abc", OutputProfile::P720p30).is_none());
     }
@@ -305,10 +305,17 @@ mod tests {
         fs::write(c.normalized_path("abc", prof), b"").unwrap(); // interrupted encode
         c.write_metadata(
             &CacheMetadata {
-                media_hash: "abc".into(), source_path: "/a".into(), profile: prof.id().into(),
-                duration_secs: 1.0, created_at: String::new(), encoder: "x".into(), app_version: "1".into(),
-            }, prof,
-        ).unwrap();
+                media_hash: "abc".into(),
+                source_path: "/a".into(),
+                profile: prof.id().into(),
+                duration_secs: 1.0,
+                created_at: String::new(),
+                encoder: "x".into(),
+                app_version: "1".into(),
+            },
+            prof,
+        )
+        .unwrap();
         assert!(c.lookup("abc", prof).is_none(), "a truncated encode must be redone");
     }
 
@@ -367,11 +374,8 @@ mod tests {
         let e0 = estimate_disk(&[600.0], OutputProfile::P1080p30, 0);
         let exact = estimate_disk(&[600.0], OutputProfile::P1080p30, e0.estimated_bytes);
         assert!(!exact.has_enough_space);
-        let with_margin = estimate_disk(
-            &[600.0],
-            OutputProfile::P1080p30,
-            e0.estimated_bytes + DISK_SAFETY_MARGIN,
-        );
+        let with_margin =
+            estimate_disk(&[600.0], OutputProfile::P1080p30, e0.estimated_bytes + DISK_SAFETY_MARGIN);
         assert!(with_margin.has_enough_space);
     }
 

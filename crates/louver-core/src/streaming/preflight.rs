@@ -32,10 +32,22 @@ pub struct CheckResult {
 
 impl CheckResult {
     fn pass(id: &str, label: &str, detail: impl Into<String>) -> Self {
-        Self { id: id.into(), label: label.into(), outcome: CheckOutcome::Pass, detail: detail.into(), code: None }
+        Self {
+            id: id.into(),
+            label: label.into(),
+            outcome: CheckOutcome::Pass,
+            detail: detail.into(),
+            code: None,
+        }
     }
     fn warn(id: &str, label: &str, detail: impl Into<String>) -> Self {
-        Self { id: id.into(), label: label.into(), outcome: CheckOutcome::Warn, detail: detail.into(), code: None }
+        Self {
+            id: id.into(),
+            label: label.into(),
+            outcome: CheckOutcome::Warn,
+            detail: detail.into(),
+            code: None,
+        }
     }
     fn fail(id: &str, label: &str, detail: impl Into<String>, code: ErrorCode) -> Self {
         Self {
@@ -80,9 +92,19 @@ pub fn run(input: &PreflightInput<'_>, net: &dyn NetworkChecker) -> PreflightRep
 
     // CHECK 1 — playlist valid
     checks.push(if !input.playlist_exists {
-        CheckResult::fail("playlist", "플레이리스트", "선택된 플레이리스트가 없습니다", ErrorCode::StreamEmptyPlaylist)
+        CheckResult::fail(
+            "playlist",
+            "플레이리스트",
+            "선택된 플레이리스트가 없습니다",
+            ErrorCode::StreamEmptyPlaylist,
+        )
     } else if input.media.is_empty() {
-        CheckResult::fail("playlist", "플레이리스트", "플레이리스트가 비어 있습니다", ErrorCode::StreamEmptyPlaylist)
+        CheckResult::fail(
+            "playlist",
+            "플레이리스트",
+            "플레이리스트가 비어 있습니다",
+            ErrorCode::StreamEmptyPlaylist,
+        )
     } else {
         CheckResult::pass("playlist", "플레이리스트", format!("{}개 영상", input.media.len()))
     });
@@ -132,7 +154,12 @@ pub fn run(input: &PreflightInput<'_>, net: &dyn NetworkChecker) -> PreflightRep
     } else if input.has_stream_key {
         CheckResult::pass("stream_key", "스트림 키", "저장된 스트림 키를 사용합니다")
     } else {
-        CheckResult::fail("stream_key", "스트림 키", ErrorCode::StreamNoStreamKey.user_message(), ErrorCode::StreamNoStreamKey)
+        CheckResult::fail(
+            "stream_key",
+            "스트림 키",
+            ErrorCode::StreamNoStreamKey.user_message(),
+            ErrorCode::StreamNoStreamKey,
+        )
     });
 
     // CHECK 5 — internet connectivity
@@ -141,14 +168,24 @@ pub fn run(input: &PreflightInput<'_>, net: &dyn NetworkChecker) -> PreflightRep
     } else if net.can_reach("www.google.com", 443, Duration::from_secs(5)) {
         CheckResult::pass("internet", "인터넷 연결", "연결됨")
     } else {
-        CheckResult::fail("internet", "인터넷 연결", ErrorCode::NetworkUnreachable.user_message(), ErrorCode::NetworkUnreachable)
+        CheckResult::fail(
+            "internet",
+            "인터넷 연결",
+            ErrorCode::NetworkUnreachable.user_message(),
+            ErrorCode::NetworkUnreachable,
+        )
     });
 
     // CHECK 6 — FFmpeg
     checks.push(if input.ffmpeg_ok {
         CheckResult::pass("ffmpeg", "방송 엔진", input.ffmpeg_version.unwrap_or("FFmpeg 사용 가능"))
     } else {
-        CheckResult::fail("ffmpeg", "방송 엔진", ErrorCode::FfmpegNotFound.user_message(), ErrorCode::FfmpegNotFound)
+        CheckResult::fail(
+            "ffmpeg",
+            "방송 엔진",
+            ErrorCode::FfmpegNotFound.user_message(),
+            ErrorCode::FfmpegNotFound,
+        )
     });
 
     // CHECK 7 — ingest endpoint reachability.
@@ -157,14 +194,23 @@ pub fn run(input: &PreflightInput<'_>, net: &dyn NetworkChecker) -> PreflightRep
         CheckResult::pass("ingest", "업로드 네트워크", "테스트 모드에서는 확인하지 않습니다")
     } else {
         match parse_rtmp_host(input.rtmps_url) {
-            None => CheckResult::fail("ingest", "업로드 네트워크", "RTMPS 주소 형식이 올바르지 않습니다", ErrorCode::ConfigInvalid),
+            None => CheckResult::fail(
+                "ingest",
+                "업로드 네트워크",
+                "RTMPS 주소 형식이 올바르지 않습니다",
+                ErrorCode::ConfigInvalid,
+            ),
             Some((host, port)) => {
                 if net.can_reach(&host, port, Duration::from_secs(8)) {
                     CheckResult::pass("ingest", "업로드 네트워크", format!("{host}:{port} 연결 가능"))
                 } else {
                     // A warning, not a failure: FFmpeg may still succeed, and
                     // we would rather attempt the broadcast than refuse it.
-                    CheckResult::warn("ingest", "업로드 네트워크", format!("{host}:{port}에 미리 연결하지 못했습니다"))
+                    CheckResult::warn(
+                        "ingest",
+                        "업로드 네트워크",
+                        format!("{host}:{port}에 미리 연결하지 못했습니다"),
+                    )
                 }
             }
         }
@@ -172,7 +218,12 @@ pub fn run(input: &PreflightInput<'_>, net: &dyn NetworkChecker) -> PreflightRep
 
     // Licence gate (§47) — not one of the seven, but it blocks RTMPS.
     if !input.dry_run && !input.license_allows_broadcast {
-        checks.push(CheckResult::fail("license", "라이선스", ErrorCode::LicenseMissing.user_message(), ErrorCode::LicenseMissing));
+        checks.push(CheckResult::fail(
+            "license",
+            "라이선스",
+            ErrorCode::LicenseMissing.user_message(),
+            ErrorCode::LicenseMissing,
+        ));
     }
 
     let can_broadcast = !checks.iter().any(|c| c.outcome == CheckOutcome::Fail);
@@ -313,7 +364,10 @@ mod tests {
         i.ffmpeg_ok = false;
         let r = run(&i, &Net(true));
         assert!(!r.can_broadcast);
-        assert_eq!(r.checks.iter().find(|c| c.id == "ffmpeg").unwrap().code.as_deref(), Some("LL-CONFIG-002"));
+        assert_eq!(
+            r.checks.iter().find(|c| c.id == "ffmpeg").unwrap().code.as_deref(),
+            Some("LL-CONFIG-002")
+        );
     }
 
     #[test]
@@ -351,7 +405,10 @@ mod tests {
         i.license_allows_broadcast = false;
         let r = run(&i, &Net(true));
         assert!(!r.can_broadcast, "§47: broadcasting requires a licence");
-        assert_eq!(r.checks.iter().find(|c| c.id == "license").unwrap().code.as_deref(), Some("LL-LICENSE-001"));
+        assert_eq!(
+            r.checks.iter().find(|c| c.id == "license").unwrap().code.as_deref(),
+            Some("LL-LICENSE-001")
+        );
 
         i.dry_run = true;
         assert!(run(&i, &Net(true)).can_broadcast, "dev/testing must not need a licence");

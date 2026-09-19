@@ -84,17 +84,11 @@ pub fn build_plan(
             LouverError::with_detail(ErrorCode::MediaFileMissing, format!("media id {}", it.media_id))
         })?;
         if !m.status.is_broadcast_ready() {
-            return Err(LouverError::with_detail(
-                ErrorCode::StreamNotNormalized,
-                m.display_name.clone(),
-            ));
+            return Err(LouverError::with_detail(ErrorCode::StreamNotNormalized, m.display_name.clone()));
         }
         let path = PathBuf::from(m.normalized_path.clone().unwrap_or_else(|| m.source_path.clone()));
         if !path.is_file() {
-            return Err(LouverError::with_detail(
-                ErrorCode::MediaFileMissing,
-                path.display().to_string(),
-            ));
+            return Err(LouverError::with_detail(ErrorCode::MediaFileMissing, path.display().to_string()));
         }
         resolved.push(ResolvedItem {
             media_id: m.id,
@@ -188,8 +182,14 @@ mod tests {
     fn a_plan_lists_items_in_order_and_writes_the_manifest() {
         let f = fixture(&[3602.0, 3501.0, 3734.0]);
         let plan = build_plan(
-            1, &items(3), &lookup(&f.media), PlaybackMode::Sequential,
-            OutputProfile::P1080p30, StreamMode::StreamCopy, 1, &f.manifest,
+            1,
+            &items(3),
+            &lookup(&f.media),
+            PlaybackMode::Sequential,
+            OutputProfile::P1080p30,
+            StreamMode::StreamCopy,
+            1,
+            &f.manifest,
         )
         .unwrap();
 
@@ -211,8 +211,14 @@ mod tests {
         let mut its = items(3);
         its[1].enabled = false;
         let plan = build_plan(
-            1, &its, &lookup(&f.media), PlaybackMode::Sequential,
-            OutputProfile::P1080p30, StreamMode::StreamCopy, 1, &f.manifest,
+            1,
+            &its,
+            &lookup(&f.media),
+            PlaybackMode::Sequential,
+            OutputProfile::P1080p30,
+            StreamMode::StreamCopy,
+            1,
+            &f.manifest,
         )
         .unwrap();
         assert_eq!(plan.items.len(), 2);
@@ -224,8 +230,14 @@ mod tests {
     fn an_empty_playlist_is_rejected() {
         let f = fixture(&[]);
         let e = build_plan(
-            1, &[], &lookup(&f.media), PlaybackMode::Sequential,
-            OutputProfile::P1080p30, StreamMode::StreamCopy, 1, &f.manifest,
+            1,
+            &[],
+            &lookup(&f.media),
+            PlaybackMode::Sequential,
+            OutputProfile::P1080p30,
+            StreamMode::StreamCopy,
+            1,
+            &f.manifest,
         )
         .unwrap_err();
         assert_eq!(e.code, ErrorCode::StreamEmptyPlaylist);
@@ -236,8 +248,14 @@ mod tests {
         let mut f = fixture(&[10.0, 10.0]);
         f.media[1].status = MediaStatus::OptimizationRequired;
         let e = build_plan(
-            1, &items(2), &lookup(&f.media), PlaybackMode::Sequential,
-            OutputProfile::P1080p30, StreamMode::StreamCopy, 1, &f.manifest,
+            1,
+            &items(2),
+            &lookup(&f.media),
+            PlaybackMode::Sequential,
+            OutputProfile::P1080p30,
+            StreamMode::StreamCopy,
+            1,
+            &f.manifest,
         )
         .unwrap_err();
         assert_eq!(e.code, ErrorCode::StreamNotNormalized);
@@ -249,8 +267,14 @@ mod tests {
         let mut f = fixture(&[10.0]);
         f.media[0].normalized_path = Some("/no/such/file.mp4".into());
         let e = build_plan(
-            1, &items(1), &lookup(&f.media), PlaybackMode::Sequential,
-            OutputProfile::P1080p30, StreamMode::StreamCopy, 1, &f.manifest,
+            1,
+            &items(1),
+            &lookup(&f.media),
+            PlaybackMode::Sequential,
+            OutputProfile::P1080p30,
+            StreamMode::StreamCopy,
+            1,
+            &f.manifest,
         )
         .unwrap_err();
         assert_eq!(e.code, ErrorCode::MediaFileMissing);
@@ -262,8 +286,14 @@ mod tests {
         f.media[0].status = MediaStatus::Compatible;
         f.media[0].normalized_path = None;
         let plan = build_plan(
-            1, &items(1), &lookup(&f.media), PlaybackMode::Sequential,
-            OutputProfile::P1080p30, StreamMode::StreamCopy, 1, &f.manifest,
+            1,
+            &items(1),
+            &lookup(&f.media),
+            PlaybackMode::Sequential,
+            OutputProfile::P1080p30,
+            StreamMode::StreamCopy,
+            1,
+            &f.manifest,
         )
         .unwrap();
         assert_eq!(plan.items[0].path.to_string_lossy(), f.media[0].source_path);
@@ -275,15 +305,27 @@ mod tests {
     fn current_and_next_item_track_the_loop() {
         let f = fixture(&[10.0, 12.0, 8.0]); // 30s cycle
         let plan = build_plan(
-            1, &items(3), &lookup(&f.media), PlaybackMode::Sequential,
-            OutputProfile::P1080p30, StreamMode::StreamCopy, 1, &f.manifest,
+            1,
+            &items(3),
+            &lookup(&f.media),
+            PlaybackMode::Sequential,
+            OutputProfile::P1080p30,
+            StreamMode::StreamCopy,
+            1,
+            &f.manifest,
         )
         .unwrap();
 
         for (elapsed, want_idx) in [
-            (0.0, 0), (9.9, 0), (10.0, 1), (21.9, 1), (22.0, 2), (29.9, 2),
+            (0.0, 0),
+            (9.9, 0),
+            (10.0, 1),
+            (21.9, 1),
+            (22.0, 2),
+            (29.9, 2),
             // second cycle
-            (30.0, 0), (45.0, 1),
+            (30.0, 0),
+            (45.0, 1),
             // hours later, still correct
             (3600.0 + 5.0, 0),
         ] {
@@ -317,8 +359,14 @@ mod tests {
         let f = fixture(&[10.0, 10.0, 10.0, 10.0, 10.0]);
         let build = |seed| {
             build_plan(
-                1, &items(5), &lookup(&f.media), PlaybackMode::ShuffleOnce,
-                OutputProfile::P1080p30, StreamMode::StreamCopy, seed, &f.manifest,
+                1,
+                &items(5),
+                &lookup(&f.media),
+                PlaybackMode::ShuffleOnce,
+                OutputProfile::P1080p30,
+                StreamMode::StreamCopy,
+                seed,
+                &f.manifest,
             )
             .unwrap()
             .items

@@ -106,13 +106,17 @@ impl ErrorCode {
             MediaNormalizeCancelled => "최적화가 취소되었습니다.",
             StreamFfmpegSpawn => "방송 엔진을 시작하지 못했습니다. 프로그램을 다시 설치해주세요.",
             StreamFfmpegExit => "방송이 예기치 않게 중단되었습니다. 자동으로 다시 연결합니다.",
-            StreamNotNormalized => "아직 방송용으로 최적화되지 않은 영상이 있습니다. 먼저 최적화를 완료해주세요.",
+            StreamNotNormalized => {
+                "아직 방송용으로 최적화되지 않은 영상이 있습니다. 먼저 최적화를 완료해주세요."
+            }
             StreamEmptyPlaylist => "플레이리스트가 비어 있습니다. 영상을 먼저 추가해주세요.",
             StreamAlreadyRunning => "이미 방송이 진행 중입니다.",
             StreamInvalidTransition => "현재 상태에서는 요청한 동작을 수행할 수 없습니다.",
             StreamNoStreamKey => "스트림 키가 없습니다. 설정에서 YouTube 스트림 키를 입력해주세요.",
             NetworkUnreachable => "인터넷에 연결할 수 없습니다. 네트워크 연결을 확인해주세요.",
-            NetworkRtmpRejected => "유튜브 서버에 연결하지 못했습니다. 스트림 키와 인터넷 연결을 확인해주세요.",
+            NetworkRtmpRejected => {
+                "유튜브 서버에 연결하지 못했습니다. 스트림 키와 인터넷 연결을 확인해주세요."
+            }
             StorageInsufficientSpace => "저장 공간이 부족합니다. 공간을 확보한 뒤 다시 시도해주세요.",
             StorageCacheCorrupt => "최적화 캐시가 손상되었습니다. 해당 영상을 다시 최적화합니다.",
             StorageIo => "파일을 읽거나 쓰지 못했습니다. 디스크 상태를 확인해주세요.",
@@ -207,18 +211,38 @@ pub type Result<T> = std::result::Result<T, LouverError>;
 pub const ALL_ERROR_CODES: &[ErrorCode] = {
     use ErrorCode::*;
     &[
-        MediaProbeFailed, MediaUnsupported, MediaFileMissing, MediaNoVideoStream,
-        MediaNormalizeFailed, MediaNormalizeCancelled,
-        StreamFfmpegSpawn, StreamFfmpegExit, StreamNotNormalized, StreamEmptyPlaylist,
-        StreamAlreadyRunning, StreamInvalidTransition, StreamNoStreamKey,
-        NetworkUnreachable, NetworkRtmpRejected,
-        StorageInsufficientSpace, StorageCacheCorrupt, StorageIo,
-        DbOpen, DbMigration, DbQuery,
-        SecretStoreUnavailable, SecretNotFound,
-        LicenseMissing, LicenseInvalidSignature, LicenseMalformed, LicenseExpired,
+        MediaProbeFailed,
+        MediaUnsupported,
+        MediaFileMissing,
+        MediaNoVideoStream,
+        MediaNormalizeFailed,
+        MediaNormalizeCancelled,
+        StreamFfmpegSpawn,
+        StreamFfmpegExit,
+        StreamNotNormalized,
+        StreamEmptyPlaylist,
+        StreamAlreadyRunning,
+        StreamInvalidTransition,
+        StreamNoStreamKey,
+        NetworkUnreachable,
+        NetworkRtmpRejected,
+        StorageInsufficientSpace,
+        StorageCacheCorrupt,
+        StorageIo,
+        DbOpen,
+        DbMigration,
+        DbQuery,
+        SecretStoreUnavailable,
+        SecretNotFound,
+        LicenseMissing,
+        LicenseInvalidSignature,
+        LicenseMalformed,
+        LicenseExpired,
         LicenseDeviceMismatch,
-        ScheduleInvalidTime, ScheduleNoDays,
-        ConfigInvalid, FfmpegNotFound,
+        ScheduleInvalidTime,
+        ScheduleNoDays,
+        ConfigInvalid,
+        FfmpegNotFound,
     ]
 };
 

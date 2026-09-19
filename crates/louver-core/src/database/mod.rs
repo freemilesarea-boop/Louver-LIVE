@@ -32,8 +32,8 @@ impl Database {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut conn = Connection::open(path)
-            .map_err(|e| LouverError::with_detail(ErrorCode::DbOpen, e.to_string()))?;
+        let mut conn =
+            Connection::open(path).map_err(|e| LouverError::with_detail(ErrorCode::DbOpen, e.to_string()))?;
         Self::configure(&conn)?;
         migrations::run(&mut conn)?;
         Ok(Self { conn: Arc::new(Mutex::new(conn)), path: Some(path.to_path_buf()) })
@@ -72,10 +72,8 @@ impl Database {
                 if !path.exists() {
                     return Ok((Self::open(path)?, None));
                 }
-                let backup = path.with_extension(format!(
-                    "corrupt-{}.db",
-                    chrono::Utc::now().format("%Y%m%d%H%M%S")
-                ));
+                let backup =
+                    path.with_extension(format!("corrupt-{}.db", chrono::Utc::now().format("%Y%m%d%H%M%S")));
                 std::fs::rename(path, &backup)?;
                 // WAL sidecars belong to the old file.
                 for ext in ["db-wal", "db-shm"] {
@@ -151,10 +149,23 @@ impl Database {
                 pixel_format=excluded.pixel_format, is_hdr=excluded.is_hdr,
                 file_size=excluded.file_size, last_error=excluded.last_error",
             params![
-                m.source_path, m.display_name, m.status.id(), m.media_hash, m.normalized_path,
-                m.normalized_profile, m.duration_secs, m.normalized_duration_secs,
-                m.width, m.height, m.fps, m.video_codec, m.audio_codec, m.pixel_format,
-                m.is_hdr as i32, m.file_size as i64, m.last_error
+                m.source_path,
+                m.display_name,
+                m.status.id(),
+                m.media_hash,
+                m.normalized_path,
+                m.normalized_profile,
+                m.duration_secs,
+                m.normalized_duration_secs,
+                m.width,
+                m.height,
+                m.fps,
+                m.video_codec,
+                m.audio_codec,
+                m.pixel_format,
+                m.is_hdr as i32,
+                m.file_size as i64,
+                m.last_error
             ],
         )?;
         Ok(c.query_row("SELECT id FROM media WHERE source_path=?1", [&m.source_path], |r| r.get(0))?)
@@ -203,12 +214,7 @@ impl Database {
 
     // -- playlists ---------------------------------------------------------
 
-    pub fn create_playlist(
-        &self,
-        name: &str,
-        mode: PlaybackMode,
-        profile: OutputProfile,
-    ) -> Result<i64> {
+    pub fn create_playlist(&self, name: &str, mode: PlaybackMode, profile: OutputProfile) -> Result<i64> {
         let c = self.conn.lock().unwrap();
         c.execute(
             "INSERT INTO playlists (name, playback_mode, output_profile) VALUES (?1,?2,?3)",
@@ -302,10 +308,10 @@ impl Database {
     }
 
     pub fn set_item_enabled(&self, item_id: i64, enabled: bool) -> Result<()> {
-        self.conn.lock().unwrap().execute(
-            "UPDATE playlist_items SET enabled=?2 WHERE id=?1",
-            params![item_id, enabled as i32],
-        )?;
+        self.conn
+            .lock()
+            .unwrap()
+            .execute("UPDATE playlist_items SET enabled=?2 WHERE id=?1", params![item_id, enabled as i32])?;
         Ok(())
     }
 
@@ -418,11 +424,7 @@ impl Database {
             .conn
             .lock()
             .unwrap()
-            .query_row(
-                "SELECT * FROM stream_sessions ORDER BY id DESC LIMIT 1",
-                [],
-                row_to_session,
-            )
+            .query_row("SELECT * FROM stream_sessions ORDER BY id DESC LIMIT 1", [], row_to_session)
             .optional()?)
     }
 
@@ -522,10 +524,8 @@ fn row_to_playlist(r: &Row<'_>) -> rusqlite::Result<Playlist> {
     Ok(Playlist {
         id: r.get("id")?,
         name: r.get("name")?,
-        playback_mode: PlaybackMode::from_id(&r.get::<_, String>("playback_mode")?)
-            .unwrap_or_default(),
-        output_profile: OutputProfile::from_id(&r.get::<_, String>("output_profile")?)
-            .unwrap_or_default(),
+        playback_mode: PlaybackMode::from_id(&r.get::<_, String>("playback_mode")?).unwrap_or_default(),
+        output_profile: OutputProfile::from_id(&r.get::<_, String>("output_profile")?).unwrap_or_default(),
         created_at: r.get("created_at")?,
         updated_at: r.get("updated_at")?,
     })
@@ -543,8 +543,7 @@ fn row_to_session(r: &Row<'_>) -> rusqlite::Result<StreamSession> {
             "compatibility_encode" => StreamMode::CompatibilityEncode,
             _ => StreamMode::StreamCopy,
         },
-        playback_mode: PlaybackMode::from_id(&r.get::<_, String>("playback_mode")?)
-            .unwrap_or_default(),
+        playback_mode: PlaybackMode::from_id(&r.get::<_, String>("playback_mode")?).unwrap_or_default(),
         order_seed: r.get("order_seed")?,
         restart_count: r.get("restart_count")?,
         user_requested_stop: r.get::<_, i64>("user_requested_stop")? != 0,
@@ -613,7 +612,15 @@ mod tests {
         assert_eq!(db.list_media().unwrap().len(), 1);
         assert_eq!(db.get_media(id).unwrap().unwrap().duration_secs, 99.0);
 
-        db.update_media_status(id, MediaStatus::Normalized, Some("/cache/n.mp4"), Some("1080p30"), Some(98.9), None).unwrap();
+        db.update_media_status(
+            id,
+            MediaStatus::Normalized,
+            Some("/cache/n.mp4"),
+            Some("1080p30"),
+            Some(98.9),
+            None,
+        )
+        .unwrap();
         let got = db.get_media(id).unwrap().unwrap();
         assert_eq!(got.status, MediaStatus::Normalized);
         assert_eq!(got.normalized_path.as_deref(), Some("/cache/n.mp4"));
@@ -706,7 +713,15 @@ mod tests {
     fn sessions_track_lifecycle_and_orphans() {
         let db = Database::open_in_memory().unwrap();
         let pl = db.create_playlist("x", PlaybackMode::Sequential, OutputProfile::P1080p30).unwrap();
-        let sid = db.create_session(pl, Some("2026-01-02 08:00"), StreamMode::StreamCopy, PlaybackMode::Sequential, 4242).unwrap();
+        let sid = db
+            .create_session(
+                pl,
+                Some("2026-01-02 08:00"),
+                StreamMode::StreamCopy,
+                PlaybackMode::Sequential,
+                4242,
+            )
+            .unwrap();
 
         db.update_session_state(sid, StreamState::Live, 0, false, None).unwrap();
         let s = db.get_session(sid).unwrap().unwrap();
@@ -737,8 +752,13 @@ mod tests {
     #[test]
     fn events_are_masked_before_storage() {
         let db = Database::open_in_memory().unwrap();
-        db.log_event(None, EventLevel::Error, Some("LL-STREAM-002"),
-            "failed publishing to rtmps://a.rtmps.youtube.com/live2/abcd-efgh-ijkl-mnop").unwrap();
+        db.log_event(
+            None,
+            EventLevel::Error,
+            Some("LL-STREAM-002"),
+            "failed publishing to rtmps://a.rtmps.youtube.com/live2/abcd-efgh-ijkl-mnop",
+        )
+        .unwrap();
         let ev = &db.recent_events(10).unwrap()[0];
         assert!(!ev.message.contains("abcd-efgh"), "stream key stored in the DB: {}", ev.message);
         assert!(ev.message.contains("••••"));
@@ -789,7 +809,9 @@ mod tests {
         let p = dir.path().join("louver.db");
         let pl = {
             let db = Database::open(&p).unwrap();
-            let pl = db.create_playlist("Morning Jazz", PlaybackMode::ShuffleOnce, OutputProfile::P720p30).unwrap();
+            let pl = db
+                .create_playlist("Morning Jazz", PlaybackMode::ShuffleOnce, OutputProfile::P720p30)
+                .unwrap();
             db.set_setting("launch_at_startup", "true").unwrap();
             pl
         };

@@ -197,7 +197,9 @@ mod tests {
         l.info(LogTarget::App, "app line");
         l.info(LogTarget::Stream, "stream line");
         l.info(LogTarget::Ffmpeg, "ffmpeg line");
-        for (f, want) in [("app.log", "app line"), ("stream.log", "stream line"), ("ffmpeg.log", "ffmpeg line")] {
+        for (f, want) in
+            [("app.log", "app line"), ("stream.log", "stream line"), ("ffmpeg.log", "ffmpeg line")]
+        {
             let c = std::fs::read_to_string(d.path().join(f)).unwrap();
             assert!(c.contains(want), "{f}");
             assert_eq!(c.lines().count(), 1, "{f} got someone else's line");

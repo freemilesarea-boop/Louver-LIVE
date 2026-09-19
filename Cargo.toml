@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/louver-core",
+    "apps/desktop/src-tauri",
+    "tools/license-generator",
 ]
 
 [workspace.package]

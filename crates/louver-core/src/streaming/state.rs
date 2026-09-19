@@ -286,9 +286,14 @@ mod tests {
     #[test]
     fn state_strings_round_trip() {
         for s in [
-            StreamState::Idle, StreamState::Preparing, StreamState::Connecting,
-            StreamState::Live, StreamState::Reconnecting, StreamState::Stopping,
-            StreamState::Stopped, StreamState::Error,
+            StreamState::Idle,
+            StreamState::Preparing,
+            StreamState::Connecting,
+            StreamState::Live,
+            StreamState::Reconnecting,
+            StreamState::Stopping,
+            StreamState::Stopped,
+            StreamState::Error,
         ] {
             assert_eq!(StreamState::from_str_opt(s.as_str()), Some(s));
         }

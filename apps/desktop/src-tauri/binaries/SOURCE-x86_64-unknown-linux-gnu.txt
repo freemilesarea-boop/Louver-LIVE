@@ -1,0 +1,2 @@
+system PATH fallback: /usr/bin/ffmpeg
+DEVELOPMENT ONLY - not licence-cleared for redistribution

@@ -12,11 +12,10 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-pub const MIGRATIONS: &[Migration] = &[
-    Migration {
-        version: 1,
-        name: "initial_schema",
-        sql: r#"
+pub const MIGRATIONS: &[Migration] = &[Migration {
+    version: 1,
+    name: "initial_schema",
+    sql: r#"
 CREATE TABLE settings (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
@@ -99,8 +98,7 @@ CREATE TABLE stream_events (
 );
 CREATE INDEX idx_events_session ON stream_events(session_id, at DESC);
 "#,
-    },
-];
+}];
 
 /// Highest schema version this build knows about.
 pub fn latest_version() -> i64 {
@@ -137,8 +135,7 @@ pub fn run(conn: &mut Connection) -> Result<i64> {
             rusqlite::params![m.version, m.name],
         )
         .map_err(|e| LouverError::with_detail(ErrorCode::DbMigration, e.to_string()))?;
-        tx.commit()
-            .map_err(|e| LouverError::with_detail(ErrorCode::DbMigration, e.to_string()))?;
+        tx.commit().map_err(|e| LouverError::with_detail(ErrorCode::DbMigration, e.to_string()))?;
     }
 
     Ok(latest_version())
@@ -170,16 +167,19 @@ mod tests {
         let mut c = Connection::open_in_memory().unwrap();
         run(&mut c).unwrap();
         let required = [
-            "settings", "media", "playlists", "playlist_items",
-            "schedules", "stream_sessions", "stream_events",
+            "settings",
+            "media",
+            "playlists",
+            "playlist_items",
+            "schedules",
+            "stream_sessions",
+            "stream_events",
         ];
         for t in required {
             let n: i64 = c
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    [t],
-                    |r| r.get(0),
-                )
+                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1", [t], |r| {
+                    r.get(0)
+                })
                 .unwrap();
             assert_eq!(n, 1, "table {t} missing (§36)");
         }

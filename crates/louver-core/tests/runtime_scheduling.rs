@@ -5,7 +5,7 @@
 //! verified in seconds rather than over a day.
 
 use louver_core::clock::{Clock, TestClock};
-use louver_core::config::{OutputProfile, StreamMode};
+use louver_core::config::OutputProfile;
 use louver_core::database::models::{DaysOfWeek, EventLevel, Media, MediaStatus, Schedule};
 use louver_core::database::Database;
 use louver_core::error::Result;
@@ -132,9 +132,8 @@ fn harness(now: &str) -> Harness {
     let db = Database::open(&dir.path().join("louver.db")).unwrap();
 
     // One playlist with three ready-to-broadcast files.
-    let playlist_id = db
-        .create_playlist("Night Jazz", PlaybackMode::Sequential, OutputProfile::P1080p30)
-        .unwrap();
+    let playlist_id =
+        db.create_playlist("Night Jazz", PlaybackMode::Sequential, OutputProfile::P1080p30).unwrap();
     for i in 0..3 {
         let p = dir.path().join(format!("n{i}.mp4"));
         std::fs::write(&p, b"video").unwrap();
@@ -256,10 +255,7 @@ fn the_live_command_carries_the_stream_key_but_the_logs_do_not() {
     // ...but nothing that reaches the log or the database contains it.
     assert!(!h.events.logs().contains("abcd-efgh"), "key leaked to the event sink");
     let stored = h.db.recent_events(100).unwrap();
-    assert!(
-        !stored.iter().any(|e| e.message.contains("abcd-efgh")),
-        "key leaked into stream_events"
-    );
+    assert!(!stored.iter().any(|e| e.message.contains("abcd-efgh")), "key leaked into stream_events");
 }
 
 #[test]
@@ -503,16 +499,19 @@ fn a_power_cut_mid_broadcast_resumes_with_the_same_play_order() {
     // Same database and state file as the crashed process.
     std::fs::copy(h.session_store.path(), h2.session_store.path()).unwrap();
     let h2_playlist = h2.playlist_id;
-    h2.db.update_playlist(h2_playlist, "Night Jazz", PlaybackMode::ShuffleOnce, OutputProfile::P1080p30).unwrap();
-    h2.db.create_schedule(&Schedule {
-        id: 0,
-        playlist_id: h2_playlist,
-        days_of_week: DaysOfWeek::everyday(),
-        start_time: "20:00".into(),
-        end_time: "08:00".into(),
-        enabled: true,
-    })
-    .unwrap();
+    h2.db
+        .update_playlist(h2_playlist, "Night Jazz", PlaybackMode::ShuffleOnce, OutputProfile::P1080p30)
+        .unwrap();
+    h2.db
+        .create_schedule(&Schedule {
+            id: 0,
+            playlist_id: h2_playlist,
+            days_of_week: DaysOfWeek::everyday(),
+            start_time: "20:00".into(),
+            end_time: "08:00".into(),
+            enabled: true,
+        })
+        .unwrap();
 
     let msg = h2.rt.recover_on_startup();
     assert!(h2.rt.is_active(), "the broadcast was not resumed after a power cut");
@@ -552,11 +551,16 @@ fn a_crash_whose_window_has_already_ended_does_not_broadcast() {
     let mut h2 = harness(&format!("{TUE} 14:00:00"));
     std::fs::copy(h.session_store.path(), h2.session_store.path()).unwrap();
     let pid = h2.playlist_id;
-    h2.db.create_schedule(&Schedule {
-        id: 0, playlist_id: pid, days_of_week: DaysOfWeek::everyday(),
-        start_time: "20:00".into(), end_time: "23:00".into(), enabled: true,
-    })
-    .unwrap();
+    h2.db
+        .create_schedule(&Schedule {
+            id: 0,
+            playlist_id: pid,
+            days_of_week: DaysOfWeek::everyday(),
+            start_time: "20:00".into(),
+            end_time: "23:00".into(),
+            enabled: true,
+        })
+        .unwrap();
 
     let msg = h2.rt.recover_on_startup();
     assert!(!h2.rt.is_active(), "resumed a broadcast outside its schedule (§32)");
@@ -590,9 +594,8 @@ fn a_dangling_database_session_is_closed_at_startup() {
 fn a_launch_failure_is_reported_and_retried_rather_than_crashing() {
     let mut h = harness(&format!("{MON} 12:00:00"));
     h.launcher.fail_next.store(true, Ordering::SeqCst);
-    let err = h
-        .rt
-        .start(StartOptions {
+    let err =
+        h.rt.start(StartOptions {
             playlist_id: h.playlist_id,
             reason: StartReason::Manual,
             dry_run: false,

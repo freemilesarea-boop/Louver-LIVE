@@ -108,7 +108,9 @@ mod tests {
     #[test]
     fn app_paths_are_all_under_the_data_dir() {
         let p = AppPaths::new("/data/LouverLive");
-        for path in [p.database(), p.cache_dir(), p.logs_dir(), p.session_file(), p.license_file(), p.manifest_file()] {
+        for path in
+            [p.database(), p.cache_dir(), p.logs_dir(), p.session_file(), p.license_file(), p.manifest_file()]
+        {
             assert!(path.starts_with("/data/LouverLive"), "{path:?} escaped the data dir");
         }
         assert!(p.database().ends_with("louver.db"));

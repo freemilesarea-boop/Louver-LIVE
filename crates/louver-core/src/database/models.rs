@@ -200,8 +200,12 @@ mod tests {
     #[test]
     fn media_status_round_trips() {
         for s in [
-            MediaStatus::Imported, MediaStatus::Compatible, MediaStatus::OptimizationRequired,
-            MediaStatus::Normalized, MediaStatus::Missing, MediaStatus::Failed,
+            MediaStatus::Imported,
+            MediaStatus::Compatible,
+            MediaStatus::OptimizationRequired,
+            MediaStatus::Normalized,
+            MediaStatus::Missing,
+            MediaStatus::Failed,
         ] {
             assert_eq!(MediaStatus::from_id(s.id()), Some(s));
         }
@@ -211,7 +215,12 @@ mod tests {
     fn only_compatible_and_normalized_are_broadcast_ready() {
         assert!(MediaStatus::Compatible.is_broadcast_ready());
         assert!(MediaStatus::Normalized.is_broadcast_ready());
-        for s in [MediaStatus::Imported, MediaStatus::OptimizationRequired, MediaStatus::Missing, MediaStatus::Failed] {
+        for s in [
+            MediaStatus::Imported,
+            MediaStatus::OptimizationRequired,
+            MediaStatus::Missing,
+            MediaStatus::Failed,
+        ] {
             assert!(!s.is_broadcast_ready(), "{s:?} must not be broadcastable");
         }
     }

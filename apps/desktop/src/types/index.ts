@@ -1,0 +1,226 @@
+/** Mirrors the serde representations in `louver-core`. */
+
+export type StreamState =
+  | 'IDLE' | 'PREPARING' | 'CONNECTING' | 'LIVE'
+  | 'RECONNECTING' | 'STOPPING' | 'STOPPED' | 'ERROR'
+
+export type MediaStatus =
+  | 'imported' | 'compatible' | 'optimization_required'
+  | 'normalized' | 'missing' | 'failed'
+
+export type PlaybackMode = 'sequential' | 'shuffle_once'
+export type StreamMode = 'stream_copy' | 'compatibility_encode'
+export type StartReason = 'manual' | 'scheduled' | 'recovered'
+export type CheckOutcome = 'pass' | 'warn' | 'fail'
+export type EventLevel = 'info' | 'warn' | 'error'
+
+/** The structured error every command rejects with (§35). */
+export interface LouverError {
+  code_str: string
+  message: string
+  detail?: string | null
+}
+
+export interface Media {
+  id: number
+  source_path: string
+  display_name: string
+  status: MediaStatus
+  media_hash: string
+  normalized_path?: string | null
+  normalized_profile?: string | null
+  duration_secs: number
+  normalized_duration_secs?: number | null
+  width: number
+  height: number
+  fps: number
+  video_codec: string
+  audio_codec?: string | null
+  pixel_format?: string | null
+  is_hdr: boolean
+  file_size: number
+  added_at: string
+  last_error?: string | null
+}
+
+export interface Playlist {
+  id: number
+  name: string
+  playback_mode: PlaybackMode
+  output_profile: string
+  created_at: string
+  updated_at: string
+}
+
+export interface PlaylistItemView {
+  id: number
+  playlist_id: number
+  media_id: number
+  position: number
+  enabled: boolean
+  media: Media
+}
+
+export interface PlaylistView {
+  playlist: Playlist
+  items: PlaylistItemView[]
+  total_duration_secs: number
+  total_duration_label: string
+  unready_count: number
+}
+
+export interface ScheduleView {
+  id: number
+  playlist_id: number
+  days_of_week: number
+  start_time: string
+  end_time: string
+  enabled: boolean
+  playlist_name?: string | null
+  days_label: string
+  crosses_midnight: boolean
+  next_start?: string | null
+  next_end?: string | null
+  window_duration_label: string
+}
+
+export interface StreamProgress {
+  frames: number
+  fps: number
+  bitrate_kbps: number
+  total_bytes: number
+  out_time_ms: number
+  speed: number
+}
+
+export interface SupervisorStatus {
+  state: StreamState
+  mode: StreamMode
+  pid?: number | null
+  restart_count: number
+  reconnect_count: number
+  seconds_since_data?: number | null
+  progress: StreamProgress
+  last_error?: LouverError | null
+  next_retry_in_secs?: number | null
+}
+
+export interface RuntimeStatus {
+  supervisor: SupervisorStatus
+  playlist_id?: number | null
+  playlist_name?: string | null
+  current_item?: string | null
+  next_item?: string | null
+  current_index?: number | null
+  item_count: number
+  elapsed_secs: number
+  remaining_secs?: number | null
+  scheduled_end?: string | null
+  start_reason?: StartReason | null
+  dry_run: boolean
+  next_scheduled_start?: string | null
+  cycle_duration_secs: number
+}
+
+export interface CheckResult {
+  id: string
+  label: string
+  outcome: CheckOutcome
+  detail: string
+  code?: string | null
+}
+
+export interface PreflightReport {
+  checks: CheckResult[]
+  can_broadcast: boolean
+}
+
+export interface DiskEstimate {
+  files_to_process: number
+  total_duration_secs: number
+  estimated_bytes: number
+  available_bytes: number
+  has_enough_space: boolean
+  safety_margin_bytes: number
+}
+
+export interface NormalizeProgress {
+  media_id: number
+  file_name: string
+  percent: number
+  files_done: number
+  files_total: number
+  remaining_files: number
+  estimated_cache_bytes: number
+}
+
+export interface LicenseState {
+  status: 'valid' | 'development' | 'missing' | 'invalid' | 'expired' | 'device_mismatch'
+  payload?: { license_id: string; product: string; edition: string; expires_at?: string | null } | null
+  message: string
+  device_binding_enforced: boolean
+}
+
+export interface ProfileOption {
+  id: string
+  label: string
+  video_kbps: number
+}
+
+export interface SettingsView {
+  rtmps_url: string
+  output_profile: string
+  stream_mode: StreamMode
+  launch_at_startup: boolean
+  start_minimized: boolean
+  minimize_to_tray: boolean
+  auto_reconnect: boolean
+  developer_mode: boolean
+  enforce_device_binding: boolean
+  first_run_complete: boolean
+  cache_location: string
+  cache_size_bytes: number
+  cache_size_label: string
+  stream_key_masked: string
+  stream_key_hint?: string | null
+  has_stream_key: boolean
+  secret_backend: string
+  secret_backend_is_secure: boolean
+  ffmpeg_path?: string | null
+  ffmpeg_version?: string | null
+  hardware_encoder: string
+  logs_dir: string
+  app_version: string
+  license: LicenseState
+  profiles: ProfileOption[]
+}
+
+export interface DashboardMetrics {
+  app_cpu_percent: number
+  app_memory_bytes: number
+  system_cpu_percent: number
+  total_memory_bytes: number
+  available_memory_bytes: number
+  ffmpeg_cpu_percent: number
+  ffmpeg_memory_bytes: number
+  app_memory_label: string
+  cache_bytes: number
+  cache_label: string
+  free_disk_bytes: number
+  free_disk_label: string
+  sleep_prevented: boolean
+}
+
+export interface StreamEvent {
+  id: number
+  session_id?: number | null
+  at: string
+  level: EventLevel
+  code?: string | null
+  message: string
+}
+
+export interface ImportResult {
+  imported: Media[]
+  failed: { path: string; code: string; message: string }[]
+}

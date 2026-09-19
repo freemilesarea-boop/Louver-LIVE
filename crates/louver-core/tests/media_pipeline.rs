@@ -64,7 +64,14 @@ fn full_pipeline_normalizes_concatenates_and_stream_copies() {
             "fixture {i} was already compatible; it would not exercise the normalizer"
         );
         let out = normalize_one(
-            &b, &cache, src, &format!("fixture{i}"), &info, PROFILE, &CancelToken::new(), |_| {},
+            &b,
+            &cache,
+            src,
+            &format!("fixture{i}"),
+            &info,
+            PROFILE,
+            &CancelToken::new(),
+            |_| {},
         )
         .expect("normalize failed");
         assert!(!out.from_cache);
@@ -83,14 +90,19 @@ fn full_pipeline_normalizes_concatenates_and_stream_copies() {
         );
         signatures.insert(format!(
             "{}|{}x{}|{}|{}|{}|{}|{}",
-            info.video_codec, info.width, info.height, info.fps, info.pixel_format,
+            info.video_codec,
+            info.width,
+            info.height,
+            info.fps,
+            info.pixel_format,
             info.time_base,
             info.audio_codec.clone().unwrap_or_default(),
             info.audio_sample_rate.unwrap_or(0),
         ));
     }
     assert_eq!(
-        signatures.len(), 1,
+        signatures.len(),
+        1,
         "normalized files disagree on codec/geometry/timebase, so concat cannot stream-copy: {signatures:?}"
     );
 
@@ -149,10 +161,9 @@ fn infinite_loop_repeats_the_playlist_in_order() {
     let mut cycle = 0.0;
     for (i, src) in sources.iter().enumerate() {
         let info = probe(&b, src).unwrap();
-        let out = normalize_one(
-            &b, &cache, src, &format!("loop{i}"), &info, PROFILE, &CancelToken::new(), |_| {},
-        )
-        .unwrap();
+        let out =
+            normalize_one(&b, &cache, src, &format!("loop{i}"), &info, PROFILE, &CancelToken::new(), |_| {})
+                .unwrap();
         cycle += out.duration_secs;
         normalized.push(out.output_path);
     }
@@ -176,8 +187,11 @@ fn infinite_loop_repeats_the_playlist_in_order() {
     // Three cycles' worth of frames, continuous, with no duplicated timestamps.
     let v = sorted_pts(&tools, &out, "v:0");
     assert!(v.len() >= 530, "expected ~540 frames for 18s at 30fps, got {}", v.len());
-    assert_eq!(v.len(), v.iter().map(|f| (f * 1000.0) as i64).collect::<std::collections::HashSet<_>>().len(),
-        "duplicate video timestamps in the looped output");
+    assert_eq!(
+        v.len(),
+        v.iter().map(|f| (f * 1000.0) as i64).collect::<std::collections::HashSet<_>>().len(),
+        "duplicate video timestamps in the looped output"
+    );
 
     // §54 asks the order to be verified by the file boundaries. The fixtures
     // are solid red/green/blue, so the average frame colour identifies which
@@ -196,19 +210,42 @@ fn infinite_loop_repeats_the_playlist_in_order() {
 }
 
 /// Sample one frame at `t` seconds and classify its dominant colour.
-fn dominant_colour(tools: &louver_core::streaming::ffmpeg::FfmpegTools, file: &std::path::Path, t: f64) -> char {
+fn dominant_colour(
+    tools: &louver_core::streaming::ffmpeg::FfmpegTools,
+    file: &std::path::Path,
+    t: f64,
+) -> char {
     let out = std::process::Command::new(&tools.ffmpeg)
         .args([
-            "-hide_banner", "-loglevel", "error",
-            "-ss", &format!("{t:.3}"), "-i", &file.to_string_lossy(),
-            "-frames:v", "1", "-vf", "scale=1:1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-ss",
+            &format!("{t:.3}"),
+            "-i",
+            &file.to_string_lossy(),
+            "-frames:v",
+            "1",
+            "-vf",
+            "scale=1:1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-",
         ])
         .output()
         .expect("colour sample failed");
     let px = out.stdout;
     assert!(px.len() >= 3, "no pixel returned at t={t}");
     let (r, g, bl) = (px[0], px[1], px[2]);
-    if r >= g && r >= bl { 'R' } else if g >= bl { 'G' } else { 'B' }
+    if r >= g && r >= bl {
+        'R'
+    } else if g >= bl {
+        'G'
+    } else {
+        'B'
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -226,7 +263,16 @@ fn concat_case_a_identical_sources() {
     let src = make_fixture(
         &tools,
         &fixture_dir(),
-        &FixtureSpec { name: "case_a", duration: 4.0, size: "1280x720", fps: 30, sample_rate: 48000, channels: 2, tone_hz: 440, pattern: "testsrc2" },
+        &FixtureSpec {
+            name: "case_a",
+            duration: 4.0,
+            size: "1280x720",
+            fps: 30,
+            sample_rate: 48000,
+            channels: 2,
+            tone_hz: 440,
+            pattern: "testsrc2",
+        },
     );
     let info = probe(&b, &src).unwrap();
     let n = normalize_one(&b, &cache, &src, "case_a", &info, PROFILE, &CancelToken::new(), |_| {}).unwrap();
@@ -236,7 +282,8 @@ fn concat_case_a_identical_sources() {
     write_manifest(&manifest, &files).unwrap();
 
     let out = work.path().join("a.flv");
-    let (code, stderr) = run_ffmpeg(&tools, &b.build_dry_run_args(&manifest, &out, StreamMode::StreamCopy, None, false));
+    let (code, stderr) =
+        run_ffmpeg(&tools, &b.build_dry_run_args(&manifest, &out, StreamMode::StreamCopy, None, false));
     assert_eq!(code, 0, "{stderr}");
     assert!(timestamp_faults(&stderr).is_empty(), "case A faults:\n{stderr}");
     assert!((format_duration(&tools, &out) - n.duration_secs * 3.0).abs() < 0.3);
@@ -252,9 +299,36 @@ fn concat_case_b_and_c_different_sources_and_durations() {
 
     // Durations are deliberately unequal and not whole seconds.
     let specs = vec![
-        FixtureSpec { name: "case_b1", duration: 3.4,  size: "854x480",   fps: 25, sample_rate: 44100, channels: 2, tone_hz: 300, pattern: "testsrc2" },
-        FixtureSpec { name: "case_b2", duration: 5.75, size: "1920x1080", fps: 50, sample_rate: 22050, channels: 1, tone_hz: 500, pattern: "smptebars" },
-        FixtureSpec { name: "case_b3", duration: 2.2,  size: "640x360",   fps: 15, sample_rate: 48000, channels: 2, tone_hz: 700, pattern: "testsrc" },
+        FixtureSpec {
+            name: "case_b1",
+            duration: 3.4,
+            size: "854x480",
+            fps: 25,
+            sample_rate: 44100,
+            channels: 2,
+            tone_hz: 300,
+            pattern: "testsrc2",
+        },
+        FixtureSpec {
+            name: "case_b2",
+            duration: 5.75,
+            size: "1920x1080",
+            fps: 50,
+            sample_rate: 22050,
+            channels: 1,
+            tone_hz: 500,
+            pattern: "smptebars",
+        },
+        FixtureSpec {
+            name: "case_b3",
+            duration: 2.2,
+            size: "640x360",
+            fps: 15,
+            sample_rate: 48000,
+            channels: 2,
+            tone_hz: 700,
+            pattern: "testsrc",
+        },
     ];
     let sources = make_fixtures(&tools, &fixture_dir(), &specs);
 
@@ -262,7 +336,9 @@ fn concat_case_b_and_c_different_sources_and_durations() {
     let mut total = 0.0;
     for (i, s) in sources.iter().enumerate() {
         let info = probe(&b, s).unwrap();
-        let n = normalize_one(&b, &cache, s, &format!("caseb{i}"), &info, PROFILE, &CancelToken::new(), |_| {}).unwrap();
+        let n =
+            normalize_one(&b, &cache, s, &format!("caseb{i}"), &info, PROFILE, &CancelToken::new(), |_| {})
+                .unwrap();
         total += n.duration_secs;
         files.push(n.output_path);
     }
@@ -270,7 +346,8 @@ fn concat_case_b_and_c_different_sources_and_durations() {
     let manifest = work.path().join("b.txt");
     write_manifest(&manifest, &files).unwrap();
     let out = work.path().join("b.flv");
-    let (code, stderr) = run_ffmpeg(&tools, &b.build_dry_run_args(&manifest, &out, StreamMode::StreamCopy, None, false));
+    let (code, stderr) =
+        run_ffmpeg(&tools, &b.build_dry_run_args(&manifest, &out, StreamMode::StreamCopy, None, false));
 
     assert_eq!(code, 0, "{stderr}");
     assert!(timestamp_faults(&stderr).is_empty(), "case B/C faults:\n{stderr}");
@@ -297,12 +374,34 @@ fn concat_case_d_skewed_timestamps_are_repaired_by_normalization() {
     if !skewed.is_file() {
         let st = std::process::Command::new(&tools.ffmpeg)
             .args([
-                "-hide_banner", "-loglevel", "error", "-y",
-                "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=5",
-                "-itsoffset", "0.7", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=44100:duration=5",
-                "-map", "0:v", "-map", "1:a",
-                "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-muxdelay", "0.9",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=1280x720:rate=30:duration=5",
+                "-itsoffset",
+                "0.7",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:sample_rate=44100:duration=5",
+                "-map",
+                "0:v",
+                "-map",
+                "1:a",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-pix_fmt",
+                "yuv420p",
+                "-c:a",
+                "aac",
+                "-muxdelay",
+                "0.9",
             ])
             .arg(&skewed)
             .status()
@@ -311,15 +410,27 @@ fn concat_case_d_skewed_timestamps_are_repaired_by_normalization() {
     }
 
     let normal = make_fixture(
-        &tools, &dir,
-        &FixtureSpec { name: "case_d2", duration: 4.0, size: "1280x720", fps: 30, sample_rate: 48000, channels: 2, tone_hz: 880, pattern: "smptebars" },
+        &tools,
+        &dir,
+        &FixtureSpec {
+            name: "case_d2",
+            duration: 4.0,
+            size: "1280x720",
+            fps: 30,
+            sample_rate: 48000,
+            channels: 2,
+            tone_hz: 880,
+            pattern: "smptebars",
+        },
     );
 
     let mut files = Vec::new();
     let mut total = 0.0;
     for (i, s) in [skewed.clone(), normal].iter().enumerate() {
         let info = probe(&b, s).unwrap();
-        let n = normalize_one(&b, &cache, s, &format!("cased{i}"), &info, PROFILE, &CancelToken::new(), |_| {}).unwrap();
+        let n =
+            normalize_one(&b, &cache, s, &format!("cased{i}"), &info, PROFILE, &CancelToken::new(), |_| {})
+                .unwrap();
         total += n.duration_secs;
         files.push(n.output_path);
     }
@@ -327,7 +438,8 @@ fn concat_case_d_skewed_timestamps_are_repaired_by_normalization() {
     let manifest = work.path().join("d.txt");
     write_manifest(&manifest, &files).unwrap();
     let out = work.path().join("d.flv");
-    let (code, stderr) = run_ffmpeg(&tools, &b.build_dry_run_args(&manifest, &out, StreamMode::StreamCopy, None, false));
+    let (code, stderr) =
+        run_ffmpeg(&tools, &b.build_dry_run_args(&manifest, &out, StreamMode::StreamCopy, None, false));
 
     assert_eq!(code, 0, "{stderr}");
     assert!(
@@ -363,7 +475,9 @@ fn looped_stream_copy_does_not_accumulate_av_drift() {
     let mut cycle = 0.0;
     for (i, s) in sources.iter().enumerate() {
         let info = probe(&b, s).unwrap();
-        let n = normalize_one(&b, &cache, s, &format!("fixture{i}"), &info, PROFILE, &CancelToken::new(), |_| {}).unwrap();
+        let n =
+            normalize_one(&b, &cache, s, &format!("fixture{i}"), &info, PROFILE, &CancelToken::new(), |_| {})
+                .unwrap();
         cycle += n.duration_secs;
         files.push(n.output_path);
     }

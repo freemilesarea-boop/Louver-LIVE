@@ -27,11 +27,7 @@ use std::time::{Duration, Instant};
 
 /// Starts FFmpeg. Abstracted so tests can run the whole runtime without it.
 pub trait StreamLauncher: Send + Sync {
-    fn launch(
-        &self,
-        supervisor: &mut StreamSupervisor,
-        args: &[String],
-    ) -> Result<Box<dyn ProcessHandle>>;
+    fn launch(&self, supervisor: &mut StreamSupervisor, args: &[String]) -> Result<Box<dyn ProcessHandle>>;
 }
 
 /// Launches the real bundled FFmpeg.
@@ -41,11 +37,7 @@ pub struct FfmpegLauncher {
 }
 
 impl StreamLauncher for FfmpegLauncher {
-    fn launch(
-        &self,
-        supervisor: &mut StreamSupervisor,
-        args: &[String],
-    ) -> Result<Box<dyn ProcessHandle>> {
+    fn launch(&self, supervisor: &mut StreamSupervisor, args: &[String]) -> Result<Box<dyn ProcessHandle>> {
         let log = Arc::clone(&self.log);
         supervisor.spawn(&self.program, args, move |l| log(l))
     }
@@ -210,7 +202,8 @@ impl BroadcastRuntime {
         let sup = self.supervisor.status();
         let elapsed = self.started_at.map(|t| t.elapsed().as_secs() as i64).unwrap_or(0);
         let (cur, next, idx) = match self.plan.as_ref().and_then(|p| {
-            p.item_at(elapsed as f64).map(|(i, it)| (i, it.display_name.clone(), p.next_item(i).map(|n| n.display_name.clone())))
+            p.item_at(elapsed as f64)
+                .map(|(i, it)| (i, it.display_name.clone(), p.next_item(i).map(|n| n.display_name.clone())))
         }) {
             Some((i, c, n)) => (Some(c), n, Some(i)),
             None => (None, None, None),
@@ -229,9 +222,7 @@ impl BroadcastRuntime {
             current_index: idx,
             item_count: self.plan.as_ref().map(|p| p.items.len()).unwrap_or(0),
             elapsed_secs: elapsed,
-            remaining_secs: self
-                .scheduled_end
-                .map(|e| (e - self.clock.now_utc()).num_seconds().max(0)),
+            remaining_secs: self.scheduled_end.map(|e| (e - self.clock.now_utc()).num_seconds().max(0)),
             scheduled_end: self.scheduled_end.map(|e| e.to_rfc3339()),
             start_reason: self.reason,
             dry_run: self.dry_run,
@@ -422,7 +413,11 @@ impl BroadcastRuntime {
         let _ = self.sleep.allow_sleep();
         self.log(
             EventLevel::Info,
-            if user_initiated { "방송을 종료했습니다 (사용자 요청)" } else { "방송을 종료했습니다 (예약 종료)" },
+            if user_initiated {
+                "방송을 종료했습니다 (사용자 요청)"
+            } else {
+                "방송을 종료했습니다 (예약 종료)"
+            },
         );
         if let Some(s) = self.session_state.as_mut() {
             s.user_requested_stop = true;
@@ -430,7 +425,13 @@ impl BroadcastRuntime {
             let _ = self.session_store.save(s);
         }
         if let Some(id) = self.session_id {
-            let _ = self.db.update_session_state(id, StreamState::Stopped, self.supervisor.restart_count() as i64, true, None);
+            let _ = self.db.update_session_state(
+                id,
+                StreamState::Stopped,
+                self.supervisor.restart_count() as i64,
+                true,
+                None,
+            );
         }
         let _ = self.session_store.clear();
         self.plan = None;

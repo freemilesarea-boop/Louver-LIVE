@@ -1,0 +1,61 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Louver Live",
+  "version": "1.0.0",
+  "identifier": "com.louver.live",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm run build:web",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Louver Live",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 1024,
+        "minHeight": 680,
+        "resizable": true,
+        "center": true,
+        "theme": "Dark",
+        "backgroundColor": "#0B0D10"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost data:; style-src 'self' 'unsafe-inline'; script-src 'self'"
+    },
+    "trayIcon": {
+      "id": "louver-tray",
+      "iconPath": "icons/icon.png",
+      "iconAsTemplate": true
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis", "msi", "dmg", "app", "deb", "appimage"],
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/icon.png", "icons/icon.ico", "icons/icon.icns"],
+    "copyright": "Copyright © Louver Live",
+    "category": "Video",
+    "shortDescription": "YouTube 음악 라이브 자동 송출",
+    "longDescription": "완성된 음악 영상을 넣어두면 지정한 시간 동안 자동으로 순차 반복하며 YouTube Live로 송출합니다.",
+    "resources": [],
+    "externalBin": ["binaries/ffmpeg", "binaries/ffprobe"],
+    "licenseFile": "../../../LICENSES.md",
+    "windows": {
+      "nsis": { "installMode": "perMachine" }
+    },
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  },
+  "plugins": {
+    "updater": {
+      "active": false,
+      "endpoints": ["https://releases.louver.live/{{target}}/{{arch}}/{{current_version}}"],
+      "dialog": true,
+      "pubkey": "REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY"
+    }
+  }
+}

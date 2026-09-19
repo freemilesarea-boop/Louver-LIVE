@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::*;
+// `common` is used via the require_ffmpeg! macro, which refers to it by path.
 use louver_core::config::StreamMode;
 use louver_core::session::{decide_recovery, RecoveryDecision, SessionState, SessionStore};
 use louver_core::streaming::state::StreamState;
@@ -18,16 +18,33 @@ use std::time::Duration;
 /// An FFmpeg that will run for a long time, so the test can kill it.
 fn long_running_args(out: &std::path::Path) -> Vec<String> {
     vec![
-        "-hide_banner".into(), "-nostdin".into(), "-loglevel".into(), "error".into(),
-        "-progress".into(), "pipe:1".into(), "-y".into(),
-        "-f".into(), "lavfi".into(),
-        "-i".into(), "testsrc2=size=320x240:rate=30".into(),
-        "-f".into(), "lavfi".into(),
-        "-i".into(), "sine=frequency=440:sample_rate=48000".into(),
-        "-c:v".into(), "libx264".into(), "-preset".into(), "ultrafast".into(),
-        "-pix_fmt".into(), "yuv420p".into(),
-        "-c:a".into(), "aac".into(), "-t".into(), "600".into(),
-        "-f".into(), "flv".into(),
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-progress".into(),
+        "pipe:1".into(),
+        "-y".into(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        "testsrc2=size=320x240:rate=30".into(),
+        "-f".into(),
+        "lavfi".into(),
+        "-i".into(),
+        "sine=frequency=440:sample_rate=48000".into(),
+        "-c:v".into(),
+        "libx264".into(),
+        "-preset".into(),
+        "ultrafast".into(),
+        "-pix_fmt".into(),
+        "yuv420p".into(),
+        "-c:a".into(),
+        "aac".into(),
+        "-t".into(),
+        "600".into(),
+        "-f".into(),
+        "flv".into(),
         out.to_string_lossy().into_owned(),
     ]
 }
@@ -35,10 +52,16 @@ fn long_running_args(out: &std::path::Path) -> Vec<String> {
 /// FFmpeg that fails immediately, standing in for "YouTube refused us".
 fn failing_args() -> Vec<String> {
     vec![
-        "-hide_banner".into(), "-nostdin".into(), "-loglevel".into(), "error".into(),
+        "-hide_banner".into(),
+        "-nostdin".into(),
+        "-loglevel".into(),
+        "error".into(),
         "-y".into(),
-        "-i".into(), "/nonexistent/input/file.mp4".into(),
-        "-f".into(), "null".into(), "-".into(),
+        "-i".into(),
+        "/nonexistent/input/file.mp4".into(),
+        "-f".into(),
+        "null".into(),
+        "-".into(),
     ]
 }
 
@@ -191,13 +214,13 @@ fn ffmpeg_stderr_reaches_the_log_callback_with_secrets_masked() {
     args.pop();
     args.pop();
     args.extend([
-        "-f".to_string(), "flv".to_string(),
+        "-f".to_string(),
+        "flv".to_string(),
         "rtmps://a.rtmps.youtube.com/live2/abcd-efgh-ijkl-mnop".to_string(),
     ]);
 
-    let child = sup
-        .spawn(&tools.ffmpeg, &args, move |line| sink.lock().unwrap().push(line.to_string()))
-        .unwrap();
+    let child =
+        sup.spawn(&tools.ffmpeg, &args, move |line| sink.lock().unwrap().push(line.to_string())).unwrap();
     sup.attach(child).unwrap();
     wait_for_action(&mut sup, Duration::from_secs(20));
     std::thread::sleep(Duration::from_millis(300));

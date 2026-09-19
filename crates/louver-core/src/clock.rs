@@ -9,9 +9,7 @@ pub trait Clock: Send + Sync + std::fmt::Debug {
 
     /// Current local time, which is what schedules are expressed in.
     fn now_local(&self) -> NaiveDateTime {
-        Local
-            .from_utc_datetime(&self.now_utc().naive_utc())
-            .naive_local()
+        Local.from_utc_datetime(&self.now_utc().naive_utc()).naive_local()
     }
 }
 

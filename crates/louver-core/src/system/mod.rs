@@ -60,9 +60,7 @@ impl MetricsCollector {
 
         let cores = self.sys.cpus().len().max(1) as f32;
         let me = self.sys.process(self.pid);
-        let ff = ffmpeg_pid
-            .map(sysinfo::Pid::from_u32)
-            .and_then(|p| self.sys.process(p));
+        let ff = ffmpeg_pid.map(sysinfo::Pid::from_u32).and_then(|p| self.sys.process(p));
 
         SystemMetrics {
             // sysinfo reports per-core percentages; normalize to the machine.
@@ -96,10 +94,7 @@ impl MetricsCollector {
         if !self.is_ffmpeg_process(pid) {
             return false;
         }
-        self.sys
-            .process(sysinfo::Pid::from_u32(pid))
-            .map(|p| p.kill())
-            .unwrap_or(false)
+        self.sys.process(sysinfo::Pid::from_u32(pid)).map(|p| p.kill()).unwrap_or(false)
     }
 }
 
@@ -220,7 +215,11 @@ pub fn format_bytes(b: u64) -> String {
         v /= 1024.0;
         i += 1;
     }
-    if i == 0 { format!("{b} B") } else { format!("{v:.1} {}", U[i]) }
+    if i == 0 {
+        format!("{b} B")
+    } else {
+        format!("{v:.1} {}", U[i])
+    }
 }
 
 /// Format a duration as `HH:MM:SS`.
@@ -304,7 +303,10 @@ mod tests {
             parse_rtmp_host("rtmps://a.rtmps.youtube.com/live2"),
             Some(("a.rtmps.youtube.com".into(), 443))
         );
-        assert_eq!(parse_rtmp_host("rtmp://a.rtmp.youtube.com/live2"), Some(("a.rtmp.youtube.com".into(), 1935)));
+        assert_eq!(
+            parse_rtmp_host("rtmp://a.rtmp.youtube.com/live2"),
+            Some(("a.rtmp.youtube.com".into(), 1935))
+        );
         assert_eq!(parse_rtmp_host("rtmps://host.example:1936/live2"), Some(("host.example".into(), 1936)));
         assert_eq!(parse_rtmp_host("https://example.com"), None);
         assert_eq!(parse_rtmp_host("not a url"), None);

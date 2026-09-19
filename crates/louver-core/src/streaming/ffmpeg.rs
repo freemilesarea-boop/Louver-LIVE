@@ -30,7 +30,10 @@ impl FfmpegTools {
         if let Some(dir) = sidecar_dir {
             // Tauri sidecars are suffixed with the target triple.
             for candidate in [
-                (dir.join(format!("{}-{}", fm, target_triple())), dir.join(format!("{}-{}", fp, target_triple()))),
+                (
+                    dir.join(format!("{}-{}", fm, target_triple())),
+                    dir.join(format!("{}-{}", fp, target_triple())),
+                ),
                 (dir.join(&fm), dir.join(&fp)),
             ] {
                 if candidate.0.is_file() && candidate.1.is_file() {
@@ -54,11 +57,7 @@ impl FfmpegTools {
             .args(["-hide_banner", "-version"])
             .output()
             .map_err(|e| LouverError::with_detail(ErrorCode::FfmpegNotFound, e.to_string()))?;
-        Ok(String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string())
+        Ok(String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or_default().to_string())
     }
 
     /// Video encoders FFmpeg reports as available, used for hardware detection (§9).
@@ -83,7 +82,11 @@ impl FfmpegTools {
 }
 
 fn exe_name(base: &str) -> String {
-    if cfg!(windows) { format!("{base}.exe") } else { base.to_string() }
+    if cfg!(windows) {
+        format!("{base}.exe")
+    } else {
+        base.to_string()
+    }
 }
 
 /// The Tauri sidecar target triple for the running platform (§49).
@@ -102,11 +105,8 @@ pub fn target_triple() -> &'static str {
 }
 
 fn which(name: &str) -> Option<PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|p| p.join(name))
-            .find(|p| p.is_file())
-    })
+    std::env::var_os("PATH")
+        .and_then(|paths| std::env::split_paths(&paths).map(|p| p.join(name)).find(|p| p.is_file()))
 }
 
 /// Hardware H.264 encoders, most preferred first, per platform (§9).
@@ -175,10 +175,7 @@ fn split_keep_delims(s: &str) -> Vec<String> {
 
 fn mask_token(tok: &str) -> String {
     // An RTMP(S) URL: keep scheme+host+app path, mask any trailing key segment.
-    if let Some(rest) = tok
-        .strip_prefix("rtmps://")
-        .or_else(|| tok.strip_prefix("rtmp://"))
-    {
+    if let Some(rest) = tok.strip_prefix("rtmps://").or_else(|| tok.strip_prefix("rtmp://")) {
         let scheme = if tok.starts_with("rtmps://") { "rtmps://" } else { "rtmp://" };
         let segments: Vec<&str> = rest.split('/').collect();
         // host / app / [key...]
@@ -203,8 +200,7 @@ pub fn looks_like_stream_key(tok: &str) -> bool {
         return false;
     }
     let groups: Vec<&str> = core.split('-').collect();
-    groups.len() >= 4
-        && groups.iter().all(|g| !g.is_empty() && g.chars().all(|c| c.is_ascii_alphanumeric()))
+    groups.len() >= 4 && groups.iter().all(|g| !g.is_empty() && g.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 /// Mask a full argv vector for logging.
@@ -250,8 +246,10 @@ impl FfmpegCommandBuilder {
     /// `ffprobe` arguments producing the JSON the probe module parses (§6).
     pub fn build_probe_args(&self, input: &Path) -> Vec<String> {
         vec![
-            "-v".into(), "error".into(),
-            "-print_format".into(), "json".into(),
+            "-v".into(),
+            "error".into(),
+            "-print_format".into(),
+            "json".into(),
             "-show_format".into(),
             "-show_streams".into(),
             "-show_entries".into(),
@@ -294,29 +292,37 @@ impl FfmpegCommandBuilder {
         let mut a: Vec<String> = vec![
             "-hide_banner".into(),
             "-nostdin".into(),
-            "-loglevel".into(), "error".into(),
-            "-progress".into(), "pipe:1".into(), // machine-readable progress (§40)
+            "-loglevel".into(),
+            "error".into(),
+            "-progress".into(),
+            "pipe:1".into(), // machine-readable progress (§40)
             "-y".into(),
-            "-i".into(), input.to_string_lossy().into_owned(),
+            "-i".into(),
+            input.to_string_lossy().into_owned(),
         ];
 
         if has_audio {
             a.extend([
                 "-filter_complex".into(),
                 format!("[0:v]{vf}[v];[0:a]{af}[a]"),
-                "-map".into(), "[v]".into(),
-                "-map".into(), "[a]".into(),
+                "-map".into(),
+                "[v]".into(),
+                "-map".into(),
+                "[a]".into(),
             ]);
         } else {
             // A silent source, bounded by the -t below.
             a.extend([
-                "-f".into(), "lavfi".into(),
+                "-f".into(),
+                "lavfi".into(),
                 "-i".into(),
                 format!("anullsrc=channel_layout=stereo:sample_rate={}", p.audio_sample_rate()),
                 "-filter_complex".into(),
                 format!("[0:v]{vf}[v]"),
-                "-map".into(), "[v]".into(),
-                "-map".into(), "1:a".into(),
+                "-map".into(),
+                "[v]".into(),
+                "-map".into(),
+                "1:a".into(),
             ]);
         }
 
@@ -326,16 +332,26 @@ impl FfmpegCommandBuilder {
         a.extend(self.video_encode_args());
 
         a.extend([
-            "-r".into(), p.fps().to_string(),
-            "-fps_mode".into(), "cfr".into(),
-            "-video_track_timescale".into(), p.video_timescale().to_string(),
-            "-c:a".into(), "aac".into(),
-            "-b:a".into(), format!("{}k", p.audio_kbps()),
-            "-ar".into(), p.audio_sample_rate().to_string(),
-            "-ac".into(), p.audio_channels().to_string(),
-            "-movflags".into(), "+faststart".into(),
-            "-map_metadata".into(), "-1".into(),
-            "-avoid_negative_ts".into(), "make_zero".into(),
+            "-r".into(),
+            p.fps().to_string(),
+            "-fps_mode".into(),
+            "cfr".into(),
+            "-video_track_timescale".into(),
+            p.video_timescale().to_string(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            format!("{}k", p.audio_kbps()),
+            "-ar".into(),
+            p.audio_sample_rate().to_string(),
+            "-ac".into(),
+            p.audio_channels().to_string(),
+            "-movflags".into(),
+            "+faststart".into(),
+            "-map_metadata".into(),
+            "-1".into(),
+            "-avoid_negative_ts".into(),
+            "make_zero".into(),
             output.to_string_lossy().into_owned(),
         ]);
         a
@@ -347,38 +363,51 @@ impl FfmpegCommandBuilder {
         let mut a: Vec<String> = vec!["-c:v".into(), self.encoder.clone()];
         match self.encoder.as_str() {
             "h264_nvenc" => a.extend([
-                "-preset".into(), "p4".into(),
-                "-rc".into(), "cbr".into(),
-                "-profile:v".into(), "high".into(),
+                "-preset".into(),
+                "p4".into(),
+                "-rc".into(),
+                "cbr".into(),
+                "-profile:v".into(),
+                "high".into(),
             ]),
-            "h264_qsv" => a.extend([
-                "-preset".into(), "medium".into(),
-                "-profile:v".into(), "high".into(),
-            ]),
+            "h264_qsv" => a.extend(["-preset".into(), "medium".into(), "-profile:v".into(), "high".into()]),
             "h264_amf" => a.extend([
-                "-quality".into(), "balanced".into(),
-                "-rc".into(), "cbr".into(),
-                "-profile:v".into(), "high".into(),
+                "-quality".into(),
+                "balanced".into(),
+                "-rc".into(),
+                "cbr".into(),
+                "-profile:v".into(),
+                "high".into(),
             ]),
-            "h264_videotoolbox" => a.extend([
-                "-profile:v".into(), "high".into(),
-                "-allow_sw".into(), "1".into(),
-            ]),
+            "h264_videotoolbox" => {
+                a.extend(["-profile:v".into(), "high".into(), "-allow_sw".into(), "1".into()])
+            }
             _ => a.extend([
-                "-preset".into(), "veryfast".into(),
-                "-profile:v".into(), "high".into(),
-                "-level".into(), "4.2".into(),
-                "-x264-params".into(), "force-cfr=1".into(),
+                "-preset".into(),
+                "veryfast".into(),
+                "-profile:v".into(),
+                "high".into(),
+                "-level".into(),
+                "4.2".into(),
+                "-x264-params".into(),
+                "force-cfr=1".into(),
             ]),
         }
         a.extend([
-            "-pix_fmt".into(), "yuv420p".into(),
-            "-b:v".into(), format!("{kbps}k"),
-            "-maxrate".into(), format!("{kbps}k"),
-            "-bufsize".into(), format!("{}k", kbps * 2),
-            "-g".into(), p.gop().to_string(),
-            "-keyint_min".into(), p.gop().to_string(),
-            "-sc_threshold".into(), "0".into(),
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-b:v".into(),
+            format!("{kbps}k"),
+            "-maxrate".into(),
+            format!("{kbps}k"),
+            "-bufsize".into(),
+            format!("{}k", kbps * 2),
+            "-g".into(),
+            p.gop().to_string(),
+            "-keyint_min".into(),
+            p.gop().to_string(),
+            "-sc_threshold".into(),
+            "0".into(),
         ]);
         a
     }
@@ -397,8 +426,10 @@ impl FfmpegCommandBuilder {
         let mut a: Vec<String> = vec![
             "-hide_banner".into(),
             "-nostdin".into(),
-            "-loglevel".into(), "warning".into(),
-            "-progress".into(), "pipe:1".into(),
+            "-loglevel".into(),
+            "warning".into(),
+            "-progress".into(),
+            "pipe:1".into(),
             // Feed the muxer at wall-clock speed; without this FFmpeg would
             // push the whole playlist to YouTube as fast as it can read it.
             "-re".into(),
@@ -407,9 +438,12 @@ impl FfmpegCommandBuilder {
             a.extend(["-stream_loop".into(), "-1".into()]);
         }
         a.extend([
-            "-f".into(), "concat".into(),
-            "-safe".into(), "0".into(),
-            "-i".into(), manifest.to_string_lossy().into_owned(),
+            "-f".into(),
+            "concat".into(),
+            "-safe".into(),
+            "0".into(),
+            "-i".into(),
+            manifest.to_string_lossy().into_owned(),
         ]);
 
         match mode {
@@ -419,19 +453,27 @@ impl FfmpegCommandBuilder {
             StreamMode::CompatibilityEncode => {
                 a.extend(self.video_encode_args());
                 a.extend([
-                    "-r".into(), self.profile.fps().to_string(),
-                    "-fps_mode".into(), "cfr".into(),
-                    "-c:a".into(), "aac".into(),
-                    "-b:a".into(), format!("{}k", self.profile.audio_kbps()),
-                    "-ar".into(), self.profile.audio_sample_rate().to_string(),
-                    "-ac".into(), self.profile.audio_channels().to_string(),
+                    "-r".into(),
+                    self.profile.fps().to_string(),
+                    "-fps_mode".into(),
+                    "cfr".into(),
+                    "-c:a".into(),
+                    "aac".into(),
+                    "-b:a".into(),
+                    format!("{}k", self.profile.audio_kbps()),
+                    "-ar".into(),
+                    self.profile.audio_sample_rate().to_string(),
+                    "-ac".into(),
+                    self.profile.audio_channels().to_string(),
                 ]);
             }
         }
 
         a.extend([
-            "-f".into(), "flv".into(),
-            "-flvflags".into(), "no_duration_filesize".into(),
+            "-f".into(),
+            "flv".into(),
+            "-flvflags".into(),
+            "no_duration_filesize".into(),
             destination.to_string(),
         ]);
         a
@@ -446,12 +488,7 @@ impl FfmpegCommandBuilder {
         duration_secs: Option<f64>,
         loop_forever: bool,
     ) -> Vec<String> {
-        let mut a = self.build_stream_args(
-            manifest,
-            &output.to_string_lossy(),
-            mode,
-            loop_forever,
-        );
+        let mut a = self.build_stream_args(manifest, &output.to_string_lossy(), mode, loop_forever);
         // Dry runs read as fast as the disk allows; `-re` only matters when a
         // live server is pacing us.
         if let Some(pos) = a.iter().position(|x| x == "-re") {
@@ -509,10 +546,7 @@ mod tests {
         let mac = PathBuf::from("/Users/test/Music/오늘 밤 재즈.mp4");
         for p in [win, mac] {
             let args = builder().build_normalize_args(&p, Path::new("/tmp/o.mp4"), 5.0, true);
-            assert!(
-                args.contains(&p.to_string_lossy().into_owned()),
-                "korean path mangled: {args:?}"
-            );
+            assert!(args.contains(&p.to_string_lossy().into_owned()), "korean path mangled: {args:?}");
         }
     }
 
@@ -534,14 +568,21 @@ mod tests {
             true,
         );
         assert!(a.windows(2).any(|w| w == ["-c", "copy"]));
-        for forbidden in ["libx264", "h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox", "-c:v", "-b:v"] {
+        for forbidden in
+            ["libx264", "h264_nvenc", "h264_qsv", "h264_amf", "h264_videotoolbox", "-c:v", "-b:v"]
+        {
             assert!(!a.iter().any(|x| x == forbidden), "stream copy leaked {forbidden}: {a:?}");
         }
     }
 
     #[test]
     fn stream_copy_loops_forever_and_paces_with_re() {
-        let a = builder().build_stream_args(Path::new("/tmp/m.txt"), "rtmps://x/y/z", StreamMode::StreamCopy, true);
+        let a = builder().build_stream_args(
+            Path::new("/tmp/m.txt"),
+            "rtmps://x/y/z",
+            StreamMode::StreamCopy,
+            true,
+        );
         assert!(a.windows(2).any(|w| w == ["-stream_loop", "-1"]));
         assert!(a.contains(&"-re".to_string()));
         assert!(a.windows(2).any(|w| w == ["-f", "concat"]));
@@ -550,13 +591,23 @@ mod tests {
 
     #[test]
     fn non_looping_stream_omits_stream_loop() {
-        let a = builder().build_stream_args(Path::new("/tmp/m.txt"), "rtmps://x/y/z", StreamMode::StreamCopy, false);
+        let a = builder().build_stream_args(
+            Path::new("/tmp/m.txt"),
+            "rtmps://x/y/z",
+            StreamMode::StreamCopy,
+            false,
+        );
         assert!(!a.contains(&"-stream_loop".to_string()));
     }
 
     #[test]
     fn compatibility_mode_does_encode() {
-        let a = builder().build_stream_args(Path::new("/tmp/m.txt"), "rtmps://x/y/z", StreamMode::CompatibilityEncode, true);
+        let a = builder().build_stream_args(
+            Path::new("/tmp/m.txt"),
+            "rtmps://x/y/z",
+            StreamMode::CompatibilityEncode,
+            true,
+        );
         assert!(a.windows(2).any(|w| w == ["-c:v", "libx264"]));
         assert!(!a.windows(2).any(|w| w == ["-c", "copy"]));
     }
@@ -595,10 +646,7 @@ mod tests {
 
     #[test]
     fn normalize_720p_uses_smaller_geometry_and_bitrate() {
-        let b = FfmpegCommandBuilder::new(
-            FfmpegTools::new("ffmpeg", "ffprobe"),
-            OutputProfile::P720p30,
-        );
+        let b = FfmpegCommandBuilder::new(FfmpegTools::new("ffmpeg", "ffprobe"), OutputProfile::P720p30);
         let joined = b.build_normalize_args(Path::new("/in.mp4"), Path::new("/o.mp4"), 3.0, true).join(" ");
         assert!(joined.contains("scale=1280:720"));
         assert!(joined.contains("-b:v 4000k"));
@@ -641,11 +689,8 @@ mod tests {
         assert_eq!(select_encoder(&none), "libx264");
         assert!(!is_hardware_encoder("libx264"));
 
-        let hw: Vec<String> = preferred_hw_encoders()
-            .iter()
-            .map(|s| s.to_string())
-            .chain(["libx264".to_string()])
-            .collect();
+        let hw: Vec<String> =
+            preferred_hw_encoders().iter().map(|s| s.to_string()).chain(["libx264".to_string()]).collect();
         let picked = select_encoder(&hw);
         assert_eq!(picked, preferred_hw_encoders()[0]);
         assert!(is_hardware_encoder(&picked));
@@ -701,8 +746,11 @@ mod tests {
     #[test]
     fn target_triple_is_a_known_tauri_triple() {
         let known = [
-            "x86_64-pc-windows-msvc", "aarch64-apple-darwin", "x86_64-apple-darwin",
-            "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
+            "x86_64-pc-windows-msvc",
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "x86_64-unknown-linux-gnu",
+            "aarch64-unknown-linux-gnu",
         ];
         assert!(known.contains(&target_triple()));
     }

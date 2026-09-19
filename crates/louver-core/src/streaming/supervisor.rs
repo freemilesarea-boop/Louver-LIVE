@@ -59,11 +59,8 @@ pub fn apply_progress_line(p: &mut StreamProgress, line: &str) -> bool {
         "fps" => p.fps = v.parse().unwrap_or(p.fps),
         "bitrate" => {
             // e.g. "10216.3kbits/s" or "N/A"
-            p.bitrate_kbps = v
-                .trim_end_matches("bits/s")
-                .trim_end_matches('k')
-                .parse()
-                .unwrap_or(p.bitrate_kbps);
+            p.bitrate_kbps =
+                v.trim_end_matches("bits/s").trim_end_matches('k').parse().unwrap_or(p.bitrate_kbps);
         }
         "total_size" => p.total_bytes = v.parse().unwrap_or(p.total_bytes),
         "out_time_ms" => p.out_time_ms = v.parse::<u64>().map(|us| us / 1000).unwrap_or(p.out_time_ms),
@@ -219,10 +216,7 @@ impl StreamSupervisor {
     /// True when FFmpeg is alive but has stopped producing output.
     pub fn is_stalled(&self) -> bool {
         self.machine.state() == StreamState::Live
-            && self
-                .last_data_at
-                .map(|t| t.elapsed() > self.stall_timeout)
-                .unwrap_or(false)
+            && self.last_data_at.map(|t| t.elapsed() > self.stall_timeout).unwrap_or(false)
     }
 
     /// The user pressed Stop. Terminates FFmpeg and blocks all reconnection (§17).
@@ -312,10 +306,7 @@ impl StreamSupervisor {
         mut on_log: impl FnMut(&str) + Send + 'static,
     ) -> Result<Box<dyn ProcessHandle>> {
         let mut cmd = Command::new(program);
-        cmd.args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -325,9 +316,8 @@ impl StreamSupervisor {
 
         on_log(&format!("spawn: {} {}", program.display(), mask_argv(args).join(" ")));
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| LouverError::with_detail(ErrorCode::StreamFfmpegSpawn, e.to_string()))?;
+        let mut child =
+            cmd.spawn().map_err(|e| LouverError::with_detail(ErrorCode::StreamFfmpegSpawn, e.to_string()))?;
 
         let progress = Arc::clone(&self.progress);
         let saw_data = Arc::clone(&self.saw_data);
@@ -559,9 +549,9 @@ mod tests {
     fn a_successful_reconnect_resets_the_backoff() {
         let mut s = live_supervisor();
         s.child = Some(FakeProcess::crashed());
-        s.poll();
+        let _ = s.poll();
         s.child = Some(FakeProcess::crashed());
-        s.poll();
+        let _ = s.poll();
         assert_eq!(s.reconnect_count(), 2);
 
         s.machine_mut().transition(StreamState::Connecting).unwrap();
@@ -617,8 +607,8 @@ mod tests {
 
     #[test]
     fn a_live_process_that_stops_producing_output_is_restarted() {
-        let mut s = StreamSupervisor::new(StreamMode::StreamCopy)
-            .with_stall_timeout(Duration::from_millis(50));
+        let mut s =
+            StreamSupervisor::new(StreamMode::StreamCopy).with_stall_timeout(Duration::from_millis(50));
         s.begin().unwrap();
         let (p, terminated) = FakeProcess::running(5);
         s.attach(p).unwrap();
@@ -637,8 +627,8 @@ mod tests {
 
     #[test]
     fn note_data_keeps_a_busy_stream_from_being_declared_stalled() {
-        let mut s = StreamSupervisor::new(StreamMode::StreamCopy)
-            .with_stall_timeout(Duration::from_millis(80));
+        let mut s =
+            StreamSupervisor::new(StreamMode::StreamCopy).with_stall_timeout(Duration::from_millis(80));
         s.begin().unwrap();
         let (p, _) = FakeProcess::running(5);
         s.attach(p).unwrap();
@@ -656,8 +646,12 @@ mod tests {
     fn progress_lines_are_parsed() {
         let mut p = StreamProgress::default();
         for line in [
-            "frame=1800", "fps=30.0", "bitrate=10216.3kbits/s",
-            "total_size=1234567", "out_time_ms=60000000", "speed=1.00x",
+            "frame=1800",
+            "fps=30.0",
+            "bitrate=10216.3kbits/s",
+            "total_size=1234567",
+            "out_time_ms=60000000",
+            "speed=1.00x",
             "progress=continue",
         ] {
             assert!(!apply_progress_line(&mut p, line));
@@ -686,7 +680,7 @@ mod tests {
     fn status_reports_the_pending_retry_while_reconnecting() {
         let mut s = live_supervisor();
         s.child = Some(FakeProcess::crashed());
-        s.poll();
+        let _ = s.poll();
         assert_eq!(s.status().next_retry_in_secs, Some(2));
         assert_eq!(s.status().state, StreamState::Reconnecting);
     }

@@ -128,7 +128,8 @@ pub fn decide_recovery(
     } else {
         RecoveryDecision::CleanUpOnly {
             session: Box::new(s),
-            reason: "이전 방송이 비정상 종료되었습니다. 예약 시간이 아니므로 방송을 시작하지 않습니다.".into(),
+            reason: "이전 방송이 비정상 종료되었습니다. 예약 시간이 아니므로 방송을 시작하지 않습니다."
+                .into(),
         }
     }
 }
@@ -267,7 +268,9 @@ mod tests {
 
     #[test]
     fn every_non_terminal_state_counts_as_an_unclean_shutdown() {
-        for st in [StreamState::Preparing, StreamState::Connecting, StreamState::Live, StreamState::Reconnecting] {
+        for st in
+            [StreamState::Preparing, StreamState::Connecting, StreamState::Live, StreamState::Reconnecting]
+        {
             let mut s = state();
             s.stream_state = st;
             assert!(!s.is_clean_shutdown(), "{st} should look like a crash");
