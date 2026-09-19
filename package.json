@@ -26,7 +26,8 @@
     "rc:boundaries": "node scripts/analyse-boundaries.mjs",
     "secret-scan": "node scripts/secret-scan.mjs",
     "ffmpeg:manifest": "node scripts/ffmpeg-manifest.mjs",
-    "soak:overnight": "node scripts/overnight-soak.mjs"
+    "soak:overnight": "node scripts/overnight-soak.mjs",
+    "soak:report": "node scripts/soak-report.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

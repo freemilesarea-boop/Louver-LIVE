@@ -1,0 +1,121 @@
+name: Release artifacts
+
+# Builds the installers that cannot be built here. This repository's own CI
+# runs on Linux, and a macOS .app or a Windows .exe can only be produced on
+# macOS and Windows respectively — so those artifacts come from this workflow
+# rather than from a developer's machine.
+#
+# Run it from the Actions tab (workflow_dispatch) or by pushing a v* tag.
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign:
+        description: 'Sign and notarize the macOS build (needs the secrets below)'
+        type: boolean
+        default: false
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macOS Apple Silicon
+            os: macos-14           # arm64 runner
+            target: aarch64-apple-darwin
+            artifacts: |
+              apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+              apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app
+          - label: macOS Intel
+            os: macos-13
+            target: x86_64-apple-darwin
+            artifacts: |
+              apps/desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
+          - label: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifacts: |
+              apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+              apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+
+      - run: npm ci
+
+      # No development fallback in a release. If the download hosts cannot be
+      # reached the build fails here rather than shipping the runner's own
+      # FFmpeg, which is dynamically linked and would not run on a user's
+      # machine.
+      - name: Fetch the FFmpeg sidecars
+        run: node scripts/fetch-ffmpeg.mjs --require-download --target ${{ matrix.target }}
+
+      # The licence, linkage, encoders, protocols and minimum version are read
+      # out of the binaries themselves. A build that fails this does not ship.
+      - name: Verify the FFmpeg sidecars
+        run: node scripts/ffmpeg-manifest.mjs --check
+
+      - name: Verify the application
+        run: npm run verify
+
+      - name: Build the installer
+        uses: tauri-apps/tauri-action@v0
+        env:
+          # Present only when the release is signed; tauri-action skips
+          # signing when they are absent, which is what an unsigned test
+          # build wants.
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          # The updater signing key. Never stored in the repository; see
+          # SIGNING.md for how it is generated and where it lives.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          args: --target ${{ matrix.target }}
+
+      # What actually got built, recorded next to the artifact — so a tester
+      # can tell a signed build from an unsigned one without guessing.
+      - name: Describe the artifact
+        shell: bash
+        run: |
+          {
+            echo "target: ${{ matrix.target }}"
+            echo "runner: ${{ matrix.os }}"
+            echo "commit: ${{ github.sha }}"
+            echo "signed: ${{ secrets.APPLE_SIGNING_IDENTITY != '' || secrets.WINDOWS_CERTIFICATE != '' }}"
+            echo "built:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          } > BUILD-INFO.txt
+          cat BUILD-INFO.txt
+          cat rc-results/ffmpeg-manifest.json >> BUILD-INFO.txt || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: louver-live-${{ matrix.target }}
+          retention-days: 30
+          path: |
+            ${{ matrix.artifacts }}
+            BUILD-INFO.txt

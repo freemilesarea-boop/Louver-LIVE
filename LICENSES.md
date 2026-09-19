@@ -32,6 +32,31 @@ Because the live path never encodes, the encoder requirement applies only to
 import-time optimization — which every supported platform can satisfy with an
 OS or hardware encoder.
 
+### Minimum version: FFmpeg 5.1
+
+Licence is not the only thing that disqualifies a build. Normalization uses
+`-fps_mode`, which replaced `-vsync` in **FFmpeg 5.1**; an older binary rejects
+it and every import fails. This was found the hard way — both FFmpeg builds
+distributed through npm (`@ffmpeg-installer/darwin-arm64` 4.1.5,
+`@ffmpeg-installer/win32-x64` 4.1.0) are 4.1 and cannot optimize a single
+video, while broadcasting fine, because broadcasting is a remux.
+
+Two things enforce it:
+
+- `scripts/ffmpeg-manifest.mjs --check` probes `-fps_mode` on the actual
+  binary and marks anything below 5.1 UNFIT, so a too-old build cannot reach a
+  release.
+- At runtime `FfmpegTools::capabilities()` asks the binary what it supports —
+  RTMPS, an H.264 encoder **proved by encoding a frame**, AAC, `-fps_mode` —
+  rather than parsing its version string. Preflight then separates the two
+  answers: no RTMPS blocks broadcasting outright; no encoder or no `-fps_mode`
+  is a warning, because an already-optimized library still broadcasts.
+
+The encoder fallback chain is checked the same way: each candidate is proved on
+the real binary before it is used, so the chain can never select an encoder
+that the shipped build does not actually have. That is what makes Option B
+below safe to switch to without touching code.
+
 ### Option A — GPL build (default, chosen for v1.0)
 
 | | |
