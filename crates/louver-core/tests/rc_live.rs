@@ -294,24 +294,25 @@ fn rc_broadcast() {
 
     // Reaching LIVE means the ingest accepted the stream.
     let connect_started = Instant::now();
-    let mut connected = false;
+    let mut connected = None;
     while connect_started.elapsed() < Duration::from_secs(60) {
         h.rt.tick();
         if h.rt.state() == StreamState::Live {
-            connected = true;
+            // Capture it here: reading `elapsed()` later would report the whole
+            // run instead of the connect time.
+            connected = Some(connect_started.elapsed());
             break;
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    assert!(
-        connected,
+    let connect_time = connected.unwrap_or_else(|| panic!(
         "never reached LIVE against {} (state {})\nruntime log:\n{}\nffmpeg:\n{}",
         destination_label(),
         h.rt.state(),
         h.recorder.logs.lock().unwrap().join("\n"),
         h.ffmpeg_log.lock().unwrap().join("\n"),
-    );
-    eprintln!("connected in {:.1}s — broadcasting\n", connect_started.elapsed().as_secs_f64());
+    ));
+    eprintln!("connected in {:.1}s — broadcasting\n", connect_time.as_secs_f64());
 
     let mut metrics = MetricsCollector::new();
     let mut samples: Vec<Sample> = Vec::new();
@@ -393,7 +394,7 @@ fn rc_broadcast() {
         "playlist_videos": 5,
         "cycle_seconds": h.cycle_secs,
         "loops_completed": (elapsed / h.cycle_secs * 10.0).round() / 10.0,
-        "connect_seconds": connect_started.elapsed().as_secs_f64(),
+        "connect_seconds": (connect_time.as_secs_f64() * 100.0).round() / 100.0,
         "samples": samples.len(),
         "app_rss_start": app_rss.first(),
         "app_rss_end": app_rss.last(),

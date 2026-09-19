@@ -40,7 +40,7 @@ not YouTube, and this report never claims otherwise.
 | 1 | `npm run verify` | **PASS** |
 | 2 | Real macOS packaged application | **NOT TESTED** — no macOS machine |
 | 3 | Real YouTube Live, 30 minutes | **NOT TESTED** — no stream key. 30 min over real RTMP: PASS |
-| 4 | Playlist loop | **PASS** — 17 boundaries, all clean |
+| 4 | Playlist loop | **PASS** — 21 boundaries over 4.3 loops, all clean |
 | 5 | Network failure recovery | **PASS** — 60s packet blackhole |
 | 6 | FFmpeg crash recovery | **PASS** — 3 kills, 3 recoveries |
 | 7 | Application restart recovery | **PASS** — real processes, real RTMP |
@@ -64,20 +64,21 @@ PASS  frontend lint                PASS  frontend build
 PASS  frontend tests               PASS  UI e2e tests
 ```
 
-| Suite | Tests |
-| --- | --- |
-| `louver-core` unit | 253 |
-| `louver-desktop` unit | 3 |
-| media pipeline (real FFmpeg) | 9 |
-| supervisor / recovery (real processes) | 9 |
-| runtime scheduling (virtual clock) | 16 |
-| runtime live (real FFmpeg) | 2 |
-| RC security | 7 |
-| RC licence | 10 |
-| docs sync | 5 |
-| frontend unit | 16 |
-| UI e2e | 18 |
-| **Total** | **348** |
+| Suite | Tests | Uses |
+| --- | --- | --- |
+| `louver-core` unit | 244 | — |
+| `louver-desktop` unit | 3 | — |
+| media pipeline | 9 | real FFmpeg |
+| supervisor / recovery | 9 | real processes |
+| runtime scheduling | 16 | virtual clock |
+| runtime live | 2 | real FFmpeg |
+| RC security | 7 | real FFmpeg |
+| RC licence | 10 | real Ed25519 keypair |
+| docs sync | 5 | — |
+| frontend unit | 16 | jsdom |
+| UI e2e | 18 | jsdom + in-memory backend |
+| **Total, automatic** | **339** | |
+| RC harness (`--ignored`, run by hand) | 4 | real RTMP endpoint |
 
 Release build: `louver-desktop` 7.5 MB stripped; Linux `.deb` bundles with
 both sidecars. macOS and Windows bundles **NOT BUILT** — Tauri does not
@@ -94,40 +95,48 @@ lengths and formats (95s/1280×720/25fps, 62s/1920×1080/30fps,
 128s/854×480/24fps/mono, 47s/1920×1080/60fps, 83s/640×360/15fps), Sequential,
 1080p30:
 
-*(30-minute run results are recorded in §10 below.)*
-
-An earlier uninterrupted capture of the same playlist ran **24.4 minutes**
-(3.52 playlist cycles) in a single RTMP session and is the basis of the
-boundary analysis in §5.
+**30 minutes, completed 13:01.** `rc-results/run2/rc-30min-summary.json`.
 
 | Metric | Measured |
 | --- | --- |
+| Duration | 1800 s |
+| Playlist loops completed | **4.3** |
+| Publisher sessions at the ingest | **1** — one unbroken RTMP connection for the whole 30 minutes |
 | Connect time | 1.0 s |
-| Reconnects | 0 |
-| Throughput | 8.2 – 10.4 Mbps (profile cap 10 Mbps) |
-| FFmpeg CPU | 0.5 – 0.7 % |
-| App (runtime) memory | 10.4 MB, flat |
-| FFmpeg memory | 57 → 65 MB, then flat |
-| FFmpeg errors | 0 |
+| Reconnects / restarts | **0 / 0** |
+| Ticks not LIVE | **0** |
+| Data sent | 1.18 GB |
+| Throughput | 5.25 Mbps |
+| FFmpeg CPU | mean **0.57 %**, peak **0.63 %** |
+| FFmpeg memory | 59.7 → 68.1 MB; steady-state growth **0.00 %** |
+| Runtime memory | 10.86 → 10.89 MB; steady-state growth **0.00 %** |
+| FFmpeg errors | **0** |
+| State transitions | `CONNECTING → LIVE (1s) → STOPPED` — nothing else |
+
+Throughput is 5.25 Mbps rather than the 10 Mbps profile cap because the
+fixtures are synthetic test patterns, which compress far below it. Real music
+video would sit near the cap. This affects network throughput only: stream
+copy does the same work per byte whatever the bytes contain.
 
 ---
 
 ## 5. Playlist boundary test (§6)
 
 Measured on the stream the ingest **received**, not on the sender's own view.
-17 boundaries across 3.52 cycles, covering every transition including the
-loop seam (rc_05 → rc_01).
+**21 boundaries across 4.3 cycles** of the 30-minute run, covering every
+transition including the loop seam (rc_05 → rc_01). An earlier 24.4-minute
+capture gave the same result across 17 boundaries.
 
 | Check | Result |
 | --- | --- |
 | Freeze (화면 멈춤) | **0** — worst inter-frame gap at a seam 55 ms (< 2 frames) |
 | Black frame (검은 프레임) | **0** — luminance 92–131 at every seam |
-| Audio dropout (순간적인 음소거) | **0** — peak −20.7 to −21.0 dB at every seam |
+| Audio dropout (순간적인 음소거) | **0** — peak −20.7 to −21.1 dB at every seam |
 | Audio gap | 22 ms at every seam — exactly one AAC frame, inaudible |
 | Timestamp jump | **0** duplicate, **0** backwards |
-| Buffering / stream restart | **0** — one RTMP session throughout |
-| Frame count | 43 865 vs 43 876 expected (0.03 %) |
-| A/V sync | 0 ms → 3 ms over 24 minutes, max 20 ms — **not accumulating** |
+| Buffering / stream restart | **0** — one RTMP session for all 30 minutes |
+| Frame count | 54 028 vs 54 040 expected (0.02 %) |
+| A/V sync | 6 ms → 4 ms over 30 minutes, max 16 ms — **not accumulating** |
 | Keyframe interval | max 2.02 s (YouTube requires ≤ 4 s) |
 
 Every boundary was clean. Raw data: `rc-results/boundary-analysis.json`.
@@ -266,9 +275,9 @@ All from the local RTMP runs; see §10 for the long-run figures.
 
 | Metric | Measured |
 | --- | --- |
-| FFmpeg CPU, 1080p30 stream copy | **0.5 – 0.7 %** |
-| FFmpeg memory | 57 → 65 MB, then flat |
-| Broadcast runtime memory | 10.4 MB, flat |
+| FFmpeg CPU, 1080p30 stream copy | mean **0.57 %**, peak **0.63 %** over 30 minutes |
+| FFmpeg memory | 59.7 → 68.1 MB; steady-state growth 0.00 % |
+| Broadcast runtime memory | 10.86 → 10.89 MB; steady-state growth 0.00 % |
 | Desktop shell (Tauri + webview), idle | **173.6 MB, 0.1 % CPU, 30 threads — completely flat over 40 minutes** |
 | Normalization | 3.4× realtime (libx264 veryfast, 4 cores, software only) |
 
