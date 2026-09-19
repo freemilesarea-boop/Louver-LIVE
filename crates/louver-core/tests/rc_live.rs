@@ -305,13 +305,15 @@ fn rc_broadcast() {
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    let connect_time = connected.unwrap_or_else(|| panic!(
-        "never reached LIVE against {} (state {})\nruntime log:\n{}\nffmpeg:\n{}",
-        destination_label(),
-        h.rt.state(),
-        h.recorder.logs.lock().unwrap().join("\n"),
-        h.ffmpeg_log.lock().unwrap().join("\n"),
-    ));
+    let connect_time = connected.unwrap_or_else(|| {
+        panic!(
+            "never reached LIVE against {} (state {})\nruntime log:\n{}\nffmpeg:\n{}",
+            destination_label(),
+            h.rt.state(),
+            h.recorder.logs.lock().unwrap().join("\n"),
+            h.ffmpeg_log.lock().unwrap().join("\n"),
+        )
+    });
     eprintln!("connected in {:.1}s — broadcasting\n", connect_time.as_secs_f64());
 
     let mut metrics = MetricsCollector::new();
