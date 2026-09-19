@@ -6,6 +6,38 @@ cannot be cleared from this machine. Details in *Release Blockers*.
 Everything below that says PASS was executed and its output observed. Anything
 not executed says **NOT TESTED**, never PASS.
 
+## What would make this a Release Candidate
+
+The rule, stated in advance so the verdict is not an opinion:
+
+**A. Must be true — each one is a blocker on its own.**
+
+| | Condition | Today |
+| --- | --- | --- |
+| A1 | `npm run verify` passes on the release commit | **PASS** |
+| A2 | The FFmpeg sidecars are licence-cleared, static, and pass `ffmpeg-manifest.mjs --check` | **BLOCKER** — only the development fallback exists here |
+| A3 | One real YouTube broadcast of 30 minutes or more, with a recovered interruption | **NOT TESTED** — needs a stream key |
+| A4 | The packaged app runs on real macOS, through `MACOS_RELEASE_TEST.md` | **NOT TESTED** — no macOS machine |
+| A5 | The packaged app runs on real Windows 10/11 x64 | **NOT TESTED** — no Windows machine |
+| A6 | A production licence key exists, and a release build rejects a licence signed by any other key | **NOT TESTED** — no production key, by design (see `SIGNING.md`) |
+| A7 | The stream key appears in no log, database, crash report or UI outside its own masked field | **PASS** |
+| A8 | A long unattended run holds the broadcast with no leak, no unrecovered failure and no orphan process | see §10 |
+
+**B. Must be recorded, not necessarily cleared.**
+
+Code signing and notarization, a 24-hour run, and hardware-encoder figures may
+be absent at RC as long as they are stated as absent. They are not blockers;
+pretending they were measured would be.
+
+**C. The disqualifier.**
+
+Any figure in this report that was not produced by running something. A single
+estimated number invalidates the report, whatever the other rows say.
+
+On that rule: **A2 and A3–A6 are open, so this is not yet a Release
+Candidate.** What is open is open for lack of a machine, a key or a signature —
+not for lack of a working product on the platform where it has been measured.
+
 ---
 
 ## 1. Environment
