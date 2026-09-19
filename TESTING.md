@@ -172,6 +172,39 @@ both processes, and writes a CSV plus a JSON summary. The stream key is read
 from the environment into the in-memory secret store and is masked everywhere
 it is reported — including in the harness's own console output.
 
+### An unattended long run
+
+```bash
+npm run soak:overnight -- --end-at 2026-09-20T02:35:00Z --port 1940 --push
+```
+
+One command that starts an ingest, broadcasts against it until a wall-clock
+end time, stops the way the Stop button does, checks for orphans and zombies,
+analyses what the ingest received, and writes
+`rc-results/overnight/FINAL_RESULT.md` with a PASS/FAIL/INCOMPLETE verdict. It
+needs nobody watching it, which is the point.
+
+Two things it does differently from a short run, both forced by length:
+
+- **The CSV is written as it goes.** A thirteen-hour run that dies at hour ten
+  must still leave ten hours of evidence behind.
+- **The capture is a rolling window.** A full capture at 5 Mbps is about 2.4 GB
+  an hour, so the ingest writes standalone FLV pieces and keeps only the first
+  few and the last few. Comparing A/V skew in the last piece against the first
+  is how drift across the whole run gets measured without storing the whole
+  run.
+
+If the run itself is interrupted — this repository's own container has been
+reclaimed mid-run — the analysis is a separate program and can still produce
+the verdict from whatever reached the disk:
+
+```bash
+npm run soak:report -- --out rc-results/overnight
+```
+
+A criterion it cannot measure is reported as NOT TESTED, which makes the
+overall result INCOMPLETE. It is never a pass.
+
 Other runs in the same file:
 
 | Test | What it does |
