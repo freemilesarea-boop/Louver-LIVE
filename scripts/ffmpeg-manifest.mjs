@@ -49,6 +49,28 @@ function linkage(path) {
   return { static: libs <= 8, shared_libraries: libs }
 }
 
+/**
+ * Minimum FFmpeg the product works with.
+ *
+ * The normalizer sends `-fps_mode`, which FFmpeg only gained in 5.1. A 4.x
+ * build looks entirely healthy — reports a version, lists libx264, speaks
+ * RTMPS — and then fails the moment a user presses "optimize". The npm-
+ * distributed builds are exactly this, so the gate is not hypothetical.
+ */
+const MIN_FFMPEG_MAJOR = 5
+const MIN_FFMPEG_MINOR = 1
+
+/** Parse "6.1.1-3ubuntu5", "n6.1", "4.1.5" → [major, minor]. */
+function parseVersion(s) {
+  const m = /(\d+)\.(\d+)/.exec(String(s).replace(/^n/, ''))
+  return m ? [Number(m[1]), Number(m[2])] : null
+}
+
+function versionAtLeast(v, major, minor) {
+  if (!v) return null
+  return v[0] > major || (v[0] === major && v[1] >= minor)
+}
+
 function describe(path) {
   const version = run(path, ['-hide_banner', '-version'])
   const firstLine = version.split('\n')[0] ?? ''
@@ -63,10 +85,24 @@ function describe(path) {
   const sourceFile = join(BIN_DIR, `SOURCE-${basename(path).replace(/^ffmpeg-/, '')}.txt`)
   const provider = existsSync(sourceFile) ? readFileSync(sourceFile, 'utf8').trim() : 'UNRECORDED'
 
+  const versionText = firstLine.replace('ffmpeg version ', '').split(' Copyright')[0]
+  const parsed = parseVersion(versionText)
+  // `-fps_mode` is the specific thing 4.x lacks; probe it rather than trusting
+  // the version string, which distributions format inconsistently.
+  const fpsModeProbe = run(path, [
+    '-hide_banner', '-loglevel', 'error', '-nostdin',
+    '-f', 'lavfi', '-i', 'color=black:size=64x64:rate=30:duration=0.1',
+    '-fps_mode', 'cfr', '-frames:v', '1', '-f', 'null', '-',
+  ])
+  const supportsFpsMode = !/unrecognized option|option not found/i.test(fpsModeProbe)
+
   return {
     binary: basename(path),
     size_bytes: statSync(path).size,
-    version: firstLine.replace('ffmpeg version ', '').split(' Copyright')[0],
+    version: versionText,
+    version_parsed: parsed,
+    version_ok: versionAtLeast(parsed, MIN_FFMPEG_MAJOR, MIN_FFMPEG_MINOR),
+    supports_fps_mode: supportsFpsMode,
     version_line: firstLine,
     provider,
     licence: licenceOf(config),
@@ -87,7 +123,12 @@ if (!binaries.length) {
   process.exit(1)
 }
 
-const manifest = { generated_at: new Date().toISOString(), host: process.platform, binaries: [] }
+const manifest = {
+  generated_at: new Date().toISOString(),
+  host: process.platform,
+  minimum_ffmpeg: `${MIN_FFMPEG_MAJOR}.${MIN_FFMPEG_MINOR}`,
+  binaries: [],
+}
 const problems = []
 
 for (const b of binaries) {
@@ -103,6 +144,7 @@ for (const b of binaries) {
   console.log(`  H.264 encoders ${d.h264_encoders.join(', ') || 'NONE'}`)
   console.log(`  AAC            ${d.has_aac ? 'yes' : 'NO'}`)
   console.log(`  RTMPS          ${d.supports_rtmps ? 'yes' : 'NO'}`)
+  console.log(`  -fps_mode      ${d.supports_fps_mode ? 'yes' : 'NO'}  (needed to optimize videos)`)
 
   // Conditions that make a binary unfit to ship.
   if (!d.licence.redistributable) problems.push(`${d.binary}: ${d.licence.why}`)
@@ -112,6 +154,15 @@ for (const b of binaries) {
   if (!d.h264_encoders.length) problems.push(`${d.binary}: no H.264 encoder, so videos cannot be optimized`)
   if (!d.has_aac) problems.push(`${d.binary}: no AAC encoder`)
   if (!d.supports_rtmps) problems.push(`${d.binary}: no RTMPS support, so it cannot publish to YouTube`)
+  if (d.version_ok === false) {
+    problems.push(
+      `${d.binary}: FFmpeg ${d.version} is older than the required ${MIN_FFMPEG_MAJOR}.${MIN_FFMPEG_MINOR} — ` +
+        'video optimization would fail on the user\'s machine',
+    )
+  }
+  if (!d.supports_fps_mode) {
+    problems.push(`${d.binary}: does not accept -fps_mode, which the normalizer requires`)
+  }
 }
 
 const out = join(ROOT, 'rc-results/ffmpeg-manifest.json')

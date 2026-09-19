@@ -44,6 +44,8 @@ pub struct AppState {
     pub logger: Arc<Logger>,
     pub tools: Option<FfmpegTools>,
     pub encoder: String,
+    /// What the bundled FFmpeg can actually do, probed once at startup (§15).
+    pub ffmpeg_caps: Option<louver_core::streaming::ffmpeg::FfmpegCapabilities>,
     pub keys: Arc<StreamKeyStore>,
     pub runtime: Mutex<BroadcastRuntime>,
     pub metrics: Mutex<MetricsCollector>,
@@ -79,7 +81,16 @@ impl AppState {
             .unwrap_or_default();
 
         // Proves the encoder on this hardware rather than trusting the list.
-        let encoder = tools.as_ref().map(|t| t.detect_encoder()).unwrap_or_else(|| "libx264".to_string());
+        // Probes what this build can really do, rather than trusting the
+        // encoder list or a version string (§15).
+        let ffmpeg_caps = tools.as_ref().map(|t| t.capabilities());
+        for problem in ffmpeg_caps.as_ref().map(|c| c.problems()).unwrap_or_default() {
+            logger.error(LogTarget::App, &format!("FFmpeg 제한: {problem}"));
+        }
+        let encoder = ffmpeg_caps
+            .as_ref()
+            .and_then(|c| c.h264_encoder.clone())
+            .unwrap_or_else(|| "libx264".to_string());
         logger.info(LogTarget::App, &format!("최적화 인코더: {encoder}"));
 
         let fallback = FfmpegTools::new("ffmpeg", "ffprobe");
@@ -125,6 +136,7 @@ impl AppState {
             logger,
             tools,
             encoder,
+            ffmpeg_caps,
             keys,
             runtime: Mutex::new(runtime),
             metrics: Mutex::new(MetricsCollector::new()),

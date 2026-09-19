@@ -25,7 +25,8 @@
     "rc:sink": "node scripts/rtmp-sink.mjs",
     "rc:boundaries": "node scripts/analyse-boundaries.mjs",
     "secret-scan": "node scripts/secret-scan.mjs",
-    "ffmpeg:manifest": "node scripts/ffmpeg-manifest.mjs"
+    "ffmpeg:manifest": "node scripts/ffmpeg-manifest.mjs",
+    "soak:overnight": "node scripts/overnight-soak.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

@@ -29,6 +29,7 @@ pub fn run_preflight(
         .collect();
 
     let version = state.tools.as_ref().and_then(|t| t.version().ok());
+    let ffmpeg_problems = state.ffmpeg_caps.as_ref().map(|c| c.problems()).unwrap_or_default();
     let url = state.db.get_setting_or(louver_core::settings_keys::RTMPS_URL, louver_core::DEFAULT_RTMPS_URL);
 
     Ok(preflight::run(
@@ -39,6 +40,8 @@ pub fn run_preflight(
             rtmps_url: &url,
             ffmpeg_ok: state.tools.is_some(),
             ffmpeg_version: version.as_deref(),
+            ffmpeg_can_broadcast: state.ffmpeg_caps.as_ref().is_none_or(|c| c.can_broadcast()),
+            ffmpeg_problems: &ffmpeg_problems,
             license_allows_broadcast: state.license_state().status.allows_broadcast(),
             dry_run,
         },

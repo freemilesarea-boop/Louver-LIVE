@@ -219,9 +219,12 @@ is the OS-level autostart entry and an actual reboot. Both are in
 
 ---
 
-## 10. Six-hour soak (§11)
+## 10. Long-run soak (§11)
 
-*(Filled in when the run completes; see the end of this document.)*
+<!-- LONG-RUN:BEGIN -->
+*(No long run has completed yet. Written here from the measurement when one
+does; NOT TESTED until then.)*
+<!-- LONG-RUN:END -->
 
 ---
 

@@ -81,6 +81,12 @@ pub struct PreflightInput<'a> {
     pub rtmps_url: &'a str,
     pub ffmpeg_ok: bool,
     pub ffmpeg_version: Option<&'a str>,
+    /// Problems with the bundled FFmpeg, from a real capability probe (§15).
+    /// Only the ones that block *broadcasting* fail this check; a build that
+    /// cannot optimize still streams, and CHECK 3 already covers unoptimized
+    /// files.
+    pub ffmpeg_can_broadcast: bool,
+    pub ffmpeg_problems: &'a [String],
     pub license_allows_broadcast: bool,
     /// Dry runs skip the network and key checks.
     pub dry_run: bool,
@@ -176,16 +182,31 @@ pub fn run(input: &PreflightInput<'_>, net: &dyn NetworkChecker) -> PreflightRep
         )
     });
 
-    // CHECK 6 — FFmpeg
-    checks.push(if input.ffmpeg_ok {
-        CheckResult::pass("ffmpeg", "방송 엔진", input.ffmpeg_version.unwrap_or("FFmpeg 사용 가능"))
-    } else {
+    // CHECK 6 — FFmpeg.
+    //
+    // Three outcomes, not two. A build that cannot speak RTMPS cannot broadcast
+    // at all, so that is a hard fail. A build that can speak RTMPS but lacks an
+    // H.264 encoder, AAC or `-fps_mode` can still broadcast — going live is a
+    // remux of already-optimized files and uses no encoder — it just cannot
+    // optimize new imports. That is a warning, not a blocker.
+    checks.push(if !input.ffmpeg_ok {
         CheckResult::fail(
             "ffmpeg",
             "방송 엔진",
             ErrorCode::FfmpegNotFound.user_message(),
             ErrorCode::FfmpegNotFound,
         )
+    } else if !input.ffmpeg_can_broadcast {
+        CheckResult::fail(
+            "ffmpeg",
+            "방송 엔진",
+            format!("FFmpeg가 방송에 필요한 기능을 지원하지 않습니다: {}", input.ffmpeg_problems.join(", ")),
+            ErrorCode::FfmpegNotFound,
+        )
+    } else if !input.ffmpeg_problems.is_empty() {
+        CheckResult::warn("ffmpeg", "방송 엔진", input.ffmpeg_problems.join(", "))
+    } else {
+        CheckResult::pass("ffmpeg", "방송 엔진", input.ffmpeg_version.unwrap_or("FFmpeg 사용 가능"))
     });
 
     // CHECK 7 — ingest endpoint reachability.
@@ -275,6 +296,8 @@ mod tests {
             rtmps_url: "rtmps://a.rtmps.youtube.com/live2",
             ffmpeg_ok: true,
             ffmpeg_version: Some("ffmpeg version 6.1.1"),
+            ffmpeg_can_broadcast: true,
+            ffmpeg_problems: &[],
             license_allows_broadcast: true,
             dry_run: false,
         }
@@ -352,6 +375,40 @@ mod tests {
         assert_eq!(r.checks.iter().find(|c| c.id == "internet").unwrap().outcome, CheckOutcome::Fail);
         // But an unreachable ingest host alone is only a warning.
         assert_eq!(r.checks.iter().find(|c| c.id == "ingest").unwrap().outcome, CheckOutcome::Warn);
+    }
+
+    #[test]
+    fn an_ffmpeg_that_cannot_speak_rtmps_blocks_broadcasting() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.mp4");
+        std::fs::write(&f, b"x").unwrap();
+        let m = vec![media_at(&f, MediaStatus::Normalized)];
+        let problems = vec!["이 FFmpeg는 RTMPS를 지원하지 않아 YouTube로 송출할 수 없습니다".to_string()];
+        let mut i = good_input(&m);
+        i.ffmpeg_can_broadcast = false;
+        i.ffmpeg_problems = &problems;
+        let r = run(&i, &Net(true));
+        assert!(!r.can_broadcast);
+        let c = r.checks.iter().find(|c| c.id == "ffmpeg").unwrap();
+        assert_eq!(c.outcome, CheckOutcome::Fail);
+        assert!(c.detail.contains("RTMPS"));
+    }
+
+    #[test]
+    fn an_ffmpeg_that_cannot_optimize_only_warns_because_broadcasting_is_a_remux() {
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join("a.mp4");
+        std::fs::write(&f, b"x").unwrap();
+        let m = vec![media_at(&f, MediaStatus::Normalized)];
+        // FFmpeg 4.x: streams fine, cannot normalize. The files here are
+        // already normalized, so the broadcast must still be allowed.
+        let problems =
+            vec!["이 FFmpeg는 너무 오래되어 영상 최적화를 할 수 없습니다 (FFmpeg 5.1 이상 필요)".to_string()];
+        let mut i = good_input(&m);
+        i.ffmpeg_problems = &problems;
+        let r = run(&i, &Net(true));
+        assert!(r.can_broadcast, "{:?}", r.first_failure());
+        assert_eq!(r.checks.iter().find(|c| c.id == "ffmpeg").unwrap().outcome, CheckOutcome::Warn);
     }
 
     #[test]

@@ -203,12 +203,10 @@ monotonic, capped at 60 s, reset after a successful reconnect.
 
 ## 6. Long-run stability
 
-Filled in from the longest completed run. See `soak-results/<label>/summary.json`
-for the raw data of any run.
-
-*(6-hour soak in progress at the time of writing; results are appended below
-when it completes. Nothing is projected here — if the run did not finish, this
-section says so.)*
+<!-- LONG-RUN:BEGIN -->
+*(No long run has completed yet. `scripts/overnight-soak.mjs` writes this
+section from the measured result when one does; nothing here is projected.)*
+<!-- LONG-RUN:END -->
 
 ## 7. Test suite runtime
 

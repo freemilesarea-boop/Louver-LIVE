@@ -77,6 +77,64 @@ impl FfmpegTools {
         "libx264".to_string()
     }
 
+    /// Everything about the bundled FFmpeg that the product depends on.
+    ///
+    /// Each item is *probed*, not inferred from a version string: distributions
+    /// number their builds inconsistently ("6.1.1-3ubuntu5", "n6.1", "4.1.5"),
+    /// and what matters is whether the binary accepts the arguments we send it.
+    ///
+    /// This exists because the normalizer uses `-fps_mode`, which FFmpeg only
+    /// gained in 5.1. A bundled 4.x build looks perfectly healthy — it reports
+    /// a version, lists libx264, speaks RTMPS — and then fails the moment the
+    /// user presses "optimize". Catching that at startup instead is the
+    /// difference between a clear message and a mystery.
+    pub fn capabilities(&self) -> FfmpegCapabilities {
+        let version = self.version().unwrap_or_default();
+        let listed = self.available_encoders().unwrap_or_default();
+        let h264 = preferred_hw_encoders()
+            .iter()
+            .chain(preferred_sw_encoders())
+            .find(|e| listed.iter().any(|l| l == *e) && self.encoder_works(e))
+            .map(|e| (*e).to_string());
+
+        FfmpegCapabilities {
+            supports_fps_mode: self.accepts_output_flag(&["-fps_mode", "cfr"]),
+            h264_encoder: h264,
+            has_aac: listed.iter().any(|e| e == "aac"),
+            supports_rtmps: self.supports_protocol("rtmps"),
+            version_line: version,
+        }
+    }
+
+    /// Does this build accept an output option? Probes with a one-frame encode.
+    fn accepts_output_flag(&self, flag: &[&str]) -> bool {
+        let mut args: Vec<String> = vec![
+            "-hide_banner".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-nostdin".into(),
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            "color=black:size=64x64:rate=30:duration=0.1".into(),
+        ];
+        args.extend(flag.iter().map(|s| (*s).to_string()));
+        args.extend(["-frames:v".into(), "1".into(), "-f".into(), "null".into(), "-".into()]);
+
+        let Ok(out) = Command::new(&self.ffmpeg).args(&args).output() else { return false };
+        // An unknown option is reported rather than silently ignored.
+        let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+        out.status.success() && !err.contains("unrecognized option") && !err.contains("option not found")
+    }
+
+    fn supports_protocol(&self, name: &str) -> bool {
+        Command::new(&self.ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-protocols"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).split_whitespace().any(|p| p == name))
+            .unwrap_or(false)
+    }
+
     /// Whether this FFmpeg can encode H.264 at all.
     ///
     /// A build with no usable H.264 encoder can still broadcast — the live
@@ -118,7 +176,10 @@ impl FfmpegTools {
             .unwrap_or(false)
     }
 
-    /// Video encoders FFmpeg reports as available, used for hardware detection (§9).
+    /// Encoders FFmpeg reports as available, used for capability detection (§9).
+    ///
+    /// Includes audio as well as video: the normalizer needs AAC, and listing
+    /// only video encoders made the AAC check silently fail.
     pub fn available_encoders(&self) -> Result<Vec<String>> {
         let out = Command::new(&self.ffmpeg)
             .args(["-hide_banner", "-loglevel", "error", "-encoders"])
@@ -128,8 +189,10 @@ impl FfmpegTools {
             .lines()
             .filter_map(|l| {
                 let l = l.trim();
-                // Lines look like: " V....D h264_nvenc  NVIDIA NVENC H.264 encoder"
-                if l.starts_with('V') {
+                // Lines look like " V....D h264_nvenc  NVIDIA NVENC H.264 encoder"
+                // or " A....D aac  AAC (Advanced Audio Coding)". The leading
+                // letter is the media type.
+                if l.starts_with('V') || l.starts_with('A') {
                     l.split_whitespace().nth(1).map(str::to_string)
                 } else {
                     None
@@ -180,6 +243,52 @@ pub fn preferred_sw_encoders() -> &'static [&'static str] {
         &["libx264", "libopenh264", "h264_mf"]
     } else {
         &["libx264", "libopenh264"]
+    }
+}
+
+/// What the bundled FFmpeg can actually do (§15).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct FfmpegCapabilities {
+    pub version_line: String,
+    /// `-fps_mode`, required by the normalizer. FFmpeg 5.1 and later.
+    pub supports_fps_mode: bool,
+    /// The H.264 encoder that was proved to work, if any.
+    pub h264_encoder: Option<String>,
+    pub has_aac: bool,
+    /// Required to publish to YouTube.
+    pub supports_rtmps: bool,
+}
+
+impl FfmpegCapabilities {
+    /// Can this build run a broadcast at all?
+    ///
+    /// Broadcasting is a remux, so it needs neither an encoder nor `-fps_mode`;
+    /// only the ability to speak RTMPS.
+    pub fn can_broadcast(&self) -> bool {
+        self.supports_rtmps
+    }
+
+    /// Can this build optimize a video for broadcast?
+    pub fn can_normalize(&self) -> bool {
+        self.supports_fps_mode && self.h264_encoder.is_some() && self.has_aac
+    }
+
+    /// Everything that is wrong, in words the user can act on.
+    pub fn problems(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if !self.supports_rtmps {
+            v.push("이 FFmpeg는 RTMPS를 지원하지 않아 YouTube로 송출할 수 없습니다".into());
+        }
+        if !self.supports_fps_mode {
+            v.push("이 FFmpeg는 너무 오래되어 영상 최적화를 할 수 없습니다 (FFmpeg 5.1 이상 필요)".into());
+        }
+        if self.h264_encoder.is_none() {
+            v.push("사용 가능한 H.264 인코더가 없어 영상 최적화를 할 수 없습니다".into());
+        }
+        if !self.has_aac {
+            v.push("AAC 인코더가 없어 영상 최적화를 할 수 없습니다".into());
+        }
+        v
     }
 }
 
@@ -1135,5 +1244,122 @@ mod ffmpeg_error_tests {
         let d = e.detail.unwrap();
         assert!(!d.contains("abcd-efgh"), "stream key leaked into the error detail: {d}");
         assert!(d.contains("••••"));
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    fn tools() -> Option<FfmpegTools> {
+        FfmpegTools::discover(Some(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../apps/desktop/src-tauri/binaries"),
+        ))
+        .ok()
+    }
+
+    #[test]
+    fn the_bundled_ffmpeg_can_do_everything_the_product_needs() {
+        let Some(t) = tools() else {
+            eprintln!("SKIP: no ffmpeg available");
+            return;
+        };
+        let c = t.capabilities();
+        eprintln!("{c:#?}");
+
+        assert!(!c.version_line.is_empty(), "no version reported");
+        assert!(c.supports_rtmps, "cannot publish to YouTube: {:?}", c.problems());
+        assert!(
+            c.supports_fps_mode,
+            "the normalizer sends -fps_mode, which this build rejects — FFmpeg 5.1+ is required"
+        );
+        assert!(c.h264_encoder.is_some(), "no working H.264 encoder");
+        assert!(c.has_aac);
+        assert!(c.can_broadcast());
+        assert!(c.can_normalize());
+        assert!(c.problems().is_empty(), "{:?}", c.problems());
+    }
+
+    #[test]
+    fn an_unknown_option_is_detected_rather_than_silently_ignored() {
+        let Some(t) = tools() else {
+            eprintln!("SKIP: no ffmpeg available");
+            return;
+        };
+        // The probe must be able to tell a supported flag from an invented one,
+        // or the FFmpeg 4.x case it exists to catch would slip through.
+        assert!(t.accepts_output_flag(&["-fps_mode", "cfr"]));
+        assert!(!t.accepts_output_flag(&["-definitely_not_a_real_option", "1"]));
+    }
+
+    #[test]
+    fn broadcasting_and_normalizing_are_judged_separately() {
+        // A build that cannot encode can still broadcast: the live path is a
+        // remux. Saying "FFmpeg is broken" in that case would be wrong.
+        let remux_only = FfmpegCapabilities {
+            version_line: "ffmpeg version 4.1".into(),
+            supports_fps_mode: false,
+            h264_encoder: None,
+            has_aac: false,
+            supports_rtmps: true,
+        };
+        assert!(remux_only.can_broadcast());
+        assert!(!remux_only.can_normalize());
+        assert_eq!(remux_only.problems().len(), 3);
+
+        let unusable = FfmpegCapabilities { supports_rtmps: false, ..remux_only.clone() };
+        assert!(!unusable.can_broadcast());
+        assert!(unusable.problems()[0].contains("RTMPS"));
+
+        let good = FfmpegCapabilities {
+            version_line: "ffmpeg version 6.1.1".into(),
+            supports_fps_mode: true,
+            h264_encoder: Some("libx264".into()),
+            has_aac: true,
+            supports_rtmps: true,
+        };
+        assert!(good.can_broadcast() && good.can_normalize());
+        assert!(good.problems().is_empty());
+    }
+
+    #[test]
+    fn an_ffmpeg_4_style_build_is_rejected_for_normalization() {
+        // Exactly what the npm-distributed FFmpeg 4.1 builds look like: GPL,
+        // libx264 present, RTMPS present, but no -fps_mode.
+        let ffmpeg_4 = FfmpegCapabilities {
+            version_line: "ffmpeg version 4.1.5".into(),
+            supports_fps_mode: false,
+            h264_encoder: Some("libx264".into()),
+            has_aac: true,
+            supports_rtmps: true,
+        };
+        assert!(ffmpeg_4.can_broadcast(), "4.x can still remux");
+        assert!(!ffmpeg_4.can_normalize(), "4.x must not be trusted to optimize");
+        assert!(ffmpeg_4.problems().iter().any(|p| p.contains("5.1")));
+    }
+}
+
+#[cfg(test)]
+mod encoder_listing_tests {
+    use super::*;
+
+    #[test]
+    fn the_encoder_list_includes_audio_as_well_as_video() {
+        // The regression: listing only video encoders made the AAC capability
+        // check report false on a build that plainly has AAC.
+        let Ok(t) = FfmpegTools::discover(Some(
+            &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../apps/desktop/src-tauri/binaries"),
+        )) else {
+            eprintln!("SKIP: no ffmpeg available");
+            return;
+        };
+        let e = t.available_encoders().unwrap();
+        assert!(e.iter().any(|x| x == "aac"), "aac missing from the encoder list");
+        assert!(e.iter().any(|x| x == "libx264" || x.starts_with("h264_")), "no h264 encoder listed");
+        // Selecting a video encoder must still not pick an audio one.
+        let picked = select_encoder(&e);
+        assert!(picked == "libx264" || picked.starts_with("h264_"), "picked {picked}");
     }
 }

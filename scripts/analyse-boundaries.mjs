@@ -8,6 +8,11 @@
  * actually received, rather than from the sender's own opinion of itself.
  *
  *   node scripts/analyse-boundaries.mjs <captured.flv> --cycle 95,62,128,47,83
+ *
+ * The file may be a mid-stream segment rather than the whole capture — a long
+ * run is kept as a rolling window of standalone FLV pieces, not one 30 GB file.
+ * Timestamps in such a piece continue the original timeline, so boundaries are
+ * enumerated in absolute stream time and seeks are made relative to the piece.
  */
 import { spawnSync } from 'node:child_process'
 import { existsSync, writeFileSync, mkdirSync } from 'node:fs'
@@ -53,8 +58,8 @@ console.log(`playlist cycle ${CYCLE}s: ${NAMES.map((n, i) => `${n}=${DURATIONS[i
 const vRaw = ffprobe(['-v', 'error', '-select_streams', 'v:0', '-show_entries', 'packet=pts_time,flags', '-of', 'csv=p=0', FILE])
 const aRaw = ffprobe(['-v', 'error', '-select_streams', 'a:0', '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', FILE])
 
-const video = []
-const keyframes = []
+let video = []
+let keyframes = []
 for (const line of vRaw.split('\n')) {
   const [t, flags] = line.split(',')
   const pts = Number(t)
@@ -62,21 +67,48 @@ for (const line of vRaw.split('\n')) {
   video.push(pts)
   if (flags && flags.includes('K')) keyframes.push(pts)
 }
-const audio = aRaw.split('\n').map((l) => Number(l.split(',')[0])).filter(Number.isFinite)
+let audio = aRaw.split('\n').map((l) => Number(l.split(',')[0])).filter(Number.isFinite)
 video.sort((a, b) => a - b)
 audio.sort((a, b) => a - b)
 
+/**
+ * Where the media in this piece actually begins.
+ *
+ * A segment opens with codec headers stamped at timestamp 0 even when its
+ * media starts an hour into the broadcast, so the first packet is not the
+ * origin. The origin is the first timestamp closely followed by another.
+ */
+function mediaStart(list) {
+  for (let i = 0; i < list.length - 1; i++) {
+    if (list[i + 1] - list[i] < 1) return list[i]
+  }
+  return list[0]
+}
+
+// Absolute position of this piece within the broadcast. Zero for a whole
+// capture; the offset of the piece otherwise.
+const T0 = mediaStart(video)
+if (T0 > 0) {
+  video = video.filter((t) => t >= T0)
+  keyframes = keyframes.filter((t) => t >= T0)
+  audio = audio.filter((t) => t >= T0 - 1)
+  console.log(`piece starts ${T0.toFixed(1)}s into the broadcast`)
+}
 const span = video.at(-1) - video[0]
 console.log(`video : ${video.length} frames, ${video[0].toFixed(3)}s .. ${video.at(-1).toFixed(3)}s`)
 console.log(`audio : ${audio.length} packets, ${audio[0].toFixed(3)}s .. ${audio.at(-1).toFixed(3)}s`)
 console.log(`span  : ${span.toFixed(1)}s = ${(span / CYCLE).toFixed(2)} playlist cycles\n`)
 
 // --- boundaries ------------------------------------------------------------
+// Enumerated over the whole broadcast timeline, then narrowed to what this
+// piece actually contains.
+const END = video.at(-1)
 const boundaries = []
-for (let t = 0, i = 0; t < span; i++) {
+for (let t = 0, i = 0; t < END; i++) {
   const idx = i % DURATIONS.length
   t += DURATIONS[idx]
-  if (t >= span - 1) break
+  if (t >= END - 1) break
+  if (t <= T0 + 1) continue // not in this piece, or too close to its first frame
   boundaries.push({
     at: Number(t.toFixed(3)),
     from: NAMES[idx],
@@ -101,7 +133,7 @@ function gapNear(list, t, window) {
 /** Mean luminance of the frame at t, to detect a black frame. */
 function luminanceAt(t) {
   const r = spawnSync(ffmpegBin(), [
-    '-hide_banner', '-loglevel', 'error', '-ss', String(t.toFixed(3)), '-i', FILE,
+    '-hide_banner', '-loglevel', 'error', '-ss', String((t - T0).toFixed(3)), '-i', FILE,
     '-frames:v', '1', '-vf', 'scale=8:8,format=gray', '-f', 'rawvideo', '-',
   ], { encoding: 'buffer', maxBuffer: 1024 * 1024 })
   if (r.status !== 0 || !r.stdout?.length) return null
@@ -111,7 +143,7 @@ function luminanceAt(t) {
 /** Peak audio level over a short window, to detect a dropout. */
 function audioPeakDb(t, dur = 0.6) {
   const r = spawnSync(ffmpegBin(), [
-    '-hide_banner', '-ss', String(Math.max(0, t).toFixed(3)), '-t', String(dur),
+    '-hide_banner', '-ss', String(Math.max(0, t - T0).toFixed(3)), '-t', String(dur),
     '-i', FILE, '-map', '0:a:0', '-af', 'volumedetect', '-f', 'null', '-',
   ], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 })
   const m = (r.stdout + r.stderr).match(/max_volume:\s*(-?\d+(?:\.\d+)?) dB/)
@@ -154,6 +186,10 @@ console.log('─'.repeat(96))
 const deltas = []
 for (let i = 1; i < video.length; i++) deltas.push(video[i] - video[i - 1])
 const freezes = deltas.filter((d) => d > frameGap * 2.5)
+// Where the worst one is. At either edge of a kept piece it is the cut itself
+// — an artefact of capturing a window — and not a fault in the broadcast.
+// Anywhere else it is real.
+const worstFreezeIdx = deltas.indexOf(Math.max(...(freezes.length ? freezes : [0])))
 const dupes = video.length - new Set(video.map((t) => Math.round(t * 1000))).size
 const backwards = deltas.filter((d) => d < 0).length
 
@@ -173,6 +209,7 @@ const kfMax = kfGaps.length ? Math.max(...kfGaps) : 0
 
 const summary = {
   file: FILE,
+  starts_at_seconds: Number(T0.toFixed(2)),
   duration_seconds: Number(span.toFixed(2)),
   playlist_cycle_seconds: CYCLE,
   cycles_completed: Number((span / CYCLE).toFixed(2)),
@@ -183,6 +220,12 @@ const summary = {
   backwards_timestamps: backwards,
   freezes_over_2_5_frames: freezes.length,
   worst_freeze_ms: freezes.length ? Number((Math.max(...freezes) * 1000).toFixed(1)) : 0,
+  worst_freeze_at_seconds: freezes.length ? Number(video[worstFreezeIdx].toFixed(3)) : null,
+  // True when the gap is where this piece was cut out of the stream — at its
+  // first or last frame — rather than something the broadcast did.
+  worst_freeze_is_at_piece_edge: freezes.length
+    ? video[worstFreezeIdx] === video[0] || video[worstFreezeIdx + 1] === video.at(-1)
+    : false,
   av_skew_max_ms: Number((Math.max(...skews) * 1000).toFixed(1)),
   av_skew_first_ms: Number((skews[0] * 1000).toFixed(1)),
   av_skew_last_ms: Number((skews.at(-1) * 1000).toFixed(1)),
@@ -198,8 +241,8 @@ console.log(`  freezes > 2.5 frames  ${summary.freezes_over_2_5_frames}${summary
 console.log(`  A/V skew              first ${summary.av_skew_first_ms}ms, last ${summary.av_skew_last_ms}ms, max ${summary.av_skew_max_ms}ms`)
 console.log(`  keyframe interval max ${summary.keyframe_interval_max_s}s`)
 
-mkdirSync(join(ROOT, 'rc-results'), { recursive: true })
-const out = join(ROOT, 'rc-results', 'boundary-analysis.json')
+const out = resolve(ROOT, arg('out', 'rc-results/boundary-analysis.json'))
+mkdirSync(dirname(out), { recursive: true })
 writeFileSync(out, JSON.stringify(summary, null, 2))
 console.log(`\nwritten to ${out}`)
 

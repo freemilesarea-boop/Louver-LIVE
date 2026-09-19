@@ -47,7 +47,7 @@ use louver_core::streaming::state::StreamState;
 use louver_core::system::{MetricsCollector, NoopSleepPreventer};
 use louver_core::PlaybackMode;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -212,36 +212,134 @@ fn destination_label() -> String {
 }
 
 struct Sample {
+    /// Wall-clock instant of the sample, so a long run can be lined up against
+    /// the system log afterwards. Elapsed time alone cannot do that.
+    wall: String,
     elapsed: f64,
     app_rss: u64,
     app_cpu: f32,
     ff_rss: u64,
     ff_cpu: f32,
     pid: Option<u32>,
+    app_pid: u32,
     state: StreamState,
     reconnects: u32,
+    restarts: u32,
     bytes: u64,
+    /// How many times the playlist has been round, to one decimal.
+    cycle: f64,
+    current_media: String,
+    system_used_bytes: u64,
+    /// Seconds since FFmpeg last reported progress. A rising value is a stall.
+    since_progress: Option<u64>,
+    /// TCP reachability of the ingest endpoint at sample time.
+    net_ok: bool,
+    /// `publishing` while bytes are still climbing, `stalled` when they are not.
+    ingest: &'static str,
+    ffmpeg_errors: usize,
+    zombies: usize,
 }
 
-fn write_csv(path: &Path, samples: &[Sample]) {
-    let mut f = std::fs::File::create(path).unwrap();
-    writeln!(f, "elapsed_s,app_rss_bytes,app_cpu_pct,ffmpeg_rss_bytes,ffmpeg_cpu_pct,ffmpeg_pid,state,reconnects,bytes_sent").unwrap();
-    for s in samples {
-        writeln!(
-            f,
-            "{:.0},{},{:.2},{},{:.2},{},{},{},{}",
-            s.elapsed,
-            s.app_rss,
-            s.app_cpu,
-            s.ff_rss,
-            s.ff_cpu,
-            s.pid.map(|p| p.to_string()).unwrap_or_default(),
-            s.state,
-            s.reconnects,
-            s.bytes
-        )
-        .unwrap();
+const CSV_HEADER: &str = "timestamp,elapsed_s,state,playlist_cycle,current_media,ffmpeg_pid,app_pid,\
+ffmpeg_cpu_pct,app_cpu_pct,ffmpeg_rss_bytes,app_rss_bytes,system_used_bytes,reconnects,restarts,\
+network,seconds_since_progress,ingest_status,ffmpeg_errors,zombies,bytes_sent";
+
+fn csv_row(s: &Sample) -> String {
+    format!(
+        "{},{:.0},{},{:.2},{},{},{},{:.2},{:.2},{},{},{},{},{},{},{},{},{},{},{}",
+        s.wall,
+        s.elapsed,
+        s.state,
+        s.cycle,
+        s.current_media,
+        s.pid.map(|p| p.to_string()).unwrap_or_default(),
+        s.app_pid,
+        s.ff_cpu,
+        s.app_cpu,
+        s.ff_rss,
+        s.app_rss,
+        s.system_used_bytes,
+        s.reconnects,
+        s.restarts,
+        if s.net_ok { "up" } else { "down" },
+        s.since_progress.map(|v| v.to_string()).unwrap_or_default(),
+        s.ingest,
+        s.ffmpeg_errors,
+        s.zombies,
+        s.bytes,
+    )
+}
+
+/// UTC, second precision. Avoids pulling a date crate into the harness.
+fn wall_clock() -> String {
+    let out = std::process::Command::new("date")
+        .args(["-u", "+%Y-%m-%dT%H:%M:%SZ"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok());
+    out.map(|s| s.trim().to_string()).unwrap_or_default()
+}
+
+/// Host and port of the ingest we are publishing to.
+fn ingest_host_port() -> (String, u16) {
+    let url = env_or("LOUVER_TEST_RTMPS_URL", "rtmp://127.0.0.1:1935/live");
+    let rest = url.split("://").nth(1).unwrap_or("");
+    let authority = rest.split('/').next().unwrap_or("");
+    match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(1935u16)),
+        None => (authority.to_string(), if url.starts_with("rtmps") { 443 } else { 1935 }),
     }
+}
+
+/// Is the publisher's connection to the ingest still established?
+///
+/// A `connect()` probe cannot answer this. The test ingest accepts exactly one
+/// connection at a time, so while the broadcast is healthy a second connection
+/// is refused — the probe would report "network down" for a perfectly good
+/// stream. The kernel's connection table answers the real question directly.
+/// Where it is not available (macOS, Windows) this falls back to the probe.
+fn ingest_connection_established() -> bool {
+    let (host, port) = ingest_host_port();
+    let needle = format!(":{port:04X}");
+    let mut saw_table = false;
+    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(table) = std::fs::read_to_string(path) else { continue };
+        saw_table = true;
+        for line in table.lines().skip(1) {
+            let mut f = line.split_whitespace();
+            let (_sl, local, remote, state) = (f.next(), f.next(), f.next(), f.next());
+            // 01 is TCP_ESTABLISHED.
+            if state == Some("01")
+                && (remote.is_some_and(|r| r.ends_with(&needle))
+                    || local.is_some_and(|l| l.ends_with(&needle)))
+            {
+                return true;
+            }
+        }
+    }
+    if saw_table {
+        return false;
+    }
+    use std::net::ToSocketAddrs;
+    let Ok(mut addrs) = (host.as_str(), port).to_socket_addrs() else { return false };
+    let Some(addr) = addrs.next() else { return false };
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(5)).is_ok()
+}
+
+/// Zombies left behind by this process (§33: a long run must not accumulate
+/// reaped-but-not-collected children).
+fn zombie_children() -> usize {
+    let me = std::process::id().to_string();
+    let Ok(out) = std::process::Command::new("ps").args(["-eo", "stat=,ppid="]).output() else {
+        return 0;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| {
+            let mut it = l.split_whitespace();
+            matches!((it.next(), it.next()), (Some(st), Some(pp)) if st.starts_with('Z') && pp == me)
+        })
+        .count()
 }
 
 /// Steady-state growth: the second half only, so buffer warm-up is excluded.
@@ -319,9 +417,34 @@ fn rc_broadcast() {
     let mut metrics = MetricsCollector::new();
     let mut samples: Vec<Sample> = Vec::new();
     let started = Instant::now();
+    let started_wall = wall_clock();
     let mut next_sample = Instant::now();
     let mut max_reconnects = 0;
     let mut dropped_out = 0;
+    let mut max_since_progress = 0u64;
+    let mut max_zombies = 0usize;
+    let mut last_bytes = 0u64;
+
+    // Counting error lines needs the same rule in two places — during the run
+    // and in the summary — so it lives in one closure.
+    let error_lines = |log: &Arc<Mutex<Vec<String>>>| {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|l| {
+                let l = l.to_lowercase();
+                (l.contains("error") || l.contains("non-monotonic") || l.contains("invalid"))
+                    && !l.contains("error during demuxing")
+            })
+            .count()
+    };
+
+    // The CSV is written as the run goes, not at the end. A 13-hour run that
+    // dies at hour 10 must still leave 10 hours of evidence behind.
+    let csv = out_dir.join(format!("{label}.csv"));
+    let mut csv_file = std::fs::File::create(&csv).unwrap();
+    writeln!(csv_file, "{CSV_HEADER}").unwrap();
+    csv_file.flush().unwrap();
 
     while started.elapsed() < duration {
         h.rt.tick();
@@ -330,39 +453,64 @@ fn rc_broadcast() {
             dropped_out += 1;
         }
         max_reconnects = max_reconnects.max(st.supervisor.reconnect_count);
+        max_since_progress = max_since_progress.max(st.supervisor.seconds_since_data.unwrap_or(0));
 
         if Instant::now() >= next_sample {
             next_sample = Instant::now() + sample_every;
             let m = metrics.sample(st.supervisor.pid);
+            let elapsed = started.elapsed().as_secs_f64();
+            let bytes = st.supervisor.progress.total_bytes;
+            let zombies = zombie_children();
+            max_zombies = max_zombies.max(zombies);
             let s = Sample {
-                elapsed: started.elapsed().as_secs_f64(),
+                wall: wall_clock(),
+                elapsed,
                 app_rss: m.app_memory_bytes,
                 app_cpu: m.app_cpu_percent,
                 ff_rss: m.ffmpeg_memory_bytes,
                 ff_cpu: m.ffmpeg_cpu_percent,
                 pid: st.supervisor.pid,
+                app_pid: std::process::id(),
                 state: st.supervisor.state,
                 reconnects: st.supervisor.reconnect_count,
-                bytes: st.supervisor.progress.total_bytes,
+                restarts: st.supervisor.restart_count,
+                bytes,
+                cycle: (elapsed / h.cycle_secs * 10.0).round() / 10.0,
+                current_media: st.current_item.clone().unwrap_or_default(),
+                system_used_bytes: m.total_memory_bytes.saturating_sub(m.available_memory_bytes),
+                since_progress: st.supervisor.seconds_since_data,
+                net_ok: ingest_connection_established(),
+                ingest: if bytes > last_bytes { "publishing" } else { "stalled" },
+                ffmpeg_errors: error_lines(&h.ffmpeg_log),
+                zombies,
             };
+            last_bytes = bytes;
             eprintln!(
-                "  {:>6.0}s  {:<12} app {:>6.1}MB/{:>4.1}%  ffmpeg {:>6.1}MB/{:>4.1}%  sent {:>7.1}MB  reconnects {}",
+                "  {:>6.0}s  {:<12} app {:>6.1}MB/{:>4.1}%  ffmpeg {:>6.1}MB/{:>4.1}%  sent {:>7.1}MB  reconnects {}  cycle {:.1}",
                 s.elapsed, s.state.as_str(),
                 s.app_rss as f64 / 1048576.0, s.app_cpu,
                 s.ff_rss as f64 / 1048576.0, s.ff_cpu,
-                s.bytes as f64 / 1048576.0, s.reconnects,
+                s.bytes as f64 / 1048576.0, s.reconnects, s.cycle,
             );
+            writeln!(csv_file, "{}", csv_row(&s)).unwrap();
+            csv_file.flush().unwrap();
+            // The runtime log too, so an overnight failure is diagnosable from
+            // disk without waiting for the run to end.
+            std::fs::write(
+                out_dir.join(format!("{label}-runtime.log")),
+                h.recorder.logs.lock().unwrap().join("\n"),
+            )
+            .ok();
             samples.push(s);
         }
         std::thread::sleep(Duration::from_millis(500));
     }
 
     let final_status = h.rt.status();
+    let ended_wall = wall_clock();
     h.rt.stop(true).expect("stop failed");
 
     // --- report ----------------------------------------------------------
-    let csv = out_dir.join(format!("{label}.csv"));
-    write_csv(&csv, &samples);
     std::fs::write(out_dir.join(format!("{label}-runtime.log")), h.recorder.logs.lock().unwrap().join("\n"))
         .unwrap();
     std::fs::write(out_dir.join(format!("{label}-ffmpeg.log")), h.ffmpeg_log.lock().unwrap().join("\n"))
@@ -388,10 +536,15 @@ fn rc_broadcast() {
         })
         .count();
 
+    let app_cpu: Vec<f32> = samples.iter().map(|s| s.app_cpu).collect();
+    let peak_u64 = |v: &[u64]| v.iter().cloned().max().unwrap_or(0);
+
     let summary = serde_json::json!({
         "label": label,
         "destination": destination_label(),
         "profile": PROFILE.id(),
+        "started_at": started_wall,
+        "ended_at": ended_wall,
         "duration_seconds": elapsed.round(),
         "playlist_videos": 5,
         "cycle_seconds": h.cycle_secs,
@@ -409,9 +562,16 @@ fn rc_broadcast() {
         "ffmpeg_cpu_peak_pct": ((peak(&ff_cpu) as f64) * 100.0).round() / 100.0,
         "bytes_sent": final_status.supervisor.progress.total_bytes,
         "throughput_mbps": (mbps * 100.0).round() / 100.0,
+        "app_cpu_mean_pct": ((mean(&app_cpu) as f64) * 100.0).round() / 100.0,
+        "app_cpu_peak_pct": ((peak(&app_cpu) as f64) * 100.0).round() / 100.0,
+        "ffmpeg_rss_peak": peak_u64(&ff_rss),
+        "app_rss_peak": peak_u64(&app_rss),
         "reconnects": max_reconnects,
         "restarts": final_status.supervisor.restart_count,
         "ticks_not_live": dropped_out,
+        "longest_progress_stall_seconds": max_since_progress,
+        "zombies_peak": max_zombies,
+        "zombies_at_end": zombie_children(),
         "ffmpeg_errors": errors,
         "state_transitions": h.recorder.states.lock().unwrap()
             .iter().map(|(t, s)| format!("{t} {s}")).collect::<Vec<_>>(),
