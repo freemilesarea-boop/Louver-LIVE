@@ -23,6 +23,7 @@ pub mod error;
 pub mod license;
 pub mod logging;
 pub mod media;
+pub mod runtime;
 pub mod scheduler;
 pub mod security;
 pub mod session;
