@@ -13,7 +13,8 @@ caveat, the caveat is stated.
 | OS | Linux 6.18 (container) |
 | FFmpeg | 6.1.1 (Ubuntu build) |
 | Date | 2026-09-19 |
-| Commands | `npm run soak -- --duration 180s --sample 10s --profile 1080p30`, `cargo test --workspace` |
+| Ingest | Local RTMP server — real handshake, real socket. **Not YouTube.** |
+| Commands | `npm run soak`, the RC harness in `crates/louver-core/tests/rc_live.rs`, `npm run rc:boundaries` |
 
 This is a modest cloud VM, not the low-spec desktop the product targets. It is
 a reasonable stand-in for a low-end machine's *per-core* performance, but the
@@ -23,50 +24,67 @@ macOS and Windows figures below are **not measured** — see Not Measured.
 
 ## 1. Live broadcast cost — the number that matters
 
-1080p30, stream copy, paced with `-re` exactly as the app paces it.
-180 seconds, 18 samples.
+A **30-minute broadcast over real RTMP**, 1080p30 stream copy, driven by the
+real `BroadcastRuntime` with five source videos of differing lengths and
+formats. One unbroken publisher connection for the whole run.
 
 | Metric | Measured |
 | --- | --- |
-| FFmpeg CPU | **1.50 % min / 2.30 % max / 1.68 % mean** |
-| FFmpeg RSS | 56.3 MB → 61.7 MB, then flat |
-| Steady-state memory growth | **0.00 %** |
-| Projected 24 h memory growth | **0 %** |
-| FFmpeg restarts | 0 |
-| Timestamp / DTS errors | 0 |
-| Output rate | 4.34 Mbps |
+| FFmpeg CPU | mean **0.57 %**, peak **0.63 %** |
+| FFmpeg RSS | 59.7 MB → 68.1 MB, then flat |
+| FFmpeg steady-state memory growth | **0.00 %** |
+| Broadcast runtime RSS | 10.86 MB → 10.89 MB |
+| Runtime steady-state memory growth | **0.00 %** |
+| Reconnects / restarts | **0 / 0** |
+| Ticks not LIVE | **0** |
+| FFmpeg errors | **0** |
+| Playlist loops completed | 4.3 |
+| Data sent | 1.18 GB |
+| Throughput | 5.25 Mbps |
+| Connect time | 1.0 s |
 
-The 2.30 % peak is the first sample, while FFmpeg is opening files and filling
-buffers. From 40s onward it sits at 1.5–1.7 %.
+An earlier, shorter measurement against a **file sink** reported 1.5–1.7 %.
+The figure against a real socket is lower still, because the pacing is
+governed by the connection rather than by the disk.
 
-**Why it is this low:** the live argv contains no encoder at all. There is a
-unit test asserting exactly that (`stream_copy_argv_contains_no_video_encoder`),
-so the property cannot regress silently.
+Throughput is 5.25 Mbps against a 10 Mbps profile cap because the fixtures are
+synthetic test patterns, which compress far below it. Real music video would
+sit near the cap. It affects network throughput only, not CPU: stream copy does
+the same work per byte whatever the bytes contain.
 
-Two caveats on these figures:
+### Desktop shell, separately
 
-- **Output rate is 4.34 Mbps, not 10.** The profile caps at 10 Mbps but the
-  soak fixtures are synthetic test patterns, which compress far below the cap.
-  A real music video would push closer to 10 Mbps. This affects network
-  throughput, not CPU: stream copy does the same work per byte regardless of
-  what the bytes contain.
-- **Pacing matters enormously.** An earlier unpaced run of the same pipeline
-  reported **145 % CPU and 190 Mbps** — it was measuring how fast the disk
-  could absorb data, not what a broadcast costs. `-re` was added to the soak
-  harness, and the summary now carries a `paced_like_a_broadcast` verdict so a
-  lost flag cannot quietly invalidate a future measurement.
+The figures above are the broadcast engine. The Tauri shell — window, webview
+and the once-a-second runtime tick — was observed separately for 40 minutes:
 
-### Memory: how the leak check works
+| Metric | Measured |
+| --- | --- |
+| RSS | **173.6 MB, completely flat** |
+| CPU | 0.1 % |
+| Threads | 30, stable |
 
-Total RSS growth over the whole run reads 9.52 %, which looks alarming and is
-not. FFmpeg allocates its muxer and I/O buffers over the first ~30 seconds;
-after that memory is completely flat.
+**Why it is this low:** the live argv contains no encoder at all. A unit test
+asserts exactly that (`stream_copy_argv_contains_no_video_encoder`), and the
+app can verify it at runtime from the process's real argv (Settings →
+Developer Mode → Streaming Mode), so the property cannot regress unnoticed.
 
-The leak verdict therefore measures the **second half** of the run only. Over
-90 seconds of steady state, growth was 0.00 % — 61.7 MB at 90s and 61.7 MB at
-180s. Extrapolated to 24 hours: 0 %.
+### Two lessons about measuring this
 
-A longer run on the operator's own machine is what actually settles this:
+- **Pacing matters enormously.** An early version of the soak harness ran
+  unpaced and reported **145 % CPU and 190 Mbps** — it was measuring how fast
+  the disk could absorb data, not what a broadcast costs. A live broadcast is
+  paced by the connection. The summary now carries a
+  `paced_like_a_broadcast` verdict so a lost `-re` cannot quietly invalidate a
+  future measurement.
+
+- **Total memory growth is the wrong metric.** FFmpeg allocates its muxer and
+  I/O buffers over the first ~30 seconds, which reads as roughly 10 % growth
+  and looks like a leak. The leak verdict therefore measures the **second half
+  of the run only**. Over the 30-minute run that figure is 0.00 % for both
+  processes.
+
+A longer run on the operator's own machine is what settles the 24-hour
+question:
 
 ```bash
 npm run soak -- --duration 24h --profile 1080p30
@@ -76,21 +94,30 @@ npm run soak -- --duration 24h --profile 1080p30
 
 ## 2. Concat and loop integrity
 
-From `cargo test -p louver-core --test media_pipeline`, ten loop cycles of
-three mutually different normalized sources (thirty file boundaries):
+Measured on the stream the **ingest received**, not on the sender's own
+account of itself: `npm run rc:boundaries` decodes the captured broadcast and
+measures each transition. 21 boundaries across 4.3 playlist cycles of the
+30-minute run.
 
 | Metric | Measured |
 | --- | --- |
-| Video frames produced | 3600 for 120.000 s — exact, none dropped or duplicated |
-| Duplicate video timestamps | 0 |
-| FFmpeg warnings / DTS faults | 0 |
-| Video stalls >100 ms at a boundary | 0 |
-| A/V skew, early in the run | < 1 ms |
-| A/V skew, late in the run | < 1 ms |
-| Skew growth across 30 boundaries | none measurable |
+| Inter-frame gap at a boundary | 41 – 55 ms (< 2 frames at 30 fps) |
+| Frames stalled > 100 ms | **0** |
+| Black frames at a boundary | **0** (luminance 92 – 131) |
+| Audio dropouts at a boundary | **0** (peak −20.7 to −21.1 dB) |
+| Audio gap at a boundary | 22 ms — exactly one AAC frame, inaudible |
+| Duplicate timestamps | **0** |
+| Backwards timestamps | **0** |
+| Frames received | 54 028 vs 54 040 expected (0.02 %) |
+| A/V skew | 6 ms → 4 ms over 30 minutes, max 16 ms |
+| Keyframe interval | max 2.02 s (YouTube requires ≤ 4 s) |
+| Publisher reconnections | **0** — one RTMP session throughout |
 
-The last row is the one a 24/7 channel depends on. Even 30 ms of error per
-seam would compound to seconds of desync over a day.
+The A/V row is the one a 24/7 channel depends on. Even 30 ms of error per seam
+would compound to seconds of desync over a day; measured, it does not grow.
+
+The unit-level equivalent (`media_pipeline`, ten cycles of three sources over a
+file sink) reports the same: 3600 frames for 120.000 s, 0 duplicates, 0 faults.
 
 ### A rejected alternative, for the record
 
@@ -145,29 +172,59 @@ it would leave less than 2 GB free.
 
 ## 5. Recovery
 
-From `npm run soak -- --duration 40s --kill-every 15s`, with FFmpeg killed by
-`SIGKILL` twice mid-run:
+Against a real RTMP endpoint.
+
+**Network outage** — a genuine 60-second packet blackhole (`iptables -j DROP`),
+not a stopped server:
 
 | Metric | Measured |
 | --- | --- |
-| Restarts after a kill | 2 / 2 — every kill recovered |
-| Errors logged | 0 |
-| Memory growth across restarts | 0.16 % |
-| Orphan processes left behind | 0 |
+| LIVE → RECONNECTING | 35 s (30 s stall timeout + tick) |
+| Reconnect attempts in 60 s | 3, spaced **2 s / 5 s / 10 s** |
+| Recovery once the network returned | **4 s** |
+| App crash | none; UI answered 114 consecutive status reads |
+| Orphan processes | 0 |
+
+A stopped server is *not* equivalent: dropped packets block FFmpeg on the
+socket instead of killing it, and only stall detection notices. Measuring with
+a stopped server produced a false PASS and hid a real bug.
+
+**FFmpeg killed** — three consecutive `SIGKILL`s during a live broadcast:
+
+| Metric | Measured |
+| --- | --- |
+| Recoveries | 3 / 3, each on a new process |
+| `reconnect_count` after each success | reset to 0 — the backoff does not escalate across unrelated faults |
+| Explicit Stop honoured afterwards | yes, 40 ticks with no restart |
+| Orphan processes | 0 |
 
 Backoff timing is asserted separately in unit tests: 2 s, 5 s, 10 s, 20 s,
-monotonic, capped at 60 s, and reset to 2 s after a successful reconnect.
+monotonic, capped at 60 s, reset after a successful reconnect.
 
-## 6. Test suite runtime
+## 6. Long-run stability
+
+Filled in from the longest completed run. See `soak-results/<label>/summary.json`
+for the raw data of any run.
+
+*(6-hour soak in progress at the time of writing; results are appended below
+when it completes. Nothing is projected here — if the run did not finish, this
+section says so.)*
+
+## 7. Test suite runtime
 
 | Suite | Tests | Time |
 | --- | --- | --- |
-| Rust unit | 223 | 1.2 s |
-| Media pipeline (real FFmpeg) | 7 | 12.9 s |
-| Supervisor / recovery (real processes) | 9 | 0.9 s |
-| Runtime / scheduling (virtual clock) | 16 | 0.06 s |
-| Frontend unit | 16 | 0.9 s |
-| UI e2e | 16 | ~5 s |
+| Rust unit | 244 | 1.1 s |
+| Media pipeline (real FFmpeg) | 9 | 14.0 s |
+| Supervisor / recovery (real processes) | 9 | 1.0 s |
+| Runtime / scheduling (virtual clock) | 16 | 0.05 s |
+| Runtime live (real FFmpeg) | 2 | 11.9 s |
+| RC security (real FFmpeg) | 7 | 4.1 s |
+| RC licence | 10 | 0.06 s |
+| Docs sync | 5 | <0.1 s |
+| Frontend unit | 16 | 1.5 s |
+| UI e2e | 18 | 7.5 s |
+| **Total** | **339** | ~55 s |
 
 The runtime suite covers a full overnight broadcast, a power cut and four
 crash recoveries in 60 milliseconds, because the clock is injected.
@@ -182,21 +239,33 @@ Stated plainly rather than estimated:
   prevention and autostart code paths compile for those targets but were not
   executed there.
 - **Hardware encoders.** No NVENC/QSV/AMF/VideoToolbox device was present.
-- **Real YouTube ingest.** No stream key was available, so no end-to-end RTMPS
-  measurement exists. Set `LOUVER_TEST_RTMPS_URL` to enable that path.
-- **Runs longer than 3 minutes.** The 24-hour claim in §65 is *projected* from
-  a flat 90-second steady state, not observed. Run `npm run soak -- --duration
-  24h` to settle it.
+- **Real YouTube ingest.** No stream key was available. Every broadcast figure
+  here is against a real RTMP endpoint — real handshake, real socket, measured
+  at the receiving end — but a local one. Set `LOUVER_TEST_RTMPS_URL` and
+  `LOUVER_TEST_STREAM_KEY` to point the identical harness at YouTube.
+- **Runs longer than those stated in §6.** No 24-hour figure has been observed.
+  Run `npm run soak -- --duration 24h` on target-class hardware to obtain one;
+  nothing here is extrapolated to 24 hours.
 - **The minimum hardware spec.** README lists i5 / 8 GB as a starting point.
   It has not been validated on such a machine and should be revised once it is.
-- **Idle app CPU/RAM.** The Tauri shell was never run with a display attached
-  in this environment, so only FFmpeg's cost is reported.
+- **Real-world bitrate.** All throughput figures use synthetic test patterns,
+  which compress far below the profile cap. Measure again with actual music
+  video before quoting a bandwidth requirement to users.
 
 ## Reproducing
 
 ```bash
-npm install && npm run sidecar
-npm run soak -- --duration 180s --sample 10s --profile 1080p30
+npm install && npm run sidecar && npm run rc:fixtures
+
+# 30-minute broadcast over a real RTMP endpoint
+npm run rc:sink -- --port 1935 --out rc-results/ingest &
+LOUVER_RC_DURATION_SECS=1800 \
+  cargo test -p louver-core --test rc_live -- --ignored --nocapture rc_broadcast
+
+# boundary analysis of what the ingest received
+npm run rc:boundaries -- rc-results/ingest/session-001.flv
+
+# the unit-level pipeline checks
 cargo test -p louver-core --test media_pipeline -- --nocapture
 ```
 
