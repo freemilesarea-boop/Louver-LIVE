@@ -193,8 +193,14 @@ if (rowsCsv.length === 0) {
     `peak ${analysis.zombies_peak}, after shutdown ${analysis.zombies_after_shutdown}`)
   passFail(analysis.stray_ffmpeg_after_shutdown === 0, 'no orphan FFmpeg after Stop',
     `${analysis.stray_ffmpeg_after_shutdown} left`)
-  passFail(analysis.rtmp_publisher_sessions === 1, 'one unbroken RTMP session',
-    `${analysis.rtmp_publisher_sessions} publisher session(s)`)
+  // No summary from the ingest means the question was not answered, which is
+  // not the same as answering it badly.
+  if (analysis.rtmp_publisher_sessions === null) {
+    check('one unbroken RTMP session', 'NOT TESTED', 'the ingest wrote no summary')
+  } else {
+    passFail(analysis.rtmp_publisher_sessions === 1, 'one unbroken RTMP session',
+      `${analysis.rtmp_publisher_sessions} publisher session(s)`)
+  }
   // Reconnects are not automatically a failure — recovering from one is the
   // feature — but an unrecovered one is.
   check('reconnects', analysis.reconnects === 0 ? 'PASS' : 'INFO', `${analysis.reconnects} reconnect(s)`)
