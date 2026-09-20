@@ -191,7 +191,9 @@ describe('the main journey', () => {
       expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
     })
     expect(screen.getAllByText('LIVE').length).toBeGreaterThan(0)
-    expect(screen.getByText('STREAM COPY')).toBeInTheDocument()
+    // Twice on purpose: the readiness strip states the configured mode, and
+    // the broadcast card badges the mode the live session is running in.
+    expect(screen.getAllByText('STREAM COPY')).toHaveLength(2)
 
     // §26: stopping requires a confirmation.
     await user.click(screen.getByRole('button', { name: /방송 종료/ }))
@@ -394,8 +396,13 @@ describe('developer diagnostics', () => {
 
     await gotoPage(user, '설정')
     // §13: the panel reports the running command, not just the setting.
-    expect(await screen.findByText('Streaming Mode')).toBeInTheDocument()
-    expect(await screen.findByText(/영상 재인코딩 없음/)).toBeInTheDocument()
+    //
+    // It polls on a three-second interval, so the default one-second wait is
+    // too tight on a loaded machine — this failed only when the Rust build was
+    // running alongside it.
+    const polled = { timeout: 5000 }
+    expect(await screen.findByText('Streaming Mode', {}, polled)).toBeInTheDocument()
+    expect(await screen.findByText(/영상 재인코딩 없음/, {}, polled)).toBeInTheDocument()
 
     await user.click(screen.getByRole('button', { name: '실행 중인 명령 보기' }))
     const cmd = await screen.findByText(/-f concat/)

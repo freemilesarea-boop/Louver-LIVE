@@ -105,6 +105,18 @@ export function Dashboard() {
         <StatusPill state={state} dryRun={status?.dry_run} />
       </div>
 
+      {/* Readiness at a glance (§3). A broken install is visible here rather
+          than at the moment someone presses 방송 시작. */}
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 rounded-lg border border-ink-700 bg-ink-800/40 px-4 py-2.5">
+        <Ready label="Status" value={status?.dry_run && isLive ? 'TEST LIVE' : state} tone={isLive ? 'ok' : 'idle'} />
+        <Ready label="Streaming Mode" value={metrics?.stream_mode_label ?? '—'} tone="ok" />
+        <Ready label="FFmpeg" value={metrics?.ffmpeg_ready ? 'READY' : 'MISSING'} tone={metrics?.ffmpeg_ready ? 'ok' : 'bad'} />
+        <Ready label="ffprobe" value={metrics?.ffprobe_ready ? 'READY' : 'MISSING'} tone={metrics?.ffprobe_ready ? 'ok' : 'bad'} />
+        {metrics?.license_is_development && (
+          <Badge tone="warn">DEVELOPMENT LICENSE</Badge>
+        )}
+      </div>
+
       {/* Primary control (§26): the largest thing on the screen. */}
       <Card>
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -263,6 +275,17 @@ export function Dashboard() {
       >
         종료하면 YouTube 스트림이 즉시 중단됩니다. 예약이 설정되어 있다면 다음 예약 시간에 다시 시작됩니다.
       </Modal>
+    </div>
+  )
+}
+
+/** One label/value pair in the readiness strip. */
+function Ready({ label, value, tone }: { label: string; value: string; tone: 'ok' | 'bad' | 'idle' }) {
+  const colour = tone === 'bad' ? 'text-live' : tone === 'ok' ? 'text-ok' : 'text-ink-400'
+  return (
+    <div className="flex items-baseline gap-2">
+      <span className="text-[10px] uppercase tracking-wider text-ink-500">{label}</span>
+      <span className={`font-mono text-xs ${colour}`}>{value}</span>
     </div>
   )
 }

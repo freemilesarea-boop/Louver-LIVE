@@ -119,6 +119,14 @@ impl StreamMode {
 /// Default YouTube RTMPS ingest endpoint (§15).
 pub const DEFAULT_RTMPS_URL: &str = "rtmps://a.rtmps.youtube.com/live2";
 
+/// Local test ingest. `npm run app` starts a listener here, so the local
+/// broadcast test publishes over a real socket rather than into a file.
+///
+/// Deliberately not 1935: that is the standard RTMP port, and taking over
+/// whatever a developer already has listening there — OBS, nginx-rtmp — would
+/// be a surprise. Nothing normally listens on 1945.
+pub const DEFAULT_LOCAL_TEST_URL: &str = "rtmp://127.0.0.1:1945/live/louver-test";
+
 #[cfg(test)]
 mod tests {
     use super::*;

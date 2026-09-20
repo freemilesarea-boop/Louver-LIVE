@@ -347,6 +347,39 @@ function StreamDiagnosticsPanel() {
 
       <p className={`text-xs ${d.mismatch ? 'text-live' : 'text-ink-400'}`}>{d.verdict}</p>
 
+      {/* What the supervisor is actually seeing (§11). Every value here is read
+          from the live process, not from the UI's own idea of the state. */}
+      <dl className="mt-3 grid grid-cols-2 gap-x-6 gap-y-1.5 font-mono text-[11px] sm:grid-cols-3">
+        <Diag label="State" value={d.state} />
+        <Diag label="FFmpeg PID" value={d.ffmpeg_pid != null ? String(d.ffmpeg_pid) : '—'} />
+        <Diag label="Reconnect" value={String(d.reconnect_count)} tone={d.reconnect_count > 0 ? 'warn' : undefined} />
+        <Diag label="CPU" value={`${d.ffmpeg_cpu_percent.toFixed(1)}%`} />
+        <Diag
+          label="RAM"
+          value={d.ffmpeg_memory_bytes ? `${(d.ffmpeg_memory_bytes / 1048576).toFixed(0)} MB` : '—'}
+        />
+        <Diag
+          label="Last progress"
+          value={d.seconds_since_progress != null ? `${d.seconds_since_progress}s ago` : '—'}
+          tone={(d.seconds_since_progress ?? 0) > 15 ? 'warn' : undefined}
+        />
+        <Diag label="RTMP" value={d.publishing ? 'CONNECTED' : '—'} />
+        <Diag
+          label="Sent"
+          value={d.bytes_sent ? `${(d.bytes_sent / 1e9).toFixed(2)} GB` : '—'}
+        />
+        {d.local_test_sink.kind !== 'None' && (
+          <Diag
+            label="Test sink"
+            value={d.local_test_sink.kind === 'Rtmp' ? '로컬 RTMP' : '파일'}
+            tone={d.local_test_sink.kind === 'Rtmp' ? undefined : 'warn'}
+          />
+        )}
+      </dl>
+      {d.local_test_sink.kind !== 'None' && (
+        <p className="mt-1 break-all font-mono text-[10px] text-ink-500">{d.local_test_sink.target}</p>
+      )}
+
       {d.video_encoder_args.length > 0 && (
         <p className="mt-1 font-mono text-[11px] text-warn">
           영상 인코더 인자: {d.video_encoder_args.join(' ')}
@@ -380,6 +413,16 @@ function Row({ label, value, mono }: { label: string; value: React.ReactNode; mo
     <div className="flex items-start justify-between gap-4">
       <dt className="shrink-0 text-ink-400">{label}</dt>
       <dd className={`min-w-0 break-all text-right text-ink-200 ${mono ? 'font-mono text-xs' : ''}`}>{value}</dd>
+    </div>
+  )
+}
+
+/** One row of the supervisor readout. */
+function Diag({ label, value, tone }: { label: string; value: string; tone?: 'warn' }) {
+  return (
+    <div className="flex items-baseline justify-between gap-2">
+      <dt className="text-ink-500">{label}</dt>
+      <dd className={tone === 'warn' ? 'text-warn' : 'text-ink-200'}>{value}</dd>
     </div>
   )
 }

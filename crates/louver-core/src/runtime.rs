@@ -103,6 +103,63 @@ impl RuntimeStatus {
 /// of the process that is really running, so "is this session stream copy?"
 /// can be answered from evidence rather than from configuration — which is the
 /// first thing to check when CPU is unexpectedly high.
+/// Which sink a local test is publishing to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "target")]
+pub enum LocalTestSink {
+    None,
+    /// A real RTMP endpoint on this machine — a real socket and handshake.
+    Rtmp(String),
+    /// No endpoint was listening, so the stream went to a file instead.
+    File(String),
+}
+
+impl LocalTestSink {
+    pub fn label(&self) -> String {
+        match self {
+            Self::None => "없음".into(),
+            Self::Rtmp(url) => format!("로컬 RTMP · {url}"),
+            Self::File(p) => format!("파일 · {p}"),
+        }
+    }
+}
+
+/// Is anything listening at this `rtmp://host:port/...` URL?
+///
+/// Answered by trying to *bind* the port, not by connecting to it. Connecting
+/// would be worse than useless here: the test ingest accepts exactly one
+/// connection at a time, so a probe that connects is accepted as the real
+/// publisher, fails the RTMP handshake, and takes the listener down with it —
+/// leaving the broadcast that follows a moment later with nothing to connect
+/// to. Binding disturbs nothing: if the address is already taken, something is
+/// listening.
+///
+/// Only meaningful for a local address. A remote test ingest is taken at its
+/// word, since binding a local port says nothing about a remote host.
+fn something_is_listening(url: &str) -> bool {
+    let rest = url.split("://").nth(1).unwrap_or("");
+    let authority = rest.split('/').next().unwrap_or("");
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(1935u16)),
+        None => (authority.to_string(), 1935u16),
+    };
+    if host.is_empty() {
+        return false;
+    }
+    let is_local = matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "0.0.0.0");
+    if !is_local {
+        return true;
+    }
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        // The port is free, so nothing is there to receive the stream.
+        Ok(listener) => {
+            drop(listener);
+            false
+        }
+        Err(e) => e.kind() == std::io::ErrorKind::AddrInUse,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamDiagnostics {
     pub state: StreamState,
@@ -120,6 +177,15 @@ pub struct StreamDiagnostics {
     pub ffmpeg_cpu_percent: f32,
     /// Plain-language verdict for the developer panel.
     pub verdict: String,
+    pub ffmpeg_memory_bytes: u64,
+    pub reconnect_count: u32,
+    /// Seconds since FFmpeg last reported progress; a rising value is a stall.
+    pub seconds_since_progress: Option<u64>,
+    /// True while the publisher is connected and bytes are moving.
+    pub publishing: bool,
+    pub bytes_sent: u64,
+    /// Where a local test is publishing, when one is running.
+    pub local_test_sink: LocalTestSink,
 }
 
 /// Video-encoder arguments that must never appear in a stream-copy command.
@@ -174,6 +240,8 @@ pub struct BroadcastRuntime {
     scheduled_end: Option<chrono::DateTime<chrono::Utc>>,
     reason: Option<StartReason>,
     dry_run: bool,
+    /// Which sink the last local test used, for the UI to report honestly.
+    local_test_sink: LocalTestSink,
     /// When a restart is due after a backoff.
     restart_due: Option<Instant>,
     last_args: Vec<String>,
@@ -217,6 +285,7 @@ impl BroadcastRuntime {
             scheduled_end: None,
             reason: None,
             dry_run: false,
+            local_test_sink: LocalTestSink::None,
             restart_due: None,
             last_args: Vec::new(),
             suppressed_occurrence: None,
@@ -331,8 +400,7 @@ impl BroadcastRuntime {
         )?;
 
         let destination = if opts.dry_run {
-            std::fs::create_dir_all(&self.dry_run_dir)?;
-            self.dry_run_dir.join("dry-run.flv").to_string_lossy().into_owned()
+            self.local_test_destination()?
         } else {
             let url = self.db.get_setting_or(crate::settings_keys::RTMPS_URL, crate::DEFAULT_RTMPS_URL);
             build_ingest_url(&url, &self.keys.require()?)
@@ -650,6 +718,26 @@ impl BroadcastRuntime {
     }
 
     /// Inspect the command that is actually running (§13).
+    /// Where a local test publishes to.
+    ///
+    /// A local RTMP endpoint when one is listening, a file otherwise. The
+    /// engine is identical either way — same concat, same stream copy, same
+    /// supervisor — but publishing over a real socket exercises the RTMP
+    /// handshake, reconnection and the ingest's view of the stream, which a
+    /// file sink cannot. `npm run app` starts such an endpoint, so the button
+    /// normally takes the socket path without the user arranging anything.
+    fn local_test_destination(&mut self) -> Result<String> {
+        let url = self.db.get_setting_or(crate::settings_keys::LOCAL_TEST_URL, crate::DEFAULT_LOCAL_TEST_URL);
+        if !url.is_empty() && something_is_listening(&url) {
+            self.local_test_sink = LocalTestSink::Rtmp(url.clone());
+            return Ok(url);
+        }
+        std::fs::create_dir_all(&self.dry_run_dir)?;
+        let path = self.dry_run_dir.join("dry-run.flv").to_string_lossy().into_owned();
+        self.local_test_sink = LocalTestSink::File(path.clone());
+        Ok(path)
+    }
+
     pub fn diagnostics(&self) -> StreamDiagnostics {
         let status = self.supervisor.status();
         let argv = &self.last_args;
@@ -694,6 +782,12 @@ impl BroadcastRuntime {
             ffmpeg_pid: status.pid,
             ffmpeg_cpu_percent: 0.0, // filled in by the caller, which owns the sampler
             verdict,
+            ffmpeg_memory_bytes: 0, // likewise
+            reconnect_count: status.reconnect_count,
+            seconds_since_progress: status.seconds_since_data,
+            publishing: status.state == StreamState::Live && status.progress.total_bytes > 0,
+            bytes_sent: status.progress.total_bytes,
+            local_test_sink: if self.dry_run { self.local_test_sink.clone() } else { LocalTestSink::None },
         }
     }
 
@@ -755,5 +849,53 @@ impl Clock for ClockRef {
     }
     fn now_local(&self) -> chrono::NaiveDateTime {
         self.0.now_local()
+    }
+}
+
+#[cfg(test)]
+mod local_test_sink_tests {
+    use super::something_is_listening;
+
+    #[test]
+    fn a_port_with_a_listener_on_it_is_reported_as_listening() {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+        assert!(something_is_listening(&format!("rtmp://127.0.0.1:{port}/live/x")));
+    }
+
+    #[test]
+    fn a_free_port_is_not() {
+        // Bind and release, so the port is known to have been free.
+        let port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            l.local_addr().unwrap().port()
+        };
+        assert!(!something_is_listening(&format!("rtmp://127.0.0.1:{port}/live/x")));
+    }
+
+    #[test]
+    fn the_check_never_connects_so_a_single_connection_listener_survives_it() {
+        // The bug this guards against: a probe that *connects* is accepted as
+        // the publisher by a `-listen 1` ingest, fails its handshake, and takes
+        // the listener down — so the broadcast that follows finds nothing
+        // there. After probing, the listener must still be able to accept.
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = l.local_addr().unwrap().port();
+
+        assert!(something_is_listening(&format!("rtmp://127.0.0.1:{port}/live/x")));
+
+        l.set_nonblocking(true).unwrap();
+        match l.accept() {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {} // nothing was consumed
+            Ok(_) => panic!("the check opened a connection; a single-connection ingest would be gone"),
+            Err(e) => panic!("unexpected accept error: {e}"),
+        }
+    }
+
+    #[test]
+    fn a_remote_ingest_is_taken_at_its_word() {
+        // Binding a local port says nothing about a remote host, so the URL is
+        // used rather than second-guessed.
+        assert!(something_is_listening("rtmp://example.com:1935/live/x"));
     }
 }

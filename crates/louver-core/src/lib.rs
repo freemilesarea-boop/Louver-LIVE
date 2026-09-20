@@ -30,7 +30,7 @@ pub mod session;
 pub mod streaming;
 pub mod system;
 
-pub use config::{OutputProfile, StreamMode, DEFAULT_RTMPS_URL};
+pub use config::{OutputProfile, StreamMode, DEFAULT_LOCAL_TEST_URL, DEFAULT_RTMPS_URL};
 pub use error::{ErrorCode, LouverError, Result};
 pub use streaming::playlist::PlaybackMode;
 pub use streaming::state::StreamState;
@@ -86,6 +86,8 @@ impl AppPaths {
 /// Settings keys stored in the `settings` table.
 pub mod settings_keys {
     pub const RTMPS_URL: &str = "rtmps_url";
+    /// Where "로컬 방송 테스트" publishes when an endpoint is listening there.
+    pub const LOCAL_TEST_URL: &str = "local_test_url";
     pub const OUTPUT_PROFILE: &str = "output_profile";
     pub const LAUNCH_AT_STARTUP: &str = "launch_at_startup";
     pub const START_MINIMIZED: &str = "start_minimized";

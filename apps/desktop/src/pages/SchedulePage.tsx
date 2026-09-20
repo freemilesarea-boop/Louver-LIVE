@@ -7,7 +7,7 @@ import { Badge, Button, Card, EmptyState, Field, Input, Select, Toggle } from '@
 
 /** Schedule page (§19, §27). */
 export function SchedulePage() {
-  const { schedules, playlists, refreshSchedules, refreshPlaylists, reportError, toast } = useAppStore()
+  const { schedules, playlists, settings, refreshSchedules, refreshPlaylists, reportError, toast } = useAppStore()
 
   const [playlistId, setPlaylistId] = useState<number | ''>('')
   const [days, setDays] = useState<number>(EVERYDAY)
@@ -24,6 +24,18 @@ export function SchedulePage() {
   }, [playlists, playlistId])
 
   const overnight = crossesMidnight(start, end)
+
+  /** Fill the form with a window that begins in a few minutes, today. */
+  function applyOffsets(startInMin: number, endInMin: number) {
+    const at = (min: number) => {
+      const d = new Date(Date.now() + min * 60_000)
+      return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+    }
+    setStart(at(startInMin))
+    setEnd(at(endInMin))
+    setDays(EVERYDAY)
+    toast({ kind: 'info', message: `${at(startInMin)} 시작 · ${at(endInMin)} 종료로 채웠습니다. 예약 추가를 누르세요.` })
+  }
 
   async function create() {
     if (playlistId === '') return toast({ kind: 'error', message: '플레이리스트를 선택해주세요.' })
@@ -91,6 +103,19 @@ export function SchedulePage() {
         <Button variant="primary" onClick={() => void create()}>
           <span className="inline-flex items-center gap-2"><CalendarPlus size={15} /> 예약 추가</span>
         </Button>
+
+        {/* Developer mode only (§10). Waiting until 20:00 to find out whether the
+            scheduler fires is no way to test it, so this fills the form with a
+            window that starts in a minute. It only sets the fields — the
+            schedule it creates goes through exactly the same path as any
+            other. */}
+        {settings?.developer_mode && (
+          <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-ink-800 pt-3">
+            <span className="text-[11px] uppercase tracking-wider text-ink-500">테스트 프리셋</span>
+            <Button size="sm" onClick={() => applyOffsets(1, 3)}>1분 후 시작 · 3분 후 종료</Button>
+            <Button size="sm" onClick={() => applyOffsets(2, 10)}>2분 후 시작 · 10분 후 종료</Button>
+          </div>
+        )}
       </Card>
 
       <Card title="예약 목록">

@@ -27,7 +27,8 @@
     "secret-scan": "node scripts/secret-scan.mjs",
     "ffmpeg:manifest": "node scripts/ffmpeg-manifest.mjs",
     "soak:overnight": "node scripts/overnight-soak.mjs",
-    "soak:report": "node scripts/soak-report.mjs"
+    "soak:report": "node scripts/soak-report.mjs",
+    "app": "node scripts/app.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",

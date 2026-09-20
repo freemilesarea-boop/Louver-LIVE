@@ -161,6 +161,11 @@ fn the_runtime_drives_real_ffmpeg_and_produces_a_playable_broadcast() {
     let mut rt =
         runtime_with(db.clone(), b.clone(), dir.path(), Arc::new(NullEvents), Arc::clone(&ffmpeg_log));
 
+    // A local test publishes to a local RTMP ingest when one is listening and
+    // to a file when none is. This test is about the file, so it says so
+    // rather than depending on what happens to be listening on this machine.
+    db.set_setting(louver_core::settings_keys::LOCAL_TEST_URL, "").unwrap();
+
     rt.start(StartOptions {
         playlist_id: playlist,
         reason: StartReason::Manual,

@@ -83,7 +83,11 @@ pub fn stop_broadcast(state: State<'_, AppState>) -> CmdResult<RuntimeStatus> {
     Ok(rt.status())
 }
 
-/// Local Stream Test — the full pipeline with a file sink (§30).
+/// Local Stream Test — the full broadcast pipeline against a local ingest (§30).
+///
+/// Not a simulation: the same concat, the same stream copy, the same
+/// supervisor. Only the destination differs, and it prefers a real local RTMP
+/// endpoint over a file when one is listening.
 #[tauri::command]
 pub fn start_dry_run(state: State<'_, AppState>, playlist_id: i64) -> CmdResult<RuntimeStatus> {
     let report = run_preflight(state.clone(), playlist_id, true)?;
@@ -121,7 +125,9 @@ pub fn stream_mode_label(state: State<'_, AppState>) -> CmdResult<String> {
 pub fn stream_diagnostics(state: State<'_, AppState>) -> CmdResult<StreamDiagnostics> {
     let mut d = state.runtime.lock().unwrap().diagnostics();
     if let Some(pid) = d.ffmpeg_pid {
-        d.ffmpeg_cpu_percent = state.metrics.lock().unwrap().sample(Some(pid)).ffmpeg_cpu_percent;
+        let m = state.metrics.lock().unwrap().sample(Some(pid));
+        d.ffmpeg_cpu_percent = m.ffmpeg_cpu_percent;
+        d.ffmpeg_memory_bytes = m.ffmpeg_memory_bytes;
     }
     Ok(d)
 }

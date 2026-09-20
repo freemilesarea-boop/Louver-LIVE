@@ -132,7 +132,19 @@ export interface StreamDiagnostics {
   ffmpeg_pid?: number | null
   ffmpeg_cpu_percent: number
   verdict: string
+  ffmpeg_memory_bytes: number
+  reconnect_count: number
+  seconds_since_progress?: number | null
+  publishing: boolean
+  bytes_sent: number
+  local_test_sink: LocalTestSink
 }
+
+/** Where a local test is publishing. */
+export type LocalTestSink =
+  | { kind: 'None' }
+  | { kind: 'Rtmp'; target: string }
+  | { kind: 'File'; target: string }
 
 export interface CheckResult {
   id: string
@@ -222,6 +234,11 @@ export interface DashboardMetrics {
   free_disk_bytes: number
   free_disk_label: string
   sleep_prevented: boolean
+  ffmpeg_ready: boolean
+  ffprobe_ready: boolean
+  stream_mode_label: string
+  license_label: string
+  license_is_development: boolean
 }
 
 export interface StreamEvent {

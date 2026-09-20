@@ -414,6 +414,14 @@ export function createMockBackend(opts: MockOptions = {}) {
           : copy
             ? 'STREAM COPY: 영상 재인코딩 없음 (CPU 사용량이 낮아야 정상입니다)'
             : 'COMPATIBILITY MODE: 실시간 재인코딩 중 (CPU 사용량이 높습니다)',
+        ffmpeg_memory_bytes: live ? 63 * 1024 * 1024 : 0,
+        reconnect_count: status.supervisor.reconnect_count,
+        seconds_since_progress: live ? 0 : null,
+        publishing: live,
+        bytes_sent: live ? 1_400_000_000 : 0,
+        local_test_sink: status.dry_run
+          ? { kind: 'Rtmp', target: 'rtmp://127.0.0.1:1935/live/louver-test' }
+          : { kind: 'None' },
       }
     },
     stream_mode_label: () => (settings.get('stream_mode') === 'compatibility_encode' ? 'COMPATIBILITY ENCODE' : 'STREAM COPY'),
@@ -455,6 +463,13 @@ export function createMockBackend(opts: MockOptions = {}) {
       free_disk_bytes: 184 * 1e9,
       free_disk_label: '171.4 GB',
       sleep_prevented: status.supervisor.state === 'LIVE' && !status.dry_run,
+      ffmpeg_ready: true,
+      ffprobe_ready: true,
+      stream_mode_label: (settings.get('stream_mode') ?? 'stream_copy') === 'stream_copy'
+        ? 'STREAM COPY'
+        : 'COMPATIBILITY ENCODE',
+      license_label: '개발용',
+      license_is_development: true,
     }),
     recent_events: () => events.slice(0, 100),
     read_log: () => ['2026-03-02 20:00:00.000 [INFO] 방송 시작: Night Jazz', '2026-03-02 20:00:01.120 [INFO] 방송이 시작되었습니다'],
