@@ -137,6 +137,7 @@ impl AppState {
             db.clone(),
             Arc::clone(&secrets),
             Arc::clone(&logger),
+            Arc::clone(&keys),
         ));
 
         Ok(Self {

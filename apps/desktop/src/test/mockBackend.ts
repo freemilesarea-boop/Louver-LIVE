@@ -32,6 +32,8 @@ export interface MockOptions {
   youtubeIgnoresTitle?: boolean
   /** The day's free YouTube allowance is gone. */
   youtubeQuotaExhausted?: boolean
+  /** A scheduled window is open right now. */
+  occurrenceOpen?: { start: string; end: string; phase: 'preparing' | 'live'; retryInSecs?: number }
   /**
    * Make every YouTube Data API call fail. Used to check that the optional
    * half can break without taking the broadcast with it.
@@ -120,6 +122,7 @@ export function createMockBackend(opts: MockOptions = {}) {
       dry_run: false,
       next_scheduled_start: nextScheduledLabel(),
       cycle_duration_secs: 0,
+      active_occurrence: null,
     }
   }
 
@@ -171,6 +174,20 @@ export function createMockBackend(opts: MockOptions = {}) {
         category: ok(m.category_id),
         privacy: ok(m.privacy),
       },
+    }
+  }
+
+  /** The open window, reported whatever the stream is doing. */
+  function occurrence() {
+    const o = opts.occurrenceOpen
+    if (!o) return null
+    return {
+      start: o.start,
+      end: o.end,
+      playlist_id: playlists[0]?.id ?? 1,
+      phase: status.supervisor.state === 'LIVE' ? 'live' as const : o.phase,
+      retry_in_secs: o.retryInSecs ?? null,
+      attempts: o.retryInSecs == null ? 0 : 1,
     }
   }
 
@@ -456,7 +473,7 @@ export function createMockBackend(opts: MockOptions = {}) {
     },
 
     // --- streaming ---
-    get_status: () => status,
+    get_status: () => ({ ...status, active_occurrence: occurrence() }),
     run_preflight: (a) => preflight(a.playlistId as number, a.dryRun as boolean),
     start_broadcast: (a) => {
       const r = preflight(a.playlistId as number, false)

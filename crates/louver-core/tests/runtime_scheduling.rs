@@ -988,3 +988,106 @@ fn the_same_failure_is_not_logged_once_a_second_for_the_whole_window() {
     }
     assert_eq!(h.events.logs().matches("LL-SCHED-004").count(), 1);
 }
+
+// --- the occurrence, and retrying inside its window -------------------------
+
+#[test]
+fn the_open_window_is_reported_even_when_nothing_is_broadcasting() {
+    // §8: the dashboard and the schedule page read the same runtime, so they
+    // cannot disagree. "지금 방송 시간입니다" beside "예약된 방송이 없습니다" is
+    // what a held start used to look like.
+    let mut h = harness(&format!("{MON} 20:58:30"));
+    h.rt.set_pre_start(Arc::new(SchedulePolicyHook { hold: true, skipped: Mutex::new(0) }));
+    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+
+    h.rt.tick();
+    assert!(!h.rt.is_active(), "the hook held it");
+    let o = h.rt.status().active_occurrence.expect("the window is open and must be reported");
+    assert_eq!(o.start, "2026-03-02 20:58");
+    assert_eq!(o.end, "2026-03-02 21:00");
+    assert_eq!(o.phase, "preparing");
+    assert!(o.attempts >= 1, "and says it has tried");
+    assert!(h.rt.status().next_scheduled_start.is_none(), "an open window is not 'next'");
+}
+
+#[test]
+fn a_live_window_reports_itself_as_live() {
+    let mut h = harness(&format!("{MON} 20:58:30"));
+    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    h.rt.tick();
+    mark_connected(&mut h.rt);
+    let o = h.rt.status().active_occurrence.expect("still the open window");
+    assert_eq!(o.phase, "live");
+    assert_eq!(o.retry_in_secs, None);
+}
+
+#[test]
+fn a_window_that_closed_stops_reporting_itself() {
+    let mut h = harness(&format!("{MON} 21:05:00"));
+    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    h.rt.tick();
+    assert!(h.rt.status().active_occurrence.is_none());
+    assert_eq!(h.rt.status().next_scheduled_start.as_deref(), Some("2026-03-03 20:58"));
+}
+
+#[test]
+fn a_failed_start_retries_within_seconds_not_minutes() {
+    // §9: a window whose first attempt hit a transient error must recover
+    // inside that window. A one-minute gap loses a two-minute window entirely.
+    let mut h = harness(&format!("{MON} 20:58:10"));
+    h.rt.set_pre_start(Arc::new(SchedulePolicyHook { hold: true, skipped: Mutex::new(0) }));
+    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+
+    h.rt.tick();
+    let first = h.rt.status().active_occurrence.unwrap();
+    assert_eq!(first.attempts, 1);
+    assert!(first.retry_in_secs.unwrap() <= 5, "the first retry is seconds away: {first:?}");
+
+    // Ticking again inside the delay must not attempt, and must not log again.
+    h.rt.tick();
+    h.rt.tick();
+    assert_eq!(h.rt.status().active_occurrence.unwrap().attempts, 1);
+}
+
+#[test]
+fn the_retry_recovers_the_window_rather_than_waiting_for_tomorrow() {
+    // The whole point of §9: the cause clears, and the same window still
+    // broadcasts. The next occurrence must never be tomorrow while today's
+    // window is still open.
+    let mut h = harness(&format!("{MON} 20:58:10"));
+    let hook = Arc::new(RecordingHook::default());
+    hook.fail(not_connected());
+    h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
+    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+
+    h.rt.tick();
+    assert_eq!(h.launcher.launch_count(), 0);
+    assert!(h.rt.status().next_scheduled_start.is_none(), "still today's window");
+
+    // The transient failure clears.
+    *hook.fail_with.lock().unwrap() = None;
+    std::thread::sleep(std::time::Duration::from_millis(5100));
+    h.rt.tick();
+
+    assert!(h.rt.is_active(), "the window recovered inside itself");
+    assert_eq!(h.rt.status().active_occurrence.unwrap().phase, "live");
+}
+
+#[test]
+fn the_window_closing_stops_the_broadcast_and_leaves_nothing_running() {
+    // §10: the end of the window ends the broadcast, and nothing is left over.
+    let mut h = harness(&format!("{MON} 20:58:30"));
+    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    h.rt.tick();
+    mark_connected(&mut h.rt);
+    assert!(h.rt.is_active());
+
+    h.clock.set_str(&format!("{MON} 21:00:01"));
+    h.rt.tick();
+
+    assert!(!h.rt.is_active(), "the window closed");
+    assert!(h.rt.status().active_occurrence.is_none());
+    assert_eq!(h.rt.ffmpeg_pid(), None, "no FFmpeg left behind");
+    assert!(h.session_store.load().is_none(), "and no session file to resume from");
+    assert_eq!(h.rt.status().next_scheduled_start.as_deref(), Some("2026-03-03 20:58"));
+}

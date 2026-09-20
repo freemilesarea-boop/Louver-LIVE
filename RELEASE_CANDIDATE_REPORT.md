@@ -496,6 +496,63 @@ of a billing account on the real Cloud project — have not been run here and
 remain **NOT TESTED**. `rc-results/youtube-test.md` is where
 those results go.
 
+## 14c. A scheduled window that never started the stream (2026-09-20)
+
+Reported from a real Mac: a `20:58 → 21:00` daily schedule. At 20:59 the
+schedule page read `지금 방송 시간입니다 · 2026-09-20 21:00에 종료`, and the
+dashboard read `OFFLINE · STATUS IDLE · FFmpeg Stopped` with
+`진행 중인 YouTube 라이브를 찾지 못했습니다. YouTube에서 라이브를 먼저 만들어주세요.`
+
+Not a timing bug. The scheduler fired correctly; the startup pipeline stopped.
+
+**Cause.** `apply_metadata` opened with `api.active_broadcast(&token)?`, which
+lists `active` then `upcoming` broadcasts and returns `LL-YOUTUBE-003` when
+there are none. A scheduled window arrives with nothing on the channel — that
+is the normal case, not an edge one — so the pre-start hook returned an error,
+the scheduled start was held under the default policy, and FFmpeg was never
+launched. The product required a user who is asleep to have opened YouTube
+Studio in advance.
+
+**Fixed** by provisioning rather than requiring. `youtube/provision.rs` decides,
+and the decisions are pure so they are testable without a network:
+
+| Step | Rule |
+| --- | --- |
+| Find or create | Reuse a broadcast scheduled within 15 minutes of this window — so a retry does not leave two behind — and otherwise `liveBroadcasts.insert` with the saved title, description, privacy, `scheduledStartTime`, `scheduledEndTime` and auto start/stop. An arbitrary "upcoming" broadcast is never taken over: it may be the user's own, for another time |
+| Bind | `liveStreams.list` and match the **saved stream key** against `cdn.ingestionInfo.streamName`, then `liveBroadcasts.bind`. Never "the first stream", which binds to an endpoint nothing is publishing to and leaves YouTube waiting for video with nothing to say about why. The key is compared in memory and dropped — not logged, not stored, not in a URL or a body |
+| Confirm | `contentDetails.boundStreamId` must name the stream that was asked for. A 200 is not the answer |
+| Metadata | The same three calls the manual button uses, then read-back |
+| FFmpeg | Only now, because a broadcast that goes live first is live under whatever title it had |
+| Go live | Only once `liveStream.status.streamStatus` is `active`. YouTube refuses a transition while the stream is silent, with an error that reads like a permissions problem. `enableAutoStart` broadcasts are left to YouTube |
+| End | FFmpeg stops, the broadcast is transitioned to `complete`, the chat bot stops. A broadcast left `live` with nothing publishing to it is exactly the stale state the next window would try to reuse |
+
+Manual and scheduled starts run this through the same `PreStartHook`, so they
+cannot drift apart.
+
+**Retry.** A failed window now retries at 5s, 10s, 20s then 30s inside its own
+window instead of once a minute — a two-minute window was lost entirely by a
+single transient failure. Bounded, never a spin, and never a jump to tomorrow
+while today's window is still open.
+
+**The contradiction.** `RuntimeStatus.active_occurrence` reports the open
+window whatever the stream is doing, so the dashboard and the schedule page
+read the same runtime and cannot disagree.
+
+**Verified in the real app** under Xvfb, with nothing clicked after the
+schedule was saved: a `12:16 → 12:18` window fired by itself, the dashboard
+read `예약 방송 12:16 → 12:18 LIVE` with the `예약 시작` badge and a countdown to
+12:18, and at 12:18:00 the log recorded `예약된 종료 시간입니다` /
+`방송을 종료했습니다 (예약 종료)` with no FFmpeg process left and the next
+occurrence computed. The stream itself read RECONNECTING throughout because
+this container's stream key is a fake one that real YouTube rejects.
+
+**NOT TESTED — and this is the part that matters most.** No YouTube account
+exists here, so every call above ran against a stand-in that speaks Google's
+JSON. Whether `liveBroadcasts.insert` is accepted for a real channel, whether
+the bind takes, whether `enableAutoStart` carries a real broadcast to LIVE, and
+whether the metadata survives on the created broadcast are all **NOT TESTED**.
+TEST A–D in the request are the ones that settle it.
+
 ## 15. Known issues
 
 1. **Real YouTube broadcasting is unverified.** Everything up to the socket is

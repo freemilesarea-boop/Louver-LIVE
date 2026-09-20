@@ -8,6 +8,7 @@ use louver_core::database::Database;
 use louver_core::error::{ErrorCode, LouverError, Result};
 use louver_core::logging::{LogTarget, Logger};
 use louver_core::security::SecretStore;
+use louver_core::security::StreamKeyStore;
 use louver_core::youtube::api::YoutubeApi;
 use louver_core::youtube::api::{LiveBroadcast, MetadataVerification};
 use louver_core::youtube::bot::{BotContext, ChatBot};
@@ -16,6 +17,7 @@ use louver_core::youtube::http::UreqClient;
 use louver_core::youtube::oauth::{
     ClientCredentials, ConsentPrompt, LoopbackServer, Pkce, TokenEndpoint, TokenStore,
 };
+use louver_core::youtube::provision::{self, BroadcastChoice, GoLive, REUSE_TOLERANCE_SECS};
 use louver_core::youtube::quota::{MeteredClient, QuotaGuard, QuotaState, FREE_DAILY_UNITS};
 use louver_core::youtube::{api::API_BASE, keys, BroadcastMetadata, ChannelInfo, HttpClient};
 use std::sync::{Arc, Mutex};
@@ -47,6 +49,23 @@ pub struct YoutubeService {
     /// What happened to the metadata for the broadcast in progress, for the
     /// dashboard to show field by field (§B-10).
     apply_state: Arc<Mutex<MetadataApplyState>>,
+    /// The broadcast and stream this session provisioned, so the live
+    /// transition and the stop know what to act on without asking again.
+    live_session: Arc<Mutex<Option<ProvisionedBroadcast>>>,
+    /// Reads the saved stream key, to match it against the channel's
+    /// ingestion endpoints. Never stored or logged here.
+    keys: Arc<StreamKeyStore>,
+}
+
+/// The broadcast a window is using, and the stream it takes video from.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProvisionedBroadcast {
+    pub broadcast_id: String,
+    pub stream_id: String,
+    /// True when YouTube will take it live and end it by itself.
+    pub auto_start_stop: bool,
+    /// Set once the broadcast has actually reached `live`.
+    pub went_live: bool,
 }
 
 /// The day's free-quota spending, for the UI.
@@ -148,7 +167,12 @@ pub struct YoutubeStatus {
 }
 
 impl YoutubeService {
-    pub fn new(db: Database, secrets: Arc<dyn SecretStore>, logger: Arc<Logger>) -> Self {
+    pub fn new(
+        db: Database,
+        secrets: Arc<dyn SecretStore>,
+        logger: Arc<Logger>,
+        keys: Arc<StreamKeyStore>,
+    ) -> Self {
         let http = Arc::new(UreqClient::new());
         // Restored rather than reset: a relaunch that started the day's count
         // at zero would spend an allowance that is already gone.
@@ -182,6 +206,8 @@ impl YoutubeService {
             connecting: Arc::new(Mutex::new(None)),
             applied_this_session: Arc::new(Mutex::new(false)),
             apply_state: Arc::new(Mutex::new(MetadataApplyState::default())),
+            live_session: Arc::new(Mutex::new(None)),
+            keys,
         }
     }
 
@@ -408,7 +434,23 @@ impl YoutubeService {
         let api = YoutubeApi::with_base(self.api_http.as_ref(), base);
 
         let broadcast = api.active_broadcast(&token)?;
-        api.update_broadcast(&token, &broadcast.id, &meta, None)?;
+        self.apply_to(&api, &token, &broadcast, &meta)
+    }
+
+    /// Push the metadata onto a broadcast that is already chosen, and read it
+    /// back. Split out so the provisioning path and the manual
+    /// 지금 YouTube에 적용 button run exactly the same three calls.
+    fn apply_to(
+        &self,
+        api: &YoutubeApi,
+        token: &str,
+        broadcast: &LiveBroadcast,
+        meta: &BroadcastMetadata,
+    ) -> Result<MetadataOutcome> {
+        let token = token.to_string();
+        let broadcast = broadcast.clone();
+        let meta = meta.clone();
+        api.update_broadcast(&token, &broadcast.id, &meta, broadcast.scheduled_start_time.as_deref())?;
         self.logger.info(
             LogTarget::App,
             &format!("YOUTUBE_METADATA_UPDATED: {} ({})", broadcast.id, meta.privacy.as_api()),
@@ -434,6 +476,178 @@ impl YoutubeService {
             );
         }
         Ok(MetadataOutcome { broadcast: after, verification })
+    }
+
+    /// Get a broadcast ready for a window that is starting now.
+    ///
+    /// This is what replaced "make a live broadcast in YouTube first". The
+    /// scheduler fires while the user is asleep, so the app finds the
+    /// broadcast for this window or creates it, binds it to the ingestion
+    /// endpoint the saved stream key publishes to, and applies the metadata —
+    /// all before FFmpeg is launched, because a broadcast that goes live first
+    /// is live under whatever title it already had.
+    ///
+    /// `window_start` is the occurrence's start; a manual start passes the
+    /// current time.
+    pub fn provision_broadcast(
+        &self,
+        meta: &BroadcastMetadata,
+        window_start: chrono::DateTime<chrono::Utc>,
+        window_end: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<MetadataOutcome> {
+        let meta = meta.cleaned();
+        meta.validate()?;
+        let token = self.token()?;
+        let api = YoutubeApi::with_base(self.api_http.as_ref(), self.api_base());
+
+        // 1. The broadcast for this window: reuse one prepared earlier (a
+        //    retry inside the window must not leave two behind) or create it.
+        let upcoming = api.upcoming_broadcasts(&token)?;
+        let broadcast = match provision::choose_broadcast(&upcoming, window_start, REUSE_TOLERANCE_SECS) {
+            BroadcastChoice::Reuse(b) => {
+                self.logger.info(
+                    LogTarget::App,
+                    &format!("YOUTUBE_BROADCAST_REUSED: 이 예약의 방송을 다시 사용합니다 ({})", b.id),
+                );
+                b
+            }
+            BroadcastChoice::Create => {
+                let created = api.create_broadcast(
+                    &token,
+                    &meta,
+                    &window_start.to_rfc3339(),
+                    window_end.map(|e| e.to_rfc3339()).as_deref(),
+                    true,
+                )?;
+                self.logger.info(
+                    LogTarget::App,
+                    &format!("YOUTUBE_BROADCAST_CREATED: 예약 방송을 자동으로 만들었습니다 ({})", created.id),
+                );
+                created
+            }
+        };
+
+        // 2. Bind it to the endpoint this app is actually publishing to. The
+        //    key is read, compared and dropped; it is not logged or stored.
+        let stream_key = self
+            .keys
+            .get()?
+            .filter(|k| !k.trim().is_empty())
+            .ok_or_else(|| LouverError::new(ErrorCode::StreamNoStreamKey))?;
+        let streams = api.my_streams(&token)?;
+        let stream_id = provision::stream_for_key(&streams, &stream_key)?.id.clone();
+        drop(stream_key);
+
+        let bound = if broadcast.bound_stream_id.as_deref() == Some(stream_id.as_str()) {
+            broadcast
+        } else {
+            let b = api.bind_broadcast(&token, &broadcast.id, &stream_id)?;
+            provision::verify_bound(&b, &stream_id)?;
+            self.logger
+                .info(LogTarget::App, &format!("YOUTUBE_BROADCAST_BOUND: {} ← 스트림 {}", b.id, stream_id));
+            b
+        };
+
+        *self.live_session.lock().unwrap() = Some(ProvisionedBroadcast {
+            broadcast_id: bound.id.clone(),
+            stream_id,
+            auto_start_stop: bound.enable_auto_start,
+            went_live: bound.life_cycle_status == "live",
+        });
+
+        // 3. The metadata, through the same three calls the manual button uses.
+        self.apply_to(&api, &token, &bound, &meta)
+    }
+
+    /// Record a failed attempt to take the broadcast live.
+    ///
+    /// Not fatal: FFmpeg is already publishing, and YouTube may still take it
+    /// live by itself. The next tick tries again.
+    pub fn note_go_live_failure(&self, e: &LouverError) {
+        self.logger
+            .warn(LogTarget::App, &format!("YOUTUBE_BROADCAST_LIVE 실패: {} ({})", e.message, e.code_str));
+    }
+
+    /// The broadcast this session provisioned, if any.
+    pub fn provisioned(&self) -> Option<ProvisionedBroadcast> {
+        self.live_session.lock().unwrap().clone()
+    }
+
+    /// Take the broadcast live once its stream is carrying video.
+    ///
+    /// Called from the broadcast loop after FFmpeg has connected. Returns true
+    /// once the broadcast is live, so the caller can stop asking. YouTube
+    /// refuses a transition while the stream is inactive, so the stream is
+    /// checked first rather than the error being retried.
+    pub fn try_go_live(&self) -> Result<bool> {
+        let Some(session) = self.provisioned() else { return Ok(true) };
+        if session.went_live {
+            return Ok(true);
+        }
+        let token = self.token()?;
+        let api = YoutubeApi::with_base(self.api_http.as_ref(), self.api_base());
+        let broadcast = api.broadcast_by_id(&token, &session.broadcast_id)?;
+        let stream = api.stream_by_id(&token, &session.stream_id)?;
+
+        let done = match provision::go_live_step(&broadcast, &stream) {
+            GoLive::WaitForStream => false,
+            GoLive::AlreadyLive => true,
+            GoLive::AutoStart => {
+                // YouTube does it; this only notices when it has happened.
+                false
+            }
+            GoLive::Transition => {
+                let after = api.transition_broadcast(&token, &session.broadcast_id, "live")?;
+                self.logger.info(
+                    LogTarget::App,
+                    &format!("YOUTUBE_BROADCAST_LIVE: 방송을 LIVE로 전환했습니다 ({})", after.id),
+                );
+                after.life_cycle_status == "live"
+            }
+        };
+        if done || broadcast.life_cycle_status == "live" {
+            if let Some(s) = self.live_session.lock().unwrap().as_mut() {
+                if !s.went_live {
+                    s.went_live = true;
+                    self.logger.info(
+                        LogTarget::App,
+                        &format!("YOUTUBE_BROADCAST_LIVE: {} 가 LIVE입니다", s.broadcast_id),
+                    );
+                }
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// End the broadcast this session provisioned.
+    ///
+    /// Called when the window closes or the user stops. A broadcast left
+    /// `live` on the channel with nothing publishing to it is exactly the
+    /// stale state the next window would then try to reuse.
+    pub fn finish_broadcast(&self) {
+        let Some(session) = self.live_session.lock().unwrap().take() else { return };
+        if session.auto_start_stop && !session.went_live {
+            return; // never started; nothing on the channel to end
+        }
+        let ended = (|| -> Result<()> {
+            let token = self.token()?;
+            let api = YoutubeApi::with_base(self.api_http.as_ref(), self.api_base());
+            api.transition_broadcast(&token, &session.broadcast_id, "complete")?;
+            Ok(())
+        })();
+        match ended {
+            Ok(()) => self.logger.info(
+                LogTarget::App,
+                &format!("YOUTUBE_BROADCAST_COMPLETE: 방송을 종료했습니다 ({})", session.broadcast_id),
+            ),
+            // autoStop may already have ended it, which is a success reported
+            // as an error. Worth a line, never worth failing a stop over.
+            Err(e) => self.logger.warn(
+                LogTarget::App,
+                &format!("YOUTUBE_BROADCAST_COMPLETE 실패: {} ({})", e.message, e.code_str),
+            ),
+        }
     }
 
     /// Find whatever broadcast is on air, for the UI to show.
@@ -564,12 +778,18 @@ impl YoutubeService {
     }
 
     pub fn prepare_for_broadcast(&self) -> Result<()> {
-        self.prepare_for_broadcast_reason(false)
+        self.prepare_for_broadcast_reason(false, None)
     }
 
-    /// `scheduled` picks which of the two policies above applies.
-    pub fn prepare_for_broadcast_reason(&self, scheduled: bool) -> Result<()> {
-        match self.prepare_inner() {
+    /// `scheduled` picks which of the two policies above applies; `window` is
+    /// the occurrence being started, so a created broadcast carries the right
+    /// scheduled start and end.
+    pub fn prepare_for_broadcast_reason(
+        &self,
+        scheduled: bool,
+        window: Option<(chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>,
+    ) -> Result<()> {
+        match self.prepare_inner(window) {
             Ok(()) => Ok(()),
             Err(e) if scheduled && !self.schedule_holds_on_failure() => {
                 // Recorded, never silent: the dashboard shows 적용 실패 and the
@@ -588,7 +808,10 @@ impl YoutubeService {
         }
     }
 
-    fn prepare_inner(&self) -> Result<()> {
+    fn prepare_inner(
+        &self,
+        window: Option<(chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>,
+    ) -> Result<()> {
         if !self.apply_on_start_wanted() {
             self.set_apply_state(MetadataApplyState::default());
             return Ok(());
@@ -642,7 +865,12 @@ impl YoutubeService {
             ..Default::default()
         });
 
-        match self.apply_metadata(&meta) {
+        // Provision rather than require. The old path opened with
+        // `active_broadcast`, so a scheduled window that arrived with nothing
+        // on the channel — the normal case — failed with "make a live
+        // broadcast in YouTube first" and never started FFmpeg at all.
+        let (start, end) = window.unwrap_or((chrono::Utc::now(), None));
+        match self.provision_broadcast(&meta, start, end) {
             Ok(out) => {
                 *self.applied_this_session.lock().unwrap() = true;
                 let all = out.verification.all_applied();

@@ -30,6 +30,55 @@ pub struct LiveBroadcast {
     pub active_live_chat_id: Option<String>,
     /// `created` / `ready` / `testing` / `live` / `complete`.
     pub life_cycle_status: String,
+    /// The ingestion stream this broadcast is bound to, once it is bound.
+    /// Checked rather than assumed: binding the wrong stream produces a
+    /// broadcast that never goes live and says nothing about why.
+    pub bound_stream_id: Option<String>,
+    pub scheduled_start_time: Option<String>,
+    /// True when YouTube takes the broadcast live and ends it by itself once
+    /// the ingestion stream starts and stops.
+    pub enable_auto_start: bool,
+    pub enable_auto_stop: bool,
+}
+
+/// One of the channel's ingestion endpoints.
+///
+/// The stream key lives in `ingestion_key`, which is why this type never
+/// leaves the process: it is matched against the saved key in memory and then
+/// dropped. Nothing here is logged, stored or shown.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LiveStream {
+    pub id: String,
+    pub title: String,
+    /// `active` / `inactive` / `ready` / `error`.
+    pub stream_status: String,
+    ingestion_key: String,
+}
+
+/// Hand-written so `{:?}` cannot print the stream key.
+impl std::fmt::Debug for LiveStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveStream")
+            .field("id", &self.id)
+            .field("title", &self.title)
+            .field("stream_status", &self.stream_status)
+            .field("ingestion_key", &"<redacted>")
+            .finish()
+    }
+}
+
+impl LiveStream {
+    /// Is this the endpoint the saved stream key publishes to?
+    ///
+    /// A comparison and nothing else: the key is never returned, logged or
+    /// written down, here or anywhere the result of this travels.
+    pub fn matches_key(&self, stream_key: &str) -> bool {
+        !self.ingestion_key.is_empty() && self.ingestion_key == stream_key.trim()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.stream_status == "active"
+    }
 }
 
 impl LiveBroadcast {
@@ -132,6 +181,112 @@ impl<'a> YoutubeApi<'a> {
             .and_then(|i| i.first())
             .map(parse_broadcast)
             .ok_or_else(|| LouverError::new(ErrorCode::YoutubeNoActiveBroadcast))
+    }
+
+    /// Broadcasts that have not started yet, newest schedule first.
+    ///
+    /// Used to reuse one this app created earlier for the same window rather
+    /// than making a second. `mine=true` so another channel's broadcasts can
+    /// never be picked up.
+    pub fn upcoming_broadcasts(&self, token: &str) -> Result<Vec<LiveBroadcast>> {
+        let path = "/liveBroadcasts?part=id,snippet,status,contentDetails&broadcastStatus=upcoming&broadcastType=all&mine=true&maxResults=25";
+        let v = self.call("GET", path, token, None)?;
+        Ok(v["items"].as_array().map(|i| i.iter().map(parse_broadcast).collect()).unwrap_or_default())
+    }
+
+    /// Create the broadcast for a scheduled window.
+    ///
+    /// `enableAutoStart` and `enableAutoStop` are asked for so that YouTube
+    /// takes the broadcast live when the ingestion stream starts and ends it
+    /// when the stream stops. The explicit transition is still implemented —
+    /// see [`Self::transition_broadcast`] — because a channel or a broadcast
+    /// type that will not auto-start has to work too.
+    pub fn create_broadcast(
+        &self,
+        token: &str,
+        meta: &BroadcastMetadata,
+        scheduled_start: &str,
+        scheduled_end: Option<&str>,
+        auto_start_stop: bool,
+    ) -> Result<LiveBroadcast> {
+        let mut snippet = serde_json::json!({
+            "title": meta.title,
+            "description": meta.description,
+            "scheduledStartTime": scheduled_start,
+        });
+        if let Some(end) = scheduled_end {
+            snippet["scheduledEndTime"] = serde_json::Value::String(end.to_string());
+        }
+        let body = serde_json::json!({
+            "snippet": snippet,
+            "status": {
+                "privacyStatus": meta.privacy.as_api(),
+                // Required by YouTube on insert; a music playlist stream is
+                // not made for kids, and saying so is what keeps live chat
+                // available at all.
+                "selfDeclaredMadeForKids": false,
+            },
+            "contentDetails": {
+                "enableAutoStart": auto_start_stop,
+                "enableAutoStop": auto_start_stop,
+                "enableDvr": true,
+                "recordFromStart": true,
+            },
+        });
+        let v =
+            self.call("POST", "/liveBroadcasts?part=id,snippet,status,contentDetails", token, Some(body))?;
+        Ok(parse_broadcast(&v))
+    }
+
+    /// The channel's ingestion endpoints, with their keys.
+    ///
+    /// The keys are in the response, which is why the result is matched in
+    /// memory and dropped. Nothing here reaches a log or the database.
+    pub fn my_streams(&self, token: &str) -> Result<Vec<LiveStream>> {
+        let path = "/liveStreams?part=id,snippet,cdn,status&mine=true&maxResults=50";
+        let v = self.call("GET", path, token, None)?;
+        Ok(v["items"].as_array().map(|i| i.iter().map(parse_stream).collect()).unwrap_or_default())
+    }
+
+    /// One stream, to check whether it has started receiving video.
+    pub fn stream_by_id(&self, token: &str, stream_id: &str) -> Result<LiveStream> {
+        let path = format!("/liveStreams?part=id,snippet,cdn,status&id={stream_id}");
+        let v = self.call("GET", &path, token, None)?;
+        v["items"]
+            .as_array()
+            .and_then(|i| i.first())
+            .map(parse_stream)
+            .ok_or_else(|| LouverError::with_detail(ErrorCode::YoutubeApiFailed, "스트림을 찾지 못했습니다"))
+    }
+
+    /// Attach a broadcast to the ingestion stream it should take video from.
+    ///
+    /// Returns the broadcast as Google reports it afterwards, so the caller
+    /// can check `bound_stream_id` rather than trust the 200.
+    pub fn bind_broadcast(&self, token: &str, broadcast_id: &str, stream_id: &str) -> Result<LiveBroadcast> {
+        let path = format!(
+            "/liveBroadcasts/bind?id={broadcast_id}&streamId={stream_id}&part=id,snippet,status,contentDetails"
+        );
+        let v = self.call("POST", &path, token, None)?;
+        Ok(parse_broadcast(&v))
+    }
+
+    /// Move a broadcast to `testing`, `live` or `complete`.
+    ///
+    /// YouTube refuses `live` while the bound stream is inactive, so the
+    /// caller checks the stream first; asking anyway produces an error that
+    /// reads like a permissions problem and is not one.
+    pub fn transition_broadcast(
+        &self,
+        token: &str,
+        broadcast_id: &str,
+        status: &str,
+    ) -> Result<LiveBroadcast> {
+        let path = format!(
+            "/liveBroadcasts/transition?id={broadcast_id}&broadcastStatus={status}&part=id,snippet,status,contentDetails"
+        );
+        let v = self.call("POST", &path, token, None)?;
+        Ok(parse_broadcast(&v))
     }
 
     /// Set title, description and privacy on the broadcast.
@@ -346,6 +501,7 @@ pub fn verify_metadata(
 }
 
 fn parse_broadcast(item: &serde_json::Value) -> LiveBroadcast {
+    let text = |v: &serde_json::Value| v.as_str().filter(|s| !s.is_empty()).map(str::to_string);
     LiveBroadcast {
         id: item["id"].as_str().unwrap_or_default().to_string(),
         title: item["snippet"]["title"].as_str().unwrap_or_default().to_string(),
@@ -356,6 +512,26 @@ fn parse_broadcast(item: &serde_json::Value) -> LiveBroadcast {
             .filter(|s| !s.is_empty())
             .map(str::to_string),
         life_cycle_status: item["status"]["lifeCycleStatus"].as_str().unwrap_or_default().to_string(),
+        bound_stream_id: text(&item["contentDetails"]["boundStreamId"]),
+        scheduled_start_time: text(&item["snippet"]["scheduledStartTime"]),
+        enable_auto_start: item["contentDetails"]["enableAutoStart"].as_bool().unwrap_or(false),
+        enable_auto_stop: item["contentDetails"]["enableAutoStop"].as_bool().unwrap_or(false),
+    }
+}
+
+/// Build a [`LiveStream`] from a Google-shaped item. Tests use it so the
+/// private ingestion key is populated the way a real response populates it.
+#[cfg(test)]
+pub fn parse_stream_for_tests(item: &serde_json::Value) -> LiveStream {
+    parse_stream(item)
+}
+
+fn parse_stream(item: &serde_json::Value) -> LiveStream {
+    LiveStream {
+        id: item["id"].as_str().unwrap_or_default().to_string(),
+        title: item["snippet"]["title"].as_str().unwrap_or_default().to_string(),
+        stream_status: item["status"]["streamStatus"].as_str().unwrap_or_default().to_string(),
+        ingestion_key: item["cdn"]["ingestionInfo"]["streamName"].as_str().unwrap_or_default().to_string(),
     }
 }
 

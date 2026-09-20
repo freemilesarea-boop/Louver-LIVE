@@ -682,3 +682,203 @@ fn a_days_worth_of_chat_fits_inside_the_free_allowance() {
     assert!(!s.exhausted);
     assert!(s.spent < FREE_DAILY_UNITS - RESERVE_UNITS, "spent {} units", s.spent);
 }
+
+// --- provisioning a broadcast for a scheduled window ------------------------
+
+const NO_UPCOMING: &str = r#"{"items":[]}"#;
+
+fn created_broadcast(id: &str, start: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","snippet":{{"title":"COLORIST","scheduledStartTime":"{start}"}},
+        "status":{{"privacyStatus":"unlisted","lifeCycleStatus":"created"}},
+        "contentDetails":{{"enableAutoStart":true,"enableAutoStop":true}}}}"#
+    )
+}
+
+const MY_STREAMS: &str = r#"{"items":[
+  {"id":"s-other","snippet":{"title":"Old"},"status":{"streamStatus":"inactive"},
+   "cdn":{"ingestionInfo":{"streamName":"wrong-key-0000"}}},
+  {"id":"s-mine","snippet":{"title":"Main"},"status":{"streamStatus":"inactive"},
+   "cdn":{"ingestionInfo":{"streamName":"abcd-efgh-ijkl-mnop"}}}
+]}"#;
+
+#[test]
+fn an_empty_channel_gets_a_broadcast_created_and_bound() {
+    // The reported failure, end to end: a scheduled window arrives, the
+    // channel has nothing on it, and the app builds what it needs rather than
+    // telling a sleeping user to open YouTube Studio.
+    let bound = r#"{"id":"b-new","snippet":{"title":"COLORIST","scheduledStartTime":"2026-09-20T11:58:00Z"},
+        "status":{"privacyStatus":"unlisted","lifeCycleStatus":"ready"},
+        "contentDetails":{"boundStreamId":"s-mine","enableAutoStart":true}}"#;
+    let fake = FakeYoutube::start(vec![
+        ("GET /liveBroadcasts", 200, NO_UPCOMING.into()),
+        ("POST /liveBroadcasts/bind", 200, bound.into()),
+        ("POST /liveBroadcasts", 200, created_broadcast("b-new", "2026-09-20T11:58:00Z")),
+        ("GET /liveStreams", 200, MY_STREAMS.into()),
+    ]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    // 1. nothing upcoming
+    let upcoming = api.upcoming_broadcasts("tok").unwrap();
+    assert!(upcoming.is_empty());
+
+    // 2. create it for this window
+    let created = api
+        .create_broadcast("tok", &meta(), "2026-09-20T11:58:00Z", Some("2026-09-20T12:00:00Z"), true)
+        .unwrap();
+    assert_eq!(created.id, "b-new");
+
+    let insert = fake
+        .requests()
+        .into_iter()
+        .find(|r| r.method == "POST" && r.path.contains("liveBroadcasts?"))
+        .unwrap();
+    assert_eq!(insert.body["snippet"]["title"], meta().title);
+    assert_eq!(insert.body["snippet"]["scheduledStartTime"], "2026-09-20T11:58:00Z");
+    assert_eq!(insert.body["snippet"]["scheduledEndTime"], "2026-09-20T12:00:00Z");
+    assert_eq!(insert.body["status"]["privacyStatus"], "public");
+    assert_eq!(insert.body["contentDetails"]["enableAutoStart"], true);
+    assert_eq!(insert.body["contentDetails"]["enableAutoStop"], true);
+
+    // 3. bind it to the endpoint the saved key publishes to — not the first
+    //    stream, which would leave YouTube waiting for video forever.
+    let streams = api.my_streams("tok").unwrap();
+    let mine = louver_core::youtube::provision::stream_for_key(&streams, "abcd-efgh-ijkl-mnop").unwrap();
+    assert_eq!(mine.id, "s-mine");
+
+    let after = api.bind_broadcast("tok", &created.id, &mine.id).unwrap();
+    louver_core::youtube::provision::verify_bound(&after, "s-mine").unwrap();
+
+    let bind_req = fake.requests().into_iter().find(|r| r.path.contains("/bind")).unwrap();
+    assert!(bind_req.path.contains("id=b-new"), "{}", bind_req.path);
+    assert!(bind_req.path.contains("streamId=s-mine"), "{}", bind_req.path);
+}
+
+#[test]
+fn the_stream_key_never_reaches_the_wire_as_a_query_or_a_body() {
+    // The key is matched in memory. It must not turn up in a URL, a body or
+    // anything the fake recorded.
+    let fake = FakeYoutube::start(vec![("GET /liveStreams", 200, MY_STREAMS.into())]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    let streams = api.my_streams("tok").unwrap();
+    assert_eq!(
+        louver_core::youtube::provision::stream_for_key(&streams, "abcd-efgh-ijkl-mnop").unwrap().id,
+        "s-mine"
+    );
+
+    for r in fake.requests() {
+        assert!(!r.path.contains("abcd-efgh-ijkl-mnop"), "key in path: {}", r.path);
+        assert!(!r.body.to_string().contains("abcd-efgh-ijkl-mnop"), "key in body");
+    }
+}
+
+#[test]
+fn a_broadcast_already_prepared_for_the_window_is_reused_not_duplicated() {
+    // A retry inside the window must not leave two broadcasts on the channel.
+    let existing = r#"{"items":[{"id":"b-existing",
+        "snippet":{"title":"COLORIST","scheduledStartTime":"2026-09-20T11:58:00Z"},
+        "status":{"privacyStatus":"unlisted","lifeCycleStatus":"ready"},
+        "contentDetails":{"boundStreamId":"s-mine","enableAutoStart":true}}]}"#;
+    let fake = FakeYoutube::start(vec![("GET /liveBroadcasts", 200, existing.into())]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    let upcoming = api.upcoming_broadcasts("tok").unwrap();
+    let window =
+        chrono::DateTime::parse_from_rfc3339("2026-09-20T11:59:30Z").unwrap().with_timezone(&chrono::Utc);
+    match louver_core::youtube::provision::choose_broadcast(
+        &upcoming,
+        window,
+        louver_core::youtube::provision::REUSE_TOLERANCE_SECS,
+    ) {
+        louver_core::youtube::provision::BroadcastChoice::Reuse(b) => {
+            assert_eq!(b.id, "b-existing");
+            // Already bound, so no second bind call is needed either.
+            assert_eq!(b.bound_stream_id.as_deref(), Some("s-mine"));
+        }
+        other => panic!("should have reused: {other:?}"),
+    }
+    // And nothing was created.
+    assert!(fake.requests().iter().all(|r| r.method == "GET"));
+}
+
+#[test]
+fn the_transition_waits_for_the_stream_and_then_asks() {
+    use louver_core::youtube::provision::{go_live_step, GoLive};
+    let inactive = r#"{"items":[{"id":"s-mine","snippet":{"title":"Main"},
+        "status":{"streamStatus":"inactive"},"cdn":{"ingestionInfo":{"streamName":"k"}}}]}"#;
+    let fake = FakeYoutube::start(vec![
+        ("GET /liveStreams", 200, inactive.into()),
+        (
+            "GET /liveBroadcasts",
+            200,
+            r#"{"items":[{"id":"b1","snippet":{},
+            "status":{"privacyStatus":"unlisted","lifeCycleStatus":"ready"},
+            "contentDetails":{"boundStreamId":"s-mine","enableAutoStart":false}}]}"#
+                .into(),
+        ),
+    ]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    let b = api.broadcast_by_id("tok", "b1").unwrap();
+    let s = api.stream_by_id("tok", "s-mine").unwrap();
+    // FFmpeg has not connected yet: asking YouTube to go live now is refused
+    // with an error that reads like a permissions problem.
+    assert_eq!(go_live_step(&b, &s), GoLive::WaitForStream);
+}
+
+#[test]
+fn the_transition_carries_the_broadcast_id_and_the_target_status() {
+    let live = r#"{"id":"b1","snippet":{},"status":{"privacyStatus":"unlisted","lifeCycleStatus":"live"},
+        "contentDetails":{"boundStreamId":"s-mine"}}"#;
+    let fake = FakeYoutube::start(vec![("POST /liveBroadcasts/transition", 200, live.into())]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    let after = api.transition_broadcast("tok", "b1", "live").unwrap();
+    assert_eq!(after.life_cycle_status, "live");
+
+    let req = &fake.requests()[0];
+    assert!(req.path.contains("id=b1"), "{}", req.path);
+    assert!(req.path.contains("broadcastStatus=live"), "{}", req.path);
+}
+
+#[test]
+fn ending_a_window_completes_the_broadcast() {
+    let done = r#"{"id":"b1","snippet":{},"status":{"privacyStatus":"unlisted","lifeCycleStatus":"complete"},
+        "contentDetails":{}}"#;
+    let fake = FakeYoutube::start(vec![("POST /liveBroadcasts/transition", 200, done.into())]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    let after = api.transition_broadcast("tok", "b1", "complete").unwrap();
+    assert_eq!(after.life_cycle_status, "complete");
+    // A broadcast left `live` with nothing publishing to it is exactly the
+    // stale state the next window would try to reuse.
+    assert!(fake.requests()[0].path.contains("broadcastStatus=complete"));
+}
+
+#[test]
+fn provisioning_costs_what_the_quota_table_says() {
+    use louver_core::youtube::quota::ApiMethod;
+    // The whole scheduled start, priced: list upcoming (1), insert (50),
+    // list streams (1), bind (50), then the metadata apply. Worth knowing
+    // because it runs on every scheduled window, every day.
+    let per_start = ApiMethod::LiveBroadcastsList.units()
+        + ApiMethod::LiveBroadcastsInsert.units()
+        + ApiMethod::LiveStreamsList.units()
+        + ApiMethod::LiveBroadcastsBind.units()
+        + ApiMethod::LiveBroadcastsUpdate.units()
+        + ApiMethod::VideosList.units() * 2
+        + ApiMethod::VideosUpdate.units()
+        + ApiMethod::LiveBroadcastsList.units()
+        + ApiMethod::LiveBroadcastsTransition.units() * 2;
+    assert_eq!(per_start, 305);
+    // Even one scheduled start an hour, all day, stays inside the free
+    // allowance with room for the chat bot.
+    assert!(per_start * 24 < FREE_DAILY_UNITS - RESERVE_UNITS, "{}", per_start * 24);
+}

@@ -127,6 +127,21 @@ export interface RuntimeStatus {
   cycle_duration_secs: number
   /** Why the last start attempt failed. Cleared by the next successful start. */
   last_start_error?: LouverError | null
+  /**
+   * The scheduled window that is open right now, whether or not it is
+   * broadcasting yet — so the dashboard can never say "예약된 방송이 없습니다"
+   * while the schedule page says the window is open.
+   */
+  active_occurrence?: OccurrenceStatus | null
+}
+
+export interface OccurrenceStatus {
+  start: string
+  end: string
+  playlist_id: number
+  phase: 'preparing' | 'live' | 'stopping'
+  retry_in_secs?: number | null
+  attempts: number
 }
 
 export interface StreamDiagnostics {

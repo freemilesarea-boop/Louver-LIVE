@@ -989,3 +989,47 @@ describe('the schedule list', () => {
     expect(screen.queryByText(/지금 방송 시간입니다/)).not.toBeInTheDocument()
   })
 })
+
+describe('an open scheduled window', () => {
+  it('is reported on the dashboard even before anything is broadcasting', async () => {
+    // §8: the reported contradiction — the schedule page saying the window is
+    // open while the dashboard said there was no scheduled broadcast at all.
+    mount({ occurrenceOpen: { start: '2026-09-20 20:58', end: '2026-09-20 21:00', phase: 'preparing' } })
+    await screen.findByRole('button', { name: '대시보드' })
+
+    const row = await screen.findByTestId('active-occurrence')
+    expect(within(row).getByText(/20:58/)).toBeInTheDocument()
+    expect(within(row).getByText(/21:00/)).toBeInTheDocument()
+    expect(within(row).getByText(/시작 준비 중/)).toBeInTheDocument()
+    expect(screen.queryByText('예약된 방송이 없습니다')).not.toBeInTheDocument()
+  })
+
+  it('says when the next attempt is, rather than looking idle', async () => {
+    mount({
+      occurrenceOpen: { start: '2026-09-20 20:58', end: '2026-09-20 21:10', phase: 'preparing', retryInSecs: 5 },
+    })
+    await screen.findByRole('button', { name: '대시보드' })
+
+    // §9: a window that failed once is retrying inside itself, not waiting
+    // for tomorrow, and the screen says so.
+    const row = await screen.findByTestId('active-occurrence')
+    expect(within(row).getByText(/5초 후 재시도/)).toBeInTheDocument()
+    expect(within(row).getByText(/1회째/)).toBeInTheDocument()
+  })
+
+  it('reads LIVE once the broadcast is running', async () => {
+    const user = userEvent.setup()
+    mount({ occurrenceOpen: { start: '2026-09-20 20:58', end: '2026-09-20 21:00', phase: 'preparing' } })
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
+    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
+    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+    await waitFor(() => {
+      expect(within(screen.getByTestId('active-occurrence')).getByText('LIVE')).toBeInTheDocument()
+    })
+  })
+})

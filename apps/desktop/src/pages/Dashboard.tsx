@@ -117,11 +117,26 @@ export function Dashboard() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-lg font-semibold text-ink-100">대시보드</h1>
-          <p className="mt-1 text-xs text-ink-500">
-            {status?.next_scheduled_start
-              ? `다음 예약 방송: ${status.next_scheduled_start}`
-              : '예약된 방송이 없습니다'}
-          </p>
+          {/* An open window is reported here whatever the stream is doing.
+              "지금 방송 시간입니다" on the schedule page beside "예약된 방송이
+              없습니다" here is what a held start used to look like. */}
+          {status?.active_occurrence ? (
+            <p className="mt-1 text-xs text-ok" data-testid="active-occurrence">
+              예약 방송 {status.active_occurrence.start.slice(11)} → {status.active_occurrence.end.slice(11)}
+              <span className="ml-2 text-ink-400">
+                {status.active_occurrence.phase === 'live' ? 'LIVE'
+                  : status.active_occurrence.retry_in_secs != null
+                    ? `시작 준비 중 · ${status.active_occurrence.retry_in_secs}초 후 재시도 (${status.active_occurrence.attempts}회째)`
+                    : '시작 준비 중'}
+              </span>
+            </p>
+          ) : (
+            <p className="mt-1 text-xs text-ink-500">
+              {status?.next_scheduled_start
+                ? `다음 예약 방송: ${status.next_scheduled_start}`
+                : '예약된 방송이 없습니다'}
+            </p>
+          )}
           {/* A start that failed used to leave this screen reading OFFLINE with
               nothing to say for itself. */}
           {status?.last_start_error && (

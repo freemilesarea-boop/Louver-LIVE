@@ -39,6 +39,9 @@ const TICK: Duration = Duration::from_secs(1);
 fn youtube_follow_broadcast(state: &AppState, live: bool, broadcasting: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WORKING: AtomicBool = AtomicBool::new(false);
+    /// One transition attempt at a time; the tick runs every second and the
+    /// stream can take a while to register as active.
+    static GOING_LIVE: AtomicBool = AtomicBool::new(false);
 
     if !live {
         if state.youtube.bot_broadcast_id().is_some() {
@@ -49,6 +52,14 @@ fn youtube_follow_broadcast(state: &AppState, live: bool, broadcasting: bool) {
         // record of what happened to the metadata the moment the stream went
         // into RECONNECTING, which is exactly when the user goes looking.
         if !broadcasting {
+            // End the broadcast on the channel too, so nothing is left `live`
+            // with nothing publishing to it — which is exactly the stale state
+            // the next window would try to reuse. Off the tick, because it
+            // calls Google.
+            if state.youtube.provisioned().is_some() {
+                let youtube = std::sync::Arc::clone(&state.youtube);
+                std::thread::spawn(move || youtube.finish_broadcast());
+            }
             state.youtube.reset_live_session();
         }
         return;
@@ -57,6 +68,22 @@ fn youtube_follow_broadcast(state: &AppState, live: bool, broadcasting: bool) {
         return;
     }
 
+    // Take the provisioned broadcast live, now that FFmpeg is publishing and
+    // YouTube's ingestion stream has something to report. Asking before the
+    // stream is active is refused, so `try_go_live` checks the stream first.
+    if state.youtube.provisioned().is_some_and(|p| !p.went_live) {
+        if GOING_LIVE.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let youtube = std::sync::Arc::clone(&state.youtube);
+        std::thread::spawn(move || {
+            if let Err(e) = youtube.try_go_live() {
+                youtube.note_go_live_failure(&e);
+            }
+            GOING_LIVE.store(false, Ordering::SeqCst);
+        });
+        return;
+    }
     if !state.youtube.chat_settings().enabled || state.youtube.bot_is_running() {
         return;
     }
@@ -94,7 +121,12 @@ impl louver_core::runtime::PreStartHook for YoutubePreStart {
         // A manual start can be asked what to do about a failure; a scheduled
         // one cannot, so it follows the policy set in advance.
         let scheduled = opts.reason != louver_core::runtime::StartReason::Manual;
-        self.0.prepare_for_broadcast_reason(scheduled)
+        // The window a created broadcast is scheduled for. A manual start has
+        // none and uses now, which is what it is.
+        let window = opts.occurrence.as_ref().map(|o| {
+            (louver_core::runtime::local_to_utc(o.start), Some(louver_core::runtime::local_to_utc(o.end)))
+        });
+        self.0.prepare_for_broadcast_reason(scheduled, window)
     }
 }
 

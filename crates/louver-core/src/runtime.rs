@@ -93,6 +93,27 @@ pub struct RuntimeStatus {
     /// successful start. Without this a scheduled start that failed left the
     /// dashboard reading OFFLINE with nothing to say for itself.
     pub last_start_error: Option<LouverError>,
+    /// The scheduled window that is open right now, whether or not it is
+    /// broadcasting yet.
+    ///
+    /// Reported separately from the running session so the dashboard cannot
+    /// say "예약된 방송이 없습니다" while the schedule page says the window is
+    /// open — which is what a held start used to look like.
+    pub active_occurrence: Option<OccurrenceStatus>,
+}
+
+/// The scheduled window that is open now, and how far its broadcast has got.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OccurrenceStatus {
+    pub start: String,
+    pub end: String,
+    pub playlist_id: i64,
+    /// `preparing` while a start is owed or being retried, `live` once the
+    /// broadcast is running, `stopping` once the window has closed.
+    pub phase: String,
+    /// Seconds until the next start attempt, when one is pending.
+    pub retry_in_secs: Option<u64>,
+    pub attempts: u32,
 }
 
 impl RuntimeStatus {
@@ -192,12 +213,6 @@ pub struct StreamDiagnostics {
     pub local_test_sink: LocalTestSink,
 }
 
-/// How long to wait before retrying a scheduled start that failed.
-///
-/// Long enough that a broken schedule does not fill the log, short enough that
-/// fixing the cause during the window still gets a broadcast out of it.
-const SCHEDULE_RETRY: Duration = Duration::from_secs(60);
-
 /// Video-encoder arguments that must never appear in a stream-copy command.
 const VIDEO_ENCODER_MARKERS: &[&str] = &[
     "-c:v",
@@ -295,13 +310,15 @@ pub struct BroadcastRuntime {
     /// leaving the dashboard reading OFFLINE with no explanation.
     last_start_error: Option<LouverError>,
     pre_start: Option<Arc<dyn PreStartHook>>,
-    /// The scheduled occurrence whose start failed, and when to try it again.
+    /// The scheduled occurrence whose start failed, how many times, and when
+    /// to try it again.
     ///
     /// The tick runs once a second; without this a schedule pointing at an
     /// empty playlist would attempt — and log — a failed start every second
-    /// for the length of the window. Retrying is still wanted, because the
-    /// user may add a video mid-window and expect the broadcast to pick up.
-    failed_occurrence: Option<(Occurrence, Instant)>,
+    /// for the length of the window. Retrying is still wanted, and quickly at
+    /// first: a window whose first attempt hit a transient API error should
+    /// recover inside it rather than waiting for tomorrow.
+    failed_occurrence: Option<(Occurrence, Instant, u32)>,
 }
 
 impl BroadcastRuntime {
@@ -401,7 +418,31 @@ impl BroadcastRuntime {
             next_scheduled_start: self.next_scheduled_start(),
             cycle_duration_secs: self.plan.as_ref().map(|p| p.total_duration_secs).unwrap_or(0.0),
             last_start_error: self.last_start_error.clone(),
+            active_occurrence: self.active_occurrence_status(),
         }
+    }
+
+    /// The open window and what is happening to it, for the dashboard.
+    fn active_occurrence_status(&self) -> Option<OccurrenceStatus> {
+        let now = self.clock.now_local();
+        let schedules = self.db.list_schedules().ok()?;
+        let o = self.occurrence.clone().filter(|o| o.contains(now)).or_else(|| {
+            schedules
+                .iter()
+                .filter_map(|s| crate::scheduler::active_occurrence(s, now))
+                .min_by_key(|o| o.start)
+        })?;
+
+        let running = self.is_active() && self.occurrence.as_ref() == Some(&o);
+        let pending = self.failed_occurrence.as_ref().filter(|(f, _, _)| f == &o);
+        Some(OccurrenceStatus {
+            start: o.start.format("%Y-%m-%d %H:%M").to_string(),
+            end: o.end.format("%Y-%m-%d %H:%M").to_string(),
+            playlist_id: o.playlist_id,
+            phase: if running { "live" } else { "preparing" }.to_string(),
+            retry_in_secs: pending.map(|(_, at, _)| at.saturating_duration_since(Instant::now()).as_secs()),
+            attempts: pending.map(|(_, _, n)| n + 1).unwrap_or(0),
+        })
     }
 
     fn next_scheduled_start(&self) -> Option<String> {
@@ -796,7 +837,7 @@ impl BroadcastRuntime {
                 // usual cause is something the user can fix without touching
                 // the schedule (add a video, enter the stream key), and the
                 // window should pick up as soon as they do.
-                if let Some((failed, next_try)) = &self.failed_occurrence {
+                if let Some((failed, next_try, _)) = &self.failed_occurrence {
                     if failed == &occurrence && Instant::now() < *next_try {
                         return;
                     }
@@ -823,8 +864,8 @@ impl BroadcastRuntime {
     /// Clear the retry delay on the window that failed, for tests and for a
     /// user action that plainly changed the cause (adding videos, saving a key).
     pub fn retry_failed_occurrence_now(&mut self) {
-        if let Some((o, _)) = self.failed_occurrence.take() {
-            self.failed_occurrence = Some((o, Instant::now()));
+        if let Some((o, _, n)) = self.failed_occurrence.take() {
+            self.failed_occurrence = Some((o, Instant::now(), n));
         }
     }
 
@@ -840,9 +881,20 @@ impl BroadcastRuntime {
             skip_pre_start: false,
         };
         match self.start(opts) {
-            // `start` has already logged and rolled the state machine back to
-            // ERROR; all that is left is to space out the retry.
-            Err(_) => self.failed_occurrence = Some((occurrence.clone(), Instant::now() + SCHEDULE_RETRY)),
+            // `start` has already logged and rolled the state machine back;
+            // all that is left is to space out the retry. 5s, 10s, 20s, then
+            // 30s for the rest of the window — bounded, never a spin, and
+            // never a jump to tomorrow while the window is still open.
+            Err(_) => {
+                let attempt = self
+                    .failed_occurrence
+                    .as_ref()
+                    .filter(|(o, _, _)| o == occurrence)
+                    .map(|(_, _, n)| n + 1)
+                    .unwrap_or(0);
+                let delay = Duration::from_secs(crate::youtube::provision::retry_delay_secs(attempt));
+                self.failed_occurrence = Some((occurrence.clone(), Instant::now() + delay, attempt));
+            }
             Ok(()) => self.failed_occurrence = None,
         }
     }
