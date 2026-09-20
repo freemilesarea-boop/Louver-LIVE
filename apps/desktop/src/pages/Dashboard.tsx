@@ -273,11 +273,20 @@ export function Dashboard() {
               <Button size="sm" onClick={() => setPage('settings')}>설정에서 연결하기</Button>
             </div>
           ) : applyState?.stage === 'quota_exhausted' ? (
-            <p className="text-xs text-warn" data-testid="metadata-quota">
-              오늘 쓸 수 있는 YouTube 무료 사용량을 모두 썼습니다. 제목·설명·태그 적용과
-              자동 채팅은 사용량이 초기화되면 다시 동작합니다.
-              <span className="text-ink-400"> 영상 송출은 영향을 받지 않습니다. 추가 요금은 발생하지 않습니다.</span>
-            </p>
+            <div data-testid="metadata-quota">
+              <p className="text-xs text-warn">
+                무료 API 사용량이 소진되었습니다.
+                고급 YouTube 기능은 다음 초기화 후 다시 사용할 수 있습니다.
+                영상 방송에는 영향을 주지 않습니다.
+              </p>
+              {/* Stated as what it is — a consequence of the operating policy
+                  in YOUTUBE_OAUTH_PRODUCTION.md §0, not a claim about Google's
+                  pricing. The project carries no billing account, so there is
+                  nothing for a spent quota to bill against. */}
+              <p className="mt-1 text-[11px] text-ink-500">
+                Louver Live는 유료 Google Cloud 서비스를 사용하지 않으므로 추가 요금이 발생하지 않습니다.
+              </p>
+            </div>
           ) : applyState?.stage === 'skipped' ? (
             <div className="flex flex-wrap items-center justify-between gap-3" data-testid="metadata-skipped">
               <p className="text-xs text-ink-400">

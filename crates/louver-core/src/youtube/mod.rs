@@ -18,7 +18,7 @@ pub use api::{ChannelInfo, HttpClient, LiveBroadcast, YoutubeApi};
 pub use chat::{ChatMessage, ChatOrder, ChatSettings, ChatState, ChatStatus, MIN_INTERVAL_SECS};
 pub use metadata::{BroadcastMetadata, Privacy, CATEGORIES};
 pub use oauth::{ClientCredentials, TokenStore};
-pub use quota::{MeteredClient, QuotaGuard, QuotaState, FREE_DAILY_UNITS};
+pub use quota::{ApiMethod, MeteredClient, QuotaGuard, QuotaState, FREE_DAILY_UNITS};
 
 /// Settings keys this module owns.
 pub mod keys {

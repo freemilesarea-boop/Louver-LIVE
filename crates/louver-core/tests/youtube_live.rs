@@ -510,7 +510,9 @@ fn a_refusal_is_reported_in_googles_own_words() {
 
 // --- staying inside the free quota ------------------------------------------
 
-use louver_core::youtube::quota::{MeteredClient, QuotaGuard, QuotaState, FREE_DAILY_UNITS, RESERVE_UNITS};
+use louver_core::youtube::quota::{
+    ApiMethod, MeteredClient, QuotaGuard, QuotaState, FREE_DAILY_UNITS, RESERVE_UNITS,
+};
 
 fn metered(inner: Arc<dyn HttpClient>, guard: Arc<QuotaGuard>) -> MeteredClient {
     MeteredClient::new(inner, guard)
@@ -538,7 +540,7 @@ fn the_day_stops_before_the_allowance_runs_out() {
     let nearly_spent = QuotaState {
         day: louver_core::youtube::quota::quota_day(chrono::Utc::now()),
         spent: FREE_DAILY_UNITS - RESERVE_UNITS,
-        exhausted: false,
+        ..Default::default()
     };
     let guard = Arc::new(QuotaGuard::new(nearly_spent, FREE_DAILY_UNITS, Box::new(|_| {})));
     let http = metered(Arc::new(client()) as Arc<dyn HttpClient>, Arc::clone(&guard));
@@ -594,12 +596,15 @@ fn a_days_worth_of_chat_fits_inside_the_free_allowance() {
     // whole day, on top of one metadata apply.
     let guard = Arc::new(QuotaGuard::unlimited_for_tests());
     for _ in 0..(24 * 3) {
-        guard.try_spend(louver_core::youtube::quota::cost_of("POST", "/liveChat/messages")).unwrap();
+        guard.try_spend(ApiMethod::LiveChatMessagesInsert).unwrap();
     }
-    for (m, p) in
-        [("GET", "/liveBroadcasts"), ("PUT", "/liveBroadcasts"), ("GET", "/videos"), ("PUT", "/videos")]
-    {
-        guard.try_spend(louver_core::youtube::quota::cost_of(m, p)).unwrap();
+    for m in [
+        ApiMethod::LiveBroadcastsList,
+        ApiMethod::LiveBroadcastsUpdate,
+        ApiMethod::VideosList,
+        ApiMethod::VideosUpdate,
+    ] {
+        guard.try_spend(m).unwrap();
     }
     let s = guard.snapshot();
     assert!(!s.exhausted);

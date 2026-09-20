@@ -905,8 +905,12 @@ describe('the YouTube side of a broadcast is reported on its own', () => {
     })
 
     const panel = await screen.findByTestId('metadata-quota')
-    expect(within(panel).getByText(/사용량이 초기화되면 다시 동작합니다/)).toBeInTheDocument()
-    expect(within(panel).getByText(/추가 요금은 발생하지 않습니다/)).toBeInTheDocument()
+    expect(within(panel).getByText(/무료 API 사용량이 소진되었습니다/)).toBeInTheDocument()
+    expect(within(panel).getByText(/다음 초기화 후 다시 사용할 수 있습니다/)).toBeInTheDocument()
+    expect(within(panel).getByText(/영상 방송에는 영향을 주지 않습니다/)).toBeInTheDocument()
+    // Stated as a consequence of the operating policy, not as a claim about
+    // Google's pricing.
+    expect(within(panel).getByText(/유료 Google Cloud 서비스를 사용하지 않으므로/)).toBeInTheDocument()
     expect(screen.getByText('오늘 사용량 초과')).toBeInTheDocument()
   })
 

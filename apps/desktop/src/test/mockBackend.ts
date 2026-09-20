@@ -652,6 +652,10 @@ export function createMockBackend(opts: MockOptions = {}) {
       cap: 10000,
       exhausted: Boolean(opts.youtubeQuotaExhausted),
       day: '2026-09-20',
+      buckets: [
+        { key: 'search.list', calls: 0, daily_calls: 100, exhausted: false },
+        { key: 'videos.insert', calls: 0, daily_calls: 100, exhausted: false },
+      ],
     }),
     youtube_schedule_holds: () => youtube.scheduleHolds,
     youtube_set_schedule_holds: (a: Record<string, unknown>) => {

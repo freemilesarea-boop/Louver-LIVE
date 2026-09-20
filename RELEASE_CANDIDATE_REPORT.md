@@ -477,9 +477,10 @@ hour leaves the rest of the day with no metadata and no chat.
 | Decision | Why |
 | --- | --- |
 | The meter is in the transport, not the call sites | `MeteredClient` wraps `HttpClient`, and it is the only path from this app to the Data API. The chat bot runs on its own thread and builds its own client — metering that separately is the kind of thing that gets missed |
-| Costs are deliberate over-estimates | Google's per-method table could not be fetched from this machine (`developers.google.com` is unreachable here), so it is read 1 / write 50 / search 100 with **anything unrecognised charged as a write**. Guessing low ends in a 403 mid-apply; guessing high stops early. Only one of those is safe |
-| 500 units held in reserve | The estimate is not trustworthy at the very end, so the app stops on its own terms with a message rather than on Google's 403 |
-| Google's `quotaExceeded` latches the day shut | Whatever the local count says. The estimate can be wrong; Google's answer cannot |
+| Costs come from a per-method table, not a read/write rule of thumb | `COSTS` in `youtube/quota.rs` is the 2026 table, supplied by the product owner from Google's official quota calculator. It could not be checked from this machine (`developers.google.com` is unreachable here), so it is **single-sourced** and that table is the one place to correct it. Anything unrecognised is charged as a write, because guessing low ends in a 403 mid-apply |
+| Two allowances, counted separately | Most methods draw on one pool of 10,000 units a day. `search.list` and `videos.insert` draw on **their own allowance of 100 calls a day at 1 unit each**. Pricing those as 100-unit writes is wrong twice over: it overstates what they take from the pool and says nothing about the limit that actually stops them. Neither is called today, and a test keeps it that way |
+| 200 units held in reserve | Enough to finish one metadata apply (103) and one chat message (50), so the app stops on its own terms rather than partway through changing a title |
+| Google's `quotaExceeded` latches the allowance shut | Whatever the local count says. A refusal on a bucketed method shuts that bucket alone; the shared pool is untouched and the rest of the app carries on |
 | The ledger survives a restart | A relaunch that started the count at zero would spend an allowance already gone |
 | Running out never stops the stream | Unlike every other refusal in the pre-start hook, quota returns `Ok`: the broadcast starts and the optional half waits for the reset. It is not something the user can fix, and it is not a reason to take a 24/7 channel off air |
 

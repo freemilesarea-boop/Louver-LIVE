@@ -60,6 +60,17 @@ pub struct QuotaReport {
     pub cap: u32,
     pub exhausted: bool,
     pub day: String,
+    /// Methods with their own daily allowance, counted in calls.
+    pub buckets: Vec<BucketReport>,
+}
+
+/// One method's own daily call allowance.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BucketReport {
+    pub key: String,
+    pub calls: u32,
+    pub daily_calls: u32,
+    pub exhausted: bool,
 }
 
 /// The result of one apply, including what Google says afterwards.
@@ -524,7 +535,19 @@ impl YoutubeService {
             spent: s.spent,
             cap: self.quota.cap(),
             exhausted: s.exhausted,
-            day: s.day,
+            day: s.day.clone(),
+            // Reported separately because they run out separately: a spent
+            // bucket leaves the shared pool untouched.
+            buckets: louver_core::youtube::quota::COSTS
+                .iter()
+                .filter_map(|(_, _, b)| *b)
+                .map(|b| BucketReport {
+                    key: b.key.to_string(),
+                    calls: s.bucket_calls_made(b),
+                    daily_calls: b.daily_calls,
+                    exhausted: s.bucket_is_exhausted(b),
+                })
+                .collect(),
         }
     }
 

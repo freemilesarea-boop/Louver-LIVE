@@ -336,6 +336,15 @@ export interface QuotaReport {
   cap: number
   exhausted: boolean
   day: string
+  /** Methods with their own daily allowance, counted in calls rather than units. */
+  buckets: BucketReport[]
+}
+
+export interface BucketReport {
+  key: string
+  calls: number
+  daily_calls: number
+  exhausted: boolean
 }
 
 /**
