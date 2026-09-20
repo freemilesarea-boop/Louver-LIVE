@@ -836,8 +836,27 @@ fn the_stream_does_not_start_when_the_metadata_could_not_be_applied() {
 
     assert_eq!(e.code_str, "LL-YOUTUBE-001");
     assert_eq!(h.launcher.launch_count(), 0, "FFmpeg must not have been launched");
-    assert_eq!(h.rt.state(), StreamState::Error, "and the runtime must not hang in PREPARING");
-    assert!(!h.rt.is_active());
+    assert!(!h.rt.is_active(), "and the runtime must not hang in PREPARING");
+
+    // But it is not an ERROR either. The broadcast engine is fine; YouTube
+    // would not take a title. Painting the dashboard red over that tells the
+    // user their broadcast is broken when it is not.
+    assert_ne!(h.rt.state(), StreamState::Error, "a metadata refusal is not an engine failure");
+    assert_eq!(h.rt.state(), StreamState::Idle);
+    assert!(h.rt.status().last_start_error.is_none(), "and nothing for the dashboard to show in red");
+}
+
+#[test]
+fn a_real_engine_failure_is_still_an_error() {
+    // The other side of the same line: no playlist to broadcast is the engine
+    // failing, and that does belong in red.
+    let mut h = harness(&format!("{MON} 17:17:00"));
+    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    empty_the_playlist(&h);
+
+    h.rt.tick();
+    assert_eq!(h.rt.state(), StreamState::Error);
+    assert_eq!(h.rt.status().last_start_error.unwrap().code_str, "LL-SCHED-004");
 }
 
 #[test]
@@ -938,8 +957,10 @@ fn an_unattended_window_holds_by_default_rather_than_going_out_wrong() {
 
     h.rt.tick();
     assert_eq!(h.launcher.launch_count(), 0, "nobody is there to be asked, so it does not go out");
-    assert_eq!(h.rt.state(), StreamState::Error);
-    assert_eq!(h.rt.status().last_start_error.unwrap().code_str, "LL-YOUTUBE-001");
+    // Held, not failed: the window is simply not broadcasting, and the reason
+    // lives in the YouTube panel rather than in a red dashboard.
+    assert_ne!(h.rt.state(), StreamState::Error);
+    assert!(h.rt.status().last_start_error.is_none());
 }
 
 #[test]
@@ -956,12 +977,14 @@ fn a_channel_that_would_rather_stay_on_air_can_say_so() {
 
 #[test]
 fn the_same_failure_is_not_logged_once_a_second_for_the_whole_window() {
+    // An engine failure, because that is the one the runtime logs; a metadata
+    // refusal is the hook's to report.
     let mut h = harness(&format!("{MON} 20:05:00"));
-    h.rt.set_pre_start(Arc::new(SchedulePolicyHook { hold: true, skipped: Mutex::new(0) }));
     schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+    empty_the_playlist(&h);
 
     for _ in 0..5 {
         h.rt.tick();
     }
-    assert_eq!(h.events.logs().matches("LL-YOUTUBE-001").count(), 1);
+    assert_eq!(h.events.logs().matches("LL-SCHED-004").count(), 1);
 }

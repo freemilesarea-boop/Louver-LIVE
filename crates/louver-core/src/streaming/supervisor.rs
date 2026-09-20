@@ -216,6 +216,19 @@ impl StreamSupervisor {
         }
     }
 
+    /// Undo a [`Self::begin`] that never reached a process.
+    ///
+    /// The session is discarded rather than failed, so the runtime reads as
+    /// idle — which is what it is. Used when the work that runs before FFmpeg
+    /// declines, and the broadcast engine was never in trouble at all.
+    pub fn cancel(&mut self) {
+        let mode = self.mode;
+        if let Some(mut c) = self.child.take() {
+            let _ = c.terminate();
+        }
+        *self = Self::new(mode);
+    }
+
     /// Attach a freshly started process and move to CONNECTING.
     pub fn attach(&mut self, child: Box<dyn ProcessHandle>) -> Result<()> {
         self.child = Some(child);

@@ -763,7 +763,10 @@ describe('the YouTube side of a broadcast is reported on its own', () => {
     expect(await screen.findByText('방송 설정을 YouTube에 적용하지 못했습니다')).toBeInTheDocument()
     expect(screen.getByText(/방송 설정 자동 적용을 사용하려면 YouTube 계정 연결이 필요합니다/))
       .toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '다시 시도' })).toBeInTheDocument()
+    // Connecting an account is what actually fixes this; pressing the same
+    // button again would only repeat the same refusal.
+    expect(screen.getByRole('button', { name: 'YouTube 연결' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '다시 시도' })).not.toBeInTheDocument()
     expect(screen.getAllByTestId('status-pill')[0]).not.toHaveAttribute('data-state', 'LIVE')
 
     // Taking the offer starts the stream, and only the stream.
@@ -771,6 +774,68 @@ describe('the YouTube side of a broadcast is reported on its own', () => {
     await waitFor(() => {
       expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
     })
+  })
+
+  it('does not turn the whole dashboard red over a title', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+    await screen.findByText('방송 설정을 YouTube에 적용하지 못했습니다')
+    await user.click(screen.getByRole('button', { name: '취소' }))
+
+    // The broadcast engine was never in trouble, so the stream state stays
+    // OFFLINE — not the red ERROR a failed FFmpeg would produce.
+    await waitFor(() => {
+      expect(screen.getAllByTestId('status-pill')[0]).not.toHaveAttribute('data-state', 'ERROR')
+    })
+    expect(screen.queryByTestId('start-error')).not.toBeInTheDocument()
+
+    // The YouTube half keeps its own state, and says what to do about it.
+    expect(await screen.findByTestId('metadata-action-required')).toBeInTheDocument()
+    expect(screen.getByText('조치 필요')).toBeInTheDocument()
+  })
+
+  it('sends YouTube 연결 to the settings page instead of retrying', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+    await user.click(await screen.findByRole('button', { name: 'YouTube 연결' }))
+
+    expect(await screen.findByRole('heading', { name: 'YouTube 고급 기능 (선택)' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'YouTube 계정 연결' })).toBeInTheDocument()
+  })
+
+  it('says 적용 안 함 for a broadcast the user chose to start without settings', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+    await user.click(await screen.findByRole('button', { name: '설정 없이 방송 시작' }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+    })
+
+    // The refusal is cleared and replaced by what the user actually decided:
+    // not an outstanding problem, and not a claim that anything was applied.
+    const panel = await screen.findByTestId('metadata-skipped')
+    expect(within(panel).getByText(/YouTube에 저장된 기본 설정을 그대로 사용합니다/)).toBeInTheDocument()
+    expect(screen.getByText('적용 안 함')).toBeInTheDocument()
+    expect(screen.queryByTestId('metadata-action-required')).not.toBeInTheDocument()
+    expect(screen.queryByText('조치 필요')).not.toBeInTheDocument()
   })
 
   it('reports each field from what YouTube says afterwards, not from the status code', async () => {

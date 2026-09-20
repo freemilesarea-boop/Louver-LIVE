@@ -442,6 +442,17 @@ silent start; and a per-field panel on the dashboard.
 | §B-9 no silent default | `the_user_can_choose_to_broadcast_without_the_youtube_settings` and the two schedule-policy tests |
 | §B-10 per-field display | e2e *reports each field from what YouTube says afterwards* |
 
+**A metadata refusal is not an engine failure.** The first cut of the fix
+rolled every declined start back through the same path, so a YouTube account
+that was not connected turned the whole dashboard red — a `PREPARING → ERROR`
+that said the broadcast was broken when nothing about it was. `start` now
+tells the two apart: a stream failure (no playlist, no key, FFmpeg would not
+spawn, RTMPS refused) goes to ERROR as before, while the pre-start work
+declining cancels the attempt and leaves the runtime IDLE. The YouTube half
+carries its own state next to it — `조치 필요`, `적용 안 함`, `적용 실패` — and the
+dialog offers [취소] [YouTube 연결] [설정 없이 방송 시작], because connecting an
+account is what actually fixes it and pressing the same button again is not.
+
 **Unattended windows.** A scheduled start has nobody to ask. The default is
 the same as a cancelled manual start — hold, do not broadcast under settings
 the user did not choose — and 방송 설정 carries a switch for a 24/7 channel that

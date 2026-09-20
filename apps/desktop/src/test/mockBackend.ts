@@ -502,8 +502,10 @@ export function createMockBackend(opts: MockOptions = {}) {
             verification: outcome.verification,
           }
         }
-      } else {
-        youtube.applyState = { stage: 'off' }
+      } else if (youtube.applyOnStart && youtube.metadata.title.trim() !== '') {
+        // The user was shown the choice and took it, which is a different
+        // thing from never having asked for an apply.
+        youtube.applyState = { stage: 'skipped', requested: { ...youtube.metadata } }
       }
       startBroadcast(a.playlistId as number, false)
       return status

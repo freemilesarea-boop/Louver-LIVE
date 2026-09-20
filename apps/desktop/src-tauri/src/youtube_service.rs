@@ -58,6 +58,9 @@ pub enum ApplyStage {
     /// Asked for, but no account is connected — so it cannot happen at all.
     NotConnected,
     Applying,
+    /// The user was told it could not be applied and chose to broadcast
+    /// anyway, so YouTube keeps whatever it already had.
+    Skipped,
     /// Applied, and Google reads back what was asked for.
     Applied,
     /// The calls succeeded but at least one field did not take.
@@ -411,11 +414,16 @@ impl YoutubeService {
         self.apply_on_start_enabled() && !*self.applied_this_session.lock().unwrap()
     }
 
-    /// Forget what was done for the last broadcast. Called when the app is no
-    /// longer live, so the next Start applies again.
+    /// Forget what was done for the last broadcast, so the next Start applies
+    /// again.
+    ///
+    /// Deliberately does *not* clear [`Self::apply_state`]. That is the record
+    /// of what happened to the metadata, and it is most wanted exactly when
+    /// there is no broadcast running — after a start the user was asked about
+    /// and declined, or after one that stopped. Every start decides it afresh,
+    /// so nothing stale survives into the next broadcast.
     pub fn reset_live_session(&self) {
         *self.applied_this_session.lock().unwrap() = false;
-        self.set_apply_state(MetadataApplyState::default());
     }
 
     /// The metadata the user saved in 방송 설정.
@@ -436,6 +444,21 @@ impl YoutubeService {
                 &self.db.get_setting_or(keys::METADATA_PRIVACY, "unlisted"),
             ),
         }
+    }
+
+    /// Record that the user chose to broadcast without the settings.
+    ///
+    /// Not a failure and not a silent default: they were shown what it means
+    /// and said yes, so the dashboard says "적용 안 함" rather than 적용 실패.
+    pub fn note_skipped_by_user(&self) {
+        let meta = self.saved_metadata();
+        self.set_apply_state(MetadataApplyState {
+            stage: ApplyStage::Skipped,
+            requested: Some(meta),
+            ..Default::default()
+        });
+        self.logger
+            .info(LogTarget::App, "YOUTUBE_METADATA_SKIPPED: 사용자가 설정 없이 방송 시작을 선택했습니다");
     }
 
     /// What the metadata apply did for the broadcast in progress.
@@ -504,15 +527,20 @@ impl YoutubeService {
         }
         let meta = self.saved_metadata();
         if !self.status().connected {
+            // A held scheduled window retries once a minute, and the cause
+            // does not change in between, so say it once.
+            let already = self.apply_state().stage == ApplyStage::NotConnected;
             self.set_apply_state(MetadataApplyState {
                 stage: ApplyStage::NotConnected,
                 requested: Some(meta),
                 ..Default::default()
             });
-            self.logger.warn(
-                LogTarget::App,
-                "YOUTUBE_METADATA_SKIPPED: 계정이 연결되지 않아 방송 정보를 적용할 수 없습니다",
-            );
+            if !already {
+                self.logger.warn(
+                    LogTarget::App,
+                    "YOUTUBE_METADATA_SKIPPED: 계정이 연결되지 않아 방송 정보를 적용할 수 없습니다",
+                );
+            }
             return Err(LouverError::with_detail(
                 ErrorCode::YoutubeNotConnected,
                 "방송 설정 자동 적용을 사용하려면 YouTube 계정 연결이 필요합니다.",

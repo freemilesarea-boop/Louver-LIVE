@@ -322,7 +322,7 @@ export interface MetadataOutcome {
 }
 
 export type ApplyStage =
-  | 'off' | 'not_connected' | 'applying' | 'applied' | 'mismatch' | 'failed'
+  | 'off' | 'not_connected' | 'applying' | 'skipped' | 'applied' | 'mismatch' | 'failed'
 
 /**
  * The YouTube half of a broadcast, tracked separately from the stream's own

@@ -214,6 +214,23 @@ const VIDEO_ENCODER_MARKERS: &[&str] = &[
     "h264_videotoolbox",
 ];
 
+/// Why a start did not happen.
+///
+/// The distinction is the whole point: one of these means the broadcast engine
+/// is broken and belongs in red on the dashboard; the other means YouTube would
+/// not take the metadata, which leaves the engine perfectly healthy.
+#[derive(Debug)]
+enum StartFailure {
+    Stream(LouverError),
+    PreStart(LouverError),
+}
+
+impl From<LouverError> for StartFailure {
+    fn from(e: LouverError) -> Self {
+        StartFailure::Stream(e)
+    }
+}
+
 /// Work that has to succeed before FFmpeg is launched.
 ///
 /// This exists so that manual and scheduled starts cannot drift apart: both
@@ -426,13 +443,45 @@ impl BroadcastRuntime {
         }
         match self.start_inner(opts) {
             Ok(()) => Ok(()),
-            Err(e) => {
+            // The broadcast engine itself failed: no playlist, no key, FFmpeg
+            // would not spawn. That is an ERROR, and the dashboard should say
+            // so in red.
+            Err(StartFailure::Stream(e)) => {
                 if self.state() == StreamState::Preparing {
                     self.abandon_start(&e);
                 }
                 Err(e)
             }
+            // The pre-start work declined — the YouTube metadata could not be
+            // applied. Nothing about the broadcast engine is broken, and
+            // painting the whole dashboard red over a title says otherwise.
+            // The runtime goes back to where it was, and the caller shows the
+            // choice.
+            Err(StartFailure::PreStart(e)) => {
+                self.cancel_start();
+                Err(e)
+            }
         }
+    }
+
+    /// Undo a start the pre-start work declined, as if it had not begun.
+    ///
+    /// Not [`Self::abandon_start`]: that records a stream failure, and this is
+    /// not one. No ERROR state, no `last_start_error`, nothing in red.
+    fn cancel_start(&mut self) {
+        self.supervisor.cancel();
+        if let Some(id) = self.session_id.take() {
+            let _ = self.db.update_session_state(id, StreamState::Stopped, 0, true, None);
+        }
+        self.plan = None;
+        self.session_state = None;
+        self.started_at = None;
+        self.start_wall = None;
+        self.scheduled_end = None;
+        self.reason = None;
+        let _ = self.sleep.allow_sleep();
+        let _ = self.session_store.clear();
+        self.publish();
     }
 
     /// Roll back a start that never reached a process.
@@ -459,7 +508,7 @@ impl BroadcastRuntime {
         self.publish();
     }
 
-    fn start_inner(&mut self, opts: StartOptions) -> Result<()> {
+    fn start_inner(&mut self, opts: StartOptions) -> std::result::Result<(), StartFailure> {
         // Named separately from the empty case: a schedule whose playlist was
         // deleted is a different problem from one whose playlist has no usable
         // video, and telling the user "no broadcastable videos" about a
@@ -565,10 +614,11 @@ impl BroadcastRuntime {
         );
 
         // Before FFmpeg, not after: once the stream connects, YouTube is live
-        // under whatever title the resource already had.
+        // under whatever title the resource already had. Its refusal is tagged
+        // so the caller can tell it apart from the engine failing.
         if !opts.dry_run && !opts.skip_pre_start {
             if let Some(hook) = self.pre_start.clone() {
-                hook.before_stream(&opts)?;
+                hook.before_stream(&opts).map_err(StartFailure::PreStart)?;
             }
         }
 

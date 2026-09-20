@@ -71,6 +71,13 @@ pub fn start_broadcast(
         ));
     }
 
+    let skip = skip_youtube.unwrap_or(false);
+    if skip {
+        // Clears whatever the refused attempt left showing, and replaces it
+        // with the choice the user actually made.
+        state.youtube.note_skipped_by_user();
+    }
+
     let mut rt = state.runtime.lock().unwrap();
     rt.start(StartOptions {
         playlist_id,
@@ -79,7 +86,7 @@ pub fn start_broadcast(
         scheduled_end: None,
         occurrence: None,
         order_seed: None,
-        skip_pre_start: skip_youtube.unwrap_or(false),
+        skip_pre_start: skip,
     })?;
     Ok(rt.status())
 }

@@ -245,15 +245,38 @@ export function Dashboard() {
 
       {/* §B-1/§B-10: the YouTube side of the broadcast, reported separately
           from the stream. Shown only when the user asked for it. */}
-      {(plan?.wanted || applyState?.stage === 'not_connected' || applyState?.stage === 'failed') && (
-        <Card title="YouTube 방송 설정">
+      {(plan?.wanted
+        || applyState?.stage === 'not_connected'
+        || applyState?.stage === 'skipped'
+        || applyState?.stage === 'failed') && (
+        <Card
+          title={
+            <span className="inline-flex items-center gap-2">
+              YouTube 방송 설정
+              {/* The YouTube half carries its own state (§B-1). It is beside
+                  the stream's state, never a substitute for it: a title that
+                  will not apply does not make the broadcast engine unwell. */}
+              {applyState?.stage === 'not_connected' && <Badge tone="warn">조치 필요</Badge>}
+              {applyState?.stage === 'skipped' && <Badge>적용 안 함</Badge>}
+              {applyState?.stage === 'failed' && <Badge tone="warn">적용 실패</Badge>}
+            </span>
+          }
+        >
           {applyState?.stage === 'not_connected' ? (
-            <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex flex-wrap items-center justify-between gap-3" data-testid="metadata-action-required">
               <p className="text-xs text-warn">
                 방송 설정 자동 적용을 사용하려면 YouTube 계정 연결이 필요합니다.
                 영상 송출은 스트림 키만으로 계속 동작합니다.
               </p>
               <Button size="sm" onClick={() => setPage('settings')}>설정에서 연결하기</Button>
+            </div>
+          ) : applyState?.stage === 'skipped' ? (
+            <div className="flex flex-wrap items-center justify-between gap-3" data-testid="metadata-skipped">
+              <p className="text-xs text-ink-400">
+                이 방송에는 저장된 방송 설정을 적용하지 않았습니다.
+                제목·설명·태그는 YouTube에 저장된 기본 설정을 그대로 사용합니다.
+              </p>
+              <Button size="sm" onClick={() => setPage('settings')}>YouTube 연결</Button>
             </div>
           ) : applyState?.stage === 'failed' ? (
             <div className="flex flex-wrap items-center justify-between gap-3">
@@ -309,7 +332,10 @@ export function Dashboard() {
         footer={
           <>
             <Button onClick={() => setYoutubeBlocked(null)}>취소</Button>
-            <Button onClick={() => { setYoutubeBlocked(null); void doStart('live') }}>다시 시도</Button>
+            {/* "다시 시도" would repeat the same failure: nothing has changed
+                between the two presses. Connecting an account is the thing
+                that actually fixes it, so that is what the button says. */}
+            <Button onClick={() => { setYoutubeBlocked(null); setPage('settings') }}>YouTube 연결</Button>
             <Button variant="live" onClick={() => { setYoutubeBlocked(null); void doStart('live', true) }}>
               설정 없이 방송 시작
             </Button>
@@ -318,8 +344,9 @@ export function Dashboard() {
       >
         <p className="text-sm text-ink-200">{youtubeBlocked}</p>
         <p className="mt-3 text-xs text-ink-500">
-          설정 없이 시작하면 영상은 정상 송출되지만, YouTube 방송 제목·설명·태그는
-          지금 YouTube에 저장된 값 그대로 남습니다.
+          영상 송출 자체에는 문제가 없습니다. 설정 없이 시작하면 방송은 정상적으로
+          나가고, YouTube 방송 제목·설명·태그만 지금 YouTube에 저장된 값 그대로
+          남습니다.
         </p>
       </Modal>
 
