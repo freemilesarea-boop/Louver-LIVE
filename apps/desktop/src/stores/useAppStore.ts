@@ -6,7 +6,7 @@ import type {
   PlaylistView, RuntimeStatus, ScheduleView, SettingsView,
 } from '@/types'
 
-export type Page = 'dashboard' | 'playlist' | 'schedule' | 'logs' | 'settings'
+export type Page = 'dashboard' | 'playlist' | 'schedule' | 'broadcast' | 'logs' | 'settings'
 
 export interface Toast {
   id: number

@@ -551,6 +551,141 @@ fn row_to_session(r: &Row<'_>) -> rusqlite::Result<StreamSession> {
     })
 }
 
+/// Broadcast metadata presets and the chat rotation (V2).
+///
+/// Kept alongside the rest of the app's state rather than in a separate store:
+/// a preset is ordinary user data, and nothing here is a secret.
+impl Database {
+    pub fn list_presets(&self) -> Result<Vec<crate::youtube::BroadcastPreset>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt = c.prepare(
+            "SELECT id, name, title, description, tags, category_id, privacy
+             FROM broadcast_presets ORDER BY name COLLATE NOCASE",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::youtube::BroadcastPreset {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    metadata: crate::youtube::BroadcastMetadata {
+                        title: r.get(2)?,
+                        description: r.get(3)?,
+                        tags: split_tags(&r.get::<_, String>(4)?),
+                        category_id: r.get(5)?,
+                        privacy: crate::youtube::Privacy::from_api(&r.get::<_, String>(6)?),
+                    },
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Insert or replace by name, so saving twice under one name updates it
+    /// rather than filling the list with near-duplicates.
+    pub fn save_preset(&self, name: &str, m: &crate::youtube::BroadcastMetadata) -> Result<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(LouverError::with_detail(ErrorCode::ConfigInvalid, "프리셋 이름을 입력해주세요"));
+        }
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "INSERT INTO broadcast_presets (name, title, description, tags, category_id, privacy)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(name) DO UPDATE SET
+               title = excluded.title, description = excluded.description,
+               tags = excluded.tags, category_id = excluded.category_id,
+               privacy = excluded.privacy, updated_at = datetime('now')",
+            rusqlite::params![
+                name,
+                m.title,
+                m.description,
+                m.tags.join("\n"),
+                m.category_id,
+                m.privacy.as_api()
+            ],
+        )?;
+        Ok(c.query_row("SELECT id FROM broadcast_presets WHERE name = ?1", [name], |r| r.get(0))?)
+    }
+
+    pub fn delete_preset(&self, id: i64) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM broadcast_presets WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    pub fn list_chat_messages(&self) -> Result<Vec<crate::youtube::ChatMessage>> {
+        let c = self.conn.lock().unwrap();
+        let mut stmt =
+            c.prepare("SELECT id, position, text, enabled FROM chat_messages ORDER BY position, id")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(crate::youtube::ChatMessage {
+                    id: r.get(0)?,
+                    position: r.get(1)?,
+                    text: r.get(2)?,
+                    enabled: r.get::<_, i64>(3)? != 0,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn add_chat_message(&self, text: &str) -> Result<i64> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(LouverError::with_detail(ErrorCode::ConfigInvalid, "메시지를 입력해주세요"));
+        }
+        if text.chars().count() > crate::youtube::api::MAX_CHAT_MESSAGE_CHARS {
+            return Err(LouverError::new(ErrorCode::ChatMessageTooLong));
+        }
+        let c = self.conn.lock().unwrap();
+        let next: i64 =
+            c.query_row("SELECT COALESCE(MAX(position), -1) + 1 FROM chat_messages", [], |r| r.get(0))?;
+        c.execute(
+            "INSERT INTO chat_messages (position, text) VALUES (?1, ?2)",
+            rusqlite::params![next, text],
+        )?;
+        Ok(c.last_insert_rowid())
+    }
+
+    pub fn update_chat_message(&self, id: i64, text: &str, enabled: bool) -> Result<()> {
+        let text = text.trim();
+        if text.chars().count() > crate::youtube::api::MAX_CHAT_MESSAGE_CHARS {
+            return Err(LouverError::new(ErrorCode::ChatMessageTooLong));
+        }
+        let c = self.conn.lock().unwrap();
+        c.execute(
+            "UPDATE chat_messages SET text = ?2, enabled = ?3 WHERE id = ?1",
+            rusqlite::params![id, text, enabled as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_chat_message(&self, id: i64) -> Result<()> {
+        let c = self.conn.lock().unwrap();
+        c.execute("DELETE FROM chat_messages WHERE id = ?1", [id])?;
+        Ok(())
+    }
+
+    /// Rewrite the order from a list of ids.
+    pub fn reorder_chat_messages(&self, ids: &[i64]) -> Result<()> {
+        let mut c = self.conn.lock().unwrap();
+        let tx = c.transaction()?;
+        for (i, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE chat_messages SET position = ?2 WHERE id = ?1",
+                rusqlite::params![id, i as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+}
+
+fn split_tags(s: &str) -> Vec<String> {
+    s.lines().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

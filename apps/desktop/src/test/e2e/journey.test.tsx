@@ -435,3 +435,113 @@ describe('developer diagnostics', () => {
     expect(screen.getByText(/영상 인코더 인자/)).toBeInTheDocument()
   })
 })
+
+describe('broadcast settings and the chat bot', () => {
+  it('builds metadata with tag chips and refuses a tag list over the limit', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '방송 설정')
+
+    await user.type(
+      await screen.findByLabelText('방송 제목'),
+      'PLAYLIST for your room | lofi, chill, jazz mood',
+    )
+    await user.type(screen.getByLabelText('방송 설명'), 'lofi all night')
+
+    // Enter and comma both commit a tag, and duplicates are dropped.
+    const tagInput = screen.getByLabelText('태그 입력')
+    await user.type(tagInput, 'lofi{Enter}')
+    await user.type(tagInput, 'jazz,')
+    await user.type(tagInput, 'LOFI{Enter}')
+    expect(screen.getByText('lofi')).toBeInTheDocument()
+    expect(screen.getByText('jazz')).toBeInTheDocument()
+    expect(screen.queryByText('LOFI')).not.toBeInTheDocument()
+
+    // A tag can be taken back off.
+    await user.click(screen.getByLabelText('jazz 태그 삭제'))
+    expect(screen.queryByText('jazz')).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: '저장' }))
+    expect(await screen.findByText(/방송 정보를 저장했습니다/)).toBeInTheDocument()
+  })
+
+  it('counts a spaced tag against the budget the way YouTube does', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '방송 설정')
+
+    const tagInput = await screen.findByLabelText('태그 입력')
+    await user.type(tagInput, 'work music{Enter}')
+    // 10 characters plus the two quotes YouTube adds.
+    expect(screen.getByText(/12 \/ 500자/)).toBeInTheDocument()
+  })
+
+  it('saves a preset and puts it back when chosen', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '방송 설정')
+
+    await user.type(await screen.findByLabelText('방송 제목'), 'ROOM. 24/7 lofi')
+    await user.type(screen.getByLabelText('프리셋 이름'), 'ROOM. 24/7')
+    await user.click(screen.getByRole('button', { name: /현재 내용을 프리셋으로 저장/ }))
+    expect(await screen.findByRole('button', { name: 'ROOM. 24/7' })).toBeInTheDocument()
+
+    // Change the title, then load the preset back over it.
+    await user.clear(screen.getByLabelText('방송 제목'))
+    await user.type(screen.getByLabelText('방송 제목'), 'something else')
+    await user.click(screen.getByRole('button', { name: 'ROOM. 24/7' }))
+    await waitFor(() => {
+      expect(screen.getByLabelText('방송 제목')).toHaveValue('ROOM. 24/7 lofi')
+    })
+  })
+
+  it('manages the chat rotation and will not accept an interval under five minutes', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '방송 설정')
+
+    const input = await screen.findByLabelText('새 메시지')
+    await user.type(input, '🎧 구독해주세요{Enter}')
+    await user.type(input, '🌙 편안한 시간 보내세요{Enter}')
+    expect(await screen.findByLabelText('메시지 1')).toHaveValue('🎧 구독해주세요')
+    expect(screen.getByLabelText('메시지 2')).toHaveValue('🌙 편안한 시간 보내세요')
+
+    // Reordering swaps them.
+    await user.click(screen.getByLabelText('메시지 2 위로'))
+    await waitFor(() => {
+      expect(screen.getByLabelText('메시지 1')).toHaveValue('🌙 편안한 시간 보내세요')
+    })
+
+    // The interval control offers nothing below the floor (§6).
+    const interval = screen.getByLabelText('전송 간격') as HTMLSelectElement
+    const offered = Array.from(interval.options).map((o) => Number(o.value))
+    expect(Math.min(...offered)).toBeGreaterThanOrEqual(300)
+
+    await user.click(screen.getByLabelText('메시지 2 삭제'))
+    await waitFor(() => expect(screen.queryByLabelText('메시지 2')).not.toBeInTheDocument())
+  })
+
+  it('connects a YouTube account and shows the channel rather than the token', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '설정')
+
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    // Consent happens in a browser, so the page polls for the result rather
+    // than blocking; give it more than one poll interval.
+    const polled = { timeout: 6000 }
+    expect(await screen.findByText('ROOM.', {}, polled)).toBeInTheDocument()
+    expect(screen.getByText('UC-room')).toBeInTheDocument()
+    expect(screen.getByText('macOS 키체인')).toBeInTheDocument()
+    // Nothing token-shaped is rendered anywhere on the page.
+    expect(document.body.textContent).not.toMatch(/1\/\/|ya29\./)
+
+    await user.click(screen.getByRole('button', { name: '연결 해제' }))
+    expect(await screen.findByRole('button', { name: 'YouTube 계정 연결' }, polled)).toBeInTheDocument()
+  })
+})

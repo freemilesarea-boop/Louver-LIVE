@@ -254,3 +254,73 @@ export interface ImportResult {
   imported: Media[]
   failed: { path: string; code: string; message: string }[]
 }
+
+// --- YouTube (V2) ---------------------------------------------------------
+
+export type Privacy = 'public' | 'unlisted' | 'private'
+
+export interface BroadcastMetadata {
+  title: string
+  description: string
+  tags: string[]
+  category_id: string
+  privacy: Privacy
+}
+
+export interface BroadcastPreset extends BroadcastMetadata {
+  id: number
+  name: string
+}
+
+export interface YoutubeStatus {
+  connected: boolean
+  channel_id?: string | null
+  channel_title?: string | null
+  has_credentials: boolean
+  client_id_hint?: string | null
+  secret_backend: string
+  secret_backend_is_secure: boolean
+  connecting_error?: string | null
+}
+
+export interface LiveBroadcast {
+  id: string
+  title: string
+  privacy: Privacy
+  active_live_chat_id?: string | null
+  life_cycle_status: string
+}
+
+export interface ChatMessage {
+  id: number
+  position: number
+  text: string
+  enabled: boolean
+}
+
+export type ChatOrder = 'sequential' | 'random'
+
+export interface ChatSettings {
+  enabled: boolean
+  order: ChatOrder
+  interval_secs: number
+  send_on_start: boolean
+  send_on_end: boolean
+  avoid_repeats: boolean
+}
+
+export type ChatState =
+  | 'IDLE' | 'WAITING_FOR_LIVE_CHAT' | 'CONNECTED' | 'SENDING' | 'PAUSED' | 'ERROR'
+
+export interface ChatStatus {
+  state: ChatState
+  state_label: string
+  live_chat_id_known: boolean
+  messages_sent: number
+  seconds_until_next?: number | null
+  last_error?: string | null
+  last_error_code?: string | null
+  broadcast_id?: string | null
+  broadcast_title?: string | null
+  broadcast_privacy?: Privacy | null
+}

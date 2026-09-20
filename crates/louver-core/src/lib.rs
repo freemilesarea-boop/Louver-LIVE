@@ -29,6 +29,7 @@ pub mod security;
 pub mod session;
 pub mod streaming;
 pub mod system;
+pub mod youtube;
 
 pub use config::{OutputProfile, StreamMode, DEFAULT_LOCAL_TEST_URL, DEFAULT_RTMPS_URL};
 pub use error::{ErrorCode, LouverError, Result};

@@ -14,6 +14,8 @@ import type {
   DashboardMetrics, DiskEstimate, ImportResult, LicenseState, LouverError,
   Media, Playlist, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
   SettingsView, StreamDiagnostics, StreamEvent,
+  BroadcastMetadata, BroadcastPreset, ChatMessage, ChatSettings, ChatStatus,
+  LiveBroadcast, YoutubeStatus,
 } from '@/types'
 
 export type MockBackend = (cmd: string, args: Record<string, unknown>) => unknown | Promise<unknown>
@@ -137,6 +139,34 @@ export const api = {
   cacheInUseCount: () => call<number>('cache_in_use_count'),
   takeStartupNotice: () => call<string | null>('take_startup_notice'),
   uptimeWarnings: () => call<string[]>('uptime_warnings'),
+
+  // --- youtube (V2) ---
+  youtubeStatus: () => call<YoutubeStatus>('youtube_status'),
+  youtubeSetCredentials: (clientId: string, clientSecret: string) =>
+    call<YoutubeStatus>('youtube_set_credentials', { clientId, clientSecret }),
+  youtubeBeginConnect: () => call<string>('youtube_begin_connect'),
+  youtubeDisconnect: () => call<YoutubeStatus>('youtube_disconnect'),
+  youtubeGetMetadata: () => call<BroadcastMetadata>('youtube_get_metadata'),
+  youtubeSaveMetadata: (metadata: BroadcastMetadata) =>
+    call<BroadcastMetadata>('youtube_save_metadata', { metadata }),
+  youtubeApplyMetadata: () => call<LiveBroadcast>('youtube_apply_metadata'),
+  youtubeSetApplyOnStart: (enabled: boolean) =>
+    call<void>('youtube_set_apply_on_start', { enabled }),
+  youtubeCurrentBroadcast: () => call<LiveBroadcast>('youtube_current_broadcast'),
+  youtubeListPresets: () => call<BroadcastPreset[]>('youtube_list_presets'),
+  youtubeSavePreset: (name: string, metadata: BroadcastMetadata) =>
+    call<BroadcastPreset[]>('youtube_save_preset', { name, metadata }),
+  youtubeDeletePreset: (id: number) => call<BroadcastPreset[]>('youtube_delete_preset', { id }),
+  chatListMessages: () => call<ChatMessage[]>('chat_list_messages'),
+  chatAddMessage: (text: string) => call<ChatMessage[]>('chat_add_message', { text }),
+  chatUpdateMessage: (id: number, text: string, enabled: boolean) =>
+    call<ChatMessage[]>('chat_update_message', { id, text, enabled }),
+  chatDeleteMessage: (id: number) => call<ChatMessage[]>('chat_delete_message', { id }),
+  chatReorderMessages: (ids: number[]) => call<ChatMessage[]>('chat_reorder_messages', { ids }),
+  chatGetSettings: () => call<ChatSettings>('chat_get_settings'),
+  chatSaveSettings: (settings: ChatSettings) => call<ChatSettings>('chat_save_settings', { settings }),
+  chatStatus: () => call<ChatStatus>('chat_status'),
+  chatMinIntervalSecs: () => call<number>('chat_min_interval_secs'),
 }
 
 /** Open the native file picker, or fall back to a prompt outside Tauri. */

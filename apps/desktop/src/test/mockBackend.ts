@@ -24,6 +24,42 @@ export interface MockOptions {
 }
 
 export function createMockBackend(opts: MockOptions = {}) {
+  const youtube = {
+    connected: false,
+    nextPresetId: 1,
+    nextMessageId: 1,
+    metadata: {
+      title: '',
+      description: '',
+      tags: [] as string[],
+      category_id: '10',
+      privacy: 'unlisted' as const,
+    },
+    applied: null as null | Record<string, unknown>,
+    presets: [] as { id: number; name: string; title: string; description: string; tags: string[]; category_id: string; privacy: string }[],
+    messages: [] as { id: number; position: number; text: string; enabled: boolean }[],
+    chat: {
+      enabled: false,
+      order: 'sequential' as const,
+      interval_secs: 1200,
+      send_on_start: true,
+      send_on_end: false,
+      avoid_repeats: true,
+    },
+    chatStatus: {
+      state: 'IDLE' as const,
+      state_label: '꺼짐',
+      live_chat_id_known: false,
+      messages_sent: 0,
+      seconds_until_next: null,
+      last_error: null,
+      last_error_code: null,
+      broadcast_id: null,
+      broadcast_title: null,
+      broadcast_privacy: null,
+    },
+  }
+
   const settings = new Map<string, string>(Object.entries(opts.seedSettings ?? {}))
   let streamKey: string | null = opts.hasStreamKey === false ? null : 'abcd-efgh-ijkl-mnop'
   if (opts.hasStreamKey === false) streamKey = null
@@ -447,6 +483,103 @@ export function createMockBackend(opts: MockOptions = {}) {
     clear_stream_key: () => { streamKey = null },
     get_license: () => licenseState(),
     install_license: () => licenseState(),
+
+    // --- youtube (V2) ---
+    youtube_status: () => ({
+      connected: youtube.connected,
+      channel_id: youtube.connected ? 'UC-room' : null,
+      channel_title: youtube.connected ? 'ROOM.' : null,
+      has_credentials: true,
+      client_id_hint: '…googleusercontent.com',
+      secret_backend: 'macOS 키체인',
+      secret_backend_is_secure: true,
+      connecting_error: null,
+    }),
+    youtube_set_credentials: () => backend('youtube_status', {}),
+    youtube_begin_connect: () => {
+      // The real flow opens a browser; the mock connects immediately so the
+      // UI path after consent can be driven.
+      youtube.connected = true
+      return 'https://accounts.google.com/o/oauth2/v2/auth?mock=1'
+    },
+    youtube_disconnect: () => {
+      youtube.connected = false
+      return backend('youtube_status', {})
+    },
+    youtube_get_metadata: () => youtube.metadata,
+    youtube_save_metadata: (a: Record<string, unknown>) => {
+      youtube.metadata = a.metadata as typeof youtube.metadata
+      return youtube.metadata
+    },
+    youtube_apply_metadata: () => {
+      youtube.applied = { ...youtube.metadata }
+      return {
+        id: 'bcast-1',
+        title: youtube.metadata.title,
+        privacy: youtube.metadata.privacy,
+        active_live_chat_id: 'chat-1',
+        life_cycle_status: 'live',
+      }
+    },
+    youtube_set_apply_on_start: () => undefined,
+    youtube_current_broadcast: () => ({
+      id: 'bcast-1',
+      title: youtube.metadata.title,
+      privacy: youtube.metadata.privacy,
+      active_live_chat_id: 'chat-1',
+      life_cycle_status: 'live',
+    }),
+    youtube_list_presets: () => youtube.presets,
+    youtube_save_preset: (a: Record<string, unknown>) => {
+      const name = String(a.name)
+      const metadata = a.metadata as typeof youtube.metadata
+      youtube.presets = [
+        ...youtube.presets.filter((p) => p.name !== name),
+        { id: youtube.nextPresetId++, name, ...metadata },
+      ]
+      return youtube.presets
+    },
+    youtube_delete_preset: (a: Record<string, unknown>) => {
+      youtube.presets = youtube.presets.filter((p) => p.id !== Number(a.id))
+      return youtube.presets
+    },
+    chat_list_messages: () => youtube.messages,
+    chat_add_message: (a: Record<string, unknown>) => {
+      youtube.messages = [
+        ...youtube.messages,
+        { id: youtube.nextMessageId++, position: youtube.messages.length, text: String(a.text), enabled: true },
+      ]
+      return youtube.messages
+    },
+    chat_update_message: (a: Record<string, unknown>) => {
+      youtube.messages = youtube.messages.map((m) =>
+        m.id === Number(a.id) ? { ...m, text: String(a.text), enabled: Boolean(a.enabled) } : m,
+      )
+      return youtube.messages
+    },
+    chat_delete_message: (a: Record<string, unknown>) => {
+      youtube.messages = youtube.messages.filter((m) => m.id !== Number(a.id))
+      return youtube.messages
+    },
+    chat_reorder_messages: (a: Record<string, unknown>) => {
+      const ids = a.ids as number[]
+      youtube.messages = ids
+        .map((id, i) => {
+          const m = youtube.messages.find((x) => x.id === id)!
+          return { ...m, position: i }
+        })
+        .filter(Boolean)
+      return youtube.messages
+    },
+    chat_get_settings: () => youtube.chat,
+    chat_save_settings: (a: Record<string, unknown>) => {
+      const next = a.settings as typeof youtube.chat
+      if (next.interval_secs < 300) throw { code_str: 'LL-CONFIG-001', message: '전송 간격은 최소 5분입니다' }
+      youtube.chat = next
+      return youtube.chat
+    },
+    chat_status: () => youtube.chatStatus,
+    chat_min_interval_secs: () => 300,
 
     // --- system ---
     get_metrics: (): DashboardMetrics => ({

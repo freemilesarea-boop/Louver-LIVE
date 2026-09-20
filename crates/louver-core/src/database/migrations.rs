@@ -12,10 +12,11 @@ pub struct Migration {
     pub sql: &'static str,
 }
 
-pub const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "initial_schema",
-    sql: r#"
+pub const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "initial_schema",
+        sql: r#"
 CREATE TABLE settings (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
@@ -98,7 +99,39 @@ CREATE TABLE stream_events (
 );
 CREATE INDEX idx_events_session ON stream_events(session_id, at DESC);
 "#,
-}];
+    },
+    Migration {
+        version: 2,
+        name: "youtube_metadata_and_chat",
+        sql: r#"
+-- Saved metadata presets (§4), so a channel's usual title, description and
+-- tags are one click away rather than retyped for every broadcast.
+CREATE TABLE broadcast_presets (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL UNIQUE,
+    title       TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL DEFAULT '',
+    -- Newline separated, so the list stays readable in the file itself.
+    tags        TEXT NOT NULL DEFAULT '',
+    category_id TEXT NOT NULL DEFAULT '10',
+    privacy     TEXT NOT NULL DEFAULT 'unlisted',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- The automatic chat rotation (§5).
+CREATE TABLE chat_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    position   INTEGER NOT NULL,
+    text       TEXT NOT NULL,
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_chat_messages_position ON chat_messages(position);
+"#,
+    },
+];
 
 /// Highest schema version this build knows about.
 pub fn latest_version() -> i64 {
@@ -174,6 +207,8 @@ mod tests {
             "schedules",
             "stream_sessions",
             "stream_events",
+            "broadcast_presets",
+            "chat_messages",
         ];
         for t in required {
             let n: i64 = c
@@ -201,6 +236,6 @@ mod tests {
         let mut c = Connection::open_in_memory().unwrap();
         assert!(current_version(&c).is_err(), "no table yet");
         run(&mut c).unwrap();
-        assert_eq!(current_version(&c).unwrap(), 1);
+        assert_eq!(current_version(&c).unwrap(), MIGRATIONS.last().unwrap().version);
     }
 }

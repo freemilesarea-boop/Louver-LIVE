@@ -6,6 +6,7 @@
 pub mod commands;
 pub mod platform;
 pub mod state;
+mod youtube_service;
 
 use louver_core::logging::LogTarget;
 use louver_core::system::AutostartManager;
@@ -22,6 +23,43 @@ use tauri::{
 /// own stall detection works on a 30s horizon and the UI only shows whole
 /// seconds.
 const TICK: Duration = Duration::from_secs(1);
+
+/// Keep the chat bot attached to whatever is on air, and to nothing else.
+///
+/// Called once a second from the broadcast loop, and never blocks it: the
+/// lookup that needs the network runs on its own thread, and at most one runs
+/// at a time.
+fn youtube_follow_broadcast(state: &AppState, live: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static LOOKING: AtomicBool = AtomicBool::new(false);
+
+    if !live {
+        if state.youtube.bot_broadcast_id().is_some() {
+            state.youtube.stop_bot();
+        }
+        return;
+    }
+    if !state.youtube.chat_settings().enabled || !state.youtube.status().connected {
+        return;
+    }
+    if state.youtube.bot_is_running() {
+        return;
+    }
+    if LOOKING.swap(true, Ordering::SeqCst) {
+        return; // a lookup is already in flight
+    }
+
+    let youtube = std::sync::Arc::clone(&state.youtube);
+    let messages = state.db.list_chat_messages().unwrap_or_default();
+    std::thread::spawn(move || {
+        // A fresh lookup every time, so the chat id always belongs to the
+        // broadcast that is on air now (§7).
+        if let Ok(b) = youtube.current_broadcast() {
+            youtube.start_bot_for(&b.id, messages);
+        }
+        LOOKING.store(false, Ordering::SeqCst);
+    });
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -79,6 +117,28 @@ pub fn run() {
             commands::system::cache_in_use_count,
             commands::system::take_startup_notice,
             commands::system::uptime_warnings,
+            // youtube (V2)
+            commands::youtube::youtube_status,
+            commands::youtube::youtube_set_credentials,
+            commands::youtube::youtube_begin_connect,
+            commands::youtube::youtube_disconnect,
+            commands::youtube::youtube_get_metadata,
+            commands::youtube::youtube_save_metadata,
+            commands::youtube::youtube_apply_metadata,
+            commands::youtube::youtube_set_apply_on_start,
+            commands::youtube::youtube_current_broadcast,
+            commands::youtube::youtube_list_presets,
+            commands::youtube::youtube_save_preset,
+            commands::youtube::youtube_delete_preset,
+            commands::youtube::chat_list_messages,
+            commands::youtube::chat_add_message,
+            commands::youtube::chat_update_message,
+            commands::youtube::chat_delete_message,
+            commands::youtube::chat_reorder_messages,
+            commands::youtube::chat_get_settings,
+            commands::youtube::chat_save_settings,
+            commands::youtube::chat_status,
+            commands::youtube::chat_min_interval_secs,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -123,9 +183,17 @@ pub fn run() {
             std::thread::spawn(move || loop {
                 std::thread::sleep(TICK);
                 if let Some(s) = tick_handle.try_state::<AppState>() {
-                    if let Ok(mut rt) = s.runtime.lock() {
+                    let live = if let Ok(mut rt) = s.runtime.lock() {
                         rt.tick();
-                    }
+                        rt.state() == louver_core::streaming::state::StreamState::Live && !rt.status().dry_run
+                    } else {
+                        false
+                    };
+                    // The chat bot follows the broadcast (§7). Starting it is
+                    // handed to another thread because finding the broadcast
+                    // means calling Google, and this loop must never wait on
+                    // the network — it is the loop that keeps FFmpeg alive.
+                    youtube_follow_broadcast(&s, live);
                 }
             });
 

@@ -6,6 +6,7 @@ import { Sidebar } from '@/components/Sidebar'
 import { Dashboard } from '@/pages/Dashboard'
 import { PlaylistPage } from '@/pages/PlaylistPage'
 import { SchedulePage } from '@/pages/SchedulePage'
+import { BroadcastPage } from '@/pages/BroadcastPage'
 import { LogsPage } from '@/pages/LogsPage'
 import { SettingsPage } from '@/pages/SettingsPage'
 import { FirstRun } from '@/pages/FirstRun'
@@ -45,6 +46,7 @@ export function App() {
         {page === 'dashboard' && <Dashboard />}
         {page === 'playlist' && <PlaylistPage />}
         {page === 'schedule' && <SchedulePage />}
+        {page === 'broadcast' && <BroadcastPage />}
         {page === 'logs' && <LogsPage />}
         {page === 'settings' && <SettingsPage />}
       </main>

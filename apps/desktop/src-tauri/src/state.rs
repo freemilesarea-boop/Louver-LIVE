@@ -57,6 +57,9 @@ pub struct AppState {
     /// Message from session recovery, shown once by the UI.
     pub startup_notice: Mutex<Option<String>>,
     pub normalize_cancel: Mutex<Option<louver_core::media::normalize::CancelToken>>,
+    /// YouTube account, metadata and the chat bot (V2). Deliberately not
+    /// reachable from the broadcast tick.
+    pub youtube: Arc<crate::youtube_service::YoutubeService>,
 }
 
 impl AppState {
@@ -97,7 +100,8 @@ impl AppState {
         let builder = FfmpegCommandBuilder::new(tools.clone().unwrap_or(fallback.clone()), profile)
             .with_encoder(encoder.clone());
 
-        let keys = Arc::new(StreamKeyStore::new(crate::platform::secrets::default_store()));
+        let secrets = crate::platform::secrets::default_store();
+        let keys = Arc::new(StreamKeyStore::new(Arc::clone(&secrets)));
         let sleep: Arc<dyn SleepPreventer> = Arc::new(crate::platform::sleep::OsSleepPreventer::new());
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -129,6 +133,12 @@ impl AppState {
             paths.dry_run_dir(),
         );
 
+        let youtube = Arc::new(crate::youtube_service::YoutubeService::new(
+            db.clone(),
+            Arc::clone(&secrets),
+            Arc::clone(&logger),
+        ));
+
         Ok(Self {
             cache: MediaCache::new(cache_dir),
             paths,
@@ -146,6 +156,7 @@ impl AppState {
             db_recovery_notice,
             startup_notice: Mutex::new(None),
             normalize_cancel: Mutex::new(None),
+            youtube,
         })
     }
 

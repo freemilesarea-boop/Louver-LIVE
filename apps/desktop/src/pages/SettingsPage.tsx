@@ -1,9 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { Eye, FolderOpen, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react'
 import { useAppStore } from '@/stores/useAppStore'
 import { api, pickLicenseFile, revealPath } from '@/services/ipc'
 import { Badge, Button, Card, Field, Input, Modal, Select, Toggle } from '@/components/ui'
-import type { StreamDiagnostics } from '@/types'
+import type { StreamDiagnostics, YoutubeStatus } from '@/types'
 
 /** Settings (§45), including the stream key and licence panels. */
 export function SettingsPage() {
@@ -153,6 +153,8 @@ export function SettingsPage() {
           </Button>
         </div>
       </Card>
+
+      <YoutubeAccountCard />
 
       <Card title="라이선스">
         <div className="flex items-start justify-between gap-4">
@@ -424,5 +426,142 @@ function Diag({ label, value, tone }: { label: string; value: string; tone?: 'wa
       <dt className="text-ink-500">{label}</dt>
       <dd className={tone === 'warn' ? 'text-warn' : 'text-ink-200'}>{value}</dd>
     </div>
+  )
+}
+
+/**
+ * YouTube account (§1).
+ *
+ * The refresh token never appears here — only the channel it belongs to and
+ * which store is holding it. Consent happens in the browser; this polls until
+ * it lands, so the window is never blocked waiting on Google.
+ */
+function YoutubeAccountCard() {
+  const { reportError, toast } = useAppStore()
+  const [yt, setYt] = useState<YoutubeStatus | null>(null)
+  const [clientId, setClientId] = useState('')
+  const [clientSecret, setClientSecret] = useState('')
+  const [waiting, setWaiting] = useState(false)
+
+  const refresh = useCallback(
+    () => api.youtubeStatus().then(setYt).catch(reportError),
+    [reportError],
+  )
+  useEffect(() => { void refresh() }, [refresh])
+
+  // While consent is open in the browser there is nothing to do but watch for
+  // it to finish.
+  useEffect(() => {
+    if (!waiting) return
+    const t = setInterval(async () => {
+      const s = await api.youtubeStatus().catch(() => null)
+      if (!s) return
+      setYt(s)
+      if (s.connected) {
+        setWaiting(false)
+        toast({ kind: 'success', message: `${s.channel_title ?? 'YouTube'} 채널에 연결했습니다.` })
+      } else if (s.connecting_error) {
+        setWaiting(false)
+        toast({ kind: 'error', message: s.connecting_error })
+      }
+    }, 2000)
+    return () => clearInterval(t)
+  }, [waiting, toast])
+
+  if (!yt) return null
+
+  async function connect() {
+    try {
+      const url = await api.youtubeBeginConnect()
+      setWaiting(true)
+      await revealPath(url)
+    } catch (e) {
+      setWaiting(false)
+      reportError(e)
+    }
+  }
+
+  return (
+    <Card title="YouTube">
+      {yt.connected ? (
+        <>
+          <dl className="space-y-2">
+            <Row label="채널" value={yt.channel_title ?? '—'} />
+            <Row label="Channel ID" value={yt.channel_id ?? '—'} mono />
+            <Row label="연결 상태" value="연결됨" />
+            <Row label="토큰 저장 위치" value={yt.secret_backend} />
+          </dl>
+          {!yt.secret_backend_is_secure && (
+            <p className="mt-2 text-xs text-warn">
+              이 컴퓨터에서는 키체인을 쓸 수 없어 토큰이 메모리에만 저장됩니다. 앱을 재시작하면 다시 연결해야 합니다.
+            </p>
+          )}
+          <div className="mt-3 border-t border-ink-700 pt-3">
+            <Button
+              onClick={async () => {
+                try {
+                  setYt(await api.youtubeDisconnect())
+                  toast({ kind: 'info', message: 'YouTube 연결을 해제했습니다.' })
+                } catch (e) { reportError(e) }
+              }}
+            >
+              연결 해제
+            </Button>
+          </div>
+        </>
+      ) : (
+        <>
+          {!yt.has_credentials && (
+            <div className="mb-3 space-y-2">
+              <p className="text-xs text-ink-500">
+                Google Cloud 콘솔에서 만든 OAuth 클라이언트(데스크톱 앱)를 입력해주세요.
+                클라이언트 보안 비밀은 키체인에 저장되며 데이터베이스나 로그에는 기록되지 않습니다.
+              </p>
+              <Input
+                value={clientId}
+                aria-label="OAuth 클라이언트 ID"
+                placeholder="000000-xxxx.apps.googleusercontent.com"
+                onChange={(e) => setClientId(e.target.value)}
+              />
+              <Input
+                value={clientSecret}
+                type="password"
+                aria-label="OAuth 클라이언트 보안 비밀"
+                placeholder="클라이언트 보안 비밀"
+                onChange={(e) => setClientSecret(e.target.value)}
+              />
+              <Button
+                onClick={async () => {
+                  try {
+                    setYt(await api.youtubeSetCredentials(clientId, clientSecret))
+                    setClientSecret('')
+                    toast({ kind: 'success', message: 'API 클라이언트를 저장했습니다.' })
+                  } catch (e) { reportError(e) }
+                }}
+                disabled={!clientId.trim()}
+              >
+                저장
+              </Button>
+            </div>
+          )}
+          <div className="flex items-center gap-3">
+            <Button variant="primary" onClick={() => void connect()} disabled={!yt.has_credentials || waiting}>
+              {waiting ? '브라우저에서 진행 중…' : 'YouTube 계정 연결'}
+            </Button>
+            {yt.client_id_hint && (
+              <span className="font-mono text-[11px] text-ink-500">{yt.client_id_hint}</span>
+            )}
+          </div>
+          {waiting && (
+            <p className="mt-2 text-xs text-ink-500">
+              열린 브라우저 창에서 권한을 허용해주세요. 완료되면 자동으로 이 화면이 바뀝니다.
+            </p>
+          )}
+          {yt.connecting_error && (
+            <p className="mt-2 text-xs text-live">{yt.connecting_error}</p>
+          )}
+        </>
+      )}
+    </Card>
   )
 }

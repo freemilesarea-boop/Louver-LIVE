@@ -7,6 +7,7 @@ pub mod schedule;
 pub mod settings;
 pub mod streaming;
 pub mod system;
+pub mod youtube;
 
 /// Errors cross the IPC boundary as the structured [`LouverError`], so the UI
 /// can show a Korean message and keep the technical detail behind a disclosure

@@ -10,6 +10,9 @@ OBS 같은 범용 방송 프로그램이 아닙니다. 사용하는 방법은 �
 3. 방송 시간 정하기
 4. 방송 시작
 
+방송 제목·설명·태그와 자동 라이브 채팅은 앱 안에서 설정합니다 (YouTube Studio를
+열 필요가 없습니다). 준비 방법은 [YOUTUBE_SETUP.md](YOUTUBE_SETUP.md).
+
 ## 직접 써보기
 
 ```bash
@@ -261,6 +264,16 @@ CPU 사용량이 높은 것이 정상입니다. 설정 → 송출 → 송출 모
 | `LL-SCHED-001` | 예약 시간이 올바르지 않음 |
 | `LL-SCHED-002` | 요일이 선택되지 않음 |
 | `LL-CONFIG-001` | 설정 값이 올바르지 않음 |
+| `LL-YOUTUBE-001` | YouTube 계정이 연결되지 않음 |
+| `LL-YOUTUBE-002` | YouTube 로그인이 만료됨 |
+| `LL-YOUTUBE-003` | 진행 중인 라이브를 찾지 못함 |
+| `LL-YOUTUBE-004` | YouTube API 호출 실패 |
+| `LL-YOUTUBE-005` | YouTube API 일일 사용량 초과 |
+| `LL-YOUTUBE-006` | 방송 정보가 YouTube 제한을 넘음 |
+| `LL-CHAT-001` | 채팅 전송이 너무 잦음 |
+| `LL-CHAT-002` | 방송의 실시간 채팅이 꺼져 있음 |
+| `LL-CHAT-003` | 방송의 실시간 채팅이 종료됨 |
+| `LL-CHAT-004` | 채팅 메시지가 200자를 넘음 |
 | `LL-CONFIG-002` | FFmpeg를 찾을 수 없음 |
 
 ---

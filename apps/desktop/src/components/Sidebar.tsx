@@ -1,4 +1,4 @@
-import { CalendarClock, LayoutDashboard, ListVideo, ScrollText, Settings2 } from 'lucide-react'
+import { CalendarClock, LayoutDashboard, ListVideo, Radio, ScrollText, Settings2 } from 'lucide-react'
 import { useAppStore, type Page } from '@/stores/useAppStore'
 import { StatusPill } from './StatusPill'
 
@@ -6,6 +6,7 @@ const NAV: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'dashboard', label: '대시보드', icon: LayoutDashboard },
   { id: 'playlist', label: '플레이리스트', icon: ListVideo },
   { id: 'schedule', label: '방송 예약', icon: CalendarClock },
+  { id: 'broadcast', label: '방송 설정', icon: Radio },
   { id: 'logs', label: '로그', icon: ScrollText },
   { id: 'settings', label: '설정', icon: Settings2 },
 ]
