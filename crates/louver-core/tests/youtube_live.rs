@@ -82,6 +82,29 @@ impl FakeYoutube {
                             body: parsed,
                         });
 
+                        // Google's own rule, enforced here so no test can
+                        // pass against a request the real API refuses:
+                        // `liveBroadcasts.list` takes exactly one of `id`,
+                        // `mine` and `broadcastStatus`. Sending two is what
+                        // stopped every scheduled start on a real Mac, and a
+                        // fake that shrugged at it is why nothing caught it.
+                        if method == "GET" && path.starts_with("/liveBroadcasts") {
+                            let filters = ["&id=", "?id=", "mine=", "broadcastStatus="]
+                                .iter()
+                                .filter(|f| path.contains(**f))
+                                .count();
+                            if filters != 1 {
+                                let payload = r#"{"error":{"code":400,"message":"Incompatible parameters specified in the request: broadcastStatus, mine","errors":[{"reason":"incompatibleParameters","domain":"youtube.liveBroadcast"}]}}"#;
+                                let response = format!(
+                                    "HTTP/1.1 400 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                                    payload.len()
+                                );
+                                let _ = stream.write_all(response.as_bytes());
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+
                         let key = format!("{method} {}", path.split('?').next().unwrap_or(""));
                         let (status, payload) = responses
                             .iter()
@@ -720,7 +743,7 @@ fn an_empty_channel_gets_a_broadcast_created_and_bound() {
     let api = YoutubeApi::with_base(&http, fake.base.clone());
 
     // 1. nothing upcoming
-    let upcoming = api.upcoming_broadcasts("tok").unwrap();
+    let upcoming = api.my_broadcasts("tok").unwrap();
     assert!(upcoming.is_empty());
 
     // 2. create it for this window
@@ -786,7 +809,7 @@ fn a_broadcast_already_prepared_for_the_window_is_reused_not_duplicated() {
     let http = client();
     let api = YoutubeApi::with_base(&http, fake.base.clone());
 
-    let upcoming = api.upcoming_broadcasts("tok").unwrap();
+    let upcoming = api.my_broadcasts("tok").unwrap();
     let window =
         chrono::DateTime::parse_from_rfc3339("2026-09-20T11:59:30Z").unwrap().with_timezone(&chrono::Utc);
     match louver_core::youtube::provision::choose_broadcast(
@@ -1076,4 +1099,162 @@ fn a_manual_run_and_a_scheduled_run_are_labelled_so_they_can_be_compared() {
     let log = std::fs::read_to_string(dir.path().join("app.log")).unwrap();
     assert!(log.contains("origin=manual"), "{log}");
     assert!(log.contains("origin=scheduled"), "{log}");
+}
+
+// --- the parameter combination real Google refused ----------------------
+//
+// Confirmed on a real Mac, after the step logging above made it visible:
+//
+//   YOUTUBE_TOKEN_REFRESH_OK
+//   YOUTUBE_BROADCAST_LIST_FAIL
+//   liveBroadcasts.list HTTP 400 reason=incompatibleParameters ·
+//   Incompatible parameters specified in the request: broadcastStatus, mine
+//
+// The scheduler, OAuth, the refresh token and the client credentials were all
+// fine. `liveBroadcasts.list` takes exactly one of `id`, `mine` and
+// `broadcastStatus`, and the app was sending two of them.
+
+#[test]
+fn the_broadcast_list_never_sends_two_filters_at_once() {
+    // The regression, asserted on the request rather than on the code: this is
+    // the shape Google answered 400 to, and no amount of refactoring may bring
+    // it back.
+    let fake = FakeYoutube::start(vec![("GET /liveBroadcasts", 200, r#"{"items":[]}"#.into())]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+    api.my_broadcasts("tok").unwrap();
+
+    let listing = fake.requests();
+    assert!(!listing.is_empty(), "no request was made");
+    for r in &listing {
+        let filters = ["id=", "mine=", "broadcastStatus="].iter().filter(|f| r.path.contains(**f)).count();
+        assert_eq!(filters, 1, "liveBroadcasts.list takes exactly one filter: {}", r.path);
+        assert!(r.path.contains("mine=true"), "{}", r.path);
+        assert!(!r.path.contains("broadcastStatus"), "{}", r.path);
+        // `broadcastType` is not a filter, and Google accepts it beside `mine`.
+        assert!(r.path.contains("broadcastType=all"), "{}", r.path);
+    }
+}
+
+#[test]
+fn the_refusal_google_actually_sent_is_reported_as_a_listing_failure() {
+    // Verbatim from the Mac. What matters is that this no longer reads as
+    // "YouTube에 연결하지 못했습니다" — the account was connected and the token
+    // had just been refreshed.
+    use louver_core::logging::Logger;
+    use louver_core::youtube::steps::{ProvisionOrigin, ProvisionStep, StepRecorder};
+
+    let fake = FakeYoutube::start(vec![(
+        "GET /liveBroadcasts",
+        400,
+        r#"{"error":{"code":400,
+            "message":"Incompatible parameters specified in the request: broadcastStatus, mine",
+            "errors":[{"reason":"incompatibleParameters","domain":"youtube.liveBroadcast"}]}}"#
+            .into(),
+    )]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+    let err = api.my_broadcasts("tok").unwrap_err();
+
+    let detail = err.detail.clone().unwrap();
+    assert!(detail.contains("liveBroadcasts.list HTTP 400"), "{detail}");
+    assert!(detail.contains("reason=incompatibleParameters"), "{detail}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let rec = StepRecorder::new(Logger::new(dir.path()).unwrap(), ProvisionOrigin::Scheduled);
+    let reported = rec.fail(ProvisionStep::BroadcastList, &err);
+    assert_eq!(reported.message, "예약 방송 정보를 조회하지 못했습니다.");
+    assert!(!reported.message.contains("연결하지 못했습니다"), "{}", reported.message);
+}
+
+#[test]
+fn only_this_windows_broadcast_is_reused_out_of_a_mixed_channel() {
+    // The list is now unfiltered, so everything the channel has ever had
+    // arrives together: finished broadcasts, a broadcast for another time,
+    // one already on air, and the one this window prepared.
+    use louver_core::youtube::provision::{choose_broadcast, BroadcastChoice, REUSE_TOLERANCE_SECS};
+
+    let mixed = r#"{"items":[
+      {"id":"b-done","snippet":{"title":"어제","scheduledStartTime":"2026-09-19T23:27:00Z"},
+       "status":{"privacyStatus":"public","lifeCycleStatus":"complete"}},
+      {"id":"b-other","snippet":{"title":"내일 아침","scheduledStartTime":"2026-09-21T09:00:00Z"},
+       "status":{"privacyStatus":"public","lifeCycleStatus":"ready"}},
+      {"id":"b-onair","snippet":{"title":"지금 방송 중","scheduledStartTime":"2026-09-20T23:27:00Z"},
+       "status":{"privacyStatus":"public","lifeCycleStatus":"live"}},
+      {"id":"b-mine","snippet":{"title":"오늘 밤","scheduledStartTime":"2026-09-20T23:27:00Z"},
+       "status":{"privacyStatus":"public","lifeCycleStatus":"ready"}},
+      {"id":"b-revoked","snippet":{"title":"취소됨","scheduledStartTime":"2026-09-20T23:27:00Z"},
+       "status":{"privacyStatus":"public","lifeCycleStatus":"revoked"}}
+    ]}"#;
+    let fake = FakeYoutube::start(vec![("GET /liveBroadcasts", 200, mixed.into())]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+    let all = api.my_broadcasts("tok").unwrap();
+    assert_eq!(all.len(), 5, "the client filters nothing out of the response");
+
+    let window = |t: &str| chrono::DateTime::parse_from_rfc3339(t).unwrap().with_timezone(&chrono::Utc);
+
+    // 23:27 → 23:29. Only `b-mine` qualifies: the others are finished, on air,
+    // revoked, or for another day entirely.
+    match choose_broadcast(&all, window("2026-09-20T23:27:00Z"), REUSE_TOLERANCE_SECS) {
+        BroadcastChoice::Reuse(b) => assert_eq!(b.id, "b-mine"),
+        other => panic!("should have reused b-mine: {other:?}"),
+    }
+
+    // A window with nothing prepared for it creates rather than borrowing
+    // tomorrow morning's broadcast, which is the fallback that would rename
+    // the user's own broadcast and stream into it.
+    assert_eq!(
+        choose_broadcast(&all, window("2026-09-20T14:00:00Z"), REUSE_TOLERANCE_SECS),
+        BroadcastChoice::Create
+    );
+    // And an hour either side of tomorrow's is still not tomorrow's.
+    assert_eq!(
+        choose_broadcast(&all, window("2026-09-21T08:00:00Z"), REUSE_TOLERANCE_SECS),
+        BroadcastChoice::Create
+    );
+}
+
+#[test]
+fn a_second_page_is_read_rather_than_called_empty() {
+    // 50 broadcasts fit on a page. A channel with more of them must not be
+    // told it has none, which would leave a duplicate broadcast on the channel
+    // every single night.
+    let page1 = format!(
+        r#"{{"nextPageToken":"PAGE2","items":[{}]}}"#,
+        (0..50)
+            .map(|i| format!(
+                r#"{{"id":"old-{i}","snippet":{{"title":"t","scheduledStartTime":"2026-01-0{}T00:00:00Z"}},
+                   "status":{{"privacyStatus":"public","lifeCycleStatus":"complete"}}}}"#,
+                i % 9 + 1
+            ))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let page2 = r#"{"items":[
+      {"id":"b-mine","snippet":{"title":"오늘 밤","scheduledStartTime":"2026-09-20T23:27:00Z"},
+       "status":{"privacyStatus":"public","lifeCycleStatus":"ready"}}]}"#;
+
+    // The fake answers by path, so the page token distinguishes the two.
+    let fake = FakeYoutube::start(vec![("GET /liveBroadcasts", 200, page1.clone())]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+    let (first, next) = api.broadcasts_page("tok", None).unwrap();
+    assert_eq!(first.len(), 50);
+    assert_eq!(next.as_deref(), Some("PAGE2"), "the next page token must be read");
+
+    // Asking for that page sends it back, percent-encoded into the query.
+    let fake2 = FakeYoutube::start(vec![("GET /liveBroadcasts", 200, page2.into())]);
+    let api2 = YoutubeApi::with_base(&http, fake2.base.clone());
+    let (second, next2) = api2.broadcasts_page("tok", Some("PAGE2")).unwrap();
+    assert_eq!(second[0].id, "b-mine");
+    assert_eq!(next2, None, "the last page ends the search");
+    assert!(fake2.requests()[0].path.contains("pageToken=PAGE2"), "{}", fake2.requests()[0].path);
+
+    // And the whole-list form stops at the bound rather than reading forever.
+    let endless = FakeYoutube::start(vec![("GET /liveBroadcasts", 200, page1)]);
+    let api3 = YoutubeApi::with_base(&http, endless.base.clone());
+    let all = api3.my_broadcasts("tok").unwrap();
+    assert_eq!(endless.requests().len(), louver_core::youtube::api::MAX_BROADCAST_PAGES);
+    assert_eq!(all.len(), 50 * louver_core::youtube::api::MAX_BROADCAST_PAGES);
 }

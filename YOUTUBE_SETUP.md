@@ -117,6 +117,32 @@ YouTube Studio에서 **비공개(Private)** 또는 **일부공개(Unlisted)** �
 | 17 | 예약 방송이 실패한 경우 | `_FAIL` 줄에 API 메서드·HTTP 상태·Google reason·Google 메시지가 모두 있다 |
 | 18 | 화면 확인 | 실패 창 제목이 `YouTube에 연결하지 못했습니다`가 아니라 실패한 **단계 이름**이다 |
 | 19 | 로그 전체 검색 | 액세스 토큰·리프레시 토큰·클라이언트 시크릿·스트림 키가 한 글자도 없다 |
+| 20 | `YOUTUBE_BROADCAST_LIST_OK` 를 먼저 확인 | 조회가 성공한다. 여기서 실패하면 그 `_FAIL` 줄이 다음 원인이다 |
+| 21 | 같은 채널에 다른 시간 예정 방송을 하나 만들어 둔 뒤 예약 실행 | 그 방송은 건드리지 않고, 이 예약용 방송을 따로 만든다 |
+| 22 | 예약을 두 번 실행(재시도 유발) | 방송이 두 개 생기지 않고 `YOUTUBE_BROADCAST_REUSED` 가 남는다 |
+
+#### 2026-09-20 확인된 원인: `liveBroadcasts.list` 파라미터 조합
+
+위 로그 덕분에 실제 Google 서버에서 원인이 확정됐습니다.
+
+```
+YOUTUBE_TOKEN_REFRESH_OK
+YOUTUBE_BROADCAST_LIST_FAIL
+liveBroadcasts.list HTTP 400 reason=incompatibleParameters ·
+Incompatible parameters specified in the request: broadcastStatus, mine
+```
+
+Scheduler·OAuth·refresh token·Client ID/Secret 전부 정상이었습니다. YouTube의
+`liveBroadcasts.list`는 **`id` / `mine` / `broadcastStatus` 중 정확히 하나**만
+받는데, 앱이 `mine=true`와 `broadcastStatus=upcoming`을 함께 보내고 있었습니다.
+
+이제는 `mine=true` 하나만 보내고, 이 예약에 쓸 방송인지는 앱 안에서 판단합니다.
+
+- 아직 시작하지 않은 방송(`created`·`ready`)만 후보로 봅니다
+- `scheduledStartTime`이 이 예약 시작 시각 **±15분** 안일 때만 재사용합니다
+- 다른 시간·다른 날 방송은 절대 가져다 쓰지 않습니다. 없으면 새로 만듭니다
+- 결과가 한 페이지(50개)를 넘으면 `nextPageToken`으로 이어 읽되, 최대 4페이지
+  (200개)까지만 봅니다
 
 #### 실제 Mac에서 다시 테스트하는 방법
 
@@ -253,6 +279,9 @@ Google의 error reason, Google의 메시지. 예를 들어
 | **실제 라이브 채팅 전송** | **NOT TESTED** |
 | **Stop → Start 후 stale liveChatId 없음** | **NOT TESTED** |
 | 준비 단계별 START/OK/FAIL 로그 | **PASS** — 단위·통합 테스트 (실패 줄에 메서드·상태·reason·메시지가 모두 담기는지) |
+| `liveBroadcasts.list` 에 필터를 하나만 보냄 | **PASS** — 실제로 나간 요청 쿼리로 확인. 가짜 서버도 Google처럼 두 개면 400을 돌려줍니다 |
+| 섞인 목록에서 이 예약 방송만 고름 | **PASS** — 완료·다른 시간·방송 중·취소된 방송을 섞어놓고 확인 |
+| 50개를 넘으면 다음 페이지를 읽음 | **PASS** — `nextPageToken` 왕복과 상한 확인 |
 | 자격 증명이 로그에 남지 않음 | **PASS** — 네 가지 값 모두로 로그 전문을 검색하는 테스트 |
 | **실제 Mac 예약 방송 준비 로그 (TEST 15~19)** | **NOT TESTED** |
 | **실제 YouTube에서 LIVE 확인** | **NOT TESTED** |

@@ -656,7 +656,55 @@ build if it comes back.
 start now works. It is PASS only when a real Mac log shows
 `YOUTUBE_BROADCAST_CREATED → YOUTUBE_BROADCAST_BOUND → FFmpeg Running →
 YOUTUBE_BROADCAST_LIVE` and the channel is live. The procedure is
-`YOUTUBE_SETUP.md` §3, TEST 15~19.
+`YOUTUBE_SETUP.md` §3, TEST 15~22.
+
+## 14f. The cause, from the log above (2026-09-20)
+
+The instrumentation paid for itself on the first run. Real Mac:
+
+```
+YOUTUBE_TOKEN_REFRESH_OK
+YOUTUBE_BROADCAST_LIST_FAIL
+liveBroadcasts.list HTTP 400 reason=incompatibleParameters ·
+Incompatible parameters specified in the request: broadcastStatus, mine
+```
+
+The scheduler, OAuth, the refresh token and the client credentials were all
+working — the refresh succeeded on the line above. `liveBroadcasts.list` accepts
+exactly one of `id`, `mine` and `broadcastStatus`, and the app was sending
+`mine=true` and `broadcastStatus=upcoming` together. Every scheduled start had
+been failing on its first request to the channel, six times a window, for as
+long as the feature has existed.
+
+| Change | Why |
+| --- | --- |
+| `mine=true&broadcastType=all` and nothing else | One filter is the rule. `broadcastType` is not a filter, so it may stay |
+| The narrowing moved into `choose_broadcast` | It costs nothing in memory and cannot be refused |
+| Reusable statuses are an allowlist: `created`, `ready` | `testing` and `live` are in progress, `complete` and `revoked` are over. An allowlist is right about the statuses Google may yet add |
+| `scheduledStartTime` within ±15 minutes, still | §4: never borrow an unrelated broadcast. A window with nothing prepared creates one rather than renaming the user's own |
+| Paging, bounded | 50 to a page, at most 4 pages, and it stops at the first page that answers. A channel with 60 broadcasts must not be told it has none — that would leave a duplicate every night — and one with 6,000 must not be read to the end at a quota unit a page |
+| A refused request is not a lost connection | `LL-YOUTUBE-004`'s message covers everything from a bad parameter to an unreachable host, so it is vague enough to be wrong most of the time. Each step now supplies its own: "예약 방송 정보를 조회하지 못했습니다." The code and Google's words are unchanged, and the words move behind 상세정보 where a user need not read them |
+
+**The fakes were the reason this shipped.** Both stand-ins answered
+`mine=true&broadcastStatus=upcoming` with a cheerful 200, so eleven tests passed
+against a request real Google has never accepted. They now enforce the rule and
+return Google's own `400 incompatibleParameters`, which is what makes the
+regression real: restoring the old query fails **11 tests** across the two
+files, not one.
+
+New coverage: the request is asserted on the wire (exactly one filter, no
+`broadcastStatus`); a mixed channel — finished, another day's, on air, revoked,
+and this window's — yields only this window's broadcast; a window with nothing
+prepared for it creates rather than borrowing the user's; a second page is read
+and the bound is honoured; and the `incompatibleParameters` refusal reads as
+"예약 방송 정보를 조회하지 못했습니다" on screen, with Google's words behind the
+disclosure.
+
+**Status: NOT TESTED against real Google.** A confirmed cause and a fix that
+the refused request can no longer pass through is not the same as a working
+scheduled broadcast. The next real Mac run should show
+`YOUTUBE_BROADCAST_LIST_OK`; whatever `_FAIL` comes after it, if any, is the
+next thing to fix.
 
 ## 15. Known issues
 

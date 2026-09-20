@@ -6,11 +6,26 @@
 //! Request" is not something a user can act on.
 
 use super::metadata::{BroadcastMetadata, Privacy};
+use super::oauth::urlencode;
 use super::quota::ApiMethod;
 use crate::error::{ErrorCode, LouverError, Result};
 use serde::{Deserialize, Serialize};
 
 pub const API_BASE: &str = "https://www.googleapis.com/youtube/v3";
+
+/// How many broadcasts one `liveBroadcasts.list` page asks for. Google's
+/// maximum, so the common case — a channel with a handful — is one request.
+pub const BROADCAST_PAGE_SIZE: u32 = 50;
+
+/// How far the search for this window's broadcast will page.
+///
+/// A channel with years of past broadcasts would otherwise be read to the end
+/// on every scheduled start, at a quota unit a page, to answer a question the
+/// first page nearly always settles. Four pages is 200 broadcasts; beyond that
+/// the app creates one rather than keep looking, which is the safe way to be
+/// wrong — a duplicate broadcast is visible and fixable, a start that never
+/// happens is neither.
+pub const MAX_BROADCAST_PAGES: usize = 4;
 /// YouTube truncates chat messages beyond this.
 pub const MAX_CHAT_MESSAGE_CHARS: usize = 200;
 
@@ -187,15 +202,53 @@ impl<'a> YoutubeApi<'a> {
             .ok_or_else(|| LouverError::new(ErrorCode::YoutubeNoActiveBroadcast))
     }
 
-    /// Broadcasts that have not started yet, newest schedule first.
+    /// One page of this channel's broadcasts.
     ///
-    /// Used to reuse one this app created earlier for the same window rather
-    /// than making a second. `mine=true` so another channel's broadcasts can
-    /// never be picked up.
-    pub fn upcoming_broadcasts(&self, token: &str) -> Result<Vec<LiveBroadcast>> {
-        let path = "/liveBroadcasts?part=id,snippet,status,contentDetails&broadcastStatus=upcoming&broadcastType=all&mine=true&maxResults=25";
-        let v = self.call("GET", path, token, None)?;
-        Ok(v["items"].as_array().map(|i| i.iter().map(parse_broadcast).collect()).unwrap_or_default())
+    /// **`mine=true` is the only filter.** `liveBroadcasts.list` accepts
+    /// exactly one of `id`, `mine` and `broadcastStatus`, and real Google
+    /// answers any pair of them with
+    /// `HTTP 400 incompatibleParameters: Incompatible parameters specified in
+    /// the request: broadcastStatus, mine` — which is what stopped every
+    /// scheduled start on a real Mac before the first request had even been
+    /// made against the channel. Narrowing to `upcoming` therefore happens
+    /// here, in memory, where it costs nothing and cannot be refused.
+    ///
+    /// Returns the page and the token for the next one, if there is one.
+    pub fn broadcasts_page(
+        &self,
+        token: &str,
+        page_token: Option<&str>,
+    ) -> Result<(Vec<LiveBroadcast>, Option<String>)> {
+        let mut path = format!(
+            "/liveBroadcasts?part=id,snippet,status,contentDetails&mine=true&broadcastType=all&maxResults={BROADCAST_PAGE_SIZE}"
+        );
+        if let Some(t) = page_token.filter(|t| !t.is_empty()) {
+            path.push_str(&format!("&pageToken={}", urlencode(t)));
+        }
+        let v = self.call("GET", &path, token, None)?;
+        let items =
+            v["items"].as_array().map(|i| i.iter().map(parse_broadcast).collect()).unwrap_or_default();
+        let next = v["nextPageToken"].as_str().filter(|t| !t.is_empty()).map(str::to_string);
+        Ok((items, next))
+    }
+
+    /// This channel's broadcasts, up to [`MAX_BROADCAST_PAGES`] pages.
+    ///
+    /// The caller usually wants [`Self::broadcasts_page`] so it can stop as
+    /// soon as it has found what it is looking for; this is the whole-list
+    /// form, for callers that need one.
+    pub fn my_broadcasts(&self, token: &str) -> Result<Vec<LiveBroadcast>> {
+        let mut all = Vec::new();
+        let mut page: Option<String> = None;
+        for _ in 0..MAX_BROADCAST_PAGES {
+            let (items, next) = self.broadcasts_page(token, page.as_deref())?;
+            all.extend(items);
+            match next {
+                Some(t) => page = Some(t),
+                None => break,
+            }
+        }
+        Ok(all)
     }
 
     /// Create the broadcast for a scheduled window.

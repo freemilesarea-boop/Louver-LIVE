@@ -97,6 +97,31 @@ impl ProvisionStep {
         }
     }
 
+    /// The sentence shown in place of a failed call's own message.
+    ///
+    /// `LL-YOUTUBE-004`'s message is "YouTube에 연결하지 못했습니다", which was
+    /// wrong for every failure that has actually happened: the account was
+    /// connected, the token had just been refreshed, and Google answered —
+    /// it simply refused the request. Told that YouTube could not be reached,
+    /// a user checks their internet and reconnects their account, neither of
+    /// which is the problem.
+    ///
+    /// Used only where that generic message would have been; a failure with
+    /// something specific of its own to say — the quota is gone, the login
+    /// expired — keeps it.
+    pub fn user_message(self) -> &'static str {
+        match self {
+            Self::TokenRefresh => "Google 인증을 갱신하지 못했습니다.",
+            Self::BroadcastList => "예약 방송 정보를 조회하지 못했습니다.",
+            Self::BroadcastInsert => "예약 방송을 만들지 못했습니다.",
+            Self::StreamList => "스트림 키에 맞는 수신 지점을 찾지 못했습니다.",
+            Self::BroadcastBind => "방송을 스트림에 연결하지 못했습니다.",
+            Self::MetadataApply => "방송 정보를 적용하지 못했습니다.",
+            Self::StreamActive => "YouTube가 영상을 받고 있는지 확인하지 못했습니다.",
+            Self::BroadcastTransition => "방송을 LIVE로 전환하지 못했습니다.",
+        }
+    }
+
     /// One line of advice under the stage, so the dashboard is not only
     /// telling the user which of our steps broke.
     pub fn remedy(self) -> &'static str {
@@ -197,7 +222,16 @@ impl StepRecorder {
         let detail = err.detail.clone().unwrap_or_else(|| err.message.clone());
         self.record(step, StepOutcome::Failed, &detail, Some(err.code_str.clone()));
         self.logger.warn(LogTarget::App, &self.line(step, "FAIL", &format!("{} · {}", err.code_str, detail)));
-        err.clone()
+
+        let mut out = err.clone();
+        // `LL-YOUTUBE-004` covers everything from a refused parameter to an
+        // unreachable host, so its message has to be vague enough to be wrong
+        // most of the time. The step knows better; anything with a message of
+        // its own keeps it.
+        if err.code == crate::error::ErrorCode::YoutubeApiFailed {
+            out.message = step.user_message().to_string();
+        }
+        out
     }
 
     /// Run a call, recording whichever way it goes.
@@ -280,6 +314,32 @@ mod tests {
         assert_eq!(trace[2].outcome, StepOutcome::Skipped);
         assert_eq!(rec.failed_step(), Some(ProvisionStep::BroadcastBind));
         assert_eq!(trace[3].error_code.as_deref(), Some("LL-YOUTUBE-004"));
+    }
+
+    #[test]
+    fn a_refused_request_does_not_claim_youtube_could_not_be_reached() {
+        // The real case: the account was connected and the token had just
+        // been refreshed; Google answered, and refused the parameters.
+        let (rec, _d) = recorder();
+        let out = rec.fail(
+            ProvisionStep::BroadcastList,
+            &LouverError::with_detail(
+                ErrorCode::YoutubeApiFailed,
+                "liveBroadcasts.list HTTP 400 reason=incompatibleParameters",
+            ),
+        );
+        assert_eq!(out.message, "예약 방송 정보를 조회하지 못했습니다.");
+        assert!(!out.message.contains("연결하지 못했습니다"));
+        // The code and Google's words are untouched.
+        assert_eq!(out.code_str, "LL-YOUTUBE-004");
+        assert!(out.detail.unwrap().contains("incompatibleParameters"));
+    }
+
+    #[test]
+    fn a_failure_with_something_better_to_say_keeps_saying_it() {
+        let (rec, _d) = recorder();
+        let out = rec.fail(ProvisionStep::BroadcastList, &LouverError::new(ErrorCode::YoutubeQuotaExceeded));
+        assert!(out.message.contains("사용량"), "{}", out.message);
     }
 
     #[test]

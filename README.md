@@ -246,7 +246,7 @@ YouTube 방송을 준비하는 동안 각 단계가 `app.log`에 `_START` / `_OK
 | 이벤트 | 하는 일 |
 | --- | --- |
 | `YOUTUBE_TOKEN_REFRESH_*` | 저장된 로그인으로 Google 인증 갱신 |
-| `YOUTUBE_BROADCAST_LIST_*` | 이 예약에 쓸 방송이 이미 있는지 확인 |
+| `YOUTUBE_BROADCAST_LIST_*` | 이 예약에 쓸 방송이 이미 있는지 확인 (`mine=true` 하나만 보내고, 이 예약 시각 ±15분인 방송을 앱 안에서 고릅니다) |
 | `YOUTUBE_BROADCAST_INSERT_*` | 없으면 방송을 새로 만듦 |
 | `YOUTUBE_STREAM_LIST_*` | 저장된 스트림 키가 가리키는 수신 지점 찾기 |
 | `YOUTUBE_BROADCAST_BIND_*` | 방송과 수신 지점 연결 |

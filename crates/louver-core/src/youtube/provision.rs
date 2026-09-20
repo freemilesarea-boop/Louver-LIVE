@@ -34,24 +34,34 @@ pub enum BroadcastChoice {
     Create,
 }
 
+/// The only two states a broadcast can be in and still be taken over.
+///
+/// An allowlist rather than a list of exclusions, because the list this has to
+/// be right about is the one Google may add to. `testing` and `live` are in
+/// progress, `complete` and `revoked` are over, and none of the four is
+/// something to rename and stream into.
+const REUSABLE_STATUSES: [&str; 2] = ["created", "ready"];
+
 /// Pick the broadcast for a window out of what the channel already has.
 ///
-/// Reuse is narrow on purpose. An arbitrary "upcoming" broadcast may be
-/// something the user set up by hand for another time entirely, and taking it
-/// over would rename their broadcast and stream into it. A candidate has to
-/// be scheduled for *this* window to be reused; anything else means create.
+/// Reuse is narrow on purpose. The candidates now arrive unfiltered — Google
+/// will not accept `mine=true` and `broadcastStatus=upcoming` in one request,
+/// so the whole of the channel's list comes back and the narrowing happens
+/// here — and an arbitrary broadcast in it may be something the user set up by
+/// hand for another time entirely. Taking that one over would rename their
+/// broadcast and stream into it. A candidate has to be scheduled for *this*
+/// window; anything else means create, including "there is exactly one other
+/// upcoming broadcast and it is probably the right one".
 ///
 /// `window_start` and `tolerance_secs` describe the window being started now.
 pub fn choose_broadcast(
-    upcoming: &[LiveBroadcast],
+    candidates: &[LiveBroadcast],
     window_start: chrono::DateTime<chrono::Utc>,
     tolerance_secs: i64,
 ) -> BroadcastChoice {
     let mut best: Option<(i64, &LiveBroadcast)> = None;
-    for b in upcoming {
-        // A broadcast already bound and already past `ready` belongs to
-        // something in progress; leave it alone.
-        if b.life_cycle_status == "live" || b.life_cycle_status == "complete" {
+    for b in candidates {
+        if !REUSABLE_STATUSES.contains(&b.life_cycle_status.as_str()) {
             continue;
         }
         let Some(scheduled) = b.scheduled_start_time.as_deref() else { continue };

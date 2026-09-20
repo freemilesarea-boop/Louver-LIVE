@@ -972,8 +972,9 @@ describe('the YouTube side of a broadcast is reported on its own', () => {
 
     expect(await screen.findByText('예약 방송 생성 실패')).toBeInTheDocument()
     // And Google's own words are there to act on, not summarised away.
-    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('liveBroadcasts.insert')
-    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('reason=liveStreamingNotEnabled')
+    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('예약 방송을 만들지 못했습니다')
+    expect(screen.getByTestId('blocked-google')).toHaveTextContent('liveBroadcasts.insert')
+    expect(screen.getByTestId('blocked-google')).toHaveTextContent('reason=liveStreamingNotEnabled')
 
     // The panel behind the modal says the same thing, with the remedy and the
     // sequence it got through.
@@ -985,6 +986,32 @@ describe('the YouTube side of a broadcast is reported on its own', () => {
     expect(steps).toHaveTextContent('Google 인증 갱신')
     expect(steps).toHaveTextContent('예약 방송 확인')
     expect(steps).toHaveTextContent('예약 방송 생성')
+  })
+
+  it('does not call a refused request a lost connection', async () => {
+    // The failure real Google actually sent: `liveBroadcasts.list` with two
+    // filters. The account is connected and the token was refreshed a line
+    // earlier, so "YouTube에 연결하지 못했습니다" would send the user to check
+    // their internet and reconnect — neither of which is the problem.
+    const user = userEvent.setup()
+    mount({ youtubeApiFails: true, youtubeFailsAt: 'broadcast_list' })
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await gotoPage(user, '설정')
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    await screen.findByRole('button', { name: '연결 해제' }, { timeout: 6000 })
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+
+    expect(await screen.findByText('예약 방송 목록 조회 실패')).toBeInTheDocument()
+    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('예약 방송 정보를 조회하지 못했습니다')
+    expect(screen.queryByText(/YouTube에 연결하지 못했습니다/)).not.toBeInTheDocument()
+    // Google's own words stay available for whoever has to fix it.
+    await user.click(screen.getByRole('button', { name: '취소' }))
+    await user.click(await screen.findByText('상세정보'))
+    expect(screen.getByTestId('metadata-failed')).toHaveTextContent('incompatibleParameters')
   })
 
   it('tells a stale Google login apart from a YouTube API failure', async () => {
@@ -1004,8 +1031,9 @@ describe('the YouTube side of a broadcast is reported on its own', () => {
     await startLive(user)
 
     expect(await screen.findByText('Google 인증 갱신 실패')).toBeInTheDocument()
-    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('oauth2.token(refresh_token)')
-    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('invalid_grant')
+    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('Google 인증 갱신에 실패했습니다')
+    expect(screen.getByTestId('blocked-google')).toHaveTextContent('oauth2.token(refresh_token)')
+    expect(screen.getByTestId('blocked-google')).toHaveTextContent('invalid_grant')
 
     // And the broadcast engine is still not the thing that is unwell: the
     // user can go on air without the optional half.

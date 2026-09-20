@@ -596,13 +596,51 @@ impl YoutubeService {
 
         // 1. The broadcast for this window: reuse one prepared earlier (a
         //    retry inside the window must not leave two behind) or create it.
-        let upcoming = rec.run(
-            ProvisionStep::BroadcastList,
-            &window,
-            || api.upcoming_broadcasts(&token),
-            |b| format!("{}개 예정", b.len()),
-        )?;
-        let broadcast = match provision::choose_broadcast(&upcoming, window_start, REUSE_TOLERANCE_SECS) {
+        //
+        //    Listed with `mine=true` and nothing else. Asking Google for
+        //    `mine=true&broadcastStatus=upcoming` — one filter too many — is
+        //    what refused every scheduled start on a real Mac with
+        //    `incompatibleParameters`, so the narrowing to this window happens
+        //    below, in memory, over pages of the channel's own broadcasts.
+        let choice = rec
+            .run(
+                ProvisionStep::BroadcastList,
+                &window,
+                || {
+                    let mut seen: Vec<louver_core::youtube::api::LiveBroadcast> = Vec::new();
+                    let mut page: Option<String> = None;
+                    let mut pages = 0usize;
+                    loop {
+                        let (items, next) = api.broadcasts_page(&token, page.as_deref())?;
+                        seen.extend(items);
+                        pages += 1;
+                        let choice = provision::choose_broadcast(&seen, window_start, REUSE_TOLERANCE_SECS);
+                        // Stop at the first page that answers the question. A
+                        // channel with years of history is not worth reading to
+                        // the end, at a quota unit a page, to learn what the first
+                        // page already said.
+                        if matches!(choice, BroadcastChoice::Reuse(_))
+                            || next.is_none()
+                            || pages >= louver_core::youtube::api::MAX_BROADCAST_PAGES
+                        {
+                            return Ok((choice, seen.len(), pages));
+                        }
+                        page = next;
+                    }
+                },
+                |(choice, seen, pages)| {
+                    format!(
+                        "{seen}개 확인 ({pages}페이지) · {}",
+                        match choice {
+                            BroadcastChoice::Reuse(b) => format!("재사용 {}", b.id),
+                            BroadcastChoice::Create => "이 예약에 맞는 방송 없음".to_string(),
+                        }
+                    )
+                },
+            )?
+            .0;
+
+        let broadcast = match choice {
             BroadcastChoice::Reuse(b) => {
                 rec.skipped(ProvisionStep::BroadcastInsert, &format!("기존 방송 재사용 {}", b.id));
                 self.logger.info(

@@ -223,7 +223,7 @@ export function createMockBackend(opts: MockOptions = {}) {
       token_refresh: ['LL-YOUTUBE-AUTH-REFRESH', 'Google 인증 갱신 실패',
         'oauth2.token(refresh_token) HTTP 400 · invalid_grant: Token has been expired or revoked.'],
       broadcast_list: ['LL-YOUTUBE-004', '예약 방송 목록 조회 실패',
-        'liveBroadcasts.list HTTP 403 reason=insufficientPermissions · Request had insufficient authentication scopes.'],
+        'liveBroadcasts.list HTTP 400 reason=incompatibleParameters · Incompatible parameters specified in the request: broadcastStatus, mine'],
       broadcast_insert: ['LL-YOUTUBE-004', '예약 방송 생성 실패',
         'liveBroadcasts.insert HTTP 403 reason=liveStreamingNotEnabled · The user is not enabled for live streaming.'],
       stream_list: ['LL-YOUTUBE-004', '스트림 연결 실패',
@@ -246,6 +246,16 @@ export function createMockBackend(opts: MockOptions = {}) {
       stream_active: '인터넷 연결과 스트림 키를 확인해주세요.',
       broadcast_transition: '잠시 후 자동으로 다시 시도합니다.',
     }
+    const stepMessage: Record<ProvisionStep, string> = {
+      token_refresh: 'Google 인증을 갱신하지 못했습니다.',
+      broadcast_list: '예약 방송 정보를 조회하지 못했습니다.',
+      broadcast_insert: '예약 방송을 만들지 못했습니다.',
+      stream_list: '스트림 키에 맞는 수신 지점을 찾지 못했습니다.',
+      broadcast_bind: '방송을 스트림에 연결하지 못했습니다.',
+      metadata_apply: '방송 정보를 적용하지 못했습니다.',
+      stream_active: 'YouTube가 영상을 받고 있는지 확인하지 못했습니다.',
+      broadcast_transition: '방송을 LIVE로 전환하지 못했습니다.',
+    }
     const [code, stage, googleWords] = detail[step]
     const steps: StepRecord[] = sequence.slice(0, at < 0 ? 0 : at)
       .map((s) => ({ step: s, outcome: 'ok' as const, detail: null, error_code: null }))
@@ -253,9 +263,12 @@ export function createMockBackend(opts: MockOptions = {}) {
     return {
       error: {
         code_str: code,
+        // The step's own sentence, the way the backend now reports it: a
+        // refused parameter is not a lost connection, and telling the user
+        // YouTube could not be reached sends them to check their internet.
         message: code === 'LL-YOUTUBE-AUTH-REFRESH'
           ? 'Google 인증 갱신에 실패했습니다. 설정에서 YouTube 계정을 다시 연결해주세요.'
-          : 'YouTube에 연결하지 못했습니다. 잠시 후 다시 시도합니다.',
+          : stepMessage[step],
         detail: googleWords,
       },
       stage,

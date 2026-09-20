@@ -36,15 +36,19 @@ export function Dashboard() {
   const [busy, setBusy] = useState(false)
   const [applyState, setApplyState] = useState<MetadataApplyState | null>(null)
   const [plan, setPlan] = useState<ApplyPlan | null>(null)
-  /** The YouTube side could not be done; the user has to choose (§B-9). */
-  const [youtubeBlocked, setYoutubeBlocked] = useState<string | null>(null)
   /**
-   * Which step it failed at, when the backend got far enough to know. The
-   * heading says that rather than the one sentence every YouTube failure used
-   * to share: "예약 방송 생성 실패" and "Google 인증 갱신 실패" are different
-   * problems with different remedies.
+   * The YouTube side could not be done; the user has to choose (§B-9).
+   *
+   * `stage` is the step it failed at, when the backend got far enough to know:
+   * "예약 방송 생성 실패" and "Google 인증 갱신 실패" are different problems
+   * with different remedies, and both used to read as one sentence. When it is
+   * set, `message` is the step's own wording and `detail` is Google's, which
+   * belongs behind a disclosure rather than in front of someone who only wants
+   * to play music.
    */
-  const [blockedStage, setBlockedStage] = useState<string | null>(null)
+  const [blocked, setBlocked] = useState<
+    { message: string; detail?: string; stage?: string | null; remedy?: string | null } | null
+  >(null)
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -102,8 +106,7 @@ export function Dashboard() {
         toast({ kind: 'info', message: '로컬 테스트 송출을 시작했습니다.' })
       }
       setPreflight(null)
-      setYoutubeBlocked(null)
-      setBlockedStage(null)
+      setBlocked(null)
       await refreshStatus()
     } catch (e) {
       // A YouTube failure is the user's decision to make, not ours: starting
@@ -111,11 +114,19 @@ export function Dashboard() {
       // that must never happen behind their back (§B-9).
       const code = (e as { code_str?: string } | null)?.code_str ?? ''
       if (kind === 'live' && !skipYoutube && code.startsWith('LL-YOUTUBE-')) {
-        setYoutubeBlocked((e as { detail?: string; message: string }).detail
-          ?? (e as { message: string }).message)
+        const failure = e as { detail?: string; message: string }
         // The apply state was written before the start returned, so it already
         // names the step. Read once rather than waiting for the next poll.
-        setBlockedStage((await api.youtubeApplyState().catch(() => null))?.failed_stage ?? null)
+        const st = await api.youtubeApplyState().catch(() => null)
+        setBlocked({
+          // With a stage, the message is the step's own sentence and the
+          // detail is Google's words; without one — no account connected,
+          // say — the detail is the sentence worth reading.
+          message: st?.failed_stage ? failure.message : (failure.detail ?? failure.message),
+          detail: failure.detail,
+          stage: st?.failed_stage,
+          remedy: st?.failed_remedy,
+        })
       } else {
         reportError(e)
       }
@@ -434,23 +445,30 @@ export function Dashboard() {
       {/* §B-9: the YouTube work could not be done. The user decides — the app
           never quietly goes live under YouTube's own defaults. */}
       <Modal
-        open={youtubeBlocked != null}
-        title={blockedStage ?? '방송 설정을 YouTube에 적용하지 못했습니다'}
-        onClose={() => setYoutubeBlocked(null)}
+        open={blocked != null}
+        title={blocked?.stage ?? '방송 설정을 YouTube에 적용하지 못했습니다'}
+        onClose={() => setBlocked(null)}
         footer={
           <>
-            <Button onClick={() => setYoutubeBlocked(null)}>취소</Button>
+            <Button onClick={() => setBlocked(null)}>취소</Button>
             {/* "다시 시도" would repeat the same failure: nothing has changed
                 between the two presses. Connecting an account is the thing
                 that actually fixes it, so that is what the button says. */}
-            <Button onClick={() => { setYoutubeBlocked(null); setPage('settings') }}>YouTube 연결</Button>
-            <Button variant="live" onClick={() => { setYoutubeBlocked(null); void doStart('live', true) }}>
+            <Button onClick={() => { setBlocked(null); setPage('settings') }}>YouTube 연결</Button>
+            <Button variant="live" onClick={() => { setBlocked(null); void doStart('live', true) }}>
               설정 없이 방송 시작
             </Button>
           </>
         }
       >
-        <p className="text-sm text-ink-200" data-testid="blocked-detail">{youtubeBlocked}</p>
+        <p className="text-sm text-ink-200" data-testid="blocked-detail">{blocked?.message}</p>
+        {blocked?.remedy && <p className="mt-1 text-xs text-ink-400">{blocked.remedy}</p>}
+        {blocked?.stage && blocked.detail && (
+          <details className="mt-2 text-[11px] text-ink-500">
+            <summary className="cursor-pointer select-none">상세정보</summary>
+            <p className="mt-1 break-all" data-testid="blocked-google">{blocked.detail}</p>
+          </details>
+        )}
         <p className="mt-3 text-xs text-ink-500">
           영상 송출 자체에는 문제가 없습니다. 설정 없이 시작하면 방송은 정상적으로
           나가고, YouTube 방송 제목·설명·태그만 지금 YouTube에 저장된 값 그대로

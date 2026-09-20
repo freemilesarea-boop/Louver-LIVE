@@ -36,7 +36,8 @@ struct Fake {
 }
 
 impl Fake {
-    /// `routes` maps a "METHOD /path" prefix to (status, body).
+    /// `routes` maps a "METHOD /path?query" prefix to (status, body), first
+    /// match winning, so a more specific route is written first.
     fn start(routes: Vec<(&'static str, u16, String)>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -77,7 +78,33 @@ impl Fake {
                             .unwrap()
                             .push(format!("{method} {path} {}", String::from_utf8_lossy(&body)));
 
-                        let key = format!("{method} {}", path.split('?').next().unwrap_or(""));
+                        // Google's own rule, enforced here so no test can
+                        // pass against a request the real API refuses:
+                        // `liveBroadcasts.list` takes exactly one of `id`,
+                        // `mine` and `broadcastStatus`. Sending two is what
+                        // stopped every scheduled start on a real Mac, and a
+                        // fake that shrugged at it is why nothing caught it.
+                        if method == "GET" && path.starts_with("/liveBroadcasts") {
+                            let filters = ["&id=", "?id=", "mine=", "broadcastStatus="]
+                                .iter()
+                                .filter(|f| path.contains(**f))
+                                .count();
+                            if filters != 1 {
+                                let payload = r#"{"error":{"code":400,"message":"Incompatible parameters specified in the request: broadcastStatus, mine","errors":[{"reason":"incompatibleParameters","domain":"youtube.liveBroadcast"}]}}"#;
+                                let response = format!(
+                                    "HTTP/1.1 400 X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                                    payload.len()
+                                );
+                                let _ = stream.write_all(response.as_bytes());
+                                let _ = stream.flush();
+                                continue;
+                            }
+                        }
+
+                        // The query is part of the key: `liveBroadcasts.list`
+                        // and a lookup by id are the same path, and so are
+                        // `insert` and `bind` under a path-only key.
+                        let key = format!("{method} {path}");
                         let (status, payload) = routes
                             .iter()
                             .find(|(k, _, _)| key.starts_with(*k))
@@ -112,6 +139,12 @@ impl Drop for Fake {
 }
 
 const TOKEN_OK: &str = r#"{"access_token":"ya29.a0AfB_realaccesstoken","expires_in":3599}"#;
+
+/// The channel listing. `mine` in the key, because the read-back of one
+/// broadcast by id is the same path with a different filter.
+const LIST_BROADCASTS: &str = "GET /liveBroadcasts?part=id,snippet,status,contentDetails&mine=";
+/// Reading one broadcast back after the metadata write.
+const GET_BROADCAST: &str = "GET /liveBroadcasts?part=id,snippet,status,contentDetails&id=";
 
 struct Harness {
     service: YoutubeService,
@@ -174,7 +207,7 @@ fn a_scheduled_start_logs_every_step_it_takes() {
     // list finds nothing, insert makes one, the saved key picks the endpoint,
     // bind attaches them, and the metadata goes on before FFmpeg is asked for.
     let api = Fake::start(vec![
-        ("GET /liveBroadcasts", 200, r#"{"items":[]}"#.into()),
+        (LIST_BROADCASTS, 200, r#"{"items":[]}"#.into()),
         (
             "POST /liveBroadcasts/bind",
             200,
@@ -184,7 +217,7 @@ fn a_scheduled_start_logs_every_step_it_takes() {
                 .into(),
         ),
         (
-            "POST /liveBroadcasts",
+            "POST /liveBroadcasts?",
             200,
             r#"{"id":"b-new","snippet":{"title":"COLORIST 24시간 편집샵 느낌 플레이리스트",
                 "scheduledStartTime":"2026-09-20T12:59:00Z"},
@@ -261,9 +294,9 @@ fn a_refused_insert_names_the_request_google_refused() {
     // What the Mac log should have said. `liveStreamingNotEnabled` is a real
     // Google reason and a real remedy — it is the channel, not the app.
     let api = Fake::start(vec![
-        ("GET /liveBroadcasts", 200, r#"{"items":[]}"#.into()),
+        (LIST_BROADCASTS, 200, r#"{"items":[]}"#.into()),
         (
-            "POST /liveBroadcasts",
+            "POST /liveBroadcasts?",
             403,
             r#"{"error":{"code":403,"message":"The user is not enabled for live streaming.",
                 "errors":[{"reason":"liveStreamingNotEnabled"}]}}"#
@@ -328,6 +361,212 @@ fn a_stale_login_fails_as_a_refresh_rather_than_as_a_youtube_api_error() {
     assert_no_credentials(&log);
 }
 
+/// The channel's ingestion endpoints, one of which the saved key publishes to.
+const MY_STREAMS: &str = r#"{"items":[
+    {"id":"s-other","snippet":{"title":"Old"},"status":{"streamStatus":"inactive"},
+     "cdn":{"ingestionInfo":{"streamName":"wrong-key-0000"}}},
+    {"id":"s-mine","snippet":{"title":"Main"},"status":{"streamStatus":"inactive"},
+     "cdn":{"ingestionInfo":{"streamName":"abcd-efgh-ijkl-mnop"}}}]}"#;
+
+/// The three metadata calls, answering with what was asked for.
+fn metadata_routes(id: &str) -> Vec<(&'static str, u16, String)> {
+    vec![
+        (
+            GET_BROADCAST,
+            200,
+            format!(
+                r#"{{"items":[{{"id":"{id}","snippet":{{"title":"t"}},
+                "status":{{"privacyStatus":"unlisted","lifeCycleStatus":"ready"}},
+                "contentDetails":{{"boundStreamId":"s-mine"}}}}]}}"#
+            ),
+        ),
+        ("PUT /liveBroadcasts", 200, format!(r#"{{"id":"{id}","status":{{"privacyStatus":"unlisted"}}}}"#)),
+        ("PUT /videos", 200, format!(r#"{{"id":"{id}"}}"#)),
+        (
+            "GET /videos",
+            200,
+            format!(
+                r#"{{"items":[{{"id":"{id}","snippet":{{"title":"COLORIST 24시간 편집샵 느낌 플레이리스트",
+                "description":"24시간 편집샵 플레이리스트","tags":["lofi","jazz"],"categoryId":"10"}}}}]}}"#
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn the_list_that_real_google_refused_is_never_sent_again() {
+    // The confirmed cause, asserted on the wire. `liveBroadcasts.list` takes
+    // exactly one of `id`, `mine` and `broadcastStatus`; the app was sending
+    // `mine=true` and `broadcastStatus=upcoming` together, and real Google
+    // answered 400 incompatibleParameters before the channel was ever read.
+    let api = Fake::start(
+        vec![
+            (LIST_BROADCASTS, 200, r#"{"items":[]}"#.into()),
+            (
+                "POST /liveBroadcasts?",
+                200,
+                r#"{"id":"b-new","snippet":{"title":"t"},
+            "status":{"privacyStatus":"unlisted","lifeCycleStatus":"created"},
+            "contentDetails":{"enableAutoStart":true}}"#
+                    .into(),
+            ),
+            ("GET /liveStreams", 200, MY_STREAMS.into()),
+            (
+                "POST /liveBroadcasts/bind",
+                200,
+                r#"{"id":"b-new","snippet":{"title":"t"},
+            "status":{"privacyStatus":"unlisted","lifeCycleStatus":"ready"},
+            "contentDetails":{"boundStreamId":"s-mine","enableAutoStart":true}}"#
+                    .into(),
+            ),
+        ]
+        .into_iter()
+        .chain(metadata_routes("b-new"))
+        .collect(),
+    );
+    let tokens = Fake::start(vec![("POST /token", 200, TOKEN_OK.into())]);
+    let h = Harness::new(&api, &tokens);
+
+    h.prepare_scheduled().expect("the preparation should get all the way through");
+
+    let listings: Vec<String> =
+        api.seen().into_iter().filter(|r| r.starts_with("GET /liveBroadcasts")).collect();
+    assert!(!listings.is_empty(), "the channel was never listed");
+    for r in &listings {
+        let filters = ["&id=", "mine=", "broadcastStatus="].iter().filter(|f| r.contains(**f)).count();
+        assert_eq!(filters, 1, "exactly one filter is allowed: {r}");
+        assert!(!r.contains("broadcastStatus"), "{r}");
+    }
+}
+
+#[test]
+fn a_mixed_channel_yields_this_windows_broadcast_and_no_other() {
+    // §4: never borrow an unrelated upcoming broadcast. The list is unfiltered
+    // now, so the channel's whole history arrives — and only the broadcast
+    // scheduled for this window may be taken over.
+    let window_start = chrono::Utc::now();
+    let mixed = format!(
+        r#"{{"items":[
+          {{"id":"b-done","snippet":{{"title":"어제","scheduledStartTime":"{}"}},
+           "status":{{"privacyStatus":"public","lifeCycleStatus":"complete"}}}},
+          {{"id":"b-other","snippet":{{"title":"내일 아침","scheduledStartTime":"{}"}},
+           "status":{{"privacyStatus":"public","lifeCycleStatus":"ready"}}}},
+          {{"id":"b-mine","snippet":{{"title":"오늘 밤","scheduledStartTime":"{}"}},
+           "status":{{"privacyStatus":"unlisted","lifeCycleStatus":"ready"}},
+           "contentDetails":{{"boundStreamId":"s-mine"}}}}
+        ]}}"#,
+        (window_start - chrono::Duration::days(1)).to_rfc3339(),
+        (window_start + chrono::Duration::hours(9)).to_rfc3339(),
+        window_start.to_rfc3339(),
+    );
+    let api = Fake::start(
+        vec![(LIST_BROADCASTS, 200, mixed), ("GET /liveStreams", 200, MY_STREAMS.into())]
+            .into_iter()
+            .chain(metadata_routes("b-mine"))
+            .collect(),
+    );
+    let tokens = Fake::start(vec![("POST /token", 200, TOKEN_OK.into())]);
+    let h = Harness::new(&api, &tokens);
+
+    h.prepare_scheduled().expect("this window's broadcast is right there");
+
+    let log = h.log();
+    // §6: the sequence a reused broadcast should produce.
+    assert!(log.contains("YOUTUBE_BROADCAST_LIST_OK"), "{log}");
+    assert!(log.contains("YOUTUBE_BROADCAST_REUSED: 이 예약의 방송을 다시 사용합니다 (b-mine)"), "{log}");
+    assert!(log.contains("YOUTUBE_BROADCAST_INSERT_SKIP"), "{log}");
+    assert!(log.contains("YOUTUBE_STREAM_LIST_OK"), "{log}");
+    assert!(log.contains("YOUTUBE_METADATA_APPLY_OK"), "{log}");
+
+    // Nothing was created — the user's other broadcast was left alone, and no
+    // second one was made for a window that already had one.
+    assert!(
+        !api.seen().iter().any(|r| r.starts_with("POST /liveBroadcasts?")),
+        "a broadcast was created even though this window already had one"
+    );
+    assert_eq!(h.service.provisioned().unwrap().broadcast_id, "b-mine");
+    assert_no_credentials(&log);
+}
+
+#[test]
+fn a_window_with_nothing_prepared_for_it_creates_rather_than_borrowing() {
+    // The same channel, a window nine hours before the only other broadcast.
+    // Taking that one over would rename the user's broadcast and stream into
+    // it, so it is left alone and a new one is made.
+    let window_start = chrono::Utc::now();
+    let elsewhere = format!(
+        r#"{{"items":[{{"id":"b-other","snippet":{{"title":"내일 아침","scheduledStartTime":"{}"}},
+           "status":{{"privacyStatus":"public","lifeCycleStatus":"ready"}}}}]}}"#,
+        (window_start + chrono::Duration::hours(9)).to_rfc3339(),
+    );
+    let api = Fake::start(
+        vec![
+            (LIST_BROADCASTS, 200, elsewhere),
+            (
+                "POST /liveBroadcasts?",
+                200,
+                r#"{"id":"b-new","snippet":{"title":"t"},
+                "status":{"privacyStatus":"unlisted","lifeCycleStatus":"created"},
+                "contentDetails":{"enableAutoStart":true}}"#
+                    .into(),
+            ),
+            ("GET /liveStreams", 200, MY_STREAMS.into()),
+            (
+                "POST /liveBroadcasts/bind",
+                200,
+                r#"{"id":"b-new","snippet":{"title":"t"},
+                "status":{"privacyStatus":"unlisted","lifeCycleStatus":"ready"},
+                "contentDetails":{"boundStreamId":"s-mine","enableAutoStart":true}}"#
+                    .into(),
+            ),
+        ]
+        .into_iter()
+        .chain(metadata_routes("b-new"))
+        .collect(),
+    );
+    let tokens = Fake::start(vec![("POST /token", 200, TOKEN_OK.into())]);
+    let h = Harness::new(&api, &tokens);
+
+    h.prepare_scheduled().unwrap();
+
+    let log = h.log();
+    assert!(log.contains("YOUTUBE_BROADCAST_INSERT_OK"), "{log}");
+    assert!(log.contains("YOUTUBE_BROADCAST_CREATED"), "{log}");
+    assert!(
+        !log.contains("b-other"),
+        "the user's own broadcast was touched:
+{log}"
+    );
+    assert_eq!(h.service.provisioned().unwrap().broadcast_id, "b-new");
+}
+
+#[test]
+fn the_parameter_refusal_reads_as_a_listing_failure_not_a_lost_connection() {
+    // §7. The account is connected and the token was refreshed one line
+    // earlier; telling the user YouTube could not be reached sends them to
+    // check their internet and reconnect, neither of which is the problem.
+    let api = Fake::start(vec![(
+        LIST_BROADCASTS,
+        400,
+        r#"{"error":{"code":400,
+            "message":"Incompatible parameters specified in the request: broadcastStatus, mine",
+            "errors":[{"reason":"incompatibleParameters"}]}}"#
+            .into(),
+    )]);
+    let tokens = Fake::start(vec![("POST /token", 200, TOKEN_OK.into())]);
+    let h = Harness::new(&api, &tokens);
+
+    let err = h.prepare_scheduled().unwrap_err();
+    assert_eq!(err.message, "예약 방송 정보를 조회하지 못했습니다.");
+    assert!(!err.message.contains("연결하지 못했습니다"));
+    assert!(err.detail.unwrap().contains("reason=incompatibleParameters"));
+
+    let log = h.log();
+    assert!(log.contains("YOUTUBE_TOKEN_REFRESH_OK"), "{log}");
+    assert!(log.contains("YOUTUBE_BROADCAST_LIST_FAIL"), "{log}");
+    assert_eq!(h.service.apply_state().failed_stage.as_deref(), Some("예약 방송 목록 조회 실패"));
+}
+
 #[test]
 fn a_manual_start_and_a_scheduled_start_take_the_same_steps() {
     // §4 of the report: run both in one session and compare. They share one
@@ -340,7 +579,7 @@ fn a_manual_start_and_a_scheduled_start_take_the_same_steps() {
     let routes = move || {
         vec![
             (
-                "GET /liveBroadcasts",
+                LIST_BROADCASTS,
                 200,
                 format!(
                     r#"{{"items":[{{"id":"b-1","snippet":{{"title":"t","scheduledStartTime":"{}"}},
