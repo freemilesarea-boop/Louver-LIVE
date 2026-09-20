@@ -56,9 +56,10 @@ Every criterion below was measured and met.
 
 ## Stream received by the ingest
 
-Capture is a rolling window — a 13-hour capture would be ~30 GB — so the first
-and last pieces are kept and the middle is dropped. Comparing the two is how
-drift across the whole run is measured.
+Capture is a rolling window: keeping all of this run would have taken
+20.4 GB, so the ingest wrote standalone pieces and kept only the first
+and last few. Comparing the last against the first is how drift across the
+whole run is measured without storing the whole run.
 
 | Window | Starts at | Boundaries | Freezes | Dup ts | Backwards ts | A/V skew max | Keyframe max |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -67,8 +68,6 @@ drift across the whole run is measured.
 | tail | 30600.95s | 7 | 0 | 0 | 0 | 20 ms | 2.02 s |
 | tail-2 | 31200.07s | 7 | 0 | 0 | 0 | 20 ms | 2.02 s |
 
-A freeze marked "(at the cut)" is where the capture window was sliced out of
-the stream, not something the broadcast did.
 
 
 ## Earlier attempts at this run

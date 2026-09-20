@@ -21,7 +21,7 @@ The rule, stated in advance so the verdict is not an opinion:
 | A5 | The packaged app runs on real Windows 10/11 x64 | **NOT TESTED** — no Windows machine |
 | A6 | A production licence key exists, and a release build rejects a licence signed by any other key | **NOT TESTED** — no production key, by design (see `SIGNING.md`) |
 | A7 | The stream key appears in no log, database, crash report or UI outside its own masked field | **PASS** |
-| A8 | A long unattended run holds the broadcast with no leak, no unrecovered failure and no orphan process | see §10 |
+| A8 | A long unattended run holds the broadcast with no leak, no unrecovered failure and no orphan process | **PASS** — 8h 52m, 76.9 playlist loops, 0 reconnects, FFmpeg memory unchanged, A/V skew 20 ms at both ends |
 
 **B. Must be recorded, not necessarily cleared.**
 
@@ -77,7 +77,7 @@ not YouTube, and this report never claims otherwise.
 | 6 | FFmpeg crash recovery | **PASS** — 3 kills, 3 recoveries |
 | 7 | Application restart recovery | **PASS** — real processes, real RTMP |
 | 8 | Machine restart + autostart + schedule recovery | **PARTIAL** — scheduler fires at launch; OS autostart and reboot NOT TESTED |
-| 9 | 6-hour soak | *(see §9 below)* |
+| 9 | Long unattended soak | **PASS** — 8h 52m continuous, 0 reconnects, 0 leak; see §10 |
 | 10 | FFmpeg distribution / licence | **BLOCKER** — decision documented and gated in CI, not yet executed |
 | 11 | Production licence verification | **PASS** — rules proved on four real cases; the production key itself is **NOT GENERATED** (see §16.4) |
 | 12 | Stream key security | **PASS** |

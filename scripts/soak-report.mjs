@@ -284,17 +284,18 @@ ${checks.map((c) => `| ${c.name} | **${c.verdict}** | ${c.detail} |`).join('\n')
 
 ${analysed.length ? `## Stream received by the ingest
 
-Capture is a rolling window — a 13-hour capture would be ~30 GB — so the first
-and last pieces are kept and the middle is dropped. Comparing the two is how
-drift across the whole run is measured.
+Capture is a rolling window: keeping all of this run would have taken
+${(analysis.bytes_sent / 1e9).toFixed(1)} GB, so the ingest wrote standalone pieces and kept only the first
+and last few. Comparing the last against the first is how drift across the
+whole run is measured without storing the whole run.
 
 | Window | Starts at | Boundaries | Freezes | Dup ts | Backwards ts | A/V skew max | Keyframe max |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 ${analysed.map((a) => `| ${a.which} | ${a.starts_at_seconds}s | ${a.boundaries_crossed} | ${a.freezes_over_2_5_frames}${a.worst_freeze_is_at_piece_edge ? ' (at the cut)' : ''} | ${a.duplicate_timestamps} | ${a.backwards_timestamps} | ${a.av_skew_max_ms} ms | ${a.keyframe_interval_max_s} s |`).join('\n')}
 
-A freeze marked "(at the cut)" is where the capture window was sliced out of
+${analysed.some((a) => a.worst_freeze_is_at_piece_edge) ? `A freeze marked "(at the cut)" is where the capture window was sliced out of
 the stream, not something the broadcast did.
-` : '## Stream received by the ingest\n\nNo capture window could be analysed. **NOT TESTED.**\n'}
+` : ''}` : '## Stream received by the ingest\n\nNo capture window could be analysed. **NOT TESTED.**\n'}
 
 ${priorAttempts.length ? `## Earlier attempts at this run
 
