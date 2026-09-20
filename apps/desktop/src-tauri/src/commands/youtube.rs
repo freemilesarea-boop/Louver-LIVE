@@ -15,10 +15,10 @@ pub fn youtube_status(state: State<'_, AppState>) -> CmdResult<YoutubeStatus> {
     Ok(state.youtube.status())
 }
 
-/// Store the OAuth client for this installation (§1).
+/// Developer-only override of the OAuth client (§7).
 ///
-/// The id is ordinary configuration; the secret goes to the keychain beside
-/// the refresh token and never to SQLite.
+/// The product ships its own client, so this is not reachable from the
+/// ordinary settings screen and is refused unless 개발자 모드 is on.
 #[tauri::command]
 pub fn youtube_set_credentials(
     state: State<'_, AppState>,
@@ -33,7 +33,14 @@ pub fn youtube_set_credentials(
 /// `youtube_status`, so the window never blocks on the browser.
 #[tauri::command]
 pub fn youtube_begin_connect(state: State<'_, AppState>) -> CmdResult<String> {
-    state.youtube.begin_connect()
+    state.youtube.begin_connect(false)
+}
+
+/// 계정 변경: the same flow, but showing Google's account chooser rather than
+/// silently reusing whichever account is already signed in.
+#[tauri::command]
+pub fn youtube_switch_account(state: State<'_, AppState>) -> CmdResult<String> {
+    state.youtube.begin_connect(true)
 }
 
 #[tauri::command]

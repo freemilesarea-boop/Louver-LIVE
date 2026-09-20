@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Eye, FolderOpen, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react'
 import { useAppStore } from '@/stores/useAppStore'
-import { api, pickLicenseFile, revealPath } from '@/services/ipc'
+import { api, openUrl, pickLicenseFile, revealPath } from '@/services/ipc'
 import { Badge, Button, Card, Field, Input, Modal, Select, Toggle } from '@/components/ui'
 import type { StreamDiagnostics, YoutubeStatus } from '@/types'
 
@@ -437,11 +437,13 @@ function Diag({ label, value, tone }: { label: string; value: string; tone?: 'wa
  * it lands, so the window is never blocked waiting on Google.
  */
 function YoutubeAccountCard() {
-  const { reportError, toast } = useAppStore()
+  const { reportError, toast, settings } = useAppStore()
   const [yt, setYt] = useState<YoutubeStatus | null>(null)
+  const [waiting, setWaiting] = useState(false)
+  const [advanced, setAdvanced] = useState(false)
+  const [manualUrl, setManualUrl] = useState<string | null>(null)
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
-  const [waiting, setWaiting] = useState(false)
 
   const refresh = useCallback(
     () => api.youtubeStatus().then(setYt).catch(reportError),
@@ -470,14 +472,24 @@ function YoutubeAccountCard() {
 
   if (!yt) return null
 
-  async function connect() {
+  /** Open Google's consent page and wait for the redirect to come back. */
+  async function connect(switchAccount: boolean) {
+    let url: string
     try {
-      const url = await api.youtubeBeginConnect()
-      setWaiting(true)
-      await revealPath(url)
+      url = switchAccount ? await api.youtubeSwitchAccount() : await api.youtubeBeginConnect()
     } catch (e) {
-      setWaiting(false)
       reportError(e)
+      return
+    }
+    // The flow is already running and the loopback server is listening, so a
+    // browser that will not open is not a dead end — show the address instead
+    // of abandoning a consent attempt the user can still finish by hand.
+    setWaiting(true)
+    setManualUrl(null)
+    try {
+      await openUrl(url)
+    } catch {
+      setManualUrl(url)
     }
   }
 
@@ -488,7 +500,7 @@ function YoutubeAccountCard() {
           <dl className="space-y-2">
             <Row label="채널" value={yt.channel_title ?? '—'} />
             <Row label="Channel ID" value={yt.channel_id ?? '—'} mono />
-            <Row label="연결 상태" value="연결됨" />
+            <Row label="상태" value={<span className="text-ok">연결됨</span>} />
             <Row label="토큰 저장 위치" value={yt.secret_backend} />
           </dl>
           {!yt.secret_backend_is_secure && (
@@ -496,7 +508,10 @@ function YoutubeAccountCard() {
               이 컴퓨터에서는 키체인을 쓸 수 없어 토큰이 메모리에만 저장됩니다. 앱을 재시작하면 다시 연결해야 합니다.
             </p>
           )}
-          <div className="mt-3 border-t border-ink-700 pt-3">
+          <div className="mt-3 flex flex-wrap gap-2 border-t border-ink-700 pt-3">
+            <Button onClick={() => void connect(true)} disabled={waiting}>
+              {waiting ? '브라우저에서 진행 중…' : '계정 변경'}
+            </Button>
             <Button
               onClick={async () => {
                 try {
@@ -511,16 +526,73 @@ function YoutubeAccountCard() {
         </>
       ) : (
         <>
+          <dl className="space-y-2">
+            <Row label="상태" value={<span className="text-ink-400">연결되지 않음</span>} />
+          </dl>
+          <p className="mt-2 text-xs text-ink-500">
+            연결하면 방송 제목·설명·태그를 앱에서 바꾸고 자동 채팅을 쓸 수 있습니다.
+            영상 송출은 연결과 상관없이 그대로 동작합니다.
+          </p>
+          <div className="mt-3 border-t border-ink-700 pt-3">
+            <Button variant="primary" onClick={() => void connect(false)} disabled={!yt.has_credentials || waiting}>
+              {waiting ? '브라우저에서 진행 중…' : 'YouTube 계정 연결'}
+            </Button>
+          </div>
+          {waiting && !manualUrl && (
+            <p className="mt-2 text-xs text-ink-500">
+              열린 브라우저 창에서 Google 로그인 후 권한을 허용해주세요. 완료되면 이 화면이 자동으로 바뀝니다.
+            </p>
+          )}
+          {manualUrl && (
+            <div className="mt-2 rounded border border-warn-dim bg-warn-dim/10 p-3">
+              <p className="text-xs text-warn">
+                브라우저를 열지 못했습니다. 아래 주소를 브라우저에 직접 붙여넣어 주세요.
+                연결이 끝나면 이 화면이 자동으로 바뀝니다.
+              </p>
+              <p className="mt-2 break-all font-mono text-[11px] text-ink-300">{manualUrl}</p>
+              <Button
+                size="sm"
+                className="mt-2"
+                onClick={() => navigator.clipboard?.writeText(manualUrl).then(
+                  () => toast({ kind: 'success', message: '주소를 복사했습니다.' }),
+                  () => toast({ kind: 'error', message: '복사하지 못했습니다. 주소를 직접 선택해주세요.' }),
+                )}
+              >
+                주소 복사
+              </Button>
+            </div>
+          )}
           {!yt.has_credentials && (
-            <div className="mb-3 space-y-2">
+            <p className="mt-2 text-xs text-warn">
+              이 빌드에는 Louver Live의 YouTube 클라이언트가 포함되어 있지 않습니다.
+              정식 릴리스 빌드에서는 버튼 하나로 연결됩니다.
+            </p>
+          )}
+          {yt.connecting_error && <p className="mt-2 text-xs text-live">{yt.connecting_error}</p>}
+        </>
+      )}
+
+      {/* §7: a custom OAuth client is a developer tool, not a product feature.
+          It appears only with 개발자 모드 on, and only behind a disclosure. */}
+      {settings?.developer_mode && (
+        <div className="mt-4 border-t border-ink-800 pt-3">
+          <button
+            type="button"
+            className="text-[11px] uppercase tracking-wider text-ink-500 hover:text-ink-300"
+            onClick={() => setAdvanced((v) => !v)}
+          >
+            고급: 자체 OAuth 클라이언트 {advanced ? '숨기기' : '보기'}
+          </button>
+          {advanced && (
+            <div className="mt-2 space-y-2">
               <p className="text-xs text-ink-500">
-                Google Cloud 콘솔에서 만든 OAuth 클라이언트(데스크톱 앱)를 입력해주세요.
-                클라이언트 보안 비밀은 키체인에 저장되며 데이터베이스나 로그에는 기록되지 않습니다.
+                비워두면 빌드에 포함된 Louver Live 클라이언트를 씁니다.
+                {yt.using_custom_client && ' 현재 자체 클라이언트를 사용 중입니다.'}
               </p>
               <Input
                 value={clientId}
                 aria-label="OAuth 클라이언트 ID"
-                placeholder="000000-xxxx.apps.googleusercontent.com"
+                placeholder={yt.client_id_hint ?? '000000-xxxx.apps.googleusercontent.com'}
                 onChange={(e) => setClientId(e.target.value)}
               />
               <Input
@@ -531,36 +603,20 @@ function YoutubeAccountCard() {
                 onChange={(e) => setClientSecret(e.target.value)}
               />
               <Button
+                size="sm"
                 onClick={async () => {
                   try {
                     setYt(await api.youtubeSetCredentials(clientId, clientSecret))
                     setClientSecret('')
-                    toast({ kind: 'success', message: 'API 클라이언트를 저장했습니다.' })
+                    toast({ kind: 'success', message: 'OAuth 클라이언트를 저장했습니다.' })
                   } catch (e) { reportError(e) }
                 }}
-                disabled={!clientId.trim()}
               >
                 저장
               </Button>
             </div>
           )}
-          <div className="flex items-center gap-3">
-            <Button variant="primary" onClick={() => void connect()} disabled={!yt.has_credentials || waiting}>
-              {waiting ? '브라우저에서 진행 중…' : 'YouTube 계정 연결'}
-            </Button>
-            {yt.client_id_hint && (
-              <span className="font-mono text-[11px] text-ink-500">{yt.client_id_hint}</span>
-            )}
-          </div>
-          {waiting && (
-            <p className="mt-2 text-xs text-ink-500">
-              열린 브라우저 창에서 권한을 허용해주세요. 완료되면 자동으로 이 화면이 바뀝니다.
-            </p>
-          )}
-          {yt.connecting_error && (
-            <p className="mt-2 text-xs text-live">{yt.connecting_error}</p>
-          )}
-        </>
+        </div>
       )}
     </Card>
   )

@@ -87,13 +87,19 @@ impl TokenEndpoint for UreqClient {
         creds: &ClientCredentials,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> Result<TokenResponse> {
+        // `client_secret` is here because Google requires it for installed-app
+        // clients even alongside PKCE. The verifier is what actually protects
+        // the code; the secret ships in the binary and protects nothing on its
+        // own, which is why the user is never asked for it.
         self.post_token(&[
             ("code", code),
             ("client_id", &creds.client_id),
             ("client_secret", &creds.client_secret),
             ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
+            ("code_verifier", code_verifier),
         ])
     }
 

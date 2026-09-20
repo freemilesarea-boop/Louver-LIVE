@@ -13,7 +13,7 @@ use louver_core::youtube::bot::{BotContext, ChatBot};
 use louver_core::youtube::chat::{ChatMessage, ChatSettings, ChatState, ChatStatus};
 use louver_core::youtube::http::UreqClient;
 use louver_core::youtube::oauth::{
-    ClientCredentials, LoopbackServer, TokenEndpoint, TokenStore, BUILT_IN_CLIENT_ID, BUILT_IN_CLIENT_SECRET,
+    ClientCredentials, ConsentPrompt, LoopbackServer, Pkce, TokenEndpoint, TokenStore,
 };
 use louver_core::youtube::{api::API_BASE, keys, BroadcastMetadata, ChannelInfo, HttpClient};
 use std::sync::{Arc, Mutex};
@@ -53,6 +53,9 @@ pub struct YoutubeStatus {
     pub has_credentials: bool,
     /// Whether saved metadata is pushed automatically when a broadcast starts.
     pub apply_on_start: bool,
+    /// True when a developer has overridden the built-in OAuth client.
+    pub using_custom_client: bool,
+    /// Only the tail of the client id, and only in developer mode.
     pub client_id_hint: Option<String>,
     /// Where the refresh token is kept, so the user can see it is not the DB.
     pub secret_backend: String,
@@ -79,42 +82,52 @@ impl YoutubeService {
         self.db.get_setting_or(keys::API_BASE, API_BASE)
     }
 
-    /// The OAuth client for this installation.
+    /// The OAuth client this app uses.
     ///
-    /// A build can bake one in; otherwise the user pastes their own from the
-    /// Google Cloud console. The id lives in settings, the secret in the
-    /// keychain with the refresh token.
+    /// Normally the one compiled into the build, so connecting is a single
+    /// button and nobody has to open the Google Cloud console. A developer can
+    /// override it, but only with 개발자 모드 on — the override is not part of
+    /// the product's user interface.
     pub fn credentials(&self) -> Result<ClientCredentials> {
-        let id = self
-            .db
-            .get_setting(keys::CLIENT_ID)
-            .ok()
-            .flatten()
-            .filter(|s| !s.is_empty())
-            .or_else(|| BUILT_IN_CLIENT_ID.map(str::to_string))
-            .ok_or_else(|| {
-                LouverError::with_detail(
-                    ErrorCode::YoutubeNotConnected,
-                    "YouTube API 클라이언트가 설정되지 않았습니다",
-                )
-            })?;
-        let secret = self
-            .tokens
-            .stored_client_secret()
-            .or_else(|| BUILT_IN_CLIENT_SECRET.map(str::to_string))
-            .unwrap_or_default();
-        Ok(ClientCredentials { client_id: id, client_secret: secret })
+        if self.developer_mode() {
+            if let Some(id) =
+                self.db.get_setting(keys::CLIENT_ID).ok().flatten().filter(|s| !s.trim().is_empty())
+            {
+                return Ok(ClientCredentials {
+                    client_id: id.trim().to_string(),
+                    client_secret: self.tokens.stored_client_secret().unwrap_or_default(),
+                });
+            }
+        }
+        ClientCredentials::built_in().ok_or_else(|| {
+            LouverError::with_detail(
+                ErrorCode::YoutubeNotConnected,
+                "이 빌드에는 Louver Live의 YouTube 클라이언트가 포함되어 있지 않습니다. 릴리스 빌드에는 자동으로 포함됩니다.",
+            )
+        })
+    }
+
+    fn developer_mode(&self) -> bool {
+        self.db.get_setting_or(louver_core::settings_keys::DEVELOPER_MODE, "false") == "true"
     }
 
     pub fn has_credentials(&self) -> bool {
         self.credentials().is_ok()
     }
 
+    /// Developer escape hatch for a custom OAuth client (§7).
+    ///
+    /// Refused unless 개발자 모드 is on, so it cannot be reached from the
+    /// ordinary settings screen. An empty id clears the override and returns
+    /// to the client the build ships with.
     pub fn set_credentials(&self, client_id: &str, client_secret: &str) -> Result<()> {
-        let id = client_id.trim();
-        if id.is_empty() {
-            return Err(LouverError::with_detail(ErrorCode::ConfigInvalid, "클라이언트 ID를 입력해주세요"));
+        if !self.developer_mode() {
+            return Err(LouverError::with_detail(
+                ErrorCode::ConfigInvalid,
+                "자체 OAuth 클라이언트는 개발자 모드에서만 설정할 수 있습니다",
+            ));
         }
+        let id = client_id.trim();
         self.db.set_setting(keys::CLIENT_ID, id)?;
         if !client_secret.trim().is_empty() {
             self.tokens.save_client_secret(client_secret.trim())?;
@@ -131,15 +144,22 @@ impl YoutubeService {
             channel_title: self.db.get_setting(keys::CHANNEL_TITLE).ok().flatten(),
             has_credentials: self.has_credentials(),
             apply_on_start: self.apply_on_start_enabled(),
-            // Only the tail, and only of the id, which is not a secret.
-            client_id_hint: client_id.map(|c| {
-                let n = c.chars().count();
-                if n <= 12 {
-                    c
-                } else {
-                    format!("…{}", c.chars().skip(n - 12).collect::<String>())
-                }
-            }),
+            using_custom_client: self.developer_mode()
+                && client_id.as_deref().is_some_and(|c| !c.trim().is_empty()),
+            // Only the tail, and only of the id, which is not a secret. Shown
+            // in developer mode alone; the product UI has no place for it.
+            client_id_hint: if self.developer_mode() {
+                client_id.filter(|c| !c.trim().is_empty()).map(|c| {
+                    let n = c.chars().count();
+                    if n <= 12 {
+                        c
+                    } else {
+                        format!("…{}", c.chars().skip(n - 12).collect::<String>())
+                    }
+                })
+            } else {
+                None
+            },
             secret_backend: self.secret_backend(),
             secret_backend_is_secure: self.secret_is_secure(),
             connecting_error: self.connecting.lock().unwrap().clone(),
@@ -159,13 +179,18 @@ impl YoutubeService {
     ///
     /// The wait happens on its own thread so the window never freezes; the UI
     /// polls `status()` to find out how it went.
-    pub fn begin_connect(&self) -> Result<String> {
+    pub fn begin_connect(&self, switch_account: bool) -> Result<String> {
         let creds = self.credentials()?;
         let server = LoopbackServer::bind()?;
+        // A fresh verifier and state for every attempt. Neither is reused, and
+        // the verifier never leaves this process until the exchange.
+        let pkce = Pkce::new();
         let url = louver_core::youtube::oauth::consent_url(
             &creds.client_id,
             &server.redirect_uri(),
             server.state(),
+            &pkce,
+            if switch_account { ConsentPrompt::SelectAccount } else { ConsentPrompt::Consent },
         );
 
         *self.connecting.lock().unwrap() = None;
@@ -181,7 +206,7 @@ impl YoutubeService {
             .spawn(move || {
                 let outcome = (|| -> Result<ChannelInfo> {
                     let auth = server.wait_for_code(CONSENT_TIMEOUT)?;
-                    let tok = http.exchange_code(&creds, &auth.code, &auth.redirect_uri)?;
+                    let tok = http.exchange_code(&creds, &auth.code, &auth.redirect_uri, &pkce.verifier)?;
                     let refresh = tok.refresh_token.filter(|t| !t.is_empty()).ok_or_else(|| {
                         LouverError::with_detail(
                             ErrorCode::YoutubeAuthExpired,

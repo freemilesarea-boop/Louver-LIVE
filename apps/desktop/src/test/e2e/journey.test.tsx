@@ -545,6 +545,48 @@ describe('broadcast settings and the chat bot', () => {
     })
   })
 
+  it('never asks an ordinary user for a Client ID or Secret', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '설정')
+
+    // §1/§7: the product ships its own OAuth client. Someone who just wants to
+    // broadcast music must not meet the Google Cloud console.
+    expect(await screen.findByRole('button', { name: 'YouTube 계정 연결' })).toBeInTheDocument()
+    expect(screen.getByText('연결되지 않음')).toBeInTheDocument()
+    expect(screen.queryByLabelText('OAuth 클라이언트 ID')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('OAuth 클라이언트 보안 비밀')).not.toBeInTheDocument()
+    expect(screen.queryByText(/고급: 자체 OAuth 클라이언트/)).not.toBeInTheDocument()
+  })
+
+  it('offers 계정 변경 once connected', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '설정')
+
+    const polled = { timeout: 6000 }
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    expect(await screen.findByRole('button', { name: '계정 변경' }, polled)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '연결 해제' })).toBeInTheDocument()
+  })
+
+  it('shows the consent address when a browser cannot be opened', async () => {
+    const user = userEvent.setup()
+    mount({ failOpener: true })
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '설정')
+
+    // The consent server is already listening at this point, so a browser that
+    // will not open must not throw away the attempt.
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    expect(await screen.findByText(/브라우저를 열지 못했습니다/)).toBeInTheDocument()
+    expect(screen.getByText(/accounts\.google\.com/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '주소 복사' })).toBeInTheDocument()
+    expect(screen.queryByText('알 수 없는 오류가 발생했습니다.')).not.toBeInTheDocument()
+  })
+
   it('connects a YouTube account and shows the channel rather than the token', async () => {
     const user = userEvent.setup()
     mount()

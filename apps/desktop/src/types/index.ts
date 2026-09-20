@@ -278,6 +278,7 @@ export interface YoutubeStatus {
   channel_title?: string | null
   has_credentials: boolean
   apply_on_start: boolean
+  using_custom_client: boolean
   client_id_hint?: string | null
   secret_backend: string
   secret_backend_is_secure: boolean

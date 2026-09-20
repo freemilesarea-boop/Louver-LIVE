@@ -21,6 +21,8 @@ export interface MockOptions {
   licenseValid?: boolean
   /** Persisted settings carried across a simulated restart. */
   seedSettings?: Record<string, string>
+  /** Simulate a machine where no browser can be opened. */
+  failOpener?: boolean
 }
 
 export function createMockBackend(opts: MockOptions = {}) {
@@ -492,12 +494,17 @@ export function createMockBackend(opts: MockOptions = {}) {
       channel_title: youtube.connected ? 'ROOM.' : null,
       has_credentials: true,
       apply_on_start: youtube.applyOnStart,
+      using_custom_client: false,
       client_id_hint: '…googleusercontent.com',
       secret_backend: 'macOS 키체인',
       secret_backend_is_secure: true,
       connecting_error: null,
     }),
     youtube_set_credentials: () => backend('youtube_status', {}),
+    youtube_switch_account: () => {
+      youtube.connected = true
+      return 'https://accounts.google.com/o/oauth2/v2/auth?mock=1&prompt=select_account'
+    },
     youtube_begin_connect: () => {
       // The real flow opens a browser; the mock connects immediately so the
       // UI path after consent can be driven.
@@ -630,6 +637,12 @@ export function createMockBackend(opts: MockOptions = {}) {
     __pick_files: () => opts.filesToPick ?? ['/videos/night01.mp4', '/videos/night02.mp4', '/videos/night03.mp4'],
     __pick_license: () => '/tmp/license.json',
     __reveal: () => undefined,
+    __open_url: () => {
+      // A machine with no browser, or a denied capability, is a real case: the
+      // UI has to show the address rather than swallow the attempt.
+      if (opts.failOpener) throw new Error('no handler for opening a URL')
+      return undefined
+    },
   }
 
   const backend = (cmd: string, args: Record<string, unknown>) => {

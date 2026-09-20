@@ -11,7 +11,9 @@
 
 use crate::error::{ErrorCode, LouverError, Result};
 use crate::security::SecretStore;
+use base64::Engine as _;
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -35,18 +37,93 @@ pub const SCOPE: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
 
 /// OAuth client credentials for this installation.
 ///
-/// Compiled in when the build supplies them, otherwise entered by the user in
-/// Settings. Google calls the secret of an installed app a secret, but it is
-/// distributed inside the binary and is not treated here as one that protects
-/// anything — it is still kept out of the repository and out of the database.
+/// Baked into the build. Users never see or enter these: a person who wants to
+/// broadcast music should not have to open the Google Cloud console.
+///
+/// Google issues a secret even for "Desktop app" clients and **requires it in
+/// the token exchange**, so PKCE does not remove the need for one here — its
+/// job is to stop an intercepted authorization code from being redeemed by
+/// anyone else. Google documents this secret as not confidential for installed
+/// apps, which is why it can be distributed inside the binary; it is still
+/// kept out of this repository and out of the database.
 #[derive(Debug, Clone)]
 pub struct ClientCredentials {
     pub client_id: String,
     pub client_secret: String,
 }
 
-pub const BUILT_IN_CLIENT_ID: Option<&str> = option_env!("LOUVER_YOUTUBE_CLIENT_ID");
-pub const BUILT_IN_CLIENT_SECRET: Option<&str> = option_env!("LOUVER_YOUTUBE_CLIENT_SECRET");
+/// Supplied at build time. `LOUVER_GOOGLE_CLIENT_ID` is the documented name;
+/// the older `LOUVER_YOUTUBE_*` pair is still read so existing build scripts
+/// keep working.
+pub const BUILT_IN_CLIENT_ID: Option<&str> = match option_env!("LOUVER_GOOGLE_CLIENT_ID") {
+    Some(v) => Some(v),
+    None => option_env!("LOUVER_YOUTUBE_CLIENT_ID"),
+};
+pub const BUILT_IN_CLIENT_SECRET: Option<&str> = match option_env!("LOUVER_GOOGLE_CLIENT_SECRET") {
+    Some(v) => Some(v),
+    None => option_env!("LOUVER_YOUTUBE_CLIENT_SECRET"),
+};
+
+impl ClientCredentials {
+    /// The client this build ships with, if it was given one.
+    pub fn built_in() -> Option<Self> {
+        let id = BUILT_IN_CLIENT_ID?.trim();
+        if id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            client_id: id.to_string(),
+            client_secret: BUILT_IN_CLIENT_SECRET.unwrap_or_default().trim().to_string(),
+        })
+    }
+}
+
+/// Proof Key for Code Exchange (RFC 7636), S256.
+///
+/// A loopback redirect can be observed by anything else running on the
+/// machine. PKCE makes an intercepted authorization code useless without the
+/// verifier, which never leaves this process until the exchange.
+#[derive(Debug, Clone)]
+pub struct Pkce {
+    pub verifier: String,
+    pub challenge: String,
+}
+
+impl Pkce {
+    pub fn new() -> Self {
+        let verifier = random_token(64);
+        let digest = <Sha256 as Digest>::digest(verifier.as_bytes());
+        Self { verifier, challenge: base64_url_nopad(&digest) }
+    }
+
+    /// The challenge for a given verifier. Separate so the RFC's own test
+    /// vector can be checked against it.
+    pub fn challenge_for(verifier: &str) -> String {
+        base64_url_nopad(&<Sha256 as Digest>::digest(verifier.as_bytes()))
+    }
+}
+
+impl Default for Pkce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn base64_url_nopad(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// An unguessable token from the OS random source.
+///
+/// Used for both the PKCE verifier and the `state` parameter, so neither can
+/// be predicted by something else on the machine. The alphabet is RFC 7636's
+/// unreserved set.
+fn random_token(len: usize) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let mut bytes = vec![0u8; len];
+    rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+    bytes.iter().map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char).collect()
+}
 
 /// Tokens as Google returns them.
 #[derive(Debug, Clone, Deserialize)]
@@ -157,6 +234,7 @@ pub trait TokenEndpoint: Send + Sync {
         creds: &ClientCredentials,
         code: &str,
         redirect_uri: &str,
+        code_verifier: &str,
     ) -> Result<TokenResponse>;
     fn refresh(&self, creds: &ClientCredentials, refresh_token: &str) -> Result<TokenResponse>;
 }
@@ -174,19 +252,46 @@ pub fn urlencode(s: &str) -> String {
     out
 }
 
+/// What the consent screen should ask for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsentPrompt {
+    /// Connecting for the first time, or reconnecting the same account.
+    Consent,
+    /// "계정 변경": show the account chooser rather than assuming the last one.
+    SelectAccount,
+}
+
+impl ConsentPrompt {
+    fn as_param(self) -> &'static str {
+        match self {
+            Self::Consent => "consent",
+            Self::SelectAccount => "select_account%20consent",
+        }
+    }
+}
+
 /// The consent URL to open in the browser.
 ///
 /// `access_type=offline` is what makes Google issue a refresh token at all,
 /// and `prompt=consent` makes it do so again for an account that has already
 /// consented — without it, reconnecting yields no refresh token and the app
 /// would appear to connect and then fail an hour later.
-pub fn consent_url(client_id: &str, redirect_uri: &str, state: &str) -> String {
+pub fn consent_url(
+    client_id: &str,
+    redirect_uri: &str,
+    state: &str,
+    pkce: &Pkce,
+    prompt: ConsentPrompt,
+) -> String {
     format!(
-        "{AUTH_ENDPOINT}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent&state={}",
+        "{AUTH_ENDPOINT}?client_id={}&redirect_uri={}&response_type=code&scope={}\
+&access_type=offline&prompt={}&state={}&code_challenge={}&code_challenge_method=S256",
         urlencode(client_id),
         urlencode(redirect_uri),
         urlencode(SCOPE),
+        prompt.as_param(),
         urlencode(state),
+        urlencode(&pkce.challenge),
     )
 }
 
@@ -341,11 +446,7 @@ fn urldecode(s: &str) -> String {
 }
 
 fn random_state() -> String {
-    use std::collections::hash_map::RandomState;
-    use std::hash::{BuildHasher, Hasher};
-    let a = RandomState::new().build_hasher().finish();
-    let b = RandomState::new().build_hasher().finish();
-    format!("{a:016x}{b:016x}")
+    random_token(32)
 }
 
 #[cfg(test)]
@@ -354,8 +455,64 @@ mod tests {
     use crate::security::MemorySecretStore;
 
     #[test]
+    fn the_pkce_challenge_matches_the_rfc_test_vector() {
+        // RFC 7636 appendix B. If this ever drifts, Google rejects every
+        // exchange with invalid_grant and the cause is not obvious.
+        assert_eq!(
+            Pkce::challenge_for("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn a_verifier_is_long_unguessable_and_uses_only_unreserved_characters() {
+        let a = Pkce::new();
+        let b = Pkce::new();
+        assert_ne!(a.verifier, b.verifier, "two flows must not share a verifier");
+        assert!((43..=128).contains(&a.verifier.len()), "RFC 7636 length range");
+        assert!(a.verifier.chars().all(|c| c.is_ascii_alphanumeric() || "-._~".contains(c)));
+        assert_eq!(a.challenge, Pkce::challenge_for(&a.verifier));
+        // Base64url, no padding.
+        assert!(!a.challenge.contains('='));
+        assert!(!a.challenge.contains('+') && !a.challenge.contains('/'));
+    }
+
+    #[test]
+    fn each_flow_gets_its_own_state() {
+        let states: std::collections::HashSet<String> = (0..50).map(|_| random_state()).collect();
+        assert_eq!(states.len(), 50, "state must not repeat");
+        assert!(random_state().len() >= 32);
+    }
+
+    #[test]
+    fn the_consent_url_carries_the_challenge_and_asks_for_the_account_chooser() {
+        let pkce = Pkce::new();
+        let url = consent_url("id", "http://127.0.0.1:5000", "abc", &pkce, ConsentPrompt::SelectAccount);
+        assert!(url.contains(&format!("code_challenge={}", urlencode(&pkce.challenge))));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("prompt=select_account%20consent"));
+        // The verifier itself must never appear in a URL that opens a browser.
+        assert!(!url.contains(&pkce.verifier));
+    }
+
+    #[test]
+    fn a_build_without_a_client_reports_that_rather_than_guessing() {
+        // This build supplies none, so the product must say so instead of
+        // sending an empty client_id to Google.
+        if BUILT_IN_CLIENT_ID.is_none() {
+            assert!(ClientCredentials::built_in().is_none());
+        }
+    }
+
+    #[test]
     fn the_consent_url_asks_for_offline_access_and_one_scope() {
-        let url = consent_url("id.apps.googleusercontent.com", "http://127.0.0.1:5000", "abc");
+        let url = consent_url(
+            "id.apps.googleusercontent.com",
+            "http://127.0.0.1:5000",
+            "abc",
+            &Pkce::new(),
+            ConsentPrompt::Consent,
+        );
         assert!(url.contains("access_type=offline"), "no refresh token without it");
         assert!(url.contains("prompt=consent"), "reconnecting must re-issue a refresh token");
         assert!(url.contains(&urlencode(SCOPE)));
@@ -396,7 +553,7 @@ mod tests {
         rotate: bool,
     }
     impl TokenEndpoint for FakeEndpoint {
-        fn exchange_code(&self, _: &ClientCredentials, _: &str, _: &str) -> Result<TokenResponse> {
+        fn exchange_code(&self, _: &ClientCredentials, _: &str, _: &str, _: &str) -> Result<TokenResponse> {
             Ok(TokenResponse {
                 access_token: "at".into(),
                 refresh_token: Some("1//first".into()),

@@ -145,6 +145,7 @@ export const api = {
   youtubeSetCredentials: (clientId: string, clientSecret: string) =>
     call<YoutubeStatus>('youtube_set_credentials', { clientId, clientSecret }),
   youtubeBeginConnect: () => call<string>('youtube_begin_connect'),
+  youtubeSwitchAccount: () => call<string>('youtube_switch_account'),
   youtubeDisconnect: () => call<YoutubeStatus>('youtube_disconnect'),
   youtubeGetMetadata: () => call<BroadcastMetadata>('youtube_get_metadata'),
   youtubeSaveMetadata: (metadata: BroadcastMetadata) =>
@@ -190,6 +191,22 @@ export async function pickLicenseFile(): Promise<string | null> {
     return typeof r === 'string' ? r : null
   }
   return call<string | null>('__pick_license')
+}
+
+/**
+ * Open a URL in the user's browser.
+ *
+ * Not `revealItemInDir`, which shows a *file* in a folder and fails on a URL.
+ * The capability file permits exactly one host — Google's consent screen — so
+ * this cannot be turned into a way of opening arbitrary links.
+ */
+export async function openUrl(url: string): Promise<void> {
+  if (isTauri()) {
+    const { openUrl: open } = await import('@tauri-apps/plugin-opener')
+    await open(url)
+    return
+  }
+  await call<void>('__open_url', { url })
 }
 
 export async function revealPath(path: string): Promise<void> {

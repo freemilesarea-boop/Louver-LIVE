@@ -32,18 +32,69 @@ const REAL_SHAPED_KEY: &str = "a1b2-c3d4-e5f6-g7h8-i9j0";
 
 /// Every distinctive fragment of the key, so a partial leak is caught too.
 fn fragments() -> Vec<&'static str> {
-    vec![REAL_SHAPED_KEY, "a1b2", "c3d4", "e5f6", "g7h8", "i9j0"]
+    vec![
+        REAL_SHAPED_KEY,
+        // The same key with its separators removed, in case something strips
+        // them before logging.
+        "a1b2c3d4e5f6g7h8i9j0",
+        "a1b2",
+        "c3d4",
+        "e5f6",
+        "g7h8",
+        "i9j0",
+    ]
+}
+
+/// Does `haystack` contain `needle` as a token rather than as part of a longer
+/// run of letters and digits?
+///
+/// The short fragments are four hex characters each, and FFmpeg logs pointer
+/// addresses like `0x5647e511a380`. Plain substring matching therefore fails
+/// this test at random — roughly once in a few hundred runs — with a leak
+/// report that is not a leak. A security check nobody trusts is a security
+/// check nobody reads, so the match is anchored: a real leak of `c3d4` is
+/// surrounded by a separator, a quote, whitespace or the end of the text,
+/// never by more hex.
+fn contains_as_token(haystack: &str, needle: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end == bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 fn assert_clean(what: &str, haystack: &str) {
     for f in fragments() {
         assert!(
-            !haystack.contains(f),
+            !contains_as_token(haystack, f),
             "STREAM KEY LEAK in {what}: found {:?}\n--- content ---\n{}",
             f,
             &haystack.chars().take(4000).collect::<String>()
         );
     }
+}
+
+#[test]
+fn the_leak_check_catches_a_real_leak_but_not_a_pointer_address() {
+    // A genuine leak, in the shapes it would actually take.
+    assert!(contains_as_token("publishing to rtmps://x/live2/a1b2-c3d4-e5f6-g7h8-i9j0", REAL_SHAPED_KEY));
+    assert!(contains_as_token("key=c3d4", "c3d4"));
+    assert!(contains_as_token("\"c3d4\"", "c3d4"));
+    assert!(contains_as_token("c3d4", "c3d4"));
+    assert!(contains_as_token("a1b2-c3d4-e5f6", "c3d4"));
+
+    // And the false alarm that used to fail this suite at random.
+    assert!(!contains_as_token("[mov @ 0x5647e5c3d4a1] moov atom not found", "c3d4"));
+    assert!(!contains_as_token("0xc3d4ef", "c3d4"));
+    assert!(!contains_as_token("abc3d4", "c3d4"));
 }
 
 #[derive(Default)]
