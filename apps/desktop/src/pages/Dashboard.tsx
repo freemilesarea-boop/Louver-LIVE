@@ -5,7 +5,22 @@ import { api } from '@/services/ipc'
 import { formatDuration, formatMbps } from '@/services/format'
 import { Badge, Button, Card, Modal, Stat } from '@/components/ui'
 import { StatusPill } from '@/components/StatusPill'
-import type { ApplyPlan, MetadataApplyState, PreflightReport } from '@/types'
+import type { ApplyPlan, MetadataApplyState, PreflightReport, ProvisionStep } from '@/types'
+
+/**
+ * What each preparation step is called on screen. The log uses the API
+ * method's name; a person reading the dashboard should not have to.
+ */
+const STEP_LABEL: Record<ProvisionStep, string> = {
+  token_refresh: 'Google 인증 갱신',
+  broadcast_list: '예약 방송 확인',
+  broadcast_insert: '예약 방송 생성',
+  stream_list: '스트림 키 확인',
+  broadcast_bind: '스트림 연결',
+  metadata_apply: '방송 정보 적용',
+  stream_active: '영상 수신 확인',
+  broadcast_transition: 'LIVE 전환',
+}
 
 /** Main dashboard (§24, §26, §28). */
 export function Dashboard() {
@@ -23,6 +38,13 @@ export function Dashboard() {
   const [plan, setPlan] = useState<ApplyPlan | null>(null)
   /** The YouTube side could not be done; the user has to choose (§B-9). */
   const [youtubeBlocked, setYoutubeBlocked] = useState<string | null>(null)
+  /**
+   * Which step it failed at, when the backend got far enough to know. The
+   * heading says that rather than the one sentence every YouTube failure used
+   * to share: "예약 방송 생성 실패" and "Google 인증 갱신 실패" are different
+   * problems with different remedies.
+   */
+  const [blockedStage, setBlockedStage] = useState<string | null>(null)
 
   useEffect(() => {
     const t = setInterval(() => {
@@ -81,6 +103,7 @@ export function Dashboard() {
       }
       setPreflight(null)
       setYoutubeBlocked(null)
+      setBlockedStage(null)
       await refreshStatus()
     } catch (e) {
       // A YouTube failure is the user's decision to make, not ours: starting
@@ -90,6 +113,9 @@ export function Dashboard() {
       if (kind === 'live' && !skipYoutube && code.startsWith('LL-YOUTUBE-')) {
         setYoutubeBlocked((e as { detail?: string; message: string }).detail
           ?? (e as { message: string }).message)
+        // The apply state was written before the start returned, so it already
+        // names the step. Read once rather than waiting for the next poll.
+        setBlockedStage((await api.youtubeApplyState().catch(() => null))?.failed_stage ?? null)
       } else {
         reportError(e)
       }
@@ -322,11 +348,50 @@ export function Dashboard() {
               <Button size="sm" onClick={() => setPage('settings')}>YouTube 연결</Button>
             </div>
           ) : applyState?.stage === 'failed' ? (
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <p className="text-xs text-live">
-                {applyState.error?.message ?? '방송 설정을 YouTube에 적용하지 못했습니다.'}
-              </p>
-              <Button size="sm" onClick={() => setPage('broadcast')}>방송 설정 열기</Button>
+            /* Which step failed, not which feature wanted it. Six identical
+               "YouTube에 연결하지 못했습니다" lines is what this replaces:
+               creating the broadcast, refreshing the token and binding the
+               stream all failed with that one sentence, and only one of them
+               is something the user can do anything about. */
+            <div className="space-y-2" data-testid="metadata-failed">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-xs font-medium text-live" data-testid="metadata-failed-stage">
+                    {applyState.failed_stage ?? '방송 설정을 YouTube에 적용하지 못했습니다.'}
+                  </p>
+                  {applyState.failed_remedy && (
+                    <p className="mt-0.5 text-[11px] text-ink-400">{applyState.failed_remedy}</p>
+                  )}
+                </div>
+                <Button
+                  size="sm"
+                  onClick={() => setPage(applyState.failed_stage?.startsWith('Google') ? 'settings' : 'broadcast')}
+                >
+                  {applyState.failed_stage?.startsWith('Google') ? 'YouTube 연결' : '방송 설정 열기'}
+                </Button>
+              </div>
+              {/* Google's own words, behind the same disclosure every other
+                  technical detail lives behind. */}
+              <details className="text-[11px] text-ink-500">
+                <summary className="cursor-pointer select-none">상세정보</summary>
+                <p className="mt-1 break-all">
+                  {applyState.error?.code_str} · {applyState.error?.detail ?? applyState.error?.message}
+                </p>
+                {!!applyState.steps?.length && (
+                  <ol className="mt-1.5 space-y-0.5" data-testid="metadata-steps">
+                    {applyState.steps
+                      .filter((s) => s.outcome !== 'started')
+                      .map((s, i) => (
+                        <li key={`${s.step}-${i}`} className="flex gap-2">
+                          <span className={s.outcome === 'failed' ? 'text-live' : 'text-ink-500'}>
+                            {s.outcome === 'failed' ? '✕' : s.outcome === 'skipped' ? '–' : '✓'}
+                          </span>
+                          <span className="min-w-0 break-all">{STEP_LABEL[s.step] ?? s.step}</span>
+                        </li>
+                      ))}
+                  </ol>
+                )}
+              </details>
             </div>
           ) : applyState?.stage === 'applying' ? (
             <p className="text-xs text-ink-400">방송 설정을 YouTube에 적용하는 중입니다…</p>
@@ -370,7 +435,7 @@ export function Dashboard() {
           never quietly goes live under YouTube's own defaults. */}
       <Modal
         open={youtubeBlocked != null}
-        title="방송 설정을 YouTube에 적용하지 못했습니다"
+        title={blockedStage ?? '방송 설정을 YouTube에 적용하지 못했습니다'}
         onClose={() => setYoutubeBlocked(null)}
         footer={
           <>
@@ -385,7 +450,7 @@ export function Dashboard() {
           </>
         }
       >
-        <p className="text-sm text-ink-200">{youtubeBlocked}</p>
+        <p className="text-sm text-ink-200" data-testid="blocked-detail">{youtubeBlocked}</p>
         <p className="mt-3 text-xs text-ink-500">
           영상 송출 자체에는 문제가 없습니다. 설정 없이 시작하면 방송은 정상적으로
           나가고, YouTube 방송 제목·설명·태그만 지금 YouTube에 저장된 값 그대로

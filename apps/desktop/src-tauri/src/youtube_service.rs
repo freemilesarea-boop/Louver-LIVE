@@ -19,6 +19,7 @@ use louver_core::youtube::oauth::{
 };
 use louver_core::youtube::provision::{self, BroadcastChoice, GoLive, REUSE_TOLERANCE_SECS};
 use louver_core::youtube::quota::{MeteredClient, QuotaGuard, QuotaState, FREE_DAILY_UNITS};
+use louver_core::youtube::steps::{ProvisionOrigin, ProvisionStep, StepRecord, StepRecorder};
 use louver_core::youtube::{api::API_BASE, keys, BroadcastMetadata, ChannelInfo, HttpClient};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -55,6 +56,13 @@ pub struct YoutubeService {
     /// Reads the saved stream key, to match it against the channel's
     /// ingestion endpoints. Never stored or logged here.
     keys: Arc<StreamKeyStore>,
+    /// The last ingestion state written to the log, so the per-tick check
+    /// writes a line when it changes rather than every second.
+    stream_active_logged: Arc<Mutex<Option<bool>>>,
+    /// Whether the broadcast in progress was started by a person or by the
+    /// scheduler, so the lines written after the start carry the same origin
+    /// as the ones written before it and one run reads as one run.
+    session_origin: Arc<Mutex<ProvisionOrigin>>,
 }
 
 /// The broadcast a window is using, and the stream it takes video from.
@@ -132,6 +140,18 @@ pub struct MetadataApplyState {
     pub requested: Option<BroadcastMetadata>,
     pub verification: Option<MetadataVerification>,
     pub error: Option<LouverError>,
+    /// Which preparation step failed, in the user's words — "예약 방송 생성
+    /// 실패" rather than "YouTube에 연결하지 못했습니다". Set only on a
+    /// failure that got as far as making a call.
+    pub failed_stage: Option<String>,
+    /// What to try, under the stage.
+    pub failed_remedy: Option<String>,
+    /// Whether this attempt was started by a person or by the scheduler, so a
+    /// scheduled failure and a manual success can be told apart on the screen
+    /// as well as in the log.
+    pub origin: Option<String>,
+    /// Every step of the attempt, in order. What makes two runs comparable.
+    pub steps: Vec<StepRecord>,
 }
 
 impl std::fmt::Debug for YoutubeService {
@@ -173,7 +193,13 @@ impl YoutubeService {
         logger: Arc<Logger>,
         keys: Arc<StreamKeyStore>,
     ) -> Self {
-        let http = Arc::new(UreqClient::new());
+        // The token endpoint is fixed in a shipped build and overridable only
+        // by a setting no screen writes, so the refresh path can be driven
+        // against a local fake in a test.
+        let mut transport = UreqClient::new();
+        transport.token_endpoint =
+            db.get_setting(keys::TOKEN_ENDPOINT).ok().flatten().filter(|s| !s.trim().is_empty());
+        let http = Arc::new(transport);
         // Restored rather than reset: a relaunch that started the day's count
         // at zero would spend an allowance that is already gone.
         let restored: QuotaState = db
@@ -208,6 +234,8 @@ impl YoutubeService {
             apply_state: Arc::new(Mutex::new(MetadataApplyState::default())),
             live_session: Arc::new(Mutex::new(None)),
             keys,
+            stream_active_logged: Arc::new(Mutex::new(None)),
+            session_origin: Arc::new(Mutex::new(ProvisionOrigin::Manual)),
         }
     }
 
@@ -417,6 +445,35 @@ impl YoutubeService {
         self.tokens.access_token(&creds, self.http.as_ref())
     }
 
+    /// The access token, with the refresh recorded as a step of its own.
+    ///
+    /// The first thing a scheduled start does, and the first thing that can
+    /// fail: a manual broadcast that worked an hour ago proves the API calls
+    /// are fine and proves nothing about the refresh, because that run was
+    /// still holding the access token consent had just minted. The note says
+    /// whether Google was actually asked.
+    fn token_for(&self, rec: &StepRecorder) -> Result<String> {
+        let cached = self.tokens.has_cached_access_token();
+        let creds = self.credentials()?;
+        rec.start(
+            ProvisionStep::TokenRefresh,
+            &format!(
+                "cached={cached} · client_id={} · client_secret={}",
+                if creds.client_id.is_empty() { "missing" } else { "configured" },
+                if creds.has_secret() { "configured" } else { "missing" },
+            ),
+        );
+        match self.tokens.access_token(&creds, self.http.as_ref()) {
+            Ok(t) => {
+                // Length and nothing else. It is the one fact about a token
+                // that is worth having in a log and cannot be used.
+                rec.ok(ProvisionStep::TokenRefresh, if cached { "캐시된 토큰 사용" } else { "새 토큰 발급" });
+                Ok(t)
+            }
+            Err(e) => Err(rec.fail(ProvisionStep::TokenRefresh, &e)),
+        }
+    }
+
     /// Push the saved metadata onto the current broadcast, then read it back.
     ///
     /// Two writes, because YouTube splits the fields: title, description and
@@ -433,49 +490,80 @@ impl YoutubeService {
         let base = self.api_base();
         let api = YoutubeApi::with_base(self.api_http.as_ref(), base);
 
+        let rec = self.recorder(ProvisionOrigin::Manual);
         let broadcast = api.active_broadcast(&token)?;
-        self.apply_to(&api, &token, &broadcast, &meta)
+        self.apply_to(&api, &token, &broadcast, &meta, &rec)
     }
 
     /// Push the metadata onto a broadcast that is already chosen, and read it
     /// back. Split out so the provisioning path and the manual
     /// 지금 YouTube에 적용 button run exactly the same three calls.
+    ///
+    /// The three calls are one step in the log rather than three: they succeed
+    /// or fail together, and the error each one raises already names itself.
     fn apply_to(
         &self,
         api: &YoutubeApi,
         token: &str,
         broadcast: &LiveBroadcast,
         meta: &BroadcastMetadata,
+        rec: &StepRecorder,
     ) -> Result<MetadataOutcome> {
         let token = token.to_string();
         let broadcast = broadcast.clone();
         let meta = meta.clone();
-        api.update_broadcast(&token, &broadcast.id, &meta, broadcast.scheduled_start_time.as_deref())?;
-        self.logger.info(
-            LogTarget::App,
-            &format!("YOUTUBE_METADATA_UPDATED: {} ({})", broadcast.id, meta.privacy.as_api()),
+        rec.start(
+            ProvisionStep::MetadataApply,
+            &format!("{} · {}개 태그 · {}", broadcast.id, meta.tags.len(), meta.privacy.as_api()),
         );
 
-        api.update_video_snippet(&token, &broadcast.id, &meta)?;
-        self.logger.info(LogTarget::App, &format!("YOUTUBE_TAGS_UPDATED: {}개 태그", meta.tags.len()));
-
-        let snippet = api.video_snippet(&token, &broadcast.id)?;
-        let after = api.broadcast_by_id(&token, &broadcast.id).unwrap_or_else(|_| broadcast.clone());
-        let verification =
-            louver_core::youtube::api::verify_metadata(&meta, &snippet, after.privacy.as_api());
-        if verification.all_applied() {
-            self.logger.info(LogTarget::App, &format!("YOUTUBE_METADATA_VERIFIED: {}", broadcast.id));
-        } else {
-            self.logger.warn(
+        let outcome = (|| -> Result<MetadataOutcome> {
+            api.update_broadcast(&token, &broadcast.id, &meta, broadcast.scheduled_start_time.as_deref())?;
+            self.logger.info(
                 LogTarget::App,
-                &format!(
-                    "YOUTUBE_METADATA_MISMATCH: {} · 반영되지 않은 항목 {}",
-                    broadcast.id,
-                    verification.mismatches().join(", ")
-                ),
+                &format!("YOUTUBE_METADATA_UPDATED: {} ({})", broadcast.id, meta.privacy.as_api()),
             );
+
+            api.update_video_snippet(&token, &broadcast.id, &meta)?;
+            self.logger.info(LogTarget::App, &format!("YOUTUBE_TAGS_UPDATED: {}개 태그", meta.tags.len()));
+
+            let snippet = api.video_snippet(&token, &broadcast.id)?;
+            let after = api.broadcast_by_id(&token, &broadcast.id).unwrap_or_else(|_| broadcast.clone());
+            let verification =
+                louver_core::youtube::api::verify_metadata(&meta, &snippet, after.privacy.as_api());
+            Ok(MetadataOutcome { broadcast: after, verification })
+        })();
+
+        match outcome {
+            Ok(out) => {
+                if out.verification.all_applied() {
+                    rec.ok(ProvisionStep::MetadataApply, &format!("{} · 전 항목 반영", broadcast.id));
+                    self.logger.info(LogTarget::App, &format!("YOUTUBE_METADATA_VERIFIED: {}", broadcast.id));
+                } else {
+                    // Not an Err: every call returned 200, and the caller
+                    // decides what a partial apply is worth. Recorded as a
+                    // failed step all the same, because from the user's side
+                    // "the title did not change" is the failure.
+                    let missing = out.verification.mismatches().join(", ");
+                    rec.fail(
+                        ProvisionStep::MetadataApply,
+                        &LouverError::with_detail(
+                            ErrorCode::YoutubeApiFailed,
+                            format!("반영되지 않은 항목: {missing}"),
+                        ),
+                    );
+                    self.logger.warn(
+                        LogTarget::App,
+                        &format!(
+                            "YOUTUBE_METADATA_MISMATCH: {} · 반영되지 않은 항목 {missing}",
+                            broadcast.id
+                        ),
+                    );
+                }
+                Ok(out)
+            }
+            Err(e) => Err(rec.fail(ProvisionStep::MetadataApply, &e)),
         }
-        Ok(MetadataOutcome { broadcast: after, verification })
     }
 
     /// Get a broadcast ready for a window that is starting now.
@@ -494,17 +582,29 @@ impl YoutubeService {
         meta: &BroadcastMetadata,
         window_start: chrono::DateTime<chrono::Utc>,
         window_end: Option<chrono::DateTime<chrono::Utc>>,
+        rec: &StepRecorder,
     ) -> Result<MetadataOutcome> {
         let meta = meta.cleaned();
         meta.validate()?;
-        let token = self.token()?;
+        let token = self.token_for(rec)?;
         let api = YoutubeApi::with_base(self.api_http.as_ref(), self.api_base());
+        let window = format!(
+            "window={}…{}",
+            window_start.to_rfc3339(),
+            window_end.map(|e| e.to_rfc3339()).unwrap_or_else(|| "열림".into())
+        );
 
         // 1. The broadcast for this window: reuse one prepared earlier (a
         //    retry inside the window must not leave two behind) or create it.
-        let upcoming = api.upcoming_broadcasts(&token)?;
+        let upcoming = rec.run(
+            ProvisionStep::BroadcastList,
+            &window,
+            || api.upcoming_broadcasts(&token),
+            |b| format!("{}개 예정", b.len()),
+        )?;
         let broadcast = match provision::choose_broadcast(&upcoming, window_start, REUSE_TOLERANCE_SECS) {
             BroadcastChoice::Reuse(b) => {
+                rec.skipped(ProvisionStep::BroadcastInsert, &format!("기존 방송 재사용 {}", b.id));
                 self.logger.info(
                     LogTarget::App,
                     &format!("YOUTUBE_BROADCAST_REUSED: 이 예약의 방송을 다시 사용합니다 ({})", b.id),
@@ -512,12 +612,19 @@ impl YoutubeService {
                 b
             }
             BroadcastChoice::Create => {
-                let created = api.create_broadcast(
-                    &token,
-                    &meta,
-                    &window_start.to_rfc3339(),
-                    window_end.map(|e| e.to_rfc3339()).as_deref(),
-                    true,
+                let created = rec.run(
+                    ProvisionStep::BroadcastInsert,
+                    &window,
+                    || {
+                        api.create_broadcast(
+                            &token,
+                            &meta,
+                            &window_start.to_rfc3339(),
+                            window_end.map(|e| e.to_rfc3339()).as_deref(),
+                            true,
+                        )
+                    },
+                    |b| format!("{} · autoStart={}", b.id, b.enable_auto_start),
                 )?;
                 self.logger.info(
                     LogTarget::App,
@@ -528,21 +635,45 @@ impl YoutubeService {
         };
 
         // 2. Bind it to the endpoint this app is actually publishing to. The
-        //    key is read, compared and dropped; it is not logged or stored.
-        let stream_key = self
-            .keys
-            .get()?
-            .filter(|k| !k.trim().is_empty())
-            .ok_or_else(|| LouverError::new(ErrorCode::StreamNoStreamKey))?;
-        let streams = api.my_streams(&token)?;
-        let stream_id = provision::stream_for_key(&streams, &stream_key)?.id.clone();
-        drop(stream_key);
+        //    key is read, compared and dropped; it is not logged or stored —
+        //    which is why the step's note counts the endpoints rather than
+        //    naming them.
+        let stream_id = rec
+            .run(
+                ProvisionStep::StreamList,
+                "",
+                || {
+                    let stream_key = self
+                        .keys
+                        .get()?
+                        .filter(|k| !k.trim().is_empty())
+                        .ok_or_else(|| LouverError::new(ErrorCode::StreamNoStreamKey))?;
+                    let streams = api.my_streams(&token)?;
+                    let found = provision::stream_for_key(&streams, &stream_key).map(|s| s.id.clone());
+                    drop(stream_key);
+                    Ok((found?, streams.len()))
+                },
+                |(id, n)| format!("stream={id} · 후보 {n}개"),
+            )?
+            .0;
 
         let bound = if broadcast.bound_stream_id.as_deref() == Some(stream_id.as_str()) {
+            rec.skipped(
+                ProvisionStep::BroadcastBind,
+                &format!("{} 는 이미 {stream_id} 에 연결됨", broadcast.id),
+            );
             broadcast
         } else {
-            let b = api.bind_broadcast(&token, &broadcast.id, &stream_id)?;
-            provision::verify_bound(&b, &stream_id)?;
+            let b = rec.run(
+                ProvisionStep::BroadcastBind,
+                &format!("{} ← {stream_id}", broadcast.id),
+                || {
+                    let b = api.bind_broadcast(&token, &broadcast.id, &stream_id)?;
+                    provision::verify_bound(&b, &stream_id)?;
+                    Ok(b)
+                },
+                |b| format!("boundStreamId={}", b.bound_stream_id.clone().unwrap_or_default()),
+            )?;
             self.logger
                 .info(LogTarget::App, &format!("YOUTUBE_BROADCAST_BOUND: {} ← 스트림 {}", b.id, stream_id));
             b
@@ -556,7 +687,36 @@ impl YoutubeService {
         });
 
         // 3. The metadata, through the same three calls the manual button uses.
-        self.apply_to(&api, &token, &bound, &meta)
+        self.apply_to(&api, &token, &bound, &meta, rec)
+    }
+
+    /// Write the stream's ingestion state, once per change.
+    ///
+    /// `YOUTUBE_STREAM_ACTIVE_WAIT` is the line that distinguishes "FFmpeg is
+    /// running but YouTube is not receiving it" from "YouTube refused the
+    /// transition" — the two look identical from the dashboard and have
+    /// nothing in common.
+    fn note_stream_status(&self, stream_id: &str, active: bool, status: &str) {
+        let mut last = self.stream_active_logged.lock().unwrap();
+        if *last == Some(active) {
+            return;
+        }
+        *last = Some(active);
+        if active {
+            self.logger.info(
+                LogTarget::App,
+                &format!(
+                    "YOUTUBE_STREAM_ACTIVE: {stream_id} 가 영상을 받고 있습니다 (streamStatus={status})"
+                ),
+            );
+        } else {
+            self.logger.info(
+                LogTarget::App,
+                &format!(
+                    "YOUTUBE_STREAM_ACTIVE_WAIT: {stream_id} 가 아직 영상을 받지 못했습니다 (streamStatus={status})"
+                ),
+            );
+        }
     }
 
     /// Record a failed attempt to take the broadcast live.
@@ -584,10 +744,16 @@ impl YoutubeService {
         if session.went_live {
             return Ok(true);
         }
+        // This runs on every tick of the broadcast loop, so the two waiting
+        // lines are written when the answer *changes*. A log that repeats
+        // "still waiting" once a second is as unreadable as one that says
+        // nothing.
+        let rec = self.recorder(*self.session_origin.lock().unwrap());
         let token = self.token()?;
         let api = YoutubeApi::with_base(self.api_http.as_ref(), self.api_base());
         let broadcast = api.broadcast_by_id(&token, &session.broadcast_id)?;
         let stream = api.stream_by_id(&token, &session.stream_id)?;
+        self.note_stream_status(&session.stream_id, stream.is_active(), &stream.stream_status);
 
         let done = match provision::go_live_step(&broadcast, &stream) {
             GoLive::WaitForStream => false,
@@ -597,7 +763,12 @@ impl YoutubeService {
                 false
             }
             GoLive::Transition => {
-                let after = api.transition_broadcast(&token, &session.broadcast_id, "live")?;
+                let after = rec.run(
+                    ProvisionStep::BroadcastTransition,
+                    &format!("{} → live", session.broadcast_id),
+                    || api.transition_broadcast(&token, &session.broadcast_id, "live"),
+                    |b| format!("lifeCycleStatus={}", b.life_cycle_status),
+                )?;
                 self.logger.info(
                     LogTarget::App,
                     &format!("YOUTUBE_BROADCAST_LIVE: 방송을 LIVE로 전환했습니다 ({})", after.id),
@@ -626,6 +797,7 @@ impl YoutubeService {
     /// `live` on the channel with nothing publishing to it is exactly the
     /// stale state the next window would then try to reuse.
     pub fn finish_broadcast(&self) {
+        *self.stream_active_logged.lock().unwrap() = None;
         let Some(session) = self.live_session.lock().unwrap().take() else { return };
         if session.auto_start_stop && !session.went_live {
             return; // never started; nothing on the channel to end
@@ -743,6 +915,11 @@ impl YoutubeService {
         }
     }
 
+    /// A fresh recorder for one preparation attempt.
+    pub fn recorder(&self, origin: ProvisionOrigin) -> StepRecorder {
+        StepRecorder::new(Arc::clone(&self.logger), origin)
+    }
+
     /// What the metadata apply did for the broadcast in progress.
     pub fn apply_state(&self) -> MetadataApplyState {
         self.apply_state.lock().unwrap().clone()
@@ -789,7 +966,8 @@ impl YoutubeService {
         scheduled: bool,
         window: Option<(chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>,
     ) -> Result<()> {
-        match self.prepare_inner(window) {
+        let origin = if scheduled { ProvisionOrigin::Scheduled } else { ProvisionOrigin::Manual };
+        match self.prepare_inner(window, origin) {
             Ok(()) => Ok(()),
             Err(e) if scheduled && !self.schedule_holds_on_failure() => {
                 // Recorded, never silent: the dashboard shows 적용 실패 and the
@@ -811,6 +989,7 @@ impl YoutubeService {
     fn prepare_inner(
         &self,
         window: Option<(chrono::DateTime<chrono::Utc>, Option<chrono::DateTime<chrono::Utc>>)>,
+        origin: ProvisionOrigin,
     ) -> Result<()> {
         if !self.apply_on_start_wanted() {
             self.set_apply_state(MetadataApplyState::default());
@@ -862,15 +1041,22 @@ impl YoutubeService {
         self.set_apply_state(MetadataApplyState {
             stage: ApplyStage::Applying,
             requested: Some(meta.clone()),
+            origin: Some(origin.as_str().to_string()),
             ..Default::default()
         });
+        *self.session_origin.lock().unwrap() = origin;
+        let rec = self.recorder(origin);
+        self.logger.info(
+            LogTarget::App,
+            &format!("YOUTUBE_PREPARE_START: origin={} · 방송 준비를 시작합니다", origin.as_str()),
+        );
 
         // Provision rather than require. The old path opened with
         // `active_broadcast`, so a scheduled window that arrived with nothing
         // on the channel — the normal case — failed with "make a live
         // broadcast in YouTube first" and never started FFmpeg at all.
         let (start, end) = window.unwrap_or((chrono::Utc::now(), None));
-        match self.provision_broadcast(&meta, start, end) {
+        match self.provision_broadcast(&meta, start, end, &rec) {
             Ok(out) => {
                 *self.applied_this_session.lock().unwrap() = true;
                 let all = out.verification.all_applied();
@@ -880,6 +1066,10 @@ impl YoutubeService {
                     requested: Some(meta),
                     verification: Some(out.verification.clone()),
                     error: None,
+                    failed_stage: (!all).then(|| ProvisionStep::MetadataApply.stage_label().to_string()),
+                    failed_remedy: (!all).then(|| ProvisionStep::MetadataApply.remedy().to_string()),
+                    origin: Some(origin.as_str().to_string()),
+                    steps: rec.trace(),
                 });
                 if all {
                     self.logger.info(
@@ -901,15 +1091,29 @@ impl YoutubeService {
                 }
             }
             Err(e) => {
+                // The step that actually failed, not the feature that asked
+                // for it. This is what the dashboard shows instead of the one
+                // sentence every YouTube failure used to share.
+                let failed = rec.failed_step();
                 self.set_apply_state(MetadataApplyState {
                     stage: ApplyStage::Failed,
                     requested: Some(meta),
                     error: Some(e.clone()),
+                    failed_stage: failed.map(|s| s.stage_label().to_string()),
+                    failed_remedy: failed.map(|s| s.remedy().to_string()),
+                    origin: Some(origin.as_str().to_string()),
+                    steps: rec.trace(),
                     ..Default::default()
                 });
                 self.logger.warn(
                     LogTarget::App,
-                    &format!("방송 정보를 적용하지 못했습니다: {} ({})", e.message, e.code_str),
+                    &format!(
+                        "YOUTUBE_PREPARE_FAIL: origin={} · {} · {} ({})",
+                        origin.as_str(),
+                        failed.map(|s| s.stage_label()).unwrap_or("방송 준비 실패"),
+                        e.message,
+                        e.code_str
+                    ),
                 );
                 Err(e)
             }

@@ -12,6 +12,7 @@ import type {
   DashboardMetrics, DiskEstimate, ImportResult, LicenseState, Media, Playlist,
   PlaylistItemView, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
   SettingsView, StreamEvent, StreamState, MetadataApplyState, MetadataOutcome,
+  ProvisionStep, StepRecord, LouverError,
 } from '@/types'
 
 export interface MockOptions {
@@ -41,6 +42,8 @@ export interface MockOptions {
    * half can break without taking the broadcast with it.
    */
   youtubeApiFails?: boolean
+  /** Which preparation step `youtubeApiFails` should fail at. */
+  youtubeFailsAt?: ProvisionStep
 }
 
 export function createMockBackend(opts: MockOptions = {}) {
@@ -196,6 +199,68 @@ export function createMockBackend(opts: MockOptions = {}) {
         category: ok(m.category_id),
         privacy: ok(m.privacy),
       },
+    }
+  }
+
+  /**
+   * A preparation that got as far as `step` and was refused there.
+   *
+   * The shape the real backend produces: the steps before it succeeded, the
+   * failure carries Google's own words, and the stage is what the user reads.
+   */
+  function failureAt(step: ProvisionStep): {
+    error: LouverError
+    stage: string
+    remedy: string
+    steps: StepRecord[]
+  } {
+    const sequence: ProvisionStep[] = [
+      'token_refresh', 'broadcast_list', 'broadcast_insert', 'stream_list',
+      'broadcast_bind', 'metadata_apply',
+    ]
+    const at = sequence.indexOf(step)
+    const detail: Record<ProvisionStep, [string, string, string]> = {
+      token_refresh: ['LL-YOUTUBE-AUTH-REFRESH', 'Google 인증 갱신 실패',
+        'oauth2.token(refresh_token) HTTP 400 · invalid_grant: Token has been expired or revoked.'],
+      broadcast_list: ['LL-YOUTUBE-004', '예약 방송 목록 조회 실패',
+        'liveBroadcasts.list HTTP 403 reason=insufficientPermissions · Request had insufficient authentication scopes.'],
+      broadcast_insert: ['LL-YOUTUBE-004', '예약 방송 생성 실패',
+        'liveBroadcasts.insert HTTP 403 reason=liveStreamingNotEnabled · The user is not enabled for live streaming.'],
+      stream_list: ['LL-YOUTUBE-004', '스트림 연결 실패',
+        'liveStreams.list HTTP 401 reason=authError · Invalid Credentials'],
+      broadcast_bind: ['LL-YOUTUBE-004', '스트림 연결 실패',
+        'liveBroadcasts.bind HTTP 403 reason=insufficientPermissions · Request had insufficient authentication scopes.'],
+      metadata_apply: ['LL-YOUTUBE-004', '방송 정보 적용 실패',
+        'liveBroadcasts.update HTTP 400 reason=invalidTitle · Invalid title.'],
+      stream_active: ['LL-YOUTUBE-004', '스트림 수신 확인 실패', 'liveStreams.list HTTP 503'],
+      broadcast_transition: ['LL-YOUTUBE-004', 'LIVE 전환 실패',
+        'liveBroadcasts.transition HTTP 403 reason=errorStreamInactive · The stream is not active.'],
+    }
+    const remedy: Record<ProvisionStep, string> = {
+      token_refresh: '설정 → YouTube에서 계정을 다시 연결해주세요.',
+      broadcast_list: 'YouTube 채널에서 실시간 스트리밍이 사용 설정되어 있는지 확인해주세요.',
+      broadcast_insert: 'YouTube 채널에서 실시간 스트리밍이 사용 설정되어 있는지 확인해주세요.',
+      stream_list: '설정에 입력한 스트림 키가 이 채널의 것인지 확인해주세요.',
+      broadcast_bind: '설정에 입력한 스트림 키가 이 채널의 것인지 확인해주세요.',
+      metadata_apply: '방송 설정의 제목·설명·태그를 확인해주세요.',
+      stream_active: '인터넷 연결과 스트림 키를 확인해주세요.',
+      broadcast_transition: '잠시 후 자동으로 다시 시도합니다.',
+    }
+    const [code, stage, googleWords] = detail[step]
+    const steps: StepRecord[] = sequence.slice(0, at < 0 ? 0 : at)
+      .map((s) => ({ step: s, outcome: 'ok' as const, detail: null, error_code: null }))
+    steps.push({ step, outcome: 'failed', detail: googleWords, error_code: code })
+    return {
+      error: {
+        code_str: code,
+        message: code === 'LL-YOUTUBE-AUTH-REFRESH'
+          ? 'Google 인증 갱신에 실패했습니다. 설정에서 YouTube 계정을 다시 연결해주세요.'
+          : 'YouTube에 연결하지 못했습니다. 잠시 후 다시 시도합니다.',
+        detail: googleWords,
+      },
+      stage,
+      remedy: remedy[step],
+      steps,
     }
   }
 
@@ -559,19 +624,20 @@ export function createMockBackend(opts: MockOptions = {}) {
         }
         if (wanted) {
           if (opts.youtubeApiFails) {
+            // Mirrors the real backend: the step that failed is named, the
+            // ones before it are kept, and Google's own words ride in the
+            // detail rather than being flattened into the message.
+            const failure = failureAt(opts.youtubeFailsAt ?? 'metadata_apply')
             youtube.applyState = {
               stage: 'failed',
               requested: { ...youtube.metadata },
-              error: {
-                code_str: 'LL-YOUTUBE-004',
-                message: 'YouTube에 연결하지 못했습니다. 잠시 후 다시 시도합니다.',
-              },
+              error: failure.error,
+              failed_stage: failure.stage,
+              failed_remedy: failure.remedy,
+              origin: 'manual',
+              steps: failure.steps,
             }
-            throw {
-              code_str: 'LL-YOUTUBE-004',
-              message: 'YouTube에 연결하지 못했습니다. 잠시 후 다시 시도합니다.',
-              detail: '방송 설정을 YouTube에 적용하지 못했습니다.',
-            }
+            throw { ...failure.error }
           }
           const outcome = applyOutcome(opts.youtubeIgnoresTitle === true)
           youtube.applyState = {

@@ -277,6 +277,21 @@ impl TokenStore {
         Ok(fresh.access_token)
     }
 
+    /// Is there a cached access token that will still be valid for the next
+    /// call?
+    ///
+    /// Only whether, never the token. The provisioning log reports it so a
+    /// `YOUTUBE_TOKEN_REFRESH_OK` line says whether Google was actually asked
+    /// — a cached token proves nothing about whether the refresh path works,
+    /// and that path is exactly what a scheduled start at 03:00 depends on.
+    pub fn has_cached_access_token(&self) -> bool {
+        self.access
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|t| t.expires_at > Instant::now() + Duration::from_secs(60))
+    }
+
     /// Drop the cached access token, so the next call mints a fresh one.
     pub fn invalidate_access_token(&self) {
         *self.access.lock().unwrap() = None;

@@ -81,6 +81,36 @@ impl HttpClient for UreqClient {
     }
 }
 
+/// Which of the two token grants a request is.
+///
+/// Carried only so a failure can be named. A consent exchange that fails is
+/// the user still at the keyboard in 설정; a refresh that fails happens at
+/// 03:00 with nobody watching, and reporting the two the same way is what made
+/// the scheduled failure unreadable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenGrant {
+    AuthorizationCode,
+    Refresh,
+}
+
+impl TokenGrant {
+    /// The name used in logs and error details.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::AuthorizationCode => "oauth2.token(authorization_code)",
+            Self::Refresh => "oauth2.token(refresh_token)",
+        }
+    }
+
+    /// The error code a failure of this grant carries.
+    pub fn error_code(self) -> ErrorCode {
+        match self {
+            Self::AuthorizationCode => ErrorCode::YoutubeAuthExpired,
+            Self::Refresh => ErrorCode::YoutubeAuthRefreshFailed,
+        }
+    }
+}
+
 impl TokenEndpoint for UreqClient {
     fn exchange_code(
         &self,
@@ -89,11 +119,14 @@ impl TokenEndpoint for UreqClient {
         redirect_uri: &str,
         code_verifier: &str,
     ) -> Result<TokenResponse> {
-        self.post_token(&authorization_code_form(creds, code, redirect_uri, code_verifier))
+        self.post_token(
+            TokenGrant::AuthorizationCode,
+            &authorization_code_form(creds, code, redirect_uri, code_verifier),
+        )
     }
 
     fn refresh(&self, creds: &ClientCredentials, refresh_token: &str) -> Result<TokenResponse> {
-        self.post_token(&refresh_form(creds, refresh_token))
+        self.post_token(TokenGrant::Refresh, &refresh_form(creds, refresh_token))
     }
 }
 
@@ -141,7 +174,7 @@ pub fn refresh_form<'a>(creds: &'a ClientCredentials, refresh_token: &'a str) ->
 }
 
 impl UreqClient {
-    fn post_token(&self, form: &[(&str, &str)]) -> Result<TokenResponse> {
+    fn post_token(&self, grant: TokenGrant, form: &[(&str, &str)]) -> Result<TokenResponse> {
         let url = self.token_endpoint.as_deref().unwrap_or(TOKEN_ENDPOINT);
         let agent = Self::agent();
         let result = agent
@@ -162,15 +195,21 @@ impl UreqClient {
                 // body: the status, `error` and `error_description`. None of
                 // it contains a token or a secret.
                 Err(LouverError::with_detail(
-                    ErrorCode::YoutubeAuthExpired,
-                    describe_token_failure(status, &text),
+                    grant.error_code(),
+                    format!("{} {}", grant.name(), describe_token_failure(status, &text)),
                 ))
             }
             Err(ureq::Error::StatusCode(code)) => Err(LouverError::with_detail(
-                ErrorCode::YoutubeAuthExpired,
-                format!("토큰 요청이 거부되었습니다 (HTTP {code})"),
+                grant.error_code(),
+                format!("{} HTTP {code} · 토큰 요청이 거부되었습니다", grant.name()),
             )),
-            Err(e) => Err(transport_error(e)),
+            // A refresh that cannot reach Google is still a refresh failure —
+            // reporting it as an API failure sends the reader looking at the
+            // YouTube calls, which never happened.
+            Err(e) => Err(LouverError::with_detail(
+                grant.error_code(),
+                format!("{} · 네트워크 오류: {e}", grant.name()),
+            )),
         }
     }
 }

@@ -396,6 +396,31 @@ export interface MetadataApplyState {
   requested?: BroadcastMetadata | null
   verification?: MetadataVerification | null
   error?: LouverError | null
+  /**
+   * Which preparation step failed, in the user's words — "예약 방송 생성 실패"
+   * rather than the one sentence every YouTube error used to share.
+   */
+  failed_stage?: string | null
+  /** What to try, shown under the stage. */
+  failed_remedy?: string | null
+  /** 'manual' or 'scheduled': who started this attempt. */
+  origin?: string | null
+  /** Every step of the attempt, in order. */
+  steps?: StepRecord[]
+}
+
+export type ProvisionStep =
+  | 'token_refresh' | 'broadcast_list' | 'broadcast_insert' | 'stream_list'
+  | 'broadcast_bind' | 'metadata_apply' | 'stream_active' | 'broadcast_transition'
+
+export type StepOutcome = 'started' | 'ok' | 'failed' | 'skipped'
+
+/** One named call in getting a broadcast ready, and how it went. */
+export interface StepRecord {
+  step: ProvisionStep
+  outcome: StepOutcome
+  detail?: string | null
+  error_code?: string | null
 }
 
 /** Whether the next Start can do the YouTube work the user asked for. */

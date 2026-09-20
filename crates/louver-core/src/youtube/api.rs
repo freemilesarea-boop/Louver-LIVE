@@ -6,6 +6,7 @@
 //! Request" is not something a user can act on.
 
 use super::metadata::{BroadcastMetadata, Privacy};
+use super::quota::ApiMethod;
 use crate::error::{ErrorCode, LouverError, Result};
 use serde::{Deserialize, Serialize};
 
@@ -124,16 +125,19 @@ impl<'a> YoutubeApi<'a> {
         body: Option<serde_json::Value>,
     ) -> Result<serde_json::Value> {
         let url = format!("{}{}", self.base, path);
+        // The same classification the quota meter uses, so the name in a log
+        // line and the units charged for it can never disagree.
+        let api_method = ApiMethod::classify(method, &url);
         let (status, text) = self.http.request(method, &url, token, body)?;
         if (200..300).contains(&status) {
             return serde_json::from_str(&text).map_err(|e| {
                 LouverError::with_detail(
                     ErrorCode::YoutubeApiFailed,
-                    format!("응답을 해석하지 못했습니다: {e}"),
+                    format!("{} 응답을 해석하지 못했습니다: {e}", api_method.name()),
                 )
             });
         }
-        Err(classify(status, &text))
+        Err(classify_call(api_method, status, &text))
     }
 
     /// Which channel the connected account is.
@@ -535,26 +539,85 @@ fn parse_stream(item: &serde_json::Value) -> LiveStream {
     }
 }
 
+/// What Google said about a failed request, field by field.
+///
+/// Kept whole rather than flattened into one sentence: "a YouTube call failed"
+/// and "liveBroadcasts.insert was refused with insufficientPermissions" are
+/// the same event, and only the second one can be acted on. Everything here
+/// comes out of the `error` object — the method, the status, Google's numeric
+/// code, its reason and its message. Nothing else of the response body is
+/// read, so a credential Google happened to echo back cannot travel with it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ApiFailure {
+    /// Google's name for the request, e.g. `liveBroadcasts.insert`.
+    pub method: &'static str,
+    pub status: u16,
+    /// `error.code`, which is normally the HTTP status repeated.
+    pub google_code: Option<i64>,
+    /// `error.errors[0].reason`, e.g. `insufficientPermissions`.
+    pub reason: String,
+    /// `error.message`, verbatim.
+    pub message: String,
+}
+
+impl ApiFailure {
+    /// Read the three fields out of Google's error envelope.
+    pub fn parse(method: ApiMethod, status: u16, body: &str) -> Self {
+        let v = serde_json::from_str::<serde_json::Value>(body).ok();
+        let err = v.as_ref().map(|v| &v["error"]);
+        let reason = err
+            .and_then(|e| e["errors"].as_array())
+            .and_then(|e| e.first())
+            .and_then(|e| e["reason"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        let message = err
+            .and_then(|e| e["message"].as_str())
+            .map(str::to_string)
+            // No `error` object at all — an HTML error page, or a proxy. The
+            // first 200 characters are the only clue there is.
+            .unwrap_or_else(|| body.chars().take(200).collect());
+        Self {
+            method: method.name(),
+            status,
+            google_code: err.and_then(|e| e["code"].as_i64()),
+            reason,
+            message,
+        }
+    }
+
+    /// One line naming the request, the status and Google's own words.
+    ///
+    /// The shape the logs and the 상세정보 disclosure both use:
+    /// `liveBroadcasts.insert HTTP 403 reason=insufficientPermissions · …`.
+    pub fn describe(&self) -> String {
+        let mut s = format!("{} HTTP {}", self.method, self.status);
+        if let Some(c) = self.google_code.filter(|c| *c != self.status as i64) {
+            s.push_str(&format!(" code={c}"));
+        }
+        if !self.reason.is_empty() {
+            s.push_str(&format!(" reason={}", self.reason));
+        }
+        if !self.message.is_empty() {
+            s.push_str(&format!(" · {}", self.message));
+        }
+        s
+    }
+}
+
 /// Turn an HTTP failure into something the UI can say out loud.
 ///
 /// Google returns 403 for several unrelated conditions, so the reason string
 /// decides rather than the status alone.
 pub fn classify(status: u16, body: &str) -> LouverError {
-    let reason = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            v["error"]["errors"]
-                .as_array()
-                .and_then(|e| e.first())
-                .and_then(|e| e["reason"].as_str())
-                .map(str::to_string)
-        })
-        .unwrap_or_default();
+    classify_call(ApiMethod::Unknown, status, body)
+}
 
-    let detail = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-        .unwrap_or_else(|| body.chars().take(200).collect());
+/// [`classify`], with the request's own name kept in the detail.
+pub fn classify_call(method: ApiMethod, status: u16, body: &str) -> LouverError {
+    let failure = ApiFailure::parse(method, status, body);
+    let reason = failure.reason.clone();
+    let detail = failure.describe();
 
     let code = match (status, reason.as_str()) {
         (401, _) | (_, "authError") => ErrorCode::YoutubeAuthExpired,

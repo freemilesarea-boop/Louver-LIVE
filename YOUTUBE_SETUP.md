@@ -104,9 +104,69 @@ YouTube Studio에서 **비공개(Private)** 또는 **일부공개(Unlisted)** �
 날릴 수 있어서, Louver Live는 **기존 값을 먼저 읽어 병합한 뒤** 씁니다. 직접
 확인해보실 값이 바로 그것입니다.
 
+### 2026-09-20에 추가된 항목 (TEST 15~19) — 예약 방송 준비 단계 진단
+
+실제 Mac에서 예약 방송이 `LL-YOUTUBE-004`만 여섯 번 남기고 FFmpeg까지 가지
+못한 문제를 조사하기 위해, 준비 과정의 **모든 단계**가 로그에 남도록 했습니다.
+아래는 그 로그를 실제로 얻기 위한 절차입니다.
+
+| # | 할 일 | 통과 기준 |
+| --- | --- | --- |
+| 15 | 수동 방송 시작 → `app.log` 확인 | `origin=manual` 이 붙은 `_START`/`_OK` 줄이 단계마다 있다 |
+| 16 | 같은 세션에서 예약 방송 실행 → `app.log` 확인 | `origin=scheduled` 줄의 **순서가 15번과 같다**. 다르면 그 차이가 원인이다 |
+| 17 | 예약 방송이 실패한 경우 | `_FAIL` 줄에 API 메서드·HTTP 상태·Google reason·Google 메시지가 모두 있다 |
+| 18 | 화면 확인 | 실패 창 제목이 `YouTube에 연결하지 못했습니다`가 아니라 실패한 **단계 이름**이다 |
+| 19 | 로그 전체 검색 | 액세스 토큰·리프레시 토큰·클라이언트 시크릿·스트림 키가 한 글자도 없다 |
+
+#### 실제 Mac에서 다시 테스트하는 방법
+
+```bash
+# 1. 이전 로그를 치워 이번 실행만 보이게 합니다
+mv ~/Library/Application\ Support/LouverLive/logs/app.log \
+   ~/Library/Application\ Support/LouverLive/logs/app.log.before
+
+# 2. 공식 OAuth 클라이언트를 넣고 빌드합니다 (둘 다 필요합니다)
+export LOUVER_GOOGLE_CLIENT_ID="…apps.googleusercontent.com"
+export LOUVER_GOOGLE_CLIENT_SECRET="GOCSPX-…"
+npm run build
+
+# 3. 앱을 실행하고
+#    - 설정 → YouTube 계정 연결
+#    - 방송 설정에 제목·설명·태그·카테고리·공개범위 저장
+#    - 방송 예약에 "지금부터 2분 뒤 시작, 10분 뒤 종료" 예약을 만들고
+#    - [예약 방송 시작] 을 누른 뒤 **아무것도 누르지 않고 기다립니다**
+
+# 4. 예약 시각이 지난 뒤, 준비 과정을 순서대로 봅니다
+grep -E "YOUTUBE_(TOKEN|BROADCAST|STREAM|METADATA)_" \
+  ~/Library/Application\ Support/LouverLive/logs/app.log
+
+# 5. 실패했다면 그 한 줄이 원인을 말해줍니다
+grep "_FAIL" ~/Library/Application\ Support/LouverLive/logs/app.log
+
+# 6. 비교: 같은 빌드에서 수동 방송도 한 번 돌린 뒤
+grep -E "origin=(manual|scheduled)" \
+  ~/Library/Application\ Support/LouverLive/logs/app.log
+
+# 7. 자격 증명이 새지 않았는지 — 아무것도 나오면 안 됩니다
+grep -rniE "ya29\.|1//[A-Za-z0-9_-]{20,}|GOCSPX|$(security find-generic-password \
+  -s com.louver.live -a stream_key -w 2>/dev/null | cut -c1-6)" \
+  ~/Library/Application\ Support/LouverLive/logs/
+```
+
+**PASS 기준은 하나뿐입니다.** 로그에 아래 순서가 모두 나오고, 실제 YouTube
+채널에서 라이브가 보여야 합니다.
+
+```
+YOUTUBE_BROADCAST_CREATED  →  YOUTUBE_BROADCAST_BOUND
+  →  FFmpeg Running  →  YOUTUBE_BROADCAST_LIVE
+```
+
+여기까지 가지 못하면 어떤 단계에서 멈췄든 **FAIL**입니다. 그리고 멈춘 단계는
+이제 `_FAIL` 줄 하나로 알 수 있습니다.
+
 ### 확인용 로그
 
-**로그** 페이지 또는 `~/Library/Logs/com.louver.live/`:
+**로그** 페이지 또는 `~/Library/Application\ Support/LouverLive/logs/`:
 
 ```
 YOUTUBE_AUTH_CONNECTED    계정 연결됨
@@ -121,6 +181,26 @@ YOUTUBE_METADATA_SKIPPED  계정 미연결 등으로 적용하지 않음
 CHAT_RETRY                재시도 예정
 CHAT_STOPPED              봇 종료
 ```
+
+준비 과정은 단계마다 `_START` / `_OK` / `_FAIL` 로 남습니다:
+
+```
+YOUTUBE_PREPARE_START            준비 시작 (origin=manual 또는 origin=scheduled)
+YOUTUBE_TOKEN_REFRESH_*          Google 인증 갱신
+YOUTUBE_BROADCAST_LIST_*         이 예약에 쓸 방송이 이미 있는지
+YOUTUBE_BROADCAST_INSERT_*       없으면 새로 만듦
+YOUTUBE_STREAM_LIST_*            스트림 키가 가리키는 수신 지점 찾기
+YOUTUBE_BROADCAST_BIND_*         방송과 수신 지점 연결
+YOUTUBE_METADATA_APPLY_*         제목·설명·태그·카테고리·공개범위
+YOUTUBE_STREAM_ACTIVE_WAIT       YouTube가 아직 영상을 받지 못함
+YOUTUBE_STREAM_ACTIVE            YouTube가 영상을 받기 시작함
+YOUTUBE_BROADCAST_TRANSITION_*   LIVE 전환
+YOUTUBE_PREPARE_FAIL             어느 단계에서 멈췄는지 + 오류 코드
+```
+
+`_FAIL` 줄에는 Google이 답한 그대로가 들어갑니다 — API 메서드, HTTP 상태,
+Google의 error reason, Google의 메시지. 예를 들어
+`liveBroadcasts.insert HTTP 403 reason=liveStreamingNotEnabled` 처럼 나옵니다.
 
 토큰과 스트림 키는 어떤 로그에도 남지 않습니다.
 
@@ -172,6 +252,10 @@ CHAT_STOPPED              봇 종료
 | **실제 YouTube 라이브 메타데이터 변경** | **NOT TESTED** |
 | **실제 라이브 채팅 전송** | **NOT TESTED** |
 | **Stop → Start 후 stale liveChatId 없음** | **NOT TESTED** |
+| 준비 단계별 START/OK/FAIL 로그 | **PASS** — 단위·통합 테스트 (실패 줄에 메서드·상태·reason·메시지가 모두 담기는지) |
+| 자격 증명이 로그에 남지 않음 | **PASS** — 네 가지 값 모두로 로그 전문을 검색하는 테스트 |
+| **실제 Mac 예약 방송 준비 로그 (TEST 15~19)** | **NOT TESTED** |
+| **실제 YouTube에서 LIVE 확인** | **NOT TESTED** |
 
 아래 세 줄은 이 저장소에서 확인할 방법이 없습니다. 위 3번 절차를 Mac에서
 돌려보시면 채워집니다.

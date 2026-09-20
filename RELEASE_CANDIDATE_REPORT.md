@@ -590,6 +590,74 @@ clicked, it became `예약 방송 중 · 13:04 → 13:12 방송 중입니다` an
 `예약 방송 13:04 → 13:12 LIVE` with `FFmpeg Running` and a countdown to the
 automatic stop.
 
+## 14e. Six identical error lines for seven different failures (2026-09-20)
+
+Real Mac logs, supplied by the product owner. The scheduler was working:
+
+```
+22:34:45  SCHEDULER_ARMED: 예약 1개를 감시합니다
+22:35:01  LL-YOUTUBE-004    22:35:38  LL-YOUTUBE-004
+22:35:07  LL-YOUTUBE-004    22:36:08  LL-YOUTUBE-004
+22:35:17  LL-YOUTUBE-004    22:36:39  LL-YOUTUBE-004
+```
+
+The gaps are 5s, 10s, 20s, 30s, 30s — the bounded retry of §14c, doing exactly
+what it was built to do. `stream.log` shows `방송 시작: night (… Scheduled)` at
+each of those times and never `방송이 시작되었습니다`, so the failure is in the
+YouTube preparation, before FFmpeg is asked for anything.
+
+What could not be answered from that log is *which* request failed. A start
+makes seven of them — refresh the token, list the broadcasts, create one, list
+the streams, bind, update the broadcast, update the video — and every one of
+them raises `LL-YOUTUBE-004 · YouTube에 연결하지 못했습니다`. A manual broadcast
+on the same Mac had reached `방송이 시작되었습니다` earlier the same evening,
+which narrows nothing: that run was still holding the access token consent had
+just minted, so it exercised none of the refresh path a 22:35 start depends on.
+
+So this change is instrumentation, not a fix. No guess about the cause has been
+written into the code.
+
+| What | Where |
+| --- | --- |
+| Each step writes `_START` / `_OK` / `_FAIL` | `youtube/steps.rs`, threaded through `provision_broadcast`, `apply_to` and `try_go_live` |
+| The eight families | `YOUTUBE_TOKEN_REFRESH_*`, `YOUTUBE_BROADCAST_LIST_*`, `YOUTUBE_BROADCAST_INSERT_*`, `YOUTUBE_STREAM_LIST_*`, `YOUTUBE_BROADCAST_BIND_*`, `YOUTUBE_METADATA_APPLY_*`, `YOUTUBE_STREAM_ACTIVE_WAIT`/`YOUTUBE_STREAM_ACTIVE`, `YOUTUBE_BROADCAST_TRANSITION_*` |
+| Google's words are kept | `ApiFailure` reads `error.code`, `error.errors[0].reason` and `error.message`, and the detail reads `liveBroadcasts.insert HTTP 403 reason=liveStreamingNotEnabled · …` |
+| The API method comes from the quota classifier | One source for the name and the units, so a log line and a charge cannot disagree. `POST` and `PUT` on the same resource are now told apart (`insert` vs `update`) |
+| A failed refresh is its own error | `LL-YOUTUBE-AUTH-REFRESH`, raised only by the `refresh_token` grant. The consent exchange keeps `LL-YOUTUBE-002` |
+| Manual and scheduled are comparable | Every line carries `origin=manual` or `origin=scheduled`, and the step sequence is kept on the apply state |
+| The screen names the stage | `예약 방송 생성 실패`, `Google 인증 갱신 실패`, `스트림 연결 실패` — with the remedy under it and Google's own words behind 상세정보 |
+| Four values are never written | Access token, refresh token, client secret, stream key. No recorder method accepts one; the OK lines carry resource ids, and the FAIL lines carry only the `error` object |
+
+**Evidence.** `apps/desktop/src-tauri/tests/provisioning_log.rs` drives the real
+`YoutubeService` — real `TokenStore`, real transport, real quota meter — against
+local servers speaking Google's JSON, and asserts the log:
+
+- an empty channel provisions end to end, writing all fifteen expected lines,
+  with the refresh actually performed (`새 토큰 발급`, `grant_type=refresh_token`
+  with `client_secret=` in the body);
+- a 403 on `liveBroadcasts.insert` writes
+  `YOUTUBE_BROADCAST_INSERT_FAIL … liveBroadcasts.insert HTTP 403 reason=liveStreamingNotEnabled`,
+  after a `YOUTUBE_BROADCAST_LIST_OK` that tells the reader how far it got;
+- a revoked refresh token fails as `LL-YOUTUBE-AUTH-REFRESH` and the YouTube API
+  is never called at all;
+- a manual and a scheduled start take the identical step sequence, differing
+  only in the label.
+
+Every one of those tests also searches the whole log for the four credentials.
+
+**The documented log path was wrong.** `~/Library/Logs/com.louver.live/` is a
+folder the app has never written to; `AppPaths::logs_dir` puts them under
+`~/Library/Application Support/LouverLive/logs/`. Four documents said the wrong
+thing, including the diagnostic commands. Corrected, and
+`no_document_sends_a_mac_user_to_a_folder_the_app_never_writes` now fails the
+build if it comes back.
+
+**Status: NOT TESTED against real Google.** This adds no claim that a scheduled
+start now works. It is PASS only when a real Mac log shows
+`YOUTUBE_BROADCAST_CREATED → YOUTUBE_BROADCAST_BOUND → FFmpeg Running →
+YOUTUBE_BROADCAST_LIVE` and the channel is live. The procedure is
+`YOUTUBE_SETUP.md` §3, TEST 15~19.
+
 ## 15. Known issues
 
 1. **Real YouTube broadcasting is unverified.** Everything up to the socket is

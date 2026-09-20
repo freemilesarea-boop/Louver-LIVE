@@ -28,6 +28,9 @@ keyring = { version = "2", default-features = false, features = ["platform-windo
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_Foundation"] }
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

@@ -942,7 +942,8 @@ describe('the YouTube side of a broadcast is reported on its own', () => {
 
     await gotoPage(user, '대시보드')
     await startLive(user)
-    expect(await screen.findByText('방송 설정을 YouTube에 적용하지 못했습니다')).toBeInTheDocument()
+    // The heading names the step that failed, not the feature that wanted it.
+    expect(await screen.findByText('방송 정보 적용 실패')).toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '설정 없이 방송 시작' }))
 
     await waitFor(() => {
@@ -951,6 +952,67 @@ describe('the YouTube side of a broadcast is reported on its own', () => {
     // §12 still holds: the stream is not a casualty of the YouTube half.
     await new Promise((r) => setTimeout(r, 1200))
     expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+  })
+
+  it('names the step that failed rather than repeating one sentence for all of them', async () => {
+    // The real Mac failure this replaces: six retries, six identical
+    // "YouTube에 연결하지 못했습니다" lines, and no way to tell which of the
+    // seven requests Google refused.
+    const user = userEvent.setup()
+    mount({ youtubeApiFails: true, youtubeFailsAt: 'broadcast_insert' })
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await gotoPage(user, '설정')
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    await screen.findByRole('button', { name: '연결 해제' }, { timeout: 6000 })
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+
+    expect(await screen.findByText('예약 방송 생성 실패')).toBeInTheDocument()
+    // And Google's own words are there to act on, not summarised away.
+    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('liveBroadcasts.insert')
+    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('reason=liveStreamingNotEnabled')
+
+    // The panel behind the modal says the same thing, with the remedy and the
+    // sequence it got through.
+    await user.click(screen.getByRole('button', { name: '취소' }))
+    expect(await screen.findByTestId('metadata-failed-stage')).toHaveTextContent('예약 방송 생성 실패')
+    expect(screen.getByTestId('metadata-failed')).toHaveTextContent('실시간 스트리밍이 사용 설정')
+    await user.click(screen.getByText('상세정보'))
+    const steps = await screen.findByTestId('metadata-steps')
+    expect(steps).toHaveTextContent('Google 인증 갱신')
+    expect(steps).toHaveTextContent('예약 방송 확인')
+    expect(steps).toHaveTextContent('예약 방송 생성')
+  })
+
+  it('tells a stale Google login apart from a YouTube API failure', async () => {
+    // §3: the refresh path is what a scheduled start at 03:00 depends on, and
+    // a manual broadcast an hour earlier proves nothing about it — that run
+    // was still holding the access token consent had just minted.
+    const user = userEvent.setup()
+    mount({ youtubeApiFails: true, youtubeFailsAt: 'token_refresh' })
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await gotoPage(user, '설정')
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    await screen.findByRole('button', { name: '연결 해제' }, { timeout: 6000 })
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+
+    expect(await screen.findByText('Google 인증 갱신 실패')).toBeInTheDocument()
+    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('oauth2.token(refresh_token)')
+    expect(screen.getByTestId('blocked-detail')).toHaveTextContent('invalid_grant')
+
+    // And the broadcast engine is still not the thing that is unwell: the
+    // user can go on air without the optional half.
+    await user.click(screen.getByRole('button', { name: '설정 없이 방송 시작' }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+    })
   })
 })
 

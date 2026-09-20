@@ -14,12 +14,14 @@ pub mod metadata;
 pub mod oauth;
 pub mod provision;
 pub mod quota;
+pub mod steps;
 
 pub use api::{ChannelInfo, HttpClient, LiveBroadcast, LiveStream, YoutubeApi};
 pub use chat::{ChatMessage, ChatOrder, ChatSettings, ChatState, ChatStatus, MIN_INTERVAL_SECS};
 pub use metadata::{BroadcastMetadata, Privacy, CATEGORIES};
 pub use oauth::{ClientCredentials, TokenStore};
 pub use quota::{ApiMethod, MeteredClient, QuotaGuard, QuotaState, FREE_DAILY_UNITS};
+pub use steps::{ProvisionOrigin, ProvisionStep, StepOutcome, StepRecord, StepRecorder};
 
 /// Settings keys this module owns.
 pub mod keys {
@@ -44,6 +46,11 @@ pub mod keys {
     pub const CHAT_AVOID_REPEATS: &str = "youtube_chat_avoid_repeats";
     /// Overridden by the test harness to point at a local fake.
     pub const API_BASE: &str = "youtube_api_base";
+    /// The OAuth token endpoint, likewise. Set only by the test harness —
+    /// there is no UI for it — so that the refresh path, which a scheduled
+    /// start at 03:00 depends on and a manual start usually skips, can be
+    /// exercised without Google.
+    pub const TOKEN_ENDPOINT: &str = "youtube_token_endpoint";
     /// Send `client_secret` in the token exchange after all.
     ///
     /// Off by default: the exchange is attempted with PKCE alone. Turned on

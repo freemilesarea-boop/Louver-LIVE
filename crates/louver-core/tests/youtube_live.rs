@@ -882,3 +882,198 @@ fn provisioning_costs_what_the_quota_table_says() {
     // allowance with room for the chat bot.
     assert!(per_start * 24 < FREE_DAILY_UNITS - RESERVE_UNITS, "{}", per_start * 24);
 }
+
+// --- what a failure says about itself -----------------------------------
+//
+// The reason all of this exists: six identical `LL-YOUTUBE-004 · YouTube에
+// 연결하지 못했습니다` lines on a real Mac, for six retries of a scheduled
+// window, with no way to tell which of the seven requests Google refused.
+
+#[test]
+fn a_refused_call_names_the_method_the_status_and_googles_reason() {
+    // Every assertion here is a thing the old detail did not carry.
+    let fake = FakeYoutube::start(vec![(
+        "POST /liveBroadcasts",
+        403,
+        r#"{"error":{"code":403,"message":"The user is not enabled for live streaming.",
+            "errors":[{"reason":"liveStreamingNotEnabled","domain":"youtube.liveBroadcast"}]}}"#
+            .into(),
+    )]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    let err = api
+        .create_broadcast("tok", &meta(), "2026-09-20T11:58:00Z", None, true)
+        .expect_err("a 403 is not a success");
+
+    let detail = err.detail.expect("the detail is the whole point");
+    assert!(detail.contains("liveBroadcasts.insert"), "{detail}");
+    assert!(detail.contains("HTTP 403"), "{detail}");
+    assert!(detail.contains("reason=liveStreamingNotEnabled"), "{detail}");
+    assert!(detail.contains("The user is not enabled for live streaming."), "{detail}");
+}
+
+#[test]
+fn each_provisioning_call_names_itself_differently() {
+    // The point of the method name: four failures that used to be one line
+    // are now four distinguishable ones.
+    use louver_core::youtube::api::{classify_call, ApiFailure};
+    use louver_core::youtube::quota::ApiMethod;
+
+    let body = r#"{"error":{"code":401,"message":"Invalid Credentials",
+        "errors":[{"reason":"authError"}]}}"#;
+    let named = |m| classify_call(m, 401, body).detail.unwrap();
+
+    assert!(named(ApiMethod::LiveBroadcastsList).contains("liveBroadcasts.list"));
+    assert!(named(ApiMethod::LiveBroadcastsInsert).contains("liveBroadcasts.insert"));
+    assert!(named(ApiMethod::LiveStreamsList).contains("liveStreams.list"));
+    assert!(named(ApiMethod::LiveBroadcastsBind).contains("liveBroadcasts.bind"));
+    assert!(named(ApiMethod::LiveBroadcastsTransition).contains("liveBroadcasts.transition"));
+
+    // And the fields are readable one at a time, not only as a sentence.
+    let f = ApiFailure::parse(ApiMethod::VideosUpdate, 400, body);
+    assert_eq!(f.method, "videos.update");
+    assert_eq!(f.reason, "authError");
+    assert_eq!(f.google_code, Some(401));
+    assert_eq!(f.message, "Invalid Credentials");
+}
+
+#[test]
+fn a_reply_with_no_error_object_still_says_what_arrived() {
+    // A proxy, a captive portal or an HTML error page. The status and the
+    // first of the body is all there is, and it is better than nothing.
+    use louver_core::youtube::api::ApiFailure;
+    use louver_core::youtube::quota::ApiMethod;
+    let f = ApiFailure::parse(ApiMethod::LiveStreamsList, 502, "<html>Bad Gateway</html>");
+    assert_eq!(f.reason, "");
+    assert!(f.describe().contains("liveStreams.list HTTP 502"), "{}", f.describe());
+    assert!(f.describe().contains("Bad Gateway"), "{}", f.describe());
+}
+
+#[test]
+fn a_failed_token_refresh_is_not_reported_as_a_youtube_api_failure() {
+    // The scheduled failure this was written for: the manual broadcast an
+    // hour earlier was still using the access token consent had just minted,
+    // so it proved nothing about the refresh. A refresh that fails at 03:00
+    // needs its own code, or it reads as "YouTube에 연결하지 못했습니다" and
+    // sends the reader looking at API calls that never happened.
+    use louver_core::youtube::oauth::{ClientCredentials, TokenEndpoint};
+
+    let endpoint = FakeTokenEndpoint::start(
+        400,
+        r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#,
+    );
+    let http = token_client(&endpoint);
+    let creds = ClientCredentials { client_id: "id".into(), client_secret: "GOCSPX-x".into() };
+
+    let refused = http.refresh(&creds, "1//stored-refresh-token").unwrap_err();
+    assert_eq!(refused.code_str, "LL-YOUTUBE-AUTH-REFRESH");
+    let detail = refused.detail.unwrap();
+    assert!(detail.contains("oauth2.token(refresh_token)"), "{detail}");
+    assert!(detail.contains("invalid_grant"), "{detail}");
+    assert!(detail.contains("Token has been expired or revoked."), "{detail}");
+    // Neither credential travels with the report.
+    assert!(!detail.contains("1//stored-refresh-token"), "{detail}");
+    assert!(!detail.contains("GOCSPX-x"), "{detail}");
+
+    // The consent exchange keeps its own, different code: one is "connect the
+    // account", the other is "the account is connected and stopped working".
+    let exchange = http.exchange_code(&creds, "4/code", "http://127.0.0.1:1", "verifier").unwrap_err();
+    assert_eq!(exchange.code_str, "LL-YOUTUBE-002");
+    assert!(exchange.detail.unwrap().contains("oauth2.token(authorization_code)"));
+}
+
+#[test]
+fn a_whole_provisioning_run_is_logged_step_by_step_and_carries_no_credential() {
+    // What the log should have looked like on the Mac. Built here with the
+    // same recorder the app uses, from the same values a real run handles.
+    use louver_core::error::{ErrorCode, LouverError};
+    use louver_core::logging::Logger;
+    use louver_core::youtube::steps::{ProvisionOrigin, ProvisionStep, StepRecorder};
+
+    const ACCESS: &str = "ya29.a0AfB_realaccesstoken";
+    const REFRESH: &str = "1//04realrefreshtoken";
+    const SECRET: &str = "GOCSPX-realclientsecret";
+    const KEY: &str = "abcd-efgh-ijkl-mnop";
+
+    let dir = tempfile::tempdir().unwrap();
+    let logger = Logger::new(dir.path()).unwrap();
+    let rec = StepRecorder::new(logger, ProvisionOrigin::Scheduled);
+
+    rec.start(ProvisionStep::TokenRefresh, "cached=false · client_id=configured · client_secret=configured");
+    rec.ok(ProvisionStep::TokenRefresh, "새 토큰 발급");
+    rec.start(ProvisionStep::BroadcastList, "window=2026-09-20T12:59:00Z…2026-09-20T13:09:00Z");
+    rec.ok(ProvisionStep::BroadcastList, "0개 예정");
+    rec.start(ProvisionStep::BroadcastInsert, "window=2026-09-20T12:59:00Z…");
+    rec.ok(ProvisionStep::BroadcastInsert, "b-new · autoStart=true");
+    rec.start(ProvisionStep::StreamList, "");
+    rec.ok(ProvisionStep::StreamList, "stream=s-mine · 후보 2개");
+    rec.start(ProvisionStep::BroadcastBind, "b-new ← s-mine");
+    rec.fail(
+        ProvisionStep::BroadcastBind,
+        &LouverError::with_detail(
+            ErrorCode::YoutubeApiFailed,
+            "liveBroadcasts.bind HTTP 403 reason=insufficientPermissions · Request had insufficient authentication scopes.",
+        ),
+    );
+
+    let log = std::fs::read_to_string(dir.path().join("app.log")).unwrap();
+
+    // Every step is there, and the reader can see how far it got.
+    for line in [
+        "YOUTUBE_TOKEN_REFRESH_START",
+        "YOUTUBE_TOKEN_REFRESH_OK",
+        "YOUTUBE_BROADCAST_LIST_START",
+        "YOUTUBE_BROADCAST_LIST_OK",
+        "YOUTUBE_BROADCAST_INSERT_START",
+        "YOUTUBE_BROADCAST_INSERT_OK",
+        "YOUTUBE_STREAM_LIST_START",
+        "YOUTUBE_STREAM_LIST_OK",
+        "YOUTUBE_BROADCAST_BIND_START",
+        "YOUTUBE_BROADCAST_BIND_FAIL",
+    ] {
+        assert!(log.contains(line), "missing {line} in:\n{log}");
+    }
+    // And the failure names the request rather than the feature.
+    assert!(log.contains("reason=insufficientPermissions"), "{log}");
+    assert!(log.contains("origin=scheduled"), "{log}");
+
+    // None of the four forbidden values can reach it: no method on the
+    // recorder accepts one, so this is the belt on top of the braces.
+    for secret in [ACCESS, REFRESH, SECRET, KEY] {
+        assert!(!log.contains(secret), "a credential reached the log");
+    }
+
+    // The stage the UI shows comes from the same record.
+    assert_eq!(rec.failed_step(), Some(ProvisionStep::BroadcastBind));
+    assert_eq!(rec.failed_step().unwrap().stage_label(), "스트림 연결 실패");
+}
+
+#[test]
+fn a_manual_run_and_a_scheduled_run_are_labelled_so_they_can_be_compared() {
+    // §4 of the report: run both in one session and diff the sequences. That
+    // is only possible if each line says which run it belongs to and the
+    // sequence is kept.
+    use louver_core::logging::Logger;
+    use louver_core::youtube::steps::{ProvisionOrigin, ProvisionStep, StepRecorder};
+
+    let dir = tempfile::tempdir().unwrap();
+    let logger = Logger::new(dir.path()).unwrap();
+
+    let sequence = |origin| {
+        let rec = StepRecorder::new(std::sync::Arc::clone(&logger), origin);
+        rec.ok(ProvisionStep::TokenRefresh, "");
+        rec.ok(ProvisionStep::BroadcastList, "");
+        rec.skipped(ProvisionStep::BroadcastInsert, "");
+        rec.ok(ProvisionStep::StreamList, "");
+        rec.trace().into_iter().map(|r| (r.step, r.outcome)).collect::<Vec<_>>()
+    };
+
+    let manual = sequence(ProvisionOrigin::Manual);
+    let scheduled = sequence(ProvisionOrigin::Scheduled);
+    assert_eq!(manual, scheduled, "the two starts must go through the same steps");
+
+    let log = std::fs::read_to_string(dir.path().join("app.log")).unwrap();
+    assert!(log.contains("origin=manual"), "{log}");
+    assert!(log.contains("origin=scheduled"), "{log}");
+}

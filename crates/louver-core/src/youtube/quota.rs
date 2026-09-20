@@ -147,21 +147,60 @@ impl ApiMethod {
             .map(|(_, r)| r)
             .unwrap_or_else(|| path.trim_start_matches('/'))
             .trim_matches('/');
-        let write = !verb.eq_ignore_ascii_case("GET");
-        match (resource, write) {
-            ("channels", false) => Self::ChannelsList,
-            ("liveBroadcasts", false) => Self::LiveBroadcastsList,
-            ("liveBroadcasts", true) => Self::LiveBroadcastsUpdate,
+        // POST and PUT are both writes and both cost 50, but they are not the
+        // same method, and a log line saying which one Google refused is the
+        // difference between "a YouTube call failed" and "it would not let us
+        // create the broadcast".
+        let verb = if verb.eq_ignore_ascii_case("GET") {
+            "GET"
+        } else if verb.eq_ignore_ascii_case("PUT") {
+            "PUT"
+        } else {
+            "POST"
+        };
+        match (resource, verb) {
+            ("channels", "GET") => Self::ChannelsList,
+            ("liveBroadcasts", "GET") => Self::LiveBroadcastsList,
+            ("liveBroadcasts", "POST") => Self::LiveBroadcastsInsert,
+            ("liveBroadcasts", "PUT") => Self::LiveBroadcastsUpdate,
             ("liveBroadcasts/bind", _) => Self::LiveBroadcastsBind,
             ("liveBroadcasts/transition", _) => Self::LiveBroadcastsTransition,
-            ("liveStreams", false) => Self::LiveStreamsList,
-            ("liveStreams", true) => Self::LiveStreamsInsert,
-            ("videos", false) => Self::VideosList,
-            ("videos", true) => Self::VideosUpdate,
-            ("liveChat/messages", false) => Self::LiveChatMessagesList,
-            ("liveChat/messages", true) => Self::LiveChatMessagesInsert,
+            ("liveStreams", "GET") => Self::LiveStreamsList,
+            ("liveStreams", "POST") => Self::LiveStreamsInsert,
+            ("liveStreams", "PUT") => Self::LiveStreamsUpdate,
+            ("videos", "GET") => Self::VideosList,
+            ("videos", "POST") => Self::VideosInsert,
+            ("videos", "PUT") => Self::VideosUpdate,
+            ("liveChat/messages", "GET") => Self::LiveChatMessagesList,
+            ("liveChat/messages", _) => Self::LiveChatMessagesInsert,
             ("search", _) => Self::SearchList,
             _ => Self::Unknown,
+        }
+    }
+
+    /// The method's name as Google's own documentation writes it, e.g.
+    /// `liveBroadcasts.insert`.
+    ///
+    /// Used in the log and in the error detail, so a failure names the request
+    /// that failed rather than the feature that wanted it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::ChannelsList => "channels.list",
+            Self::LiveBroadcastsList => "liveBroadcasts.list",
+            Self::LiveBroadcastsUpdate => "liveBroadcasts.update",
+            Self::LiveBroadcastsInsert => "liveBroadcasts.insert",
+            Self::LiveBroadcastsBind => "liveBroadcasts.bind",
+            Self::LiveBroadcastsTransition => "liveBroadcasts.transition",
+            Self::LiveStreamsList => "liveStreams.list",
+            Self::LiveStreamsInsert => "liveStreams.insert",
+            Self::LiveStreamsUpdate => "liveStreams.update",
+            Self::VideosList => "videos.list",
+            Self::VideosUpdate => "videos.update",
+            Self::LiveChatMessagesList => "liveChatMessages.list",
+            Self::LiveChatMessagesInsert => "liveChatMessages.insert",
+            Self::SearchList => "search.list",
+            Self::VideosInsert => "videos.insert",
+            Self::Unknown => "youtube.unknown",
         }
     }
 }

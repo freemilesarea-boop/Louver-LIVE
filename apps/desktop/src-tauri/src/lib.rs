@@ -6,7 +6,7 @@
 pub mod commands;
 pub mod platform;
 pub mod state;
-mod youtube_service;
+pub mod youtube_service;
 
 use louver_core::logging::LogTarget;
 use louver_core::system::AutostartManager;

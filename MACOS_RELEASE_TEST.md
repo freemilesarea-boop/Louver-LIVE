@@ -93,7 +93,7 @@ never the whole key.
 ## 7. Prove the key is in the Keychain and not in the database
 
 ```bash
-sqlite3 ~/Library/Application\ Support/com.louver.live/louver.db \
+sqlite3 ~/Library/Application\ Support/LouverLive/louver.db \
   "select * from settings;" | grep -i -c "<first 4 chars of the key>"
 security find-generic-password -s "Louver Live" -a "stream_key" -w | head -c 4
 ```
@@ -115,7 +115,7 @@ normalization throughput can be compared against BENCHMARK.md §3.
 ```bash
 ffprobe -v error -select_streams v:0 \
   -show_entries stream=codec_name,width,height,r_frame_rate,pix_fmt \
-  -of default=nw=1 ~/Library/Application\ Support/com.louver.live/cache/<file>
+  -of default=nw=1 ~/Library/Application\ Support/LouverLive/cache/<file>
 ```
 
 **Pass:** identical parameters for both files — h264, 1920x1080, 30/1,
@@ -212,8 +212,8 @@ Press Stop. Then:
 
 ```bash
 pgrep -fl ffmpeg
-grep -ric "<first 4 chars of the key>" ~/Library/Logs/com.louver.live/ \
-  ~/Library/Application\ Support/com.louver.live/ | grep -v ':0$'
+grep -ric "<first 4 chars of the key>" ~/Library/Application\ Support/LouverLive/logs/ \
+  ~/Library/Application\ Support/LouverLive/ | grep -v ':0$'
 ```
 
 **Pass:** the broadcast ends cleanly, no FFmpeg process survives, and the

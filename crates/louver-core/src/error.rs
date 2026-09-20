@@ -52,6 +52,10 @@ pub enum ErrorCode {
     // LL-YOUTUBE-0xx / LL-CHAT-0xx
     YoutubeNotConnected,
     YoutubeAuthExpired,
+    /// The refresh token could not be traded for an access token. Its own code
+    /// because it has its own cause and its own remedy: nothing about the
+    /// YouTube API is wrong, the app simply cannot prove who it is any more.
+    YoutubeAuthRefreshFailed,
     YoutubeNoActiveBroadcast,
     YoutubeApiFailed,
     YoutubeQuotaExceeded,
@@ -106,6 +110,7 @@ impl ErrorCode {
             LicenseDeviceMismatch => "LL-LICENSE-005",
             YoutubeNotConnected => "LL-YOUTUBE-001",
             YoutubeAuthExpired => "LL-YOUTUBE-002",
+            YoutubeAuthRefreshFailed => "LL-YOUTUBE-AUTH-REFRESH",
             YoutubeNoActiveBroadcast => "LL-YOUTUBE-003",
             YoutubeApiFailed => "LL-YOUTUBE-004",
             YoutubeQuotaExceeded => "LL-YOUTUBE-005",
@@ -165,6 +170,9 @@ impl ErrorCode {
             LicenseDeviceMismatch => "이 라이선스는 다른 컴퓨터에 등록되어 있습니다.",
             YoutubeNotConnected => "YouTube 계정이 연결되지 않았습니다. 설정에서 연결해주세요.",
             YoutubeAuthExpired => "YouTube 로그인이 만료되었습니다. 설정에서 다시 연결해주세요.",
+            YoutubeAuthRefreshFailed => {
+                "Google 인증 갱신에 실패했습니다. 설정에서 YouTube 계정을 다시 연결해주세요."
+            }
             YoutubeNoActiveBroadcast => {
                 "진행 중인 YouTube 라이브를 찾지 못했습니다. YouTube에서 라이브를 먼저 만들어주세요."
             }
@@ -290,6 +298,7 @@ pub const ALL_ERROR_CODES: &[ErrorCode] = {
         LicenseDeviceMismatch,
         YoutubeNotConnected,
         YoutubeAuthExpired,
+        YoutubeAuthRefreshFailed,
         YoutubeNoActiveBroadcast,
         YoutubeApiFailed,
         YoutubeQuotaExceeded,
@@ -322,7 +331,19 @@ mod tests {
     fn every_code_has_korean_message_and_ll_prefix() {
         for c in ALL_ERROR_CODES {
             assert!(c.as_str().starts_with("LL-"), "{c} missing LL- prefix");
-            assert_eq!(c.as_str().split('-').count(), 3, "{c} malformed");
+            // `LL-<DOMAIN>-<NNN>` for almost all of them. A code may instead
+            // end in a written name — `LL-YOUTUBE-AUTH-REFRESH` — when that is
+            // what someone will grep a log for; the rest of the shape still
+            // holds, so the README table and the docs test are unaffected.
+            let parts: Vec<&str> = c.as_str().split('-').collect();
+            assert!(parts.len() >= 3, "{c} malformed");
+            assert!(
+                parts
+                    .iter()
+                    .all(|p| !p.is_empty()
+                        && p.chars().all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())),
+                "{c} malformed"
+            );
             assert!(!c.user_message().is_empty());
             // must not leak raw technical jargon as the primary message
             assert!(!c.user_message().contains("ffmpeg"));

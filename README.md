@@ -225,6 +225,9 @@ CPU 사용량이 높은 것이 정상입니다. 설정 → 송출 → 송출 모
 | macOS | `~/Library/Application Support/LouverLive/logs/` |
 | Linux | `~/.local/share/LouverLive/logs/` |
 
+정확한 macOS 경로는 `~/Library/Application Support/LouverLive/logs/app.log`
+입니다. `~/Library/Logs/` 아래에는 아무것도 기록하지 않습니다.
+
 `app.log`(앱), `stream.log`(방송), `ffmpeg.log`(FFmpeg 출력) 세 가지가 있으며
 각각 최대 10 MB × 5개까지 보관하고 오래된 것부터 삭제합니다.
 설정 → 고급 → `로그 폴더 열기`로 바로 열 수 있습니다.
@@ -234,6 +237,38 @@ CPU 사용량이 높은 것이 정상입니다. 설정 → 송출 → 송출 모
 
 같은 폴더에 데이터베이스(`louver.db`), 최적화 캐시(`cache/`), 세션 상태
 (`session.json`)가 함께 있습니다.
+
+### 방송 준비 과정 로그
+
+YouTube 방송을 준비하는 동안 각 단계가 `app.log`에 `_START` / `_OK` / `_FAIL`
+세 가지로 남습니다. 실패했을 때 **어느 요청이** 거부됐는지 바로 알 수 있습니다.
+
+| 이벤트 | 하는 일 |
+| --- | --- |
+| `YOUTUBE_TOKEN_REFRESH_*` | 저장된 로그인으로 Google 인증 갱신 |
+| `YOUTUBE_BROADCAST_LIST_*` | 이 예약에 쓸 방송이 이미 있는지 확인 |
+| `YOUTUBE_BROADCAST_INSERT_*` | 없으면 방송을 새로 만듦 |
+| `YOUTUBE_STREAM_LIST_*` | 저장된 스트림 키가 가리키는 수신 지점 찾기 |
+| `YOUTUBE_BROADCAST_BIND_*` | 방송과 수신 지점 연결 |
+| `YOUTUBE_METADATA_APPLY_*` | 제목·설명·태그·카테고리·공개범위 적용 |
+| `YOUTUBE_STREAM_ACTIVE_WAIT` / `YOUTUBE_STREAM_ACTIVE` | YouTube가 영상을 받기 시작했는지 |
+| `YOUTUBE_BROADCAST_TRANSITION_*` | 방송을 LIVE로 전환 |
+
+각 줄에는 그 시도를 누가 시작했는지(`origin=manual` 또는 `origin=scheduled`)가
+붙습니다. 같은 로그 안에서 수동 방송과 예약 방송의 순서를 나란히 비교할 수
+있게 하기 위한 것입니다.
+
+`_FAIL` 줄은 Google이 답한 그대로를 담습니다 — API 메서드, HTTP 상태, Google의
+error reason, Google의 메시지. 예:
+
+```
+YOUTUBE_BROADCAST_INSERT_FAIL: origin=scheduled · LL-YOUTUBE-004 ·
+liveBroadcasts.insert HTTP 403 reason=liveStreamingNotEnabled ·
+The user is not enabled for live streaming.
+```
+
+**액세스 토큰, 리프레시 토큰, 클라이언트 시크릿, 스트림 키는 이 줄들 중 어디에도
+기록되지 않습니다.** 방송 ID와 스트림 ID만 남으며, 둘 다 비밀이 아닙니다.
 
 ---
 
@@ -277,7 +312,8 @@ CPU 사용량이 높은 것이 정상입니다. 설정 → 송출 → 송출 모
 | `LL-SCHED-004` | 예약된 플레이리스트에 방송 가능한 영상이 없음 |
 | `LL-CONFIG-001` | 설정 값이 올바르지 않음 |
 | `LL-YOUTUBE-001` | YouTube 계정이 연결되지 않음 |
-| `LL-YOUTUBE-002` | YouTube 로그인이 만료됨 |
+| `LL-YOUTUBE-002` | YouTube 로그인이 만료됨 (동의 화면에서 받은 코드 교환 실패) |
+| `LL-YOUTUBE-AUTH-REFRESH` | 저장된 로그인으로 Google 인증을 갱신하지 못함 |
 | `LL-YOUTUBE-003` | 진행 중인 라이브를 찾지 못함 |
 | `LL-YOUTUBE-004` | YouTube API 호출 실패 |
 | `LL-YOUTUBE-005` | YouTube API 일일 사용량 초과 |
