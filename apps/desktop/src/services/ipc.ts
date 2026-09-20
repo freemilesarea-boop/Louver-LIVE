@@ -13,7 +13,7 @@
 import type {
   DashboardMetrics, DiskEstimate, ImportResult, LicenseState, LouverError,
   Media, Playlist, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
-  SettingsView, StreamDiagnostics, StreamEvent,
+  SettingsView, StreamDiagnostics, StreamEvent, SchedulerStatusView,
   BroadcastMetadata, BroadcastPreset, ChatMessage, ChatSettings, ChatStatus,
   LiveBroadcast, YoutubeStatus, MetadataOutcome, MetadataApplyState, ApplyPlan, QuotaReport,
 } from '@/types'
@@ -109,6 +109,10 @@ export const api = {
     startTime: string, endTime: string, enabled: boolean,
   ) => call<void>('update_schedule', { id, playlistId, daysOfWeek, startTime, endTime, enabled }),
   deleteSchedule: (id: number) => call<void>('delete_schedule', { id }),
+  schedulerStatus: () => call<SchedulerStatusView>('scheduler_status'),
+  schedulerArm: () => call<SchedulerStatusView>('scheduler_arm'),
+  schedulerDisarm: () => call<SchedulerStatusView>('scheduler_disarm'),
+  schedulerSetRestore: (enabled: boolean) => call<void>('scheduler_set_restore', { enabled }),
 
   // streaming
   getStatus: () => call<RuntimeStatus>('get_status'),

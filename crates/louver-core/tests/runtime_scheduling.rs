@@ -186,7 +186,39 @@ fn harness(now: &str) -> Harness {
     Harness { _dir: dir, db, clock, launcher, events, rt, playlist_id, session_store }
 }
 
-fn schedule(h: &Harness, days: DaysOfWeek, start: &str, end: &str) {
+/// Save a schedule *and* switch this computer on to watch the clock.
+///
+/// The two are separate on purpose — see `schedule_only` — and almost every
+/// test here is about what happens once the machine is watching, so this does
+/// both and the tests that care about the difference say so.
+fn schedule(h: &mut Harness, days: DaysOfWeek, start: &str, end: &str) {
+    schedule_only(h, days, start, end);
+    h.rt.set_armed(true);
+}
+
+/// Save the rule and nothing else, the way pressing 예약 추가 does.
+/// A second run of the app on the same database and state file, the way a
+/// relaunch sees it.
+fn harness_on(previous: &Harness, now: &str) -> Harness {
+    let mut next = harness(now);
+    next.db = previous.db.clone();
+    next.playlist_id = previous.playlist_id;
+    next.rt = BroadcastRuntime::new(
+        previous.db.clone(),
+        FfmpegCommandBuilder::new(FfmpegTools::new("ffmpeg", "ffprobe"), OutputProfile::P1080p30),
+        Arc::clone(&next.launcher) as Arc<dyn StreamLauncher>,
+        Arc::new(next.clock.clone()) as Arc<dyn Clock>,
+        Arc::new(StreamKeyStore::new(Arc::new(MemorySecretStore::new()))),
+        Arc::new(NoopSleepPreventer::default()),
+        Arc::clone(&next.events) as Arc<dyn RuntimeEvents>,
+        next.session_store.clone(),
+        next._dir.path().join("manifest.txt"),
+        next._dir.path().join("dry-run"),
+    );
+    next
+}
+
+fn schedule_only(h: &Harness, days: DaysOfWeek, start: &str, end: &str) {
     h.db.create_schedule(&Schedule {
         id: 0,
         playlist_id: h.playlist_id,
@@ -284,7 +316,7 @@ fn a_dry_run_writes_to_a_file_and_needs_no_key() {
 #[test]
 fn the_scheduler_starts_and_stops_a_broadcast_without_any_user_action() {
     let mut h = harness(&format!("{MON} 19:58:00"));
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "08:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "08:00");
 
     // Before the window: nothing runs, but the next start is known.
     h.rt.tick();
@@ -336,7 +368,7 @@ fn the_scheduler_starts_and_stops_a_broadcast_without_any_user_action() {
 #[test]
 fn a_weekday_schedule_does_not_start_on_the_weekend() {
     let mut h = harness("2026-03-07 09:30:00"); // Saturday
-    schedule(&h, DaysOfWeek::weekdays(), "09:00", "18:00");
+    schedule(&mut h, DaysOfWeek::weekdays(), "09:00", "18:00");
     h.rt.tick();
     assert!(!h.rt.is_active(), "a weekday schedule started on Saturday");
 }
@@ -344,7 +376,7 @@ fn a_weekday_schedule_does_not_start_on_the_weekend() {
 #[test]
 fn the_scheduler_does_not_stop_a_manual_broadcast() {
     let mut h = harness(&format!("{MON} 12:00:00"));
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "22:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "22:00");
 
     h.rt.start(StartOptions {
         playlist_id: h.playlist_id,
@@ -367,7 +399,7 @@ fn the_scheduler_does_not_stop_a_manual_broadcast() {
 #[test]
 fn stopping_manually_inside_a_window_does_not_immediately_restart() {
     let mut h = harness(&format!("{MON} 20:30:00"));
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "23:00");
 
     h.rt.tick();
     assert!(h.rt.is_active(), "should have auto-started inside the window");
@@ -394,7 +426,7 @@ fn stopping_manually_inside_a_window_does_not_immediately_restart() {
 #[test]
 fn a_crashed_ffmpeg_is_relaunched_automatically() {
     let mut h = harness(&format!("{MON} 20:00:00"));
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "23:00");
     h.rt.tick();
     mark_connected(&mut h.rt);
     assert_eq!(h.launcher.launch_count(), 1);
@@ -416,7 +448,7 @@ fn a_crashed_ffmpeg_is_relaunched_automatically() {
 #[test]
 fn repeated_crashes_keep_being_retried() {
     let mut h = harness(&format!("{MON} 20:00:00"));
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "23:00");
     h.rt.tick();
     mark_connected(&mut h.rt);
 
@@ -464,7 +496,7 @@ fn an_explicit_stop_is_never_undone_by_the_reconnect_logic() {
 fn launching_inside_a_window_resumes_the_broadcast_immediately() {
     // §20's example: schedule 09:00–18:00, the PC boots at 12:10.
     let mut h = harness(&format!("{MON} 12:10:00"));
-    schedule(&h, DaysOfWeek::weekdays(), "09:00", "18:00");
+    schedule(&mut h, DaysOfWeek::weekdays(), "09:00", "18:00");
 
     h.rt.recover_on_startup();
     assert!(h.rt.is_active(), "startup inside a window must resume broadcasting");
@@ -477,7 +509,7 @@ fn launching_inside_a_window_resumes_the_broadcast_immediately() {
 #[test]
 fn launching_outside_a_window_does_not_broadcast() {
     let mut h = harness(&format!("{MON} 19:30:00"));
-    schedule(&h, DaysOfWeek::weekdays(), "09:00", "18:00");
+    schedule(&mut h, DaysOfWeek::weekdays(), "09:00", "18:00");
     h.rt.recover_on_startup();
     assert!(!h.rt.is_active());
     assert_eq!(h.launcher.launch_count(), 0);
@@ -486,7 +518,7 @@ fn launching_outside_a_window_does_not_broadcast() {
 #[test]
 fn a_power_cut_mid_broadcast_resumes_with_the_same_play_order() {
     let mut h = harness(&format!("{MON} 20:00:00"));
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "08:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "08:00");
 
     // Process 1 starts a shuffled broadcast and is killed by a power cut.
     h.db.update_playlist(h.playlist_id, "Night Jazz", PlaybackMode::ShuffleOnce, OutputProfile::P1080p30)
@@ -501,8 +533,12 @@ fn a_power_cut_mid_broadcast_resumes_with_the_same_play_order() {
 
     // Process 2 starts at 03:00, still inside the window.
     let mut h2 = harness(&format!("{TUE} 03:00:00"));
-    // Same database and state file as the crashed process.
+    // Same database and state file as the crashed process. The armed flag
+    // lives in the database in the real app, so the restart restores it the
+    // way §7 asks: the machine was watching the clock, so it still is.
     std::fs::copy(h.session_store.path(), h2.session_store.path()).unwrap();
+    h2.db.set_setting(louver_core::settings_keys::SCHEDULER_ARMED, "true").unwrap();
+    h2.rt.restore_armed_state();
     let h2_playlist = h2.playlist_id;
     h2.db
         .update_playlist(h2_playlist, "Night Jazz", PlaybackMode::ShuffleOnce, OutputProfile::P1080p30)
@@ -543,9 +579,8 @@ fn a_power_cut_mid_broadcast_resumes_with_the_same_play_order() {
 
 #[test]
 fn a_crash_whose_window_has_already_ended_does_not_broadcast() {
-    let h = harness(&format!("{MON} 20:00:00"));
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
-    let mut h = h;
+    let mut h = harness(&format!("{MON} 20:00:00"));
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "23:00");
     h.rt.tick();
     mark_connected(&mut h.rt);
     h.rt.tick();
@@ -630,7 +665,7 @@ fn empty_the_playlist(h: &Harness) {
 fn starting_inside_a_window_that_already_began_broadcasts_at_once() {
     // The reported case, to the minute: 17:14 → 17:40, app running at 17:17.
     let mut h = harness(&format!("{MON} 17:17:00"));
-    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    schedule(&mut h, DaysOfWeek::everyday(), "17:14", "17:40");
 
     h.rt.tick();
     assert!(h.rt.is_active(), "17:17 is inside 17:14→17:40 and must broadcast now");
@@ -642,7 +677,7 @@ fn starting_inside_a_window_that_already_began_broadcasts_at_once() {
 #[test]
 fn starting_after_the_window_closed_waits_for_the_next_repeat() {
     let mut h = harness(&format!("{MON} 17:50:00"));
-    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    schedule(&mut h, DaysOfWeek::everyday(), "17:14", "17:40");
 
     h.rt.tick();
     assert!(!h.rt.is_active(), "17:50 is past 17:40; today's window is over");
@@ -652,7 +687,7 @@ fn starting_after_the_window_closed_waits_for_the_next_repeat() {
 #[test]
 fn a_restart_inside_the_window_picks_the_broadcast_back_up() {
     let mut h = harness(&format!("{MON} 17:17:00"));
-    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    schedule(&mut h, DaysOfWeek::everyday(), "17:14", "17:40");
 
     // Same as an OS reboot or a launch-at-startup: nothing running, mid-window.
     h.rt.recover_on_startup();
@@ -667,7 +702,7 @@ fn a_scheduled_start_that_fails_does_not_strand_the_runtime_in_preparing() {
     // reads as active, so every later tick returned early and the window was
     // never retried — the UI then showed tomorrow as the next broadcast.
     let mut h = harness(&format!("{MON} 17:17:00"));
-    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    schedule(&mut h, DaysOfWeek::everyday(), "17:14", "17:40");
     empty_the_playlist(&h);
 
     h.rt.tick();
@@ -685,7 +720,7 @@ fn a_scheduled_start_that_fails_does_not_strand_the_runtime_in_preparing() {
 #[test]
 fn a_schedule_whose_playlist_was_deleted_says_so_rather_than_reporting_it_empty() {
     let mut h = harness(&format!("{MON} 17:17:00"));
-    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    schedule(&mut h, DaysOfWeek::everyday(), "17:14", "17:40");
     h.db.delete_playlist(h.playlist_id).unwrap();
 
     h.rt.tick();
@@ -704,7 +739,7 @@ fn deleting_a_playlist_takes_its_schedules_with_it() {
     // A-4: there is no name matching anywhere, and no stale id survives —
     // the foreign key is ON DELETE CASCADE and the pragma is on.
     let h = harness(&format!("{MON} 12:00:00"));
-    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    schedule_only(&h, DaysOfWeek::everyday(), "17:14", "17:40");
     assert_eq!(h.db.list_schedules().unwrap().len(), 1);
 
     h.db.delete_playlist(h.playlist_id).unwrap();
@@ -720,7 +755,7 @@ fn deleting_a_playlist_takes_its_schedules_with_it() {
 #[test]
 fn a_failed_window_is_retried_rather_than_abandoned() {
     let mut h = harness(&format!("{MON} 17:17:00"));
-    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    schedule(&mut h, DaysOfWeek::everyday(), "17:14", "17:40");
     empty_the_playlist(&h);
 
     h.rt.tick();
@@ -805,7 +840,7 @@ fn a_scheduled_start_runs_exactly_the_same_pre_start_work() {
     let mut h = harness(&format!("{MON} 20:05:00"));
     let hook = Arc::new(RecordingHook::default());
     h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "23:00");
 
     h.rt.tick();
     assert!(h.rt.is_active());
@@ -851,7 +886,7 @@ fn a_real_engine_failure_is_still_an_error() {
     // The other side of the same line: no playlist to broadcast is the engine
     // failing, and that does belong in red.
     let mut h = harness(&format!("{MON} 17:17:00"));
-    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    schedule(&mut h, DaysOfWeek::everyday(), "17:14", "17:40");
     empty_the_playlist(&h);
 
     h.rt.tick();
@@ -912,7 +947,7 @@ fn a_reconnect_does_not_re_apply_the_metadata() {
     let mut h = harness(&format!("{MON} 20:05:00"));
     let hook = Arc::new(RecordingHook::default());
     h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "23:00");
 
     h.rt.tick();
     mark_connected(&mut h.rt);
@@ -953,7 +988,7 @@ impl louver_core::runtime::PreStartHook for SchedulePolicyHook {
 fn an_unattended_window_holds_by_default_rather_than_going_out_wrong() {
     let mut h = harness(&format!("{MON} 20:05:00"));
     h.rt.set_pre_start(Arc::new(SchedulePolicyHook { hold: true, skipped: Mutex::new(0) }));
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "23:00");
 
     h.rt.tick();
     assert_eq!(h.launcher.launch_count(), 0, "nobody is there to be asked, so it does not go out");
@@ -968,7 +1003,7 @@ fn a_channel_that_would_rather_stay_on_air_can_say_so() {
     let mut h = harness(&format!("{MON} 20:05:00"));
     let hook = Arc::new(SchedulePolicyHook { hold: false, skipped: Mutex::new(0) });
     h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "23:00");
 
     h.rt.tick();
     assert!(h.rt.is_active(), "a 24/7 channel keeps broadcasting");
@@ -980,7 +1015,7 @@ fn the_same_failure_is_not_logged_once_a_second_for_the_whole_window() {
     // An engine failure, because that is the one the runtime logs; a metadata
     // refusal is the hook's to report.
     let mut h = harness(&format!("{MON} 20:05:00"));
-    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "23:00");
     empty_the_playlist(&h);
 
     for _ in 0..5 {
@@ -998,7 +1033,7 @@ fn the_open_window_is_reported_even_when_nothing_is_broadcasting() {
     // what a held start used to look like.
     let mut h = harness(&format!("{MON} 20:58:30"));
     h.rt.set_pre_start(Arc::new(SchedulePolicyHook { hold: true, skipped: Mutex::new(0) }));
-    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:58", "21:00");
 
     h.rt.tick();
     assert!(!h.rt.is_active(), "the hook held it");
@@ -1013,7 +1048,7 @@ fn the_open_window_is_reported_even_when_nothing_is_broadcasting() {
 #[test]
 fn a_live_window_reports_itself_as_live() {
     let mut h = harness(&format!("{MON} 20:58:30"));
-    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:58", "21:00");
     h.rt.tick();
     mark_connected(&mut h.rt);
     let o = h.rt.status().active_occurrence.expect("still the open window");
@@ -1024,7 +1059,7 @@ fn a_live_window_reports_itself_as_live() {
 #[test]
 fn a_window_that_closed_stops_reporting_itself() {
     let mut h = harness(&format!("{MON} 21:05:00"));
-    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:58", "21:00");
     h.rt.tick();
     assert!(h.rt.status().active_occurrence.is_none());
     assert_eq!(h.rt.status().next_scheduled_start.as_deref(), Some("2026-03-03 20:58"));
@@ -1036,7 +1071,7 @@ fn a_failed_start_retries_within_seconds_not_minutes() {
     // inside that window. A one-minute gap loses a two-minute window entirely.
     let mut h = harness(&format!("{MON} 20:58:10"));
     h.rt.set_pre_start(Arc::new(SchedulePolicyHook { hold: true, skipped: Mutex::new(0) }));
-    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:58", "21:00");
 
     h.rt.tick();
     let first = h.rt.status().active_occurrence.unwrap();
@@ -1058,7 +1093,7 @@ fn the_retry_recovers_the_window_rather_than_waiting_for_tomorrow() {
     let hook = Arc::new(RecordingHook::default());
     hook.fail(not_connected());
     h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
-    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:58", "21:00");
 
     h.rt.tick();
     assert_eq!(h.launcher.launch_count(), 0);
@@ -1077,7 +1112,7 @@ fn the_retry_recovers_the_window_rather_than_waiting_for_tomorrow() {
 fn the_window_closing_stops_the_broadcast_and_leaves_nothing_running() {
     // §10: the end of the window ends the broadcast, and nothing is left over.
     let mut h = harness(&format!("{MON} 20:58:30"));
-    schedule(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    schedule(&mut h, DaysOfWeek::everyday(), "20:58", "21:00");
     h.rt.tick();
     mark_connected(&mut h.rt);
     assert!(h.rt.is_active());
@@ -1089,5 +1124,123 @@ fn the_window_closing_stops_the_broadcast_and_leaves_nothing_running() {
     assert!(h.rt.status().active_occurrence.is_none());
     assert_eq!(h.rt.ffmpeg_pid(), None, "no FFmpeg left behind");
     assert!(h.session_store.load().is_none(), "and no session file to resume from");
+    assert_eq!(h.rt.status().next_scheduled_start.as_deref(), Some("2026-03-03 20:58"));
+}
+
+// --- saving a rule vs switching the machine on ------------------------------
+
+use louver_core::scheduler::SchedulerState;
+
+#[test]
+fn a_saved_schedule_does_nothing_until_the_scheduler_is_started() {
+    // TEST A. The reported ambiguity: a row on screen with a green toggle,
+    // and no way to tell whether anything is actually watching the clock.
+    // Nothing is, until the user says so.
+    let mut h = harness(&format!("{MON} 20:58:30"));
+    schedule_only(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+
+    for _ in 0..5 {
+        h.rt.tick();
+    }
+    assert!(!h.rt.is_active(), "a saved rule is not a running scheduler");
+    assert_eq!(h.launcher.launch_count(), 0);
+    assert_eq!(h.rt.status().scheduler_state, SchedulerState::Stopped);
+    // And the window is not claimed as active either — nothing is watching it.
+    assert!(h.rt.status().active_occurrence.is_none());
+}
+
+#[test]
+fn starting_the_scheduler_inside_a_window_broadcasts_at_once() {
+    // TEST B, and the catch-up case together: pressing 예약 방송 시작 while a
+    // window is already open starts it now rather than tomorrow.
+    let mut h = harness(&format!("{MON} 20:58:30"));
+    schedule_only(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    h.rt.tick();
+    assert_eq!(h.launcher.launch_count(), 0);
+
+    h.rt.set_armed(true);
+    h.rt.tick();
+    assert!(h.rt.is_active());
+    assert_eq!(h.rt.status().scheduler_state, SchedulerState::Live);
+}
+
+#[test]
+fn stopping_the_scheduler_means_the_window_passes_untouched() {
+    // TEST C. 예약 방송 중지 has to mean it, including for a window that opens
+    // while the app is running.
+    let mut h = harness(&format!("{MON} 20:57:00"));
+    schedule(&mut h, DaysOfWeek::everyday(), "20:58", "21:00");
+    assert_eq!(h.rt.status().scheduler_state, SchedulerState::Waiting);
+
+    h.rt.set_armed(false);
+    h.clock.set_str(&format!("{MON} 20:58:30"));
+    for _ in 0..5 {
+        h.rt.tick();
+    }
+    assert!(!h.rt.is_active(), "the user switched it off");
+    assert_eq!(h.launcher.launch_count(), 0);
+    assert_eq!(h.rt.status().scheduler_state, SchedulerState::Stopped);
+}
+
+#[test]
+fn the_scheduler_comes_back_the_way_it_was_left() {
+    // TEST D. Armed at shutdown, armed at launch.
+    let h = harness(&format!("{MON} 12:00:00"));
+    schedule_only(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    let mut h = h;
+    h.rt.set_armed(true);
+
+    let mut again = harness_on(&h, &format!("{MON} 12:05:00"));
+    again.rt.restore_armed_state();
+    assert!(again.rt.is_armed(), "it was watching the clock, so it still is");
+    assert_eq!(again.rt.status().scheduler_state, SchedulerState::Waiting);
+}
+
+#[test]
+fn a_scheduler_the_user_stopped_stays_stopped_after_a_restart() {
+    // The other half of §7, and the one that matters: a user who switched it
+    // off must not find it running again after a reboot.
+    let h = harness(&format!("{MON} 12:00:00"));
+    schedule_only(&h, DaysOfWeek::everyday(), "20:58", "21:00");
+    let mut h = h;
+    h.rt.set_armed(true);
+    h.rt.set_armed(false);
+
+    let mut again = harness_on(&h, &format!("{MON} 12:05:00"));
+    again.rt.restore_armed_state();
+    assert!(!again.rt.is_armed());
+    assert_eq!(again.rt.status().scheduler_state, SchedulerState::Stopped);
+}
+
+#[test]
+fn restoring_can_be_switched_off_entirely() {
+    let h = harness(&format!("{MON} 12:00:00"));
+    let mut h = h;
+    h.rt.set_armed(true);
+    h.db.set_setting(louver_core::settings_keys::SCHEDULER_RESTORE_ON_LAUNCH, "false").unwrap();
+
+    let mut again = harness_on(&h, &format!("{MON} 12:05:00"));
+    again.rt.restore_armed_state();
+    assert!(!again.rt.is_armed(), "the user asked for it not to come back");
+}
+
+#[test]
+fn an_armed_scheduler_reports_waiting_then_live_then_waiting_again() {
+    // TEST F, and §1's state machine end to end: the screen can say which of
+    // these it is at every moment.
+    let mut h = harness(&format!("{MON} 20:57:00"));
+    schedule(&mut h, DaysOfWeek::everyday(), "20:58", "21:00");
+    h.rt.tick();
+    assert_eq!(h.rt.status().scheduler_state, SchedulerState::Waiting);
+
+    h.clock.set_str(&format!("{MON} 20:58:10"));
+    h.rt.tick();
+    mark_connected(&mut h.rt);
+    assert_eq!(h.rt.status().scheduler_state, SchedulerState::Live);
+
+    h.clock.set_str(&format!("{MON} 21:00:01"));
+    h.rt.tick();
+    assert_eq!(h.rt.status().scheduler_state, SchedulerState::Waiting, "back to watching the clock");
+    assert!(!h.rt.is_active());
     assert_eq!(h.rt.status().next_scheduled_start.as_deref(), Some("2026-03-03 20:58"));
 }

@@ -120,7 +120,18 @@ export function Dashboard() {
           {/* An open window is reported here whatever the stream is doing.
               "지금 방송 시간입니다" on the schedule page beside "예약된 방송이
               없습니다" here is what a held start used to look like. */}
-          {status?.active_occurrence ? (
+          {/* §10: with the scheduler running and nothing due, FFmpeg being
+              stopped is the correct state, not a fault. Say so, or the
+              readiness strip reads as a problem. */}
+          {status?.scheduler_state === 'WAITING' ? (
+            <p className="mt-1 text-xs text-ok" data-testid="scheduler-waiting">
+              예약 방송 대기 중
+              {status.next_scheduled_start && (
+                <span className="ml-2 text-ink-400">다음 방송 {status.next_scheduled_start}</span>
+              )}
+              <span className="ml-2 text-ink-500">· 예약 시간에 자동으로 시작합니다</span>
+            </p>
+          ) : status?.active_occurrence ? (
             <p className="mt-1 text-xs text-ok" data-testid="active-occurrence">
               예약 방송 {status.active_occurrence.start.slice(11)} → {status.active_occurrence.end.slice(11)}
               <span className="ml-2 text-ink-400">

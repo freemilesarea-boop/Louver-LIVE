@@ -105,6 +105,51 @@ pub fn next_occurrence(s: &Schedule, now: NaiveDateTime) -> Option<Occurrence> {
         .find(|o| o.start > now)
 }
 
+/// What this computer is doing about scheduled broadcasts.
+///
+/// The product reason this exists: a saved schedule and a running scheduler
+/// look identical on screen, and they are not the same thing at all. One is a
+/// rule in a database; the other is a machine watching a clock. A user who has
+/// only done the first will wait for a broadcast that was never going to
+/// happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SchedulerState {
+    /// Not watching. Saved schedules do nothing.
+    Stopped,
+    /// Checking that the scheduled broadcasts could actually run.
+    Arming,
+    /// Watching the clock, with nothing due yet.
+    Waiting,
+    /// A window has opened and the broadcast is being prepared.
+    Starting,
+    /// A scheduled broadcast is on air.
+    Live,
+    /// The window has closed and the broadcast is being wound up.
+    Stopping,
+    /// Armed, but something stopped the scheduled broadcast from starting.
+    Error,
+}
+
+impl SchedulerState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "STOPPED",
+            Self::Arming => "ARMING",
+            Self::Waiting => "WAITING",
+            Self::Starting => "STARTING",
+            Self::Live => "LIVE",
+            Self::Stopping => "STOPPING",
+            Self::Error => "ERROR",
+        }
+    }
+
+    /// Is the machine watching the clock?
+    pub fn is_armed(self) -> bool {
+        !matches!(self, Self::Stopped)
+    }
+}
+
 /// What the scheduler wants the app to do right now.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ScheduleDecision {

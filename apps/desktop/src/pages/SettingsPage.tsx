@@ -13,8 +13,12 @@ export function SettingsPage() {
   const [confirmReveal, setConfirmReveal] = useState(false)
   const [confirmClear, setConfirmClear] = useState(false)
   const [inUse, setInUse] = useState(0)
+  const [restoreScheduler, setRestoreScheduler] = useState(true)
 
   useEffect(() => { void refreshSettings() }, [refreshSettings])
+  useEffect(() => {
+    api.schedulerStatus().then((v) => setRestoreScheduler(v.restore_on_launch)).catch(() => {})
+  }, [])
 
   if (!settings) return <p className="text-sm text-ink-500">설정을 불러오는 중…</p>
 
@@ -44,6 +48,18 @@ export function SettingsPage() {
           hint="방송 중에는 항상 트레이로 이동하며, 프로그램은 계속 실행됩니다."
           checked={s.minimize_to_tray}
           onChange={setFlag('minimize_to_tray')}
+        />
+        {/* §7: a machine that was watching the clock should be watching it
+            again after a reboot — and one the user deliberately stopped must
+            stay stopped. */}
+        <Toggle
+          label="예약 방송 상태 자동 복원"
+          hint="재부팅 후 Louver Live가 실행되면, 이전에 [예약 방송 시작]을 눌러둔 상태를 그대로 복원합니다. 직접 중지하셨다면 복원하지 않습니다."
+          checked={restoreScheduler}
+          onChange={(v) => {
+            setRestoreScheduler(v)
+            api.schedulerSetRestore(v).catch(reportError)
+          }}
         />
       </Card>
 

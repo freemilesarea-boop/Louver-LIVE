@@ -158,6 +158,6 @@ pub fn simulate_ffmpeg_crash(state: State<'_, AppState>) -> CmdResult<()> {
     state.runtime.lock().unwrap().simulate_crash()
 }
 
-fn code_from_str(s: &str) -> Option<ErrorCode> {
+pub(crate) fn code_from_str(s: &str) -> Option<ErrorCode> {
     louver_core::error::ALL_ERROR_CODES.iter().copied().find(|c| c.as_str() == s)
 }

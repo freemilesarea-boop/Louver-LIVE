@@ -32,6 +32,8 @@ export interface MockOptions {
   youtubeIgnoresTitle?: boolean
   /** The day's free YouTube allowance is gone. */
   youtubeQuotaExhausted?: boolean
+  /** The scheduler is already watching the clock. */
+  schedulerArmed?: boolean
   /** A scheduled window is open right now. */
   occurrenceOpen?: { start: string; end: string; phase: 'preparing' | 'live'; retryInSecs?: number }
   /**
@@ -123,6 +125,26 @@ export function createMockBackend(opts: MockOptions = {}) {
       next_scheduled_start: nextScheduledLabel(),
       cycle_duration_secs: 0,
       active_occurrence: null,
+      scheduler_state: 'STOPPED',
+    }
+  }
+
+  let restoreOnLaunch = true
+
+  function schedulerStatusView() {
+    const s = schedules.find((x) => x.enabled)
+    return {
+      state: schedulerState(),
+      armed,
+      enabled_count: schedules.filter((x) => x.enabled).length,
+      next_start: s ? `내일 ${s.start_time}` : null,
+      next_end: s ? `내일 ${s.end_time}` : null,
+      next_playlist: s?.playlist_name ?? null,
+      seconds_until_start: s ? 74 : null,
+      active_start: armed ? opts.occurrenceOpen?.start ?? null : null,
+      active_end: armed ? opts.occurrenceOpen?.end ?? null : null,
+      last_error: null,
+      restore_on_launch: restoreOnLaunch,
     }
   }
 
@@ -175,6 +197,16 @@ export function createMockBackend(opts: MockOptions = {}) {
         privacy: ok(m.privacy),
       },
     }
+  }
+
+  /** Is this computer watching the clock? Saving a rule does not set it. */
+  let armed = Boolean(opts.schedulerArmed)
+
+  function schedulerState(): RuntimeStatus['scheduler_state'] {
+    if (!armed) return 'STOPPED'
+    if (status.supervisor.state === 'LIVE' && status.start_reason === 'scheduled') return 'LIVE'
+    if (opts.occurrenceOpen) return 'STARTING'
+    return 'WAITING'
   }
 
   /** The open window, reported whatever the stream is doing. */
@@ -433,6 +465,21 @@ export function createMockBackend(opts: MockOptions = {}) {
 
     // --- schedules ---
     list_schedules: () => schedules,
+    scheduler_status: () => schedulerStatusView(),
+    scheduler_arm: () => {
+      if (!schedules.some((s) => s.enabled)) {
+        throw { code_str: 'LL-SCHED-002', message: '사용 중인 예약이 없습니다. 예약을 먼저 추가하거나 켜주세요.' }
+      }
+      armed = true
+      return schedulerStatusView()
+    },
+    scheduler_disarm: () => {
+      armed = false
+      return schedulerStatusView()
+    },
+    scheduler_set_restore: (a: Record<string, unknown>) => {
+      restoreOnLaunch = Boolean(a.enabled)
+    },
     create_schedule: (a) => {
       const start = a.startTime as string, end = a.endTime as string
       const days = a.daysOfWeek as number
@@ -450,8 +497,9 @@ export function createMockBackend(opts: MockOptions = {}) {
         next_start: `내일 ${start}`, next_end: `${overnight ? '모레' : '내일'} ${end}`,
         window_duration_label: '12시간 00분 00초',
         // The fake clock is not inside any window unless a test says so.
-        active_now: Boolean(opts.scheduleActiveNow),
-        active_until: opts.scheduleActiveNow ? `오늘 ${end}` : null,
+        // `occurrenceOpen` says the same thing from the runtime's side.
+        active_now: Boolean(opts.scheduleActiveNow || opts.occurrenceOpen),
+        active_until: opts.scheduleActiveNow || opts.occurrenceOpen ? `오늘 ${end}` : null,
         playlist_missing: !playlists.some((p) => p.id === a.playlistId),
         playlist_ready_count: items.filter((i) => i.playlist_id === a.playlistId).length,
       }
@@ -473,7 +521,13 @@ export function createMockBackend(opts: MockOptions = {}) {
     },
 
     // --- streaming ---
-    get_status: () => ({ ...status, active_occurrence: occurrence() }),
+    get_status: () => ({
+      ...status,
+      // Nothing is watched unless the scheduler is running, so neither is
+      // reported — the same rule the runtime applies.
+      active_occurrence: armed ? occurrence() : null,
+      scheduler_state: schedulerState(),
+    }),
     run_preflight: (a) => preflight(a.playlistId as number, a.dryRun as boolean),
     start_broadcast: (a) => {
       const r = preflight(a.playlistId as number, false)

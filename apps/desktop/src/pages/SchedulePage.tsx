@@ -1,9 +1,29 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { CalendarPlus, Trash2 } from 'lucide-react'
 import { useAppStore } from '@/stores/useAppStore'
 import { api } from '@/services/ipc'
 import { DAY_LABELS, EVERYDAY, WEEKDAYS, crossesMidnight, hasDay, toggleDay } from '@/services/format'
 import { Badge, Button, Card, EmptyState, Field, Input, Select, Toggle } from '@/components/ui'
+import type { SchedulerStatusView } from '@/types'
+
+/** How the scheduler's state reads on screen. */
+const STATE_LABEL: Record<SchedulerStatusView['state'], string> = {
+  STOPPED: '꺼짐',
+  ARMING: '확인 중',
+  WAITING: '예약 대기 중',
+  STARTING: '방송 시작 중',
+  LIVE: '예약 방송 중',
+  STOPPING: '종료 중',
+  ERROR: '오류',
+}
+
+function countdown(total: number): string {
+  const h = Math.floor(total / 3600)
+  const m = Math.floor((total % 3600) / 60)
+  const s = total % 60
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(h)}:${pad(m)}:${pad(s)}`
+}
 
 /** Schedule page (§19, §27). */
 export function SchedulePage() {
@@ -13,11 +33,42 @@ export function SchedulePage() {
   const [days, setDays] = useState<number>(EVERYDAY)
   const [start, setStart] = useState('20:00')
   const [end, setEnd] = useState('08:00')
+  const [sched, setSched] = useState<SchedulerStatusView | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  const refreshScheduler = useCallback(
+    () => api.schedulerStatus().then(setSched).catch(() => {}),
+    [],
+  )
 
   useEffect(() => {
     void refreshSchedules()
     void refreshPlaylists()
-  }, [refreshSchedules, refreshPlaylists])
+    void refreshScheduler()
+  }, [refreshSchedules, refreshPlaylists, refreshScheduler])
+
+  // The countdown has to move, or "예약 대기 중" is just another static label
+  // that proves nothing.
+  useEffect(() => {
+    const t = setInterval(() => void refreshScheduler(), 1000)
+    return () => clearInterval(t)
+  }, [refreshScheduler])
+
+  async function arm() {
+    setBusy(true)
+    try {
+      setSched(await api.schedulerArm())
+      toast({ kind: 'success', message: '예약 방송을 시작했습니다. 예약 시간이 되면 자동으로 방송합니다.' })
+    } catch (e) { reportError(e) } finally { setBusy(false) }
+  }
+
+  async function disarm() {
+    setBusy(true)
+    try {
+      setSched(await api.schedulerDisarm())
+      toast({ kind: 'info', message: '예약 방송을 중지했습니다. 예약은 그대로 저장되어 있습니다.' })
+    } catch (e) { reportError(e) } finally { setBusy(false) }
+  }
 
   useEffect(() => {
     if (playlistId === '' && playlists[0]) setPlaylistId(playlists[0].id)
@@ -42,7 +93,16 @@ export function SchedulePage() {
     if (days === 0) return toast({ kind: 'error', message: '반복할 요일을 하나 이상 선택해주세요.' })
     try {
       await api.createSchedule(Number(playlistId), days, start, end)
-      toast({ kind: 'success', message: '예약을 추가했습니다.' })
+      // §8: "저장했습니다" alone is what left the user wondering whether
+      // anything would actually happen. Say which of the two it is.
+      const after = await api.schedulerStatus().catch(() => null)
+      setSched(after)
+      toast(after?.armed
+        ? { kind: 'success', message: '예약이 저장되었으며 자동 방송에 반영되었습니다.' }
+        : {
+            kind: 'info',
+            message: '예약이 저장되었습니다. 자동 방송을 사용하려면 아래 [예약 방송 시작]을 눌러주세요.',
+          })
       await refreshSchedules()
     } catch (e) {
       reportError(e)
@@ -52,6 +112,65 @@ export function SchedulePage() {
   return (
     <div className="space-y-4">
       <h1 className="text-lg font-semibold text-ink-100">방송 예약</h1>
+
+      {/* The one thing the old screen could not answer: is this computer
+          actually watching the clock? A saved rule and a running scheduler
+          looked identical, so a user who had only done the first waited all
+          night for a broadcast nothing was going to start. */}
+      <Card>
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0" data-testid="scheduler-state">
+            <div className="flex items-center gap-2">
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${
+                  sched?.state === 'LIVE' ? 'bg-live'
+                    : sched?.armed ? 'bg-ok' : 'bg-ink-600'
+                }`}
+              />
+              <span className="text-xl text-ink-100">
+                {sched ? STATE_LABEL[sched.state] : '—'}
+              </span>
+            </div>
+            {sched?.armed ? (
+              sched.active_start ? (
+                <p className="mt-1 text-xs text-ink-400">
+                  {sched.active_start.slice(11)} → {sched.active_end?.slice(11)} 방송 중입니다.
+                </p>
+              ) : sched.next_start ? (
+                <div className="mt-1 text-xs text-ink-400">
+                  <div>다음 방송 {sched.next_start} → {sched.next_end?.slice(11)}{sched.next_playlist ? ` · ${sched.next_playlist}` : ''}</div>
+                  {sched.seconds_until_start != null && (
+                    <div className="mt-0.5 font-mono text-sm text-ok" data-testid="scheduler-countdown">
+                      {countdown(sched.seconds_until_start)} 후 자동 시작
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <p className="mt-1 text-xs text-warn">사용 중인 예약이 없어 기다릴 방송이 없습니다.</p>
+              )
+            ) : (
+              <p className="mt-1 text-xs text-ink-500">
+                예약은 저장되어 있지만 자동 방송은 꺼져 있습니다.
+                시작을 눌러야 이 컴퓨터가 예약 시간을 감시합니다.
+              </p>
+            )}
+            {sched?.last_error && (
+              <p className="mt-1 text-xs text-live">{sched.last_error.message}</p>
+            )}
+          </div>
+          <div className="shrink-0">
+            {sched?.armed ? (
+              <Button size="lg" variant="danger" onClick={() => void disarm()} disabled={busy}>
+                예약 방송 중지
+              </Button>
+            ) : (
+              <Button size="lg" variant="live" onClick={() => void arm()} disabled={busy}>
+                예약 방송 시작
+              </Button>
+            )}
+          </div>
+        </div>
+      </Card>
 
       <Card title="새 예약">
         <div className="grid gap-4 md:grid-cols-2">
@@ -138,9 +257,18 @@ export function SchedulePage() {
                         announced *tomorrow*, which looked like a skip. */}
                     {!s.enabled ? '사용 안 함'
                       : s.active_now ? (
-                        <span className="text-ok">
-                          지금 방송 시간입니다 · {s.active_until}에 종료
-                        </span>
+                        sched?.armed ? (
+                          <span className="text-ok">
+                            지금 방송 시간입니다 · {s.active_until}에 종료
+                          </span>
+                        ) : (
+                          // The window is open, but nothing is watching it.
+                          // Saying "지금 방송 시간입니다" here would be the same
+                          // false promise the global switch exists to end.
+                          <span className="text-warn">
+                            지금이 예약 시간이지만 자동 방송이 꺼져 있습니다
+                          </span>
+                        )
                       ) : s.next_start
                         ? `다음 방송 ${s.next_start} · ${s.window_duration_label} 방송`
                         : '예정된 방송이 없습니다'}
@@ -158,7 +286,7 @@ export function SchedulePage() {
                 <div className="flex items-center gap-3">
                   <div className="w-28">
                     <Toggle
-                      label=""
+                      label="이 예약 사용"
                       checked={s.enabled}
                       onChange={async (v) => {
                         try {

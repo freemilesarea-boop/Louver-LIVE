@@ -160,6 +160,10 @@ pub fn run() {
             commands::schedule::create_schedule,
             commands::schedule::update_schedule,
             commands::schedule::delete_schedule,
+            commands::schedule::scheduler_status,
+            commands::schedule::scheduler_arm,
+            commands::schedule::scheduler_disarm,
+            commands::schedule::scheduler_set_restore,
             // streaming
             commands::streaming::get_status,
             commands::streaming::run_preflight,
@@ -247,6 +251,19 @@ pub fn run() {
                 // Installed before recovery, so a broadcast resumed at launch
                 // gets its metadata applied like any other (§B-7).
                 rt.set_pre_start(std::sync::Arc::new(YoutubePreStart(std::sync::Arc::clone(&state.youtube))));
+                // Put the scheduler back the way the user left it, before
+                // recovery runs — a machine that was watching the clock when
+                // it was shut down should be watching it again, and one the
+                // user deliberately stopped must stay stopped.
+                rt.restore_armed_state();
+                state.logger.info(
+                    LogTarget::App,
+                    if rt.is_armed() {
+                        "SCHEDULER_ARMED: 이전 상태를 복원했습니다"
+                    } else {
+                        "SCHEDULER_STOPPED: 예약 감시가 꺼져 있습니다"
+                    },
+                );
                 if let Some(pid) = rt.clean_orphan_process() {
                     state.logger.warn(LogTarget::App, &format!("이전 실행의 FFmpeg({pid})를 정리했습니다"));
                 }

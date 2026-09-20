@@ -553,6 +553,43 @@ the bind takes, whether `enableAutoStart` carries a real broadcast to LIVE, and
 whether the metadata survives on the created broadcast are all **NOT TESTED**.
 TEST A–D in the request are the ones that settle it.
 
+## 14d. Saving a schedule was not the same as running one (2026-09-20)
+
+Adding a schedule on a real Mac produced a row — `21:46 → 21:56 · 매일 · night`
+— and a green toggle, and nothing else. Nothing on the screen answered whether
+this computer was watching the clock, whether the broadcast was really going to
+start, or whether anything at all was going to happen tonight.
+
+It was a real ambiguity, not only a presentational one: a saved rule and a
+running scheduler were the same thing in the code, so the app could not have
+told the user which it had even if it had tried.
+
+They are now separate. `scheduler_armed` is a persisted setting, the runtime
+refuses to act on any schedule while it is off, and the page carries one large
+switch that says which state the machine is in.
+
+| Rule | Where |
+| --- | --- |
+| A saved schedule does nothing on its own | `tick_scheduler` and `recover_on_startup` both return early when not armed |
+| The per-row toggle means "use this rule", not "broadcasting" | Labelled `이 예약 사용`; the row says `지금이 예약 시간이지만 자동 방송이 꺼져 있습니다` when a window is open and the scheduler is off |
+| Arming checks now, not at 3am | `scheduler_arm` runs the full preflight per enabled schedule — playlist, files, FFmpeg, ffprobe, stream key, times — and refuses with the reason. It also refuses if metadata auto-apply is on with no account connected, since every window would then stop and ask a question nobody is there to answer |
+| The waiting screen proves it is waiting | `예약 대기 중`, the next window with its playlist, and a second-by-second countdown to the automatic start |
+| A stopped FFmpeg is not a fault while waiting | The dashboard says `예약 방송 대기 중 · 예약 시간에 자동으로 시작합니다` |
+| Saving says which case it is | `예약이 저장되었으며 자동 방송에 반영되었습니다` when armed, and otherwise `예약이 저장되었습니다. 자동 방송을 사용하려면 아래 [예약 방송 시작]을 눌러주세요` |
+| A reboot restores what the user chose | `예약 방송 상태 자동 복원`, default on. Armed at shutdown means armed at launch; **stopped by the user means stopped after a reboot**, which is the half that matters |
+
+States: `STOPPED` → `ARMING` → `WAITING` → `STARTING` → `LIVE` → `STOPPING` →
+`WAITING`, with `ERROR` for an armed scheduler whose start failed.
+
+**Verified in the real app** under Xvfb. Pressing 예약 방송 시작 with no stream
+key saved refused with `LL-STREAM-007` and stayed `꺼짐` — the check happening
+at the moment the user is present, which is the whole point. With the key
+saved, the panel read `예약 대기 중 · 다음 방송 2026-09-20 13:04 → 13:12 ·
+Test Playlist` above a running `00:00:22 후 자동 시작`. At 13:04, with nothing
+clicked, it became `예약 방송 중 · 13:04 → 13:12 방송 중입니다` and the dashboard
+`예약 방송 13:04 → 13:12 LIVE` with `FFmpeg Running` and a countdown to the
+automatic stop.
+
 ## 15. Known issues
 
 1. **Real YouTube broadcasting is unverified.** Everything up to the socket is

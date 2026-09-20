@@ -12,7 +12,7 @@ use crate::config::{OutputProfile, StreamMode};
 use crate::database::models::{EventLevel, Schedule};
 use crate::database::Database;
 use crate::error::{ErrorCode, LouverError, Result};
-use crate::scheduler::{Occurrence, ScheduleDecision, Scheduler};
+use crate::scheduler::{Occurrence, ScheduleDecision, Scheduler, SchedulerState};
 use crate::security::{build_ingest_url, StreamKeyStore};
 use crate::session::{SessionState, SessionStore};
 use crate::streaming::engine::{build_plan, new_order_seed, SessionPlan};
@@ -100,6 +100,8 @@ pub struct RuntimeStatus {
     /// say "예약된 방송이 없습니다" while the schedule page says the window is
     /// open — which is what a held start used to look like.
     pub active_occurrence: Option<OccurrenceStatus>,
+    /// Whether this computer is watching the clock, and what it is doing.
+    pub scheduler_state: SchedulerState,
 }
 
 /// The scheduled window that is open now, and how far its broadcast has got.
@@ -310,6 +312,12 @@ pub struct BroadcastRuntime {
     /// leaving the dashboard reading OFFLINE with no explanation.
     last_start_error: Option<LouverError>,
     pre_start: Option<Arc<dyn PreStartHook>>,
+    /// Is this computer watching the clock for scheduled broadcasts?
+    ///
+    /// Saving a schedule does not set this. The two are separate because they
+    /// are separate things, and a user who has only done the first would
+    /// otherwise wait all night for a broadcast nothing was going to start.
+    armed: bool,
     /// The scheduled occurrence whose start failed, how many times, and when
     /// to try it again.
     ///
@@ -362,8 +370,63 @@ impl BroadcastRuntime {
             suppressed_occurrence: None,
             last_start_error: None,
             pre_start: None,
+            armed: false,
             failed_occurrence: None,
         }
+    }
+
+    /// Start or stop watching the clock.
+    ///
+    /// Persisted, so a relaunch can put it back the way the user left it —
+    /// and so that a user who deliberately stopped it does not find it
+    /// running again after a reboot.
+    pub fn set_armed(&mut self, on: bool) {
+        self.armed = on;
+        let _ = self.db.set_setting(crate::settings_keys::SCHEDULER_ARMED, if on { "true" } else { "false" });
+        if !on {
+            self.failed_occurrence = None;
+        }
+        self.publish();
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    /// Put the scheduler back the way it was left, if the user asked for that.
+    ///
+    /// Called at launch, before recovery: a machine that was watching the
+    /// clock when it was shut down should be watching it again after a reboot,
+    /// and one the user deliberately stopped should stay stopped.
+    pub fn restore_armed_state(&mut self) {
+        let restore =
+            self.db.get_setting_or(crate::settings_keys::SCHEDULER_RESTORE_ON_LAUNCH, "true") == "true";
+        self.armed =
+            restore && self.db.get_setting_or(crate::settings_keys::SCHEDULER_ARMED, "false") == "true";
+    }
+
+    /// What the scheduler is doing, for the screen that has to make it obvious.
+    pub fn scheduler_state(&self) -> SchedulerState {
+        if !self.armed {
+            return SchedulerState::Stopped;
+        }
+        let manual = self.reason == Some(StartReason::Manual);
+        if self.is_active() && !manual && self.occurrence.is_some() {
+            return match self.state() {
+                StreamState::Stopping => SchedulerState::Stopping,
+                _ => SchedulerState::Live,
+            };
+        }
+        // A window is open with nothing on air: the first attempt is in
+        // flight, or a retry is pending. Either way it is starting, not idle
+        // and not broken — the retry is expected to succeed inside the window.
+        if self.active_occurrence_status().is_some() {
+            return SchedulerState::Starting;
+        }
+        if self.last_start_error.is_some() {
+            return SchedulerState::Error;
+        }
+        SchedulerState::Waiting
     }
 
     /// Install the work that runs before every broadcast, manual or scheduled.
@@ -419,11 +482,19 @@ impl BroadcastRuntime {
             cycle_duration_secs: self.plan.as_ref().map(|p| p.total_duration_secs).unwrap_or(0.0),
             last_start_error: self.last_start_error.clone(),
             active_occurrence: self.active_occurrence_status(),
+            scheduler_state: self.scheduler_state(),
         }
     }
 
     /// The open window and what is happening to it, for the dashboard.
     fn active_occurrence_status(&self) -> Option<OccurrenceStatus> {
+        // This says what the machine is doing about a window, so a machine
+        // that is not watching the clock reports nothing. Claiming "시작 준비
+        // 중" while the scheduler is stopped would be the same false promise
+        // in a new place.
+        if !self.armed {
+            return None;
+        }
         let now = self.clock.now_local();
         let schedules = self.db.list_schedules().ok()?;
         let o = self.occurrence.clone().filter(|o| o.contains(now)).or_else(|| {
@@ -818,6 +889,12 @@ impl BroadcastRuntime {
     }
 
     fn tick_scheduler(&mut self) {
+        // Saving a schedule is not the same as switching this computer on.
+        // Without the gate, a rule the user only meant to write down would
+        // start broadcasting at 3am.
+        if !self.armed {
+            return;
+        }
         let Ok(schedules) = self.db.list_schedules() else { return };
         let sc = Scheduler::new(ClockRef(Arc::clone(&self.clock)));
 
@@ -905,7 +982,10 @@ impl BroadcastRuntime {
         let previous = self.session_store.load();
         let Ok(schedules) = self.db.list_schedules() else { return None };
         let sc = Scheduler::new(ClockRef(Arc::clone(&self.clock)));
-        let active = sc.recover_on_startup(&schedules);
+        // Only if this computer was left watching the clock. Catching up into
+        // a window the user had switched the scheduler off for would be the
+        // same surprise as starting one.
+        let active = if self.armed { sc.recover_on_startup(&schedules) } else { None };
 
         // Close out anything a crashed process left dangling in the database.
         let _ = self.db.mark_orphaned_sessions("이전 실행이 비정상 종료되었습니다");

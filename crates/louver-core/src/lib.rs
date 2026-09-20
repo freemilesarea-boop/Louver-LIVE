@@ -102,6 +102,14 @@ pub mod settings_keys {
     pub const FIRST_RUN_COMPLETE: &str = "first_run_complete";
     pub const ENFORCE_DEVICE_BINDING: &str = "enforce_device_binding";
     pub const WARNED_ABOUT_UPTIME: &str = "warned_about_uptime";
+    /// Whether this computer is watching the clock for scheduled broadcasts.
+    ///
+    /// Separate from a schedule's own enabled flag: saving a rule is not the
+    /// same as switching the machine on, and the difference decides whether
+    /// anything happens tonight.
+    pub const SCHEDULER_ARMED: &str = "scheduler_armed";
+    /// Whether a relaunch puts the scheduler back the way the user left it.
+    pub const SCHEDULER_RESTORE_ON_LAUNCH: &str = "scheduler_restore_on_launch";
 }
 
 #[cfg(test)]

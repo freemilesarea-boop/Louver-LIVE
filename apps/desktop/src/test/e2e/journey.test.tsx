@@ -967,15 +967,20 @@ describe('the schedule list', () => {
 
   it('says the window is open now rather than announcing tomorrow', async () => {
     const user = userEvent.setup()
-    mount({ scheduleActiveNow: true })
+    // Armed, because an open window only means anything when this computer
+    // is watching the clock.
+    mount({ scheduleActiveNow: true, schedulerArmed: true })
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
     await makeSchedule(user)
 
     // The reported confusion: at 17:17, a 17:14→17:40 schedule showed only
     // "다음 방송 <tomorrow>", which reads as a window that was skipped.
-    expect(await screen.findByText(/지금 방송 시간입니다/)).toBeInTheDocument()
-    expect(screen.queryByText(/^다음 방송 내일/)).not.toBeInTheDocument()
+    const row = await screen.findByText(/지금 방송 시간입니다/)
+    expect(row).toBeInTheDocument()
+    // The row itself must not still be announcing tomorrow. The scheduler
+    // panel above legitimately names the *next* window; this is about the row.
+    expect(within(row.closest('li')!).queryByText(/다음 방송/)).not.toBeInTheDocument()
   })
 
   it('still shows the next repeat when no window is open', async () => {
@@ -994,7 +999,10 @@ describe('an open scheduled window', () => {
   it('is reported on the dashboard even before anything is broadcasting', async () => {
     // §8: the reported contradiction — the schedule page saying the window is
     // open while the dashboard said there was no scheduled broadcast at all.
-    mount({ occurrenceOpen: { start: '2026-09-20 20:58', end: '2026-09-20 21:00', phase: 'preparing' } })
+    mount({
+      schedulerArmed: true,
+      occurrenceOpen: { start: '2026-09-20 20:58', end: '2026-09-20 21:00', phase: 'preparing' },
+    })
     await screen.findByRole('button', { name: '대시보드' })
 
     const row = await screen.findByTestId('active-occurrence')
@@ -1006,6 +1014,7 @@ describe('an open scheduled window', () => {
 
   it('says when the next attempt is, rather than looking idle', async () => {
     mount({
+      schedulerArmed: true,
       occurrenceOpen: { start: '2026-09-20 20:58', end: '2026-09-20 21:10', phase: 'preparing', retryInSecs: 5 },
     })
     await screen.findByRole('button', { name: '대시보드' })
@@ -1019,7 +1028,10 @@ describe('an open scheduled window', () => {
 
   it('reads LIVE once the broadcast is running', async () => {
     const user = userEvent.setup()
-    mount({ occurrenceOpen: { start: '2026-09-20 20:58', end: '2026-09-20 21:00', phase: 'preparing' } })
+    mount({
+      schedulerArmed: true,
+      occurrenceOpen: { start: '2026-09-20 20:58', end: '2026-09-20 21:00', phase: 'preparing' },
+    })
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
     await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
@@ -1031,5 +1043,108 @@ describe('an open scheduled window', () => {
     await waitFor(() => {
       expect(within(screen.getByTestId('active-occurrence')).getByText('LIVE')).toBeInTheDocument()
     })
+  })
+})
+
+describe('the scheduler is a switch, not a saved rule', () => {
+  async function addSchedule(user: ReturnType<typeof userEvent.setup>) {
+    await gotoPage(user, '방송 예약')
+    await user.clear(await screen.findByLabelText('시작 시간'))
+    await user.type(screen.getByLabelText('시작 시간'), '20:58')
+    await user.clear(screen.getByLabelText('종료 시간'))
+    await user.type(screen.getByLabelText('종료 시간'), '21:00')
+    await user.click(screen.getByRole('button', { name: /예약 추가/ }))
+    await screen.findByText('20:58 → 21:00')
+  }
+
+  it('says the rule is saved but nothing is watching it yet', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await addSchedule(user)
+
+    // §8: "예약을 추가했습니다" alone is what left the user wondering whether
+    // anything would actually happen tonight.
+    expect(await screen.findByText(/자동 방송을 사용하려면/)).toBeInTheDocument()
+    const panel = screen.getByTestId('scheduler-state')
+    expect(within(panel).getByText('꺼짐')).toBeInTheDocument()
+    expect(within(panel).getByText(/자동 방송은 꺼져 있습니다/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '예약 방송 시작' })).toBeInTheDocument()
+  })
+
+  it('switches on, and then proves it is really waiting', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await addSchedule(user)
+
+    await user.click(screen.getByRole('button', { name: '예약 방송 시작' }))
+
+    const panel = await screen.findByTestId('scheduler-state')
+    expect(within(panel).getByText('예약 대기 중')).toBeInTheDocument()
+    // A countdown that moves is the difference between a claim and a fact.
+    expect(await screen.findByTestId('scheduler-countdown')).toHaveTextContent(/\d\d:\d\d:\d\d 후 자동 시작/)
+    expect(screen.getByRole('button', { name: '예약 방송 중지' })).toBeInTheDocument()
+  })
+
+  it('refuses to switch on when there is nothing to watch', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '방송 예약')
+
+    await user.click(await screen.findByRole('button', { name: '예약 방송 시작' }))
+    // Checked now rather than at 3am, when there is nobody to tell.
+    expect(await screen.findByText(/사용 중인 예약이 없습니다/)).toBeInTheDocument()
+  })
+
+  it('keeps the schedules when it is switched off', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await addSchedule(user)
+    await user.click(screen.getByRole('button', { name: '예약 방송 시작' }))
+    await screen.findByRole('button', { name: '예약 방송 중지' })
+
+    await user.click(screen.getByRole('button', { name: '예약 방송 중지' }))
+    expect(await screen.findByText(/예약은 그대로 저장되어 있습니다/)).toBeInTheDocument()
+    expect(screen.getByText('20:58 → 21:00')).toBeInTheDocument()
+    expect(within(screen.getByTestId('scheduler-state')).getByText('꺼짐')).toBeInTheDocument()
+  })
+
+  it('does not call an open window a broadcast when nothing is watching', async () => {
+    const user = userEvent.setup()
+    // The window's time has come and the scheduler is off.
+    mount({ occurrenceOpen: { start: '2026-09-20 20:58', end: '2026-09-20 21:00', phase: 'preparing' } })
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await addSchedule(user)
+
+    expect(await screen.findByText(/지금이 예약 시간이지만 자동 방송이 꺼져 있습니다/)).toBeInTheDocument()
+    expect(screen.queryByText(/지금 방송 시간입니다/)).not.toBeInTheDocument()
+  })
+
+  it('tells the dashboard that a stopped FFmpeg is the correct state', async () => {
+    mount({ schedulerArmed: true })
+    await screen.findByRole('button', { name: '대시보드' })
+
+    // §10: with the scheduler waiting, FFmpeg being stopped is not a fault.
+    const row = await screen.findByTestId('scheduler-waiting')
+    expect(within(row).getByText(/예약 방송 대기 중/)).toBeInTheDocument()
+    expect(within(row).getByText(/예약 시간에 자동으로 시작합니다/)).toBeInTheDocument()
+  })
+
+  it('labels the per-row toggle so it is not mistaken for the switch', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await addSchedule(user)
+
+    // §9: a green toggle on a row means "use this rule", not "broadcasting".
+    expect(screen.getByRole('switch', { name: '이 예약 사용' })).toBeInTheDocument()
   })
 })

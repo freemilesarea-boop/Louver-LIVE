@@ -133,6 +133,29 @@ export interface RuntimeStatus {
    * while the schedule page says the window is open.
    */
   active_occurrence?: OccurrenceStatus | null
+  /** What this computer is doing about scheduled broadcasts. */
+  scheduler_state: SchedulerState
+}
+
+/**
+ * Saving a schedule and running a scheduler are different things. One is a
+ * rule in a database; the other is this computer watching a clock.
+ */
+export type SchedulerState =
+  | 'STOPPED' | 'ARMING' | 'WAITING' | 'STARTING' | 'LIVE' | 'STOPPING' | 'ERROR'
+
+export interface SchedulerStatusView {
+  state: SchedulerState
+  armed: boolean
+  enabled_count: number
+  next_start?: string | null
+  next_end?: string | null
+  next_playlist?: string | null
+  seconds_until_start?: number | null
+  active_start?: string | null
+  active_end?: string | null
+  last_error?: LouverError | null
+  restore_on_launch: boolean
 }
 
 export interface OccurrenceStatus {
