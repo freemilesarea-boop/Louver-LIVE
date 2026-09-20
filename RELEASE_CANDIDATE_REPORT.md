@@ -458,11 +458,41 @@ the same as a cancelled manual start — hold, do not broadcast under settings
 the user did not choose — and 방송 설정 carries a switch for a 24/7 channel that
 would rather stay on air and have the failure recorded instead.
 
+### The cost rule
+
+Louver Live's YouTube integration must not put a bill on anyone's Google Cloud
+account. Half of that is configuration and half is code, and the two halves
+protect different things.
+
+Configuration carries the guarantee: the project has **no billing account
+linked**, so there is nothing to charge against and a request past the free
+quota is refused rather than billed. No pay-as-you-go, no quota-increase
+request, and YouTube Data API v3 is the only Google service enabled.
+`YOUTUBE_OAUTH_PRODUCTION.md` §0 has the click path and the check.
+
+Code protects the *broadcast*: a run that burns the day's 10,000 units in an
+hour leaves the rest of the day with no metadata and no chat.
+`youtube/quota.rs` counts the day's spending and stops before the end of it.
+
+| Decision | Why |
+| --- | --- |
+| The meter is in the transport, not the call sites | `MeteredClient` wraps `HttpClient`, and it is the only path from this app to the Data API. The chat bot runs on its own thread and builds its own client — metering that separately is the kind of thing that gets missed |
+| Costs are deliberate over-estimates | Google's per-method table could not be fetched from this machine (`developers.google.com` is unreachable here), so it is read 1 / write 50 / search 100 with **anything unrecognised charged as a write**. Guessing low ends in a 403 mid-apply; guessing high stops early. Only one of those is safe |
+| 500 units held in reserve | The estimate is not trustworthy at the very end, so the app stops on its own terms with a message rather than on Google's 403 |
+| Google's `quotaExceeded` latches the day shut | Whatever the local count says. The estimate can be wrong; Google's answer cannot |
+| The ledger survives a restart | A relaunch that started the count at zero would spend an allowance already gone |
+| Running out never stops the stream | Unlike every other refusal in the pre-start hook, quota returns `Ok`: the broadcast starts and the optional half waits for the reset. It is not something the user can fix, and it is not a reason to take a 24/7 channel off air |
+
+A realistic day — one metadata apply plus a chat message every 20 minutes —
+spends **3,704 units**, under 40% of the allowance
+(`a_days_realistic_use_fits_comfortably`).
+
 **NOT TESTED:** everything above was checked against a stand-in for the
 YouTube API and in the real app under Xvfb. TEST 1–5 against a real Google
 account and a real live broadcast — read-back of the real `videos.update`, the
-real `activeLiveChatId` rotation, and the real OAuth failure path — have not
-been run here and remain **NOT TESTED**. `rc-results/youtube-test.md` is where
+real `activeLiveChatId` rotation, the real OAuth failure path, and the absence
+of a billing account on the real Cloud project — have not been run here and
+remain **NOT TESTED**. `rc-results/youtube-test.md` is where
 those results go.
 
 ## 15. Known issues

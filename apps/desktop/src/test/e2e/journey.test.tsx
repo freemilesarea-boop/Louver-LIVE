@@ -884,6 +884,48 @@ describe('the YouTube side of a broadcast is reported on its own', () => {
     expect(within(report).getByText(/현재 Playlist/)).toBeInTheDocument()
   })
 
+  it('pauses the optional half when the free quota runs out, and broadcasts anyway', async () => {
+    const user = userEvent.setup()
+    mount({ youtubeQuotaExhausted: true })
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await gotoPage(user, '설정')
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    await screen.findByRole('button', { name: '연결 해제' }, { timeout: 6000 })
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+
+    // The allowance is not something the user can fix and not a reason to
+    // take a channel off air: no dialog, and the stream starts.
+    expect(screen.queryByText('방송 설정을 YouTube에 적용하지 못했습니다')).not.toBeInTheDocument()
+    await waitFor(() => {
+      expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+    })
+
+    const panel = await screen.findByTestId('metadata-quota')
+    expect(within(panel).getByText(/사용량이 초기화되면 다시 동작합니다/)).toBeInTheDocument()
+    expect(within(panel).getByText(/추가 요금은 발생하지 않습니다/)).toBeInTheDocument()
+    expect(screen.getByText('오늘 사용량 초과')).toBeInTheDocument()
+  })
+
+  it('shows what the day has cost, and that it costs nothing', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '설정')
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    await screen.findByRole('button', { name: '연결 해제' }, { timeout: 6000 })
+
+    // The final UX §: channel, a connected dot, and the two buttons.
+    expect(screen.getByText('ROOM.')).toBeInTheDocument()
+    expect(screen.getByText('연결됨')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '계정 변경' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '연결 해제' })).toBeInTheDocument()
+    expect(await screen.findByText(/무료 한도 내/)).toBeInTheDocument()
+  })
+
   it('keeps FFmpeg alive when the metadata call fails after the user opts to start anyway', async () => {
     const user = userEvent.setup()
     mount({ youtubeApiFails: true })

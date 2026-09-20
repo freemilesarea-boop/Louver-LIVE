@@ -12,11 +12,13 @@ pub mod chat;
 pub mod http;
 pub mod metadata;
 pub mod oauth;
+pub mod quota;
 
 pub use api::{ChannelInfo, HttpClient, LiveBroadcast, YoutubeApi};
 pub use chat::{ChatMessage, ChatOrder, ChatSettings, ChatState, ChatStatus, MIN_INTERVAL_SECS};
 pub use metadata::{BroadcastMetadata, Privacy, CATEGORIES};
 pub use oauth::{ClientCredentials, TokenStore};
+pub use quota::{MeteredClient, QuotaGuard, QuotaState, FREE_DAILY_UNITS};
 
 /// Settings keys this module owns.
 pub mod keys {
@@ -49,6 +51,8 @@ pub mod keys {
     pub const ALLOW_SECRET_FALLBACK: &str = "youtube_allow_secret_fallback";
     /// The last token-endpoint failure, kept so it can be reported.
     pub const LAST_AUTH_DIAGNOSTIC: &str = "youtube_last_auth_diagnostic";
+    /// The day's API spending, so a restart does not start the count over.
+    pub const QUOTA_STATE: &str = "youtube_quota_state";
 }
 
 /// A saved set of broadcast metadata (§4).

@@ -3,7 +3,7 @@ import { Eye, FolderOpen, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react'
 import { useAppStore } from '@/stores/useAppStore'
 import { api, openUrl, pickLicenseFile, revealPath } from '@/services/ipc'
 import { Badge, Button, Card, Field, Input, Modal, Select, Toggle } from '@/components/ui'
-import type { StreamDiagnostics, YoutubeStatus } from '@/types'
+import type { QuotaReport, StreamDiagnostics, YoutubeStatus } from '@/types'
 
 /** Settings (§45), including the stream key and licence panels. */
 export function SettingsPage() {
@@ -447,12 +447,14 @@ function YoutubeAccountCard() {
   const [manualUrl, setManualUrl] = useState<string | null>(null)
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
+  const [quota, setQuota] = useState<QuotaReport | null>(null)
 
   const refresh = useCallback(
     () => api.youtubeStatus().then(setYt).catch(reportError),
     [reportError],
   )
   useEffect(() => { void refresh() }, [refresh])
+  useEffect(() => { api.youtubeQuota().then(setQuota).catch(() => {}) }, [yt?.connected])
 
   // While consent is open in the browser there is nothing to do but watch for
   // it to finish.
@@ -509,8 +511,26 @@ function YoutubeAccountCard() {
           <dl className="space-y-2">
             <Row label="채널" value={yt.channel_title ?? '—'} />
             <Row label="Channel ID" value={yt.channel_id ?? '—'} mono />
-            <Row label="상태" value={<span className="text-ok">연결됨</span>} />
+            <Row
+              label="상태"
+              value={<span className="inline-flex items-center gap-1.5 text-ok"><span className="h-1.5 w-1.5 rounded-full bg-ok" />연결됨</span>}
+            />
             <Row label="토큰 저장 위치" value={yt.secret_backend} />
+            {/* Free allowance only — there is no billing account behind this,
+                so running out pauses the optional features until it resets and
+                can never produce a charge. */}
+            {quota && (
+              <Row
+                label="오늘 사용량"
+                value={
+                  <span className={quota.exhausted ? 'text-warn' : 'text-ink-300'}>
+                    {quota.exhausted
+                      ? '모두 사용함 · 내일 초기화'
+                      : `${quota.used_percent}% · 무료 한도 내`}
+                  </span>
+                }
+              />
+            )}
           </dl>
           {!yt.secret_backend_is_secure && (
             <p className="mt-2 text-xs text-warn">

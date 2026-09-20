@@ -30,6 +30,8 @@ export interface MockOptions {
    * the only thing read-back catches.
    */
   youtubeIgnoresTitle?: boolean
+  /** The day's free YouTube allowance is gone. */
+  youtubeQuotaExhausted?: boolean
   /**
    * Make every YouTube Data API call fail. Used to check that the optional
    * half can break without taking the broadcast with it.
@@ -467,6 +469,13 @@ export function createMockBackend(opts: MockOptions = {}) {
       // refuses the start if it cannot be done (§B-4, §B-9).
       if (!a.skipYoutube) {
         const wanted = youtube.applyOnStart && youtube.metadata.title.trim() !== ''
+        if (wanted && opts.youtubeQuotaExhausted) {
+          // Not a refusal: the allowance is not something the user can fix,
+          // and a 24/7 channel does not come off air over a title.
+          youtube.applyState = { stage: 'quota_exhausted', requested: { ...youtube.metadata } }
+          startBroadcast(a.playlistId as number, false)
+          return status
+        }
         if (wanted && !youtube.connected) {
           youtube.applyState = {
             stage: 'not_connected',
@@ -637,6 +646,13 @@ export function createMockBackend(opts: MockOptions = {}) {
       return undefined
     },
     youtube_apply_state: () => youtube.applyState,
+    youtube_quota: () => ({
+      used_percent: opts.youtubeQuotaExhausted ? 100 : 37,
+      spent: opts.youtubeQuotaExhausted ? 9500 : 3500,
+      cap: 10000,
+      exhausted: Boolean(opts.youtubeQuotaExhausted),
+      day: '2026-09-20',
+    }),
     youtube_schedule_holds: () => youtube.scheduleHolds,
     youtube_set_schedule_holds: (a: Record<string, unknown>) => {
       youtube.scheduleHolds = Boolean(a.holds)

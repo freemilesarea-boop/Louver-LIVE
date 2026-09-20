@@ -248,6 +248,7 @@ export function Dashboard() {
       {(plan?.wanted
         || applyState?.stage === 'not_connected'
         || applyState?.stage === 'skipped'
+        || applyState?.stage === 'quota_exhausted'
         || applyState?.stage === 'failed') && (
         <Card
           title={
@@ -258,6 +259,7 @@ export function Dashboard() {
                   will not apply does not make the broadcast engine unwell. */}
               {applyState?.stage === 'not_connected' && <Badge tone="warn">조치 필요</Badge>}
               {applyState?.stage === 'skipped' && <Badge>적용 안 함</Badge>}
+              {applyState?.stage === 'quota_exhausted' && <Badge tone="warn">오늘 사용량 초과</Badge>}
               {applyState?.stage === 'failed' && <Badge tone="warn">적용 실패</Badge>}
             </span>
           }
@@ -270,6 +272,12 @@ export function Dashboard() {
               </p>
               <Button size="sm" onClick={() => setPage('settings')}>설정에서 연결하기</Button>
             </div>
+          ) : applyState?.stage === 'quota_exhausted' ? (
+            <p className="text-xs text-warn" data-testid="metadata-quota">
+              오늘 쓸 수 있는 YouTube 무료 사용량을 모두 썼습니다. 제목·설명·태그 적용과
+              자동 채팅은 사용량이 초기화되면 다시 동작합니다.
+              <span className="text-ink-400"> 영상 송출은 영향을 받지 않습니다. 추가 요금은 발생하지 않습니다.</span>
+            </p>
           ) : applyState?.stage === 'skipped' ? (
             <div className="flex flex-wrap items-center justify-between gap-3" data-testid="metadata-skipped">
               <p className="text-xs text-ink-400">

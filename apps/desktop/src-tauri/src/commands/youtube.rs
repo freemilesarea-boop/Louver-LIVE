@@ -5,7 +5,7 @@
 
 use super::CmdResult;
 use crate::state::AppState;
-use crate::youtube_service::{MetadataApplyState, MetadataOutcome, YoutubeStatus};
+use crate::youtube_service::{MetadataApplyState, MetadataOutcome, QuotaReport, YoutubeStatus};
 use louver_core::youtube::chat::{ChatSettings, ChatStatus};
 use louver_core::youtube::{keys, BroadcastMetadata, BroadcastPreset, LiveBroadcast, Privacy};
 use tauri::State;
@@ -122,6 +122,15 @@ pub struct ApplyPlan {
 #[tauri::command]
 pub fn youtube_set_apply_on_start(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
     state.db.set_setting(keys::APPLY_ON_START, if enabled { "true" } else { "false" })
+}
+
+/// The day's free-quota spending.
+///
+/// Shown so that "오늘 사용량을 모두 썼습니다" is something the user can see coming
+/// rather than only discover. There is no paid tier behind it.
+#[tauri::command]
+pub fn youtube_quota(state: State<'_, AppState>) -> CmdResult<QuotaReport> {
+    Ok(state.youtube.quota_state())
 }
 
 /// What a scheduled start does when the metadata cannot be applied.

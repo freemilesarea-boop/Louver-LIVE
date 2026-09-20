@@ -60,6 +60,12 @@ fn youtube_follow_broadcast(state: &AppState, live: bool, broadcasting: bool) {
     if !state.youtube.chat_settings().enabled || state.youtube.bot_is_running() {
         return;
     }
+    // The chat bot is the heaviest spender there is — a message every interval,
+    // all day. With the day's free allowance gone it does not start, and the
+    // broadcast carries on without it.
+    if state.youtube.quota_exhausted() {
+        return;
+    }
     if WORKING.swap(true, Ordering::SeqCst) {
         return; // one round at a time
     }
@@ -160,6 +166,7 @@ pub fn run() {
             commands::youtube::youtube_apply_metadata,
             commands::youtube::youtube_set_apply_on_start,
             commands::youtube::youtube_apply_state,
+            commands::youtube::youtube_quota,
             commands::youtube::youtube_set_schedule_holds,
             commands::youtube::youtube_schedule_holds,
             commands::youtube::youtube_apply_plan,

@@ -16,6 +16,7 @@ use louver_core::youtube::http::UreqClient;
 use louver_core::youtube::oauth::{
     ClientCredentials, ConsentPrompt, LoopbackServer, Pkce, TokenEndpoint, TokenStore,
 };
+use louver_core::youtube::quota::{MeteredClient, QuotaGuard, QuotaState, FREE_DAILY_UNITS};
 use louver_core::youtube::{api::API_BASE, keys, BroadcastMetadata, ChannelInfo, HttpClient};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,7 +26,14 @@ const CONSENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct YoutubeService {
     pub tokens: Arc<TokenStore>,
+    /// The raw transport. Used for the OAuth token endpoint, which is
+    /// `oauth2.googleapis.com` and costs no YouTube quota.
     http: Arc<UreqClient>,
+    /// Every YouTube Data API call goes through this, and there is no other
+    /// way to reach the API from here — so the day's allowance cannot be
+    /// spent by a call site that forgot to ask.
+    api_http: Arc<MeteredClient>,
+    quota: Arc<QuotaGuard>,
     db: Database,
     logger: Arc<Logger>,
     bot: Mutex<Option<ChatBot>>,
@@ -39,6 +47,19 @@ pub struct YoutubeService {
     /// What happened to the metadata for the broadcast in progress, for the
     /// dashboard to show field by field (§B-10).
     apply_state: Arc<Mutex<MetadataApplyState>>,
+}
+
+/// The day's free-quota spending, for the UI.
+///
+/// There is no paid tier behind this: the project carries no billing account,
+/// so running out means the features pause until tomorrow, never a charge.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QuotaReport {
+    pub used_percent: u8,
+    pub spent: u32,
+    pub cap: u32,
+    pub exhausted: bool,
+    pub day: String,
 }
 
 /// The result of one apply, including what Google says afterwards.
@@ -61,6 +82,9 @@ pub enum ApplyStage {
     /// The user was told it could not be applied and chose to broadcast
     /// anyway, so YouTube keeps whatever it already had.
     Skipped,
+    /// The day's free API allowance is gone. Metadata and chat wait for the
+    /// quota to reset; the broadcast does not.
+    QuotaExhausted,
     /// Applied, and Google reads back what was asked for.
     Applied,
     /// The calls succeeded but at least one field did not take.
@@ -113,9 +137,32 @@ pub struct YoutubeStatus {
 
 impl YoutubeService {
     pub fn new(db: Database, secrets: Arc<dyn SecretStore>, logger: Arc<Logger>) -> Self {
+        let http = Arc::new(UreqClient::new());
+        // Restored rather than reset: a relaunch that started the day's count
+        // at zero would spend an allowance that is already gone.
+        let restored: QuotaState = db
+            .get_setting(keys::QUOTA_STATE)
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let persist_db = db.clone();
+        let quota = Arc::new(QuotaGuard::new(
+            restored,
+            FREE_DAILY_UNITS,
+            Box::new(move |st| {
+                if let Ok(json) = serde_json::to_string(st) {
+                    let _ = persist_db.set_setting(keys::QUOTA_STATE, &json);
+                }
+            }),
+        ));
+        let api_http =
+            Arc::new(MeteredClient::new(Arc::clone(&http) as Arc<dyn HttpClient>, Arc::clone(&quota)));
         Self {
             tokens: Arc::new(TokenStore::new(secrets)),
-            http: Arc::new(UreqClient::new()),
+            http,
+            api_http,
+            quota,
             db,
             logger,
             bot: Mutex::new(None),
@@ -282,6 +329,7 @@ impl YoutubeService {
         *self.connecting.lock().unwrap() = None;
         let tokens = Arc::clone(&self.tokens);
         let http = Arc::clone(&self.http);
+        let api_http = Arc::clone(&self.api_http);
         let db = self.db.clone();
         let logger = Arc::clone(&self.logger);
         let connecting = Arc::clone(&self.connecting);
@@ -301,7 +349,9 @@ impl YoutubeService {
                     })?;
                     tokens.save_refresh_token(&refresh)?;
                     let token = tokens.access_token(&creds, http.as_ref())?;
-                    YoutubeApi::with_base(http.as_ref(), api_base).my_channel(&token)
+                    // `channels.list` is a Data API call like any other, and
+                    // is charged like one.
+                    YoutubeApi::with_base(api_http.as_ref(), api_base).my_channel(&token)
                 })();
 
                 match outcome {
@@ -366,7 +416,7 @@ impl YoutubeService {
         meta.validate()?;
         let token = self.token()?;
         let base = self.api_base();
-        let api = YoutubeApi::with_base(self.http.as_ref(), base);
+        let api = YoutubeApi::with_base(self.api_http.as_ref(), base);
 
         let broadcast = api.active_broadcast(&token)?;
         api.update_broadcast(&token, &broadcast.id, &meta, None)?;
@@ -400,7 +450,7 @@ impl YoutubeService {
     /// Find whatever broadcast is on air, for the UI to show.
     pub fn current_broadcast(&self) -> Result<louver_core::youtube::LiveBroadcast> {
         let token = self.token()?;
-        YoutubeApi::with_base(self.http.as_ref(), self.api_base()).active_broadcast(&token)
+        YoutubeApi::with_base(self.api_http.as_ref(), self.api_base()).active_broadcast(&token)
     }
 
     // --- metadata on start ------------------------------------------------
@@ -459,6 +509,23 @@ impl YoutubeService {
         });
         self.logger
             .info(LogTarget::App, "YOUTUBE_METADATA_SKIPPED: 사용자가 설정 없이 방송 시작을 선택했습니다");
+    }
+
+    /// Is the day's free API allowance gone?
+    pub fn quota_exhausted(&self) -> bool {
+        self.quota.is_exhausted()
+    }
+
+    /// The day's API spending, for the UI to show.
+    pub fn quota_state(&self) -> QuotaReport {
+        let s = self.quota.snapshot();
+        QuotaReport {
+            used_percent: s.used_percent(self.quota.cap()),
+            spent: s.spent,
+            cap: self.quota.cap(),
+            exhausted: s.exhausted,
+            day: s.day,
+        }
     }
 
     /// What the metadata apply did for the broadcast in progress.
@@ -526,6 +593,27 @@ impl YoutubeService {
             return Ok(());
         }
         let meta = self.saved_metadata();
+
+        // The day's free allowance is gone. This is not something the user can
+        // fix, and it is emphatically not a reason to take a 24/7 channel off
+        // air — so unlike every other refusal here it returns Ok: the stream
+        // starts, and the optional half waits for the quota to reset.
+        if self.quota.is_exhausted() {
+            let already = self.apply_state().stage == ApplyStage::QuotaExhausted;
+            self.set_apply_state(MetadataApplyState {
+                stage: ApplyStage::QuotaExhausted,
+                requested: Some(meta),
+                ..Default::default()
+            });
+            if !already {
+                self.logger.warn(
+                    LogTarget::App,
+                    "YOUTUBE_QUOTA_EXHAUSTED: 오늘 무료 사용량을 모두 썼습니다. 방송은 계속하고 제목·채팅만 쉽니다",
+                );
+            }
+            return Ok(());
+        }
+
         if !self.status().connected {
             // A held scheduled window retries once a minute, and the cause
             // does not change in between, so say it once.
@@ -662,7 +750,9 @@ impl YoutubeService {
         self.stop_bot();
 
         let ctx = Arc::new(BotContext {
-            http: Arc::clone(&self.http) as Arc<dyn HttpClient>,
+            // The bot gets the metered client too: it runs on its own thread
+            // and would otherwise be the one place spending unbudgeted.
+            http: Arc::clone(&self.api_http) as Arc<dyn HttpClient>,
             tokens: Arc::clone(&self.tokens),
             token_endpoint: Arc::clone(&self.http) as Arc<dyn TokenEndpoint>,
             credentials: match self.credentials() {

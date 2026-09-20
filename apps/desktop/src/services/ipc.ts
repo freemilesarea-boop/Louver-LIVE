@@ -15,7 +15,7 @@ import type {
   Media, Playlist, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
   SettingsView, StreamDiagnostics, StreamEvent,
   BroadcastMetadata, BroadcastPreset, ChatMessage, ChatSettings, ChatStatus,
-  LiveBroadcast, YoutubeStatus, MetadataOutcome, MetadataApplyState, ApplyPlan,
+  LiveBroadcast, YoutubeStatus, MetadataOutcome, MetadataApplyState, ApplyPlan, QuotaReport,
 } from '@/types'
 
 export type MockBackend = (cmd: string, args: Record<string, unknown>) => unknown | Promise<unknown>
@@ -155,6 +155,7 @@ export const api = {
     call<BroadcastMetadata>('youtube_save_metadata', { metadata }),
   youtubeApplyMetadata: () => call<MetadataOutcome>('youtube_apply_metadata'),
   youtubeApplyState: () => call<MetadataApplyState>('youtube_apply_state'),
+  youtubeQuota: () => call<QuotaReport>('youtube_quota'),
   youtubeScheduleHolds: () => call<boolean>('youtube_schedule_holds'),
   youtubeSetScheduleHolds: (holds: boolean) => call<void>('youtube_set_schedule_holds', { holds }),
   youtubeApplyPlan: () => call<ApplyPlan>('youtube_apply_plan'),

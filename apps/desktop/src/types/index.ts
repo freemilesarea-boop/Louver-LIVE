@@ -322,7 +322,21 @@ export interface MetadataOutcome {
 }
 
 export type ApplyStage =
-  | 'off' | 'not_connected' | 'applying' | 'skipped' | 'applied' | 'mismatch' | 'failed'
+  | 'off' | 'not_connected' | 'applying' | 'skipped' | 'quota_exhausted'
+  | 'applied' | 'mismatch' | 'failed'
+
+/**
+ * The day's free-quota spending. There is no paid tier behind it: the project
+ * carries no billing account, so running out pauses the optional features
+ * until the quota resets, and never produces a charge.
+ */
+export interface QuotaReport {
+  used_percent: number
+  spent: number
+  cap: number
+  exhausted: boolean
+  day: string
+}
 
 /**
  * The YouTube half of a broadcast, tracked separately from the stream's own

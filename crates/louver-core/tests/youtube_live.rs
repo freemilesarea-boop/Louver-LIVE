@@ -507,3 +507,101 @@ fn a_refusal_is_reported_in_googles_own_words() {
     assert!(detail.contains("invalid_request"), "{detail}");
     assert!(detail.contains("client_secret is missing."), "{detail}");
 }
+
+// --- staying inside the free quota ------------------------------------------
+
+use louver_core::youtube::quota::{MeteredClient, QuotaGuard, QuotaState, FREE_DAILY_UNITS, RESERVE_UNITS};
+
+fn metered(inner: Arc<dyn HttpClient>, guard: Arc<QuotaGuard>) -> MeteredClient {
+    MeteredClient::new(inner, guard)
+}
+
+#[test]
+fn every_call_is_charged_against_the_days_allowance() {
+    let fake = FakeYoutube::start(vec![
+        ("GET /videos", 200, EXISTING_VIDEO.into()),
+        ("PUT /videos", 200, r#"{"id":"bcast-1"}"#.into()),
+    ]);
+    let guard = Arc::new(QuotaGuard::unlimited_for_tests());
+    let http = metered(Arc::new(client()) as Arc<dyn HttpClient>, Arc::clone(&guard));
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    api.update_video_snippet("tok", "bcast-1", &meta()).unwrap();
+
+    // One read and one write, priced as such.
+    assert_eq!(guard.snapshot().spent, 51);
+}
+
+#[test]
+fn the_day_stops_before_the_allowance_runs_out() {
+    let fake = FakeYoutube::start(vec![("GET /videos", 200, EXISTING_VIDEO.into())]);
+    let nearly_spent = QuotaState {
+        day: louver_core::youtube::quota::quota_day(chrono::Utc::now()),
+        spent: FREE_DAILY_UNITS - RESERVE_UNITS,
+        exhausted: false,
+    };
+    let guard = Arc::new(QuotaGuard::new(nearly_spent, FREE_DAILY_UNITS, Box::new(|_| {})));
+    let http = metered(Arc::new(client()) as Arc<dyn HttpClient>, Arc::clone(&guard));
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    let e = api.video_snippet("tok", "bcast-1").unwrap_err();
+    assert_eq!(e.code_str, "LL-YOUTUBE-005");
+    // And it never reached Google, so it cost nothing at all.
+    assert!(fake.requests().is_empty(), "the refusal must happen before the socket");
+}
+
+#[test]
+fn googles_own_refusal_closes_the_day_whatever_the_local_count_says() {
+    let fake = FakeYoutube::start(vec![(
+        "GET /videos",
+        403,
+        r#"{"error":{"code":403,"message":"quota","errors":[{"reason":"quotaExceeded"}]}}"#.into(),
+    )]);
+    let guard = Arc::new(QuotaGuard::unlimited_for_tests());
+    let http = metered(Arc::new(client()) as Arc<dyn HttpClient>, Arc::clone(&guard));
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    assert!(!guard.is_exhausted());
+    let e = api.video_snippet("tok", "bcast-1").unwrap_err();
+    assert_eq!(e.code_str, "LL-YOUTUBE-005");
+
+    // The local estimate thought there was plenty left. Google's answer wins,
+    // and nothing else is sent today.
+    assert!(guard.is_exhausted());
+    let second = api.video_snippet("tok", "bcast-1").unwrap_err();
+    assert_eq!(second.code_str, "LL-YOUTUBE-005");
+    assert_eq!(fake.requests().len(), 1, "the second call must not be attempted");
+}
+
+#[test]
+fn an_ordinary_failure_does_not_close_the_day() {
+    let fake = FakeYoutube::start(vec![(
+        "GET /videos",
+        500,
+        r#"{"error":{"code":500,"message":"backend"}}"#.into(),
+    )]);
+    let guard = Arc::new(QuotaGuard::unlimited_for_tests());
+    let http = metered(Arc::new(client()) as Arc<dyn HttpClient>, Arc::clone(&guard));
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    api.video_snippet("tok", "bcast-1").unwrap_err();
+    assert!(!guard.is_exhausted(), "a 500 is Google's problem, not the day's allowance");
+}
+
+#[test]
+fn a_days_worth_of_chat_fits_inside_the_free_allowance() {
+    // The heaviest thing this product does: a message every 20 minutes for a
+    // whole day, on top of one metadata apply.
+    let guard = Arc::new(QuotaGuard::unlimited_for_tests());
+    for _ in 0..(24 * 3) {
+        guard.try_spend(louver_core::youtube::quota::cost_of("POST", "/liveChat/messages")).unwrap();
+    }
+    for (m, p) in
+        [("GET", "/liveBroadcasts"), ("PUT", "/liveBroadcasts"), ("GET", "/videos"), ("PUT", "/videos")]
+    {
+        guard.try_spend(louver_core::youtube::quota::cost_of(m, p)).unwrap();
+    }
+    let s = guard.snapshot();
+    assert!(!s.exhausted);
+    assert!(s.spent < FREE_DAILY_UNITS - RESERVE_UNITS, "spent {} units", s.spent);
+}
