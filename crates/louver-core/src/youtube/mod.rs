@@ -48,7 +48,6 @@ pub mod keys {
     /// Off by default: the exchange is attempted with PKCE alone. Turned on
     /// only with evidence that Google refused the secret-less exchange for
     /// this client, which the app records verbatim when it happens.
-    pub const ALLOW_SECRET_FALLBACK: &str = "youtube_allow_secret_fallback";
     /// The last token-endpoint failure, kept so it can be reported.
     pub const LAST_AUTH_DIAGNOSTIC: &str = "youtube_last_auth_diagnostic";
     /// The day's API spending, so a restart does not start the count over.

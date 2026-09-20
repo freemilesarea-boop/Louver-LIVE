@@ -286,7 +286,8 @@ export interface YoutubeStatus {
   has_credentials: boolean
   apply_on_start: boolean
   using_custom_client: boolean
-  secret_fallback_enabled: boolean
+  /** Whether this build carries a client secret. Never the value itself. */
+  has_client_secret: boolean
   last_auth_diagnostic?: string | null
   client_id_hint?: string | null
   secret_backend: string

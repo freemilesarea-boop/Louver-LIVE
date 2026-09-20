@@ -155,81 +155,94 @@
 - 애플리케이션 유형: **데스크톱 앱**
 - 이름: `Louver Live Desktop`
 
-**클라이언트 ID를 빌드에 넣습니다. 저장소에는 넣지 않습니다.**
+클라이언트를 만들면 **클라이언트 ID와 클라이언트 보안 비밀** 두 값이 나옵니다.
+**둘 다** 빌드에 넣습니다. 저장소에는 넣지 않습니다.
 
 ```bash
 export LOUVER_GOOGLE_CLIENT_ID="000000-xxxx.apps.googleusercontent.com"
+export LOUVER_GOOGLE_CLIENT_SECRET="GOCSPX-xxxxxxxxxxxxxxxx"
 npm run build
 ```
 
-`LOUVER_GOOGLE_CLIENT_SECRET`은 **넣지 않는 것이 기본**입니다 — 아래
-"client_secret에 대하여"를 보세요. Google이 secret 없는 교환을 거부한다는 실제
-증거가 나온 뒤에만 넣습니다.
+Google이 이 Desktop 클라이언트의 토큰 교환에 secret을 요구하므로, secret 없이
+빌드한 릴리스는 연결 버튼이 항상 실패합니다 (아래 "client_secret" 절).
 
-CI에서는 저장소 시크릿 `LOUVER_GOOGLE_CLIENT_ID`로 주입합니다.
-`npm run secret-scan`이 이 값들이 작업 트리나 커밋 기록에 들어가면 빌드를
-막습니다.
+> **주의 — 빌드에 박는 값은 빌드할 때 있어야 합니다.** `option_env!`는 rustc가
+> 컴파일하는 시점의 환경을 읽고, cargo는 이 의존성을 모르므로 재빌드를
+> 트리거하지 않습니다. 이미 빌드된 바이너리에 나중에 변수를 export해도
+> **빌드에 박힌 값은 바뀌지 않습니다.** 값을 바꿨다면
+> `cargo clean -p louver-core` 후 다시 빌드하세요. (실행 시점 환경변수는
+> 별도로 우선 적용되므로, 개발 중에는 export 후 실행만으로도 동작합니다.)
+
+CI에서는 저장소 시크릿 `LOUVER_GOOGLE_CLIENT_ID`와
+`LOUVER_GOOGLE_CLIENT_SECRET`으로 주입합니다. `npm run secret-scan`이 이 값들이
+작업 트리나 커밋 기록에 들어가면 빌드를 막습니다.
 
 ---
 
-## client_secret에 대하여 — 그리고 이전 문서의 정정
+## client_secret — 실측으로 결론이 났습니다
 
-**이전 판에서 "Google 데스크톱 클라이언트는 PKCE를 써도 client_secret이 반드시
-필요하다"고 단정했습니다. 그 근거는 공식 문서가 아니라 포럼 글이었습니다.
-단정을 철회합니다.**
+이 문서는 두 번 바뀌었습니다. 처음에는 포럼 글을 근거로 "필수"라고 단정했다가
+철회했고, 그 다음에는 "측정해서 정하자"며 **secret 없이 보내는 것을 기본값**으로
+두었습니다. 2026-09-20에 실제 Mac에서 실제 Google이 답했습니다:
 
-### 확인한 것 (Google 공식 소스)
-
-Google의 OpenID Connect discovery 문서를 직접 받아 확인했습니다
-(<https://accounts.google.com/.well-known/openid-configuration>):
-
-```json
-"token_endpoint": "https://oauth2.googleapis.com/token",
-"token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
-"code_challenge_methods_supported": ["plain", "S256"]
+```
+HTTP 400
+invalid_request
+client_secret is missing.
 ```
 
-- **PKCE S256은 공식적으로 지원됩니다.**
-- 토큰 엔드포인트가 광고하는 인증 방식은 `client_secret_post`와
-  `client_secret_basic` 둘뿐이고, 공개 클라이언트(비밀 없음)를 뜻하는 `none`은
-  **목록에 없습니다.**
+**그래서 이 Desktop 클라이언트의 토큰 교환에는 client_secret을 항상 함께
+보냅니다.** PKCE는 그대로 씁니다 — secret은 PKCE를 대신하는 게 아니라 함께
+보내는 것입니다.
 
-### 확인하지 못한 것
+| | 그때 | 지금 |
+| --- | --- | --- |
+| 기본 동작 | secret 없이 PKCE만 | **PKCE + client_secret** |
+| fallback 스위치 | 개발자 모드에 있음, 기본 꺼짐 | **제거됨** (`youtube_allow_secret_fallback` 설정도 없어짐) |
+| Production 빌드 | secret 없이 빌드 | **ID와 Secret 둘 다 주입** |
 
-`none`이 없다는 사실은 시사적이지만 **Desktop 클라이언트에 대한 결론은
-아닙니다.** discovery 문서는 OpenID Connect 용도로 광고되는 값이고, 설치형 앱의
-토큰 교환에서 `client_secret`이 필수인지 선택인지는 여기서 단정할 수 없습니다.
-`developers.google.com`은 이 저장소의 네트워크에서 차단되어 있어 공식
-네이티브 앱 문서를 직접 읽지 못했습니다.
+### 왜 설정해도 전송되지 않았는가 — 원인 두 가지
 
-### 그래서 이렇게 설계했습니다 — 주장 대신 측정
+Mac에서 두 환경변수를 모두 export하고 실행했는데도 Google이 missing을 반환한
+데에는 각각 단독으로도 이 증상을 만들어내는 원인이 두 개 있었습니다.
 
-기본 동작은 **client_secret 없이 PKCE만으로 토큰을 교환하는 것**입니다.
+1. **`apply_secret_policy`가 secret을 지우고 있었습니다.** 위의 "측정하자"
+   설계에 따라, fallback 스위치가 꺼져 있으면(기본값) 자격증명에서
+   `client_secret`을 비운 뒤 교환에 넘겼습니다. 빌드에 secret이 있어도
+   전송되지 않는 것이 **의도된 동작**이었습니다. 이 함수와 스위치를 삭제했습니다.
 
-- 빌드에 secret이 없으면 `client_secret` 파라미터를 **아예 보내지 않습니다**
-  (빈 값으로 보내지 않습니다).
-- Google이 거부하면, 응답을 **그대로** 기록합니다: HTTP status, `error`,
-  `error_description`. 요약하지 않습니다 — `invalid_request`와
-  `invalid_client`는 다른 이야기이기 때문입니다.
-- 기록된 내용은 설정 화면과 `app.log`에 남고, `youtube_last_auth_diagnostic`
-  설정에도 보관됩니다.
-- fallback(`client_secret`을 함께 보내기)은 **기본값이 꺼져 있고**, 위 근거를
-  보고 판단한 뒤에만 켭니다.
+2. **`option_env!`는 빌드 시점에만 읽습니다.** `BUILT_IN_CLIENT_SECRET`은
+   `option_env!`로 정의되어 있어, rustc가 이 crate를 **컴파일할 때**의 환경을
+   읽습니다. 게다가 cargo는 이 매크로가 그 변수에 의존한다는 사실을 모르므로
+   재빌드 트리거도 걸리지 않습니다. 즉 **변수를 export하고 기존 빌드를 실행하면
+   아무 일도 일어나지 않습니다.** 이제 `ClientCredentials::resolve()`가
+   **실행 시점 환경변수를 먼저** 읽고, 없을 때만 빌드에 박힌 값을 씁니다.
+   배포 빌드는 환경이 비어 있으므로 박힌 값으로 내려갑니다.
 
-따라서 **3번 절차대로 secret 없이 성공하면, Production 빌드에 client_secret을
-넣지 않습니다.** `LOUVER_GOOGLE_CLIENT_SECRET` 없이 빌드하면 됩니다.
+### 시작 로그로 확인하기
+
+앱을 실행하면 `app.log` 맨 앞에 두 줄이 찍힙니다. **값은 절대 찍지 않습니다.**
+
+```
+[INFO] OAuth Client ID: configured
+[INFO] OAuth Client Secret: configured
+```
+
+`missing`이 보이면 그 변수가 이 프로세스에 도달하지 않은 것입니다. 이 두 줄은
+"분명히 설정했는데 왜 missing이냐"는 물음을 한 번 보고 끝내기 위한 것입니다.
 
 ### 실패했을 때 보고할 것
 
-연결이 실패하면 설정 → YouTube 고급 기능에 나오는 한 줄과 `app.log`의 해당 줄을 그대로
-알려주세요. 이런 모양입니다.
+연결이 실패하면 설정 → YouTube 고급 기능에 나오는 한 줄과 `app.log`의 해당 줄을
+그대로 알려주세요. Google의 응답은 요약하지 않고 status·`error`·
+`error_description`을 그대로 보존합니다.
 
 ```
 YouTube 연결 실패: LL-YOUTUBE-002 · HTTP 400 · invalid_request: client_secret is missing.
 ```
 
-이 한 줄이 fallback이 필요한지 아닌지를 결정합니다. 토큰이나 비밀 값은 포함되지
-않습니다.
+토큰이나 비밀 값은 포함되지 않습니다.
 
 ## 4. 검증 (verification)
 
@@ -284,6 +297,7 @@ YouTube 연결 실패: LL-YOUTUBE-002 · HTTP 400 · invalid_request: client_sec
 | refresh token은 키체인에만, DB·로그 없음 | **PASS** — `rc_security`, secret 스캐너 |
 | 빌드에 클라이언트가 없으면 그렇게 표시 | **PASS** — 단위 테스트 + UI |
 | 빌드 시 `LOUVER_GOOGLE_CLIENT_ID` 주입이 실제로 동작 | **PASS** — 주입 후 앱을 띄워 버튼이 활성화되는 것 확인 |
+| Production 빌드에 ID와 Secret이 함께 주입됨 | **NOT TESTED** — 실제 클라이언트 생성 후 확인할 항목 |
 | 브라우저를 열지 못하면 주소를 보여줌 | **PASS** — UI 테스트 |
 | 브라우저 열기 권한이 Google 동의 화면 한 곳으로 제한됨 | **PASS** — `capabilities/default.json`, Tauri가 빌드 시 검증 |
 | 메서드별 단가가 2026 표와 일치 | **PASS** — 단위 테스트 |
@@ -299,7 +313,14 @@ YouTube 연결 실패: LL-YOUTUBE-002 · HTTP 400 · invalid_request: client_sec
 | 한도 소진 시 채팅 봇이 시작하지 않음 | **PASS** — tick에서 차단 |
 | 사용량이 재시작을 넘어 유지됨 | **PASS** — DB에 보존, 복원 후 이어서 계산 |
 | **결제 계정이 연결되어 있지 않음** | **NOT TESTED** — 실제 프로젝트 생성 후 콘솔에서 확인할 항목 |
-| **client_secret 없이 실제 Google 토큰 교환 성공 여부** | **NOT TESTED** — Mac에서 확인할 핵심 항목 |
+| Google이 이 Desktop 클라이언트에 client_secret을 요구함 | **확인됨** — 실제 Mac, 실제 Google, HTTP 400 `invalid_request: client_secret is missing` |
+| secret이 있으면 요청 본문에 실제로 포함됨 | **PASS** — 단위 테스트가 6개 필드를 직접 검사 |
+| secret이 없으면 빈 값이 아니라 필드 자체가 없음 | **PASS** — 단위 테스트 |
+| secret을 요구하는 엔드포인트 상대로 교환 성공 | **PASS** — 통합 테스트, Google의 거부/수락을 그대로 재현 |
+| refresh 요청에도 secret이 포함됨 | **PASS** — 단위·통합 테스트 |
+| 실행 시점 환경변수가 빌드에 박힌 값보다 우선 | **PASS** — 실제 앱, 같은 바이너리로 missing→configured 확인 |
+| secret이 로그·DB에 남지 않음 | **PASS** — 실제 앱 실행 후 로그 3개와 settings 테이블 검사, 0건 |
+| `{:?}`가 secret을 출력하지 않음 | **PASS** — 단위 테스트 (파생 Debug가 출력하던 것을 발견해 수동 구현으로 교체) |
 | **실제 Google 계정으로 연결** | **NOT TESTED** — 클라이언트 생성 후 확인 |
 | **Google 검증 통과** | **NOT TESTED** |
 

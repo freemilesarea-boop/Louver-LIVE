@@ -133,8 +133,9 @@ pub struct YoutubeStatus {
     pub apply_on_start: bool,
     /// True when a developer has overridden the built-in OAuth client.
     pub using_custom_client: bool,
-    /// False means the token exchange is attempted with PKCE alone.
-    pub secret_fallback_enabled: bool,
+    /// Whether this build carries a client secret to send with the token
+    /// exchange. The value itself is never exposed.
+    pub has_client_secret: bool,
     /// The token endpoint's own words about the last failure, if any.
     pub last_auth_diagnostic: Option<String>,
     /// Only the tail of the client id, and only in developer mode.
@@ -199,13 +200,13 @@ impl YoutubeService {
             if let Some(id) =
                 self.db.get_setting(keys::CLIENT_ID).ok().flatten().filter(|s| !s.trim().is_empty())
             {
-                return Ok(self.apply_secret_policy(ClientCredentials {
+                return Ok(ClientCredentials {
                     client_id: id.trim().to_string(),
                     client_secret: self.tokens.stored_client_secret().unwrap_or_default(),
-                }));
+                });
             }
         }
-        ClientCredentials::built_in().map(|c| self.apply_secret_policy(c)).ok_or_else(|| {
+        ClientCredentials::resolve().ok_or_else(|| {
             LouverError::with_detail(
                 ErrorCode::YoutubeNotConnected,
                 "이 빌드에는 Louver Live의 YouTube 클라이언트가 포함되어 있지 않습니다. 릴리스 빌드에는 자동으로 포함됩니다.",
@@ -213,35 +214,12 @@ impl YoutubeService {
         })
     }
 
-    /// Drop the client secret unless the fallback has been switched on.
+    /// Does this build have a client secret to send?
     ///
-    /// The product's position is that a desktop application cannot keep a
-    /// secret, so PKCE alone should carry the exchange. If Google turns out to
-    /// refuse that for this client, the refusal is recorded verbatim and this
-    /// switch is how the fallback gets enabled — deliberately, with evidence,
-    /// rather than by shipping a secret just in case.
-    fn apply_secret_policy(&self, mut creds: ClientCredentials) -> ClientCredentials {
-        if !self.secret_fallback_enabled() {
-            creds.client_secret.clear();
-        }
-        creds
-    }
-
-    pub fn secret_fallback_enabled(&self) -> bool {
-        self.db.get_setting_or(keys::ALLOW_SECRET_FALLBACK, "false") == "true"
-    }
-
-    pub fn set_secret_fallback(&self, enabled: bool) -> Result<()> {
-        self.db.set_setting(keys::ALLOW_SECRET_FALLBACK, if enabled { "true" } else { "false" })?;
-        self.logger.info(
-            LogTarget::App,
-            if enabled {
-                "YouTube 토큰 교환에 client_secret을 함께 보냅니다 (fallback 켜짐)"
-            } else {
-                "YouTube 토큰 교환을 PKCE만으로 시도합니다 (기본값)"
-            },
-        );
-        Ok(())
+    /// The value is never returned, logged or stored — only whether there is
+    /// one, which is what the startup line and the UI need to know.
+    pub fn has_client_secret(&self) -> bool {
+        self.credentials().map(|c| c.has_secret()).unwrap_or(false)
     }
 
     /// The last token-endpoint failure, verbatim, for reporting.
@@ -286,7 +264,7 @@ impl YoutubeService {
             channel_title: self.db.get_setting(keys::CHANNEL_TITLE).ok().flatten(),
             has_credentials: self.has_credentials(),
             apply_on_start: self.apply_on_start_enabled(),
-            secret_fallback_enabled: self.secret_fallback_enabled(),
+            has_client_secret: self.has_client_secret(),
             last_auth_diagnostic: self.last_auth_diagnostic(),
             using_custom_client: self.developer_mode()
                 && client_id.as_deref().is_some_and(|c| !c.trim().is_empty()),

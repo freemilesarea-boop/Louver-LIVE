@@ -385,8 +385,31 @@ struct FakeTokenEndpoint {
     stop: Arc<std::sync::atomic::AtomicBool>,
 }
 
+/// Decides the response from the request body the fake received.
+type Decide = Box<dyn Fn(&str) -> (u16, String) + Send + Sync>;
+
 impl FakeTokenEndpoint {
     fn start(status: u16, payload: &'static str) -> Self {
+        Self::answering(Box::new(move |_| (status, payload.to_string())))
+    }
+
+    /// A token endpoint that behaves the way Google's does for this desktop
+    /// client: no `client_secret`, no token.
+    fn requiring_a_secret() -> Self {
+        Self::answering(Box::new(|body: &str| {
+            if body.contains("client_secret=") {
+                (200, r#"{"access_token":"at","refresh_token":"rt","expires_in":3599}"#.to_string())
+            } else {
+                (
+                    400,
+                    r#"{"error":"invalid_request","error_description":"client_secret is missing."}"#
+                        .to_string(),
+                )
+            }
+        }))
+    }
+
+    fn answering(decide: Decide) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let bodies = Arc::new(Mutex::new(Vec::new()));
@@ -418,6 +441,7 @@ impl FakeTokenEndpoint {
                         }
                         recorded.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
 
+                        let (status, payload) = decide(&String::from_utf8_lossy(&body));
                         let response = format!(
                             "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                             payload.len()
@@ -454,13 +478,12 @@ fn token_client(endpoint: &FakeTokenEndpoint) -> louver_core::youtube::http::Ure
 }
 
 #[test]
-fn the_exchange_carries_the_verifier_and_no_secret_by_default() {
+fn a_build_with_no_secret_sends_no_secret_field() {
     use louver_core::youtube::oauth::TokenEndpoint;
     let fake =
         FakeTokenEndpoint::start(200, r#"{"access_token":"at","refresh_token":"rt","expires_in":3599}"#);
     let http = token_client(&fake);
 
-    // An empty secret is the product's default: PKCE alone.
     let creds = louver_core::youtube::oauth::ClientCredentials {
         client_id: "cid.apps.googleusercontent.com".into(),
         client_secret: String::new(),
@@ -471,7 +494,56 @@ fn the_exchange_carries_the_verifier_and_no_secret_by_default() {
     let body = fake.last_body();
     assert!(body.contains("code_verifier=verifier-123"), "PKCE verifier must be sent: {body}");
     assert!(body.contains("grant_type=authorization_code"));
-    assert!(!body.contains("client_secret"), "no secret should be sent when the build carries none: {body}");
+    // An empty `client_secret=` is a different request from one without the
+    // field, and Google reads the two differently.
+    assert!(!body.contains("client_secret"), "{body}");
+}
+
+#[test]
+fn the_exchange_succeeds_against_an_endpoint_that_demands_the_secret() {
+    use louver_core::youtube::oauth::TokenEndpoint;
+    // Google's real answer for this desktop client, reproduced: the exchange
+    // is refused without a `client_secret` and accepted with one. This is the
+    // case that failed on a real Mac.
+    let fake = FakeTokenEndpoint::requiring_a_secret();
+    let http = token_client(&fake);
+
+    let without = louver_core::youtube::oauth::ClientCredentials {
+        client_id: "cid.apps.googleusercontent.com".into(),
+        client_secret: String::new(),
+    };
+    let refused = http.exchange_code(&without, "4/code", "http://127.0.0.1:9000", "v").unwrap_err();
+    assert_eq!(refused.code_str, "LL-YOUTUBE-002");
+    // Google's own words, kept whole, because they are what says how to fix it.
+    let detail = refused.detail.unwrap_or_default();
+    assert!(detail.contains("invalid_request"), "{detail}");
+    assert!(detail.contains("client_secret is missing"), "{detail}");
+
+    let with = louver_core::youtube::oauth::ClientCredentials {
+        client_id: "cid.apps.googleusercontent.com".into(),
+        client_secret: "GOCSPX-testsecret".into(),
+    };
+    let tok = http.exchange_code(&with, "4/code", "http://127.0.0.1:9000", "verifier-123").unwrap();
+    assert_eq!(tok.refresh_token.as_deref(), Some("rt"));
+
+    let body = fake.last_body();
+    assert!(body.contains("client_secret=GOCSPX-testsecret"), "{body}");
+    // And PKCE is still carried; the secret is in addition to it, not instead.
+    assert!(body.contains("code_verifier=verifier-123"), "{body}");
+}
+
+#[test]
+fn a_refresh_against_the_same_endpoint_also_carries_the_secret() {
+    use louver_core::youtube::oauth::TokenEndpoint;
+    // A refresh that omits it fails hours later, when nobody is watching.
+    let fake = FakeTokenEndpoint::requiring_a_secret();
+    let http = token_client(&fake);
+    let creds = louver_core::youtube::oauth::ClientCredentials {
+        client_id: "cid.apps.googleusercontent.com".into(),
+        client_secret: "GOCSPX-testsecret".into(),
+    };
+    http.refresh(&creds, "1//refresh-token").unwrap();
+    assert!(fake.last_body().contains("client_secret=GOCSPX-testsecret"));
 }
 
 #[test]

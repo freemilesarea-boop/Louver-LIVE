@@ -159,7 +159,6 @@ pub fn run() {
             commands::youtube::youtube_set_credentials,
             commands::youtube::youtube_begin_connect,
             commands::youtube::youtube_switch_account,
-            commands::youtube::youtube_set_secret_fallback,
             commands::youtube::youtube_disconnect,
             commands::youtube::youtube_get_metadata,
             commands::youtube::youtube_save_metadata,
@@ -189,6 +188,18 @@ pub fn run() {
             let paths = AppPaths::default_for_os();
             let state = AppState::build(handle.clone(), paths)?;
             state.logger.info(LogTarget::App, &format!("Louver Live {} 시작", louver_core::VERSION));
+
+            // Whether the OAuth client is configured, and nothing about what
+            // it is. Google answering "client_secret is missing" while the
+            // operator is certain they set the variable is a question these
+            // two lines settle in one look — and neither can leak a value,
+            // because neither has one to leak.
+            {
+                let (id, secret) = louver_core::youtube::oauth::credential_presence();
+                let word = |b: bool| if b { "configured" } else { "missing" };
+                state.logger.info(LogTarget::App, &format!("OAuth Client ID: {}", word(id)));
+                state.logger.info(LogTarget::App, &format!("OAuth Client Secret: {}", word(secret)));
+            }
 
             // Keep the "launch at startup" setting and the OS in agreement (§21).
             let autostart = platform::autostart::TauriAutostart::new(handle.clone());

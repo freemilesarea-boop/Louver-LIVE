@@ -43,7 +43,6 @@ export function createMockBackend(opts: MockOptions = {}) {
   const youtube = {
     connected: false,
     applyOnStart: true,
-    secretFallback: false,
     authDiagnostic: null as string | null,
     nextPresetId: 1,
     nextMessageId: 1,
@@ -592,7 +591,7 @@ export function createMockBackend(opts: MockOptions = {}) {
       has_credentials: true,
       apply_on_start: youtube.applyOnStart,
       using_custom_client: false,
-      secret_fallback_enabled: youtube.secretFallback,
+      has_client_secret: true,
       last_auth_diagnostic: youtube.authDiagnostic,
       client_id_hint: '…googleusercontent.com',
       secret_backend: 'macOS 키체인',
@@ -609,10 +608,6 @@ export function createMockBackend(opts: MockOptions = {}) {
       // UI path after consent can be driven.
       youtube.connected = true
       return 'https://accounts.google.com/o/oauth2/v2/auth?mock=1'
-    },
-    youtube_set_secret_fallback: (a: Record<string, unknown>) => {
-      youtube.secretFallback = Boolean(a.enabled)
-      return backend('youtube_status', {})
     },
     youtube_disconnect: () => {
       youtube.connected = false

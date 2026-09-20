@@ -46,15 +46,39 @@ pub const SCOPE: &str = "https://www.googleapis.com/auth/youtube.force-ssl";
 /// anyone else. Google documents this secret as not confidential for installed
 /// apps, which is why it can be distributed inside the binary; it is still
 /// kept out of this repository and out of the database.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientCredentials {
     pub client_id: String,
     pub client_secret: String,
 }
 
-/// Supplied at build time. `LOUVER_GOOGLE_CLIENT_ID` is the documented name;
-/// the older `LOUVER_YOUTUBE_*` pair is still read so existing build scripts
-/// keep working.
+/// Hand-written so `{:?}` cannot print the secret.
+///
+/// A derived `Debug` is the ordinary way a secret reaches a log: one
+/// `tracing::debug!` or `format!("{creds:?}")` anywhere above this and the
+/// value is on disk. The id is not secret and stays readable, because it is
+/// what makes a log line useful.
+impl std::fmt::Debug for ClientCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientCredentials")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &if self.has_secret() { "<configured>" } else { "<missing>" })
+            .finish()
+    }
+}
+
+/// Baked in when the release is built. `LOUVER_GOOGLE_CLIENT_ID` is the
+/// documented name; the older `LOUVER_YOUTUBE_*` pair is still read so
+/// existing build scripts keep working.
+///
+/// `option_env!` reads the environment **as rustc compiles this crate**, not
+/// as the app runs, and cargo has no way to know the macro depends on those
+/// variables — so a crate compiled without them stays compiled without them
+/// however the app is later launched. That is correct for a shipped binary,
+/// which must carry its own client rather than depend on the user's shell, and
+/// it is a trap during development: exporting the variables and running the
+/// existing build does nothing at all. [`ClientCredentials::resolve`] reads
+/// the live environment first for exactly that reason.
 pub const BUILT_IN_CLIENT_ID: Option<&str> = match option_env!("LOUVER_GOOGLE_CLIENT_ID") {
     Some(v) => Some(v),
     None => option_env!("LOUVER_YOUTUBE_CLIENT_ID"),
@@ -64,17 +88,49 @@ pub const BUILT_IN_CLIENT_SECRET: Option<&str> = match option_env!("LOUVER_GOOGL
     None => option_env!("LOUVER_YOUTUBE_CLIENT_SECRET"),
 };
 
+/// The environment variables that name the OAuth client, in the order read.
+const ID_VARS: [&str; 2] = ["LOUVER_GOOGLE_CLIENT_ID", "LOUVER_YOUTUBE_CLIENT_ID"];
+const SECRET_VARS: [&str; 2] = ["LOUVER_GOOGLE_CLIENT_SECRET", "LOUVER_YOUTUBE_CLIENT_SECRET"];
+
+/// A non-empty value for the first of these variables that has one.
+fn from_live_env(names: &[&str]) -> Option<String> {
+    names.iter().filter_map(|n| std::env::var(n).ok()).map(|v| v.trim().to_string()).find(|v| !v.is_empty())
+}
+
 impl ClientCredentials {
-    /// The client this build ships with, if it was given one.
+    /// The client this app should use: the live environment first, then
+    /// whatever was baked in at build time.
+    ///
+    /// The runtime lookup comes first so that exporting the variables and
+    /// launching an already-built binary does what everyone expects it to.
+    /// A shipped release has nothing in its environment and falls through to
+    /// the built-in pair.
+    pub fn resolve() -> Option<Self> {
+        let id = from_live_env(&ID_VARS)
+            .or_else(|| BUILT_IN_CLIENT_ID.map(|v| v.trim().to_string()))
+            .filter(|v| !v.is_empty())?;
+        let secret = from_live_env(&SECRET_VARS)
+            .or_else(|| BUILT_IN_CLIENT_SECRET.map(|v| v.trim().to_string()))
+            .unwrap_or_default();
+        Some(Self { client_id: id, client_secret: secret })
+    }
+
+    /// Kept as the older name; [`Self::resolve`] is what it now does.
     pub fn built_in() -> Option<Self> {
-        let id = BUILT_IN_CLIENT_ID?.trim();
-        if id.is_empty() {
-            return None;
-        }
-        Some(Self {
-            client_id: id.to_string(),
-            client_secret: BUILT_IN_CLIENT_SECRET.unwrap_or_default().trim().to_string(),
-        })
+        Self::resolve()
+    }
+
+    pub fn has_secret(&self) -> bool {
+        !self.client_secret.trim().is_empty()
+    }
+}
+
+/// Whether a client id and secret are available, and nothing about what they
+/// are. For the startup line that says `configured` or `missing`.
+pub fn credential_presence() -> (bool, bool) {
+    match ClientCredentials::resolve() {
+        Some(c) => (true, c.has_secret()),
+        None => (false, from_live_env(&SECRET_VARS).is_some()),
     }
 }
 

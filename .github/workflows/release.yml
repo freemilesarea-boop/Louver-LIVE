@@ -94,6 +94,13 @@ jobs:
           # SIGNING.md for how it is generated and where it lives.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # The OAuth client baked into the release, so the user never meets
+          # the Google Cloud console. Both are needed: Google refuses this
+          # desktop client's token exchange without the secret. A build
+          # without them still runs — the connect button says the build
+          # carries no client — so a fork can build without either.
+          LOUVER_GOOGLE_CLIENT_ID: ${{ secrets.LOUVER_GOOGLE_CLIENT_ID }}
+          LOUVER_GOOGLE_CLIENT_SECRET: ${{ secrets.LOUVER_GOOGLE_CLIENT_SECRET }}
         with:
           args: --target ${{ matrix.target }}
 

@@ -639,14 +639,17 @@ function YoutubeAccountCard() {
                 placeholder="클라이언트 보안 비밀"
                 onChange={(e) => setClientSecret(e.target.value)}
               />
-              <Toggle
-                label="토큰 교환에 client_secret 함께 보내기"
-                hint="기본값은 꺼짐 — PKCE만으로 교환합니다. Google이 거부한 기록을 확인한 뒤에만 켜세요."
-                checked={yt.secret_fallback_enabled}
-                onChange={(v) => {
-                  api.youtubeSetSecretFallback(v).then(setYt).catch(reportError)
-                }}
-              />
+              {/* Not a switch any more. Google refuses this desktop client's
+                  token exchange without a client_secret — "invalid_request:
+                  client_secret is missing" — so it is always sent when the
+                  build has one. All that is left to show is whether it does,
+                  never what it is. */}
+              <p className="text-xs text-ink-500">
+                토큰 교환에는 client_secret이 항상 함께 전송됩니다.
+                이 빌드의 보안 비밀: <span className={yt.has_client_secret ? 'text-ok' : 'text-warn'}>
+                  {yt.has_client_secret ? 'configured' : 'missing'}
+                </span>
+              </p>
               <Button
                 size="sm"
                 onClick={async () => {
