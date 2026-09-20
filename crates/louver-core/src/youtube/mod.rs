@@ -37,6 +37,14 @@ pub mod keys {
     pub const CHAT_AVOID_REPEATS: &str = "youtube_chat_avoid_repeats";
     /// Overridden by the test harness to point at a local fake.
     pub const API_BASE: &str = "youtube_api_base";
+    /// Send `client_secret` in the token exchange after all.
+    ///
+    /// Off by default: the exchange is attempted with PKCE alone. Turned on
+    /// only with evidence that Google refused the secret-less exchange for
+    /// this client, which the app records verbatim when it happens.
+    pub const ALLOW_SECRET_FALLBACK: &str = "youtube_allow_secret_fallback";
+    /// The last token-endpoint failure, kept so it can be reported.
+    pub const LAST_AUTH_DIAGNOSTIC: &str = "youtube_last_auth_diagnostic";
 }
 
 /// A saved set of broadcast metadata (§4).

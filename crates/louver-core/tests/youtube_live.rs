@@ -298,3 +298,135 @@ fn an_unreachable_google_is_an_error_value_not_a_panic() {
     let err = api.send_chat_message("tok", "chat", "hi").unwrap_err();
     assert_eq!(err.code_str, "LL-YOUTUBE-004");
 }
+
+// --- token exchange -------------------------------------------------------
+
+/// A stand-in for Google's token endpoint that records the form it was sent.
+struct FakeTokenEndpoint {
+    url: String,
+    bodies: Arc<Mutex<Vec<String>>>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FakeTokenEndpoint {
+    fn start(status: u16, payload: &'static str) -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let recorded = Arc::clone(&bodies);
+        let stopping = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut line = String::new();
+                        let _ = reader.read_line(&mut line);
+                        let mut length = 0usize;
+                        loop {
+                            let mut h = String::new();
+                            if reader.read_line(&mut h).is_err() || h.trim().is_empty() {
+                                break;
+                            }
+                            if let Some(v) = h.to_ascii_lowercase().strip_prefix("content-length:") {
+                                length = v.trim().parse().unwrap_or(0);
+                            }
+                        }
+                        let mut body = vec![0u8; length];
+                        if length > 0 {
+                            let _ = reader.read_exact(&mut body);
+                        }
+                        recorded.lock().unwrap().push(String::from_utf8_lossy(&body).into_owned());
+
+                        let response = format!(
+                            "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                        let _ = stream.flush();
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Self { url: format!("http://127.0.0.1:{port}/token"), bodies, stop }
+    }
+
+    fn last_body(&self) -> String {
+        self.bodies.lock().unwrap().last().cloned().unwrap_or_default()
+    }
+}
+
+impl Drop for FakeTokenEndpoint {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn token_client(endpoint: &FakeTokenEndpoint) -> louver_core::youtube::http::UreqClient {
+    let mut c = louver_core::youtube::http::UreqClient::new();
+    c.token_endpoint = Some(endpoint.url.clone());
+    c
+}
+
+#[test]
+fn the_exchange_carries_the_verifier_and_no_secret_by_default() {
+    use louver_core::youtube::oauth::TokenEndpoint;
+    let fake =
+        FakeTokenEndpoint::start(200, r#"{"access_token":"at","refresh_token":"rt","expires_in":3599}"#);
+    let http = token_client(&fake);
+
+    // An empty secret is the product's default: PKCE alone.
+    let creds = louver_core::youtube::oauth::ClientCredentials {
+        client_id: "cid.apps.googleusercontent.com".into(),
+        client_secret: String::new(),
+    };
+    let tok = http.exchange_code(&creds, "4/code", "http://127.0.0.1:9000", "verifier-123").unwrap();
+    assert_eq!(tok.refresh_token.as_deref(), Some("rt"));
+
+    let body = fake.last_body();
+    assert!(body.contains("code_verifier=verifier-123"), "PKCE verifier must be sent: {body}");
+    assert!(body.contains("grant_type=authorization_code"));
+    assert!(!body.contains("client_secret"), "no secret should be sent when the build carries none: {body}");
+}
+
+#[test]
+fn a_secret_is_sent_only_when_the_build_actually_has_one() {
+    use louver_core::youtube::oauth::TokenEndpoint;
+    let fake = FakeTokenEndpoint::start(200, r#"{"access_token":"at","expires_in":3599}"#);
+    let http = token_client(&fake);
+    let creds = louver_core::youtube::oauth::ClientCredentials {
+        client_id: "cid".into(),
+        client_secret: "GOCSPX-xyz".into(),
+    };
+    http.exchange_code(&creds, "4/code", "http://127.0.0.1:9000", "v").unwrap();
+    assert!(fake.last_body().contains("client_secret=GOCSPX-xyz"));
+}
+
+#[test]
+fn a_refusal_is_reported_in_googles_own_words() {
+    // This is the evidence that decides whether a secret is needed at all, so
+    // none of it may be summarised away.
+    use louver_core::youtube::oauth::TokenEndpoint;
+    let fake = FakeTokenEndpoint::start(
+        400,
+        r#"{"error":"invalid_request","error_description":"client_secret is missing."}"#,
+    );
+    let http = token_client(&fake);
+    let creds = louver_core::youtube::oauth::ClientCredentials {
+        client_id: "cid".into(),
+        client_secret: String::new(),
+    };
+    let err = http.exchange_code(&creds, "4/code", "http://127.0.0.1:9000", "v").unwrap_err();
+    let detail = err.detail.unwrap();
+    assert!(detail.contains("HTTP 400"), "{detail}");
+    assert!(detail.contains("invalid_request"), "{detail}");
+    assert!(detail.contains("client_secret is missing."), "{detail}");
+}

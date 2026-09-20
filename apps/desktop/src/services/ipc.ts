@@ -147,6 +147,8 @@ export const api = {
   youtubeBeginConnect: () => call<string>('youtube_begin_connect'),
   youtubeSwitchAccount: () => call<string>('youtube_switch_account'),
   youtubeDisconnect: () => call<YoutubeStatus>('youtube_disconnect'),
+  youtubeSetSecretFallback: (enabled: boolean) =>
+    call<YoutubeStatus>('youtube_set_secret_fallback', { enabled }),
   youtubeGetMetadata: () => call<BroadcastMetadata>('youtube_get_metadata'),
   youtubeSaveMetadata: (metadata: BroadcastMetadata) =>
     call<BroadcastMetadata>('youtube_save_metadata', { metadata }),

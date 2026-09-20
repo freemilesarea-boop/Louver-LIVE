@@ -51,41 +51,81 @@
 - 애플리케이션 유형: **데스크톱 앱**
 - 이름: `Louver Live Desktop`
 
-**클라이언트 ID와 보안 비밀을 빌드에 넣습니다. 저장소에는 넣지 않습니다.**
+**클라이언트 ID를 빌드에 넣습니다. 저장소에는 넣지 않습니다.**
 
 ```bash
 export LOUVER_GOOGLE_CLIENT_ID="000000-xxxx.apps.googleusercontent.com"
-export LOUVER_GOOGLE_CLIENT_SECRET="GOCSPX-..."
 npm run build
 ```
 
-CI에서는 저장소 시크릿 `LOUVER_GOOGLE_CLIENT_ID` / `LOUVER_GOOGLE_CLIENT_SECRET`
-으로 넣습니다. `npm run secret-scan`이 이 값들이 작업 트리나 커밋 기록에
-들어가면 빌드를 막습니다.
+`LOUVER_GOOGLE_CLIENT_SECRET`은 **넣지 않는 것이 기본**입니다 — 아래
+"client_secret에 대하여"를 보세요. Google이 secret 없는 교환을 거부한다는 실제
+증거가 나온 뒤에만 넣습니다.
+
+CI에서는 저장소 시크릿 `LOUVER_GOOGLE_CLIENT_ID`로 주입합니다.
+`npm run secret-scan`이 이 값들이 작업 트리나 커밋 기록에 들어가면 빌드를
+막습니다.
 
 ---
 
-## 왜 client_secret이 아직 필요한가
+## client_secret에 대하여 — 그리고 이전 문서의 정정
 
-PKCE를 쓰면 공개 클라이언트는 보통 secret 없이 토큰을 교환할 수 있습니다.
-**Google의 데스크톱 앱 클라이언트는 예외**로, PKCE를 써도 토큰 교환 요청에
-`client_secret`을 요구합니다
-([Google Developer forums](https://discuss.google.dev/t/desktop-oauth-pkce-exchange-returns-invalid-request-after-successful-loopback-callback-with-no-client-secret/390526),
-[OAuth 2.0 for iOS & Desktop Apps](https://developers.google.com/identity/protocols/oauth2/native-app)).
+**이전 판에서 "Google 데스크톱 클라이언트는 PKCE를 써도 client_secret이 반드시
+필요하다"고 단정했습니다. 그 근거는 공식 문서가 아니라 포럼 글이었습니다.
+단정을 철회합니다.**
 
-그래서 Louver Live는 **둘 다** 씁니다.
+### 확인한 것 (Google 공식 소스)
 
-- **PKCE (S256)** — 가로챈 authorization code를 다른 프로그램이 교환하지
-  못하게 막습니다. 매 요청마다 새 `code_verifier`를 만들고, 브라우저로 나가는
-  URL에는 해시(`code_challenge`)만 실립니다. RFC 7636 부록 B의 테스트 벡터로
-  구현을 검증합니다.
-- **client_secret** — Google이 요구하므로 빌드에 포함합니다. 데스크톱 앱에
-  배포되는 값이라 그 자체로는 아무것도 지켜주지 못하며, Google도 설치형 앱의
-  secret을 기밀로 보지 않습니다. **사용자에게는 절대 입력시키지 않습니다.**
+Google의 OpenID Connect discovery 문서를 직접 받아 확인했습니다
+(<https://accounts.google.com/.well-known/openid-configuration>):
 
-`state`와 `code_verifier`는 OS 난수원에서 만듭니다.
+```json
+"token_endpoint": "https://oauth2.googleapis.com/token",
+"token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
+"code_challenge_methods_supported": ["plain", "S256"]
+```
 
----
+- **PKCE S256은 공식적으로 지원됩니다.**
+- 토큰 엔드포인트가 광고하는 인증 방식은 `client_secret_post`와
+  `client_secret_basic` 둘뿐이고, 공개 클라이언트(비밀 없음)를 뜻하는 `none`은
+  **목록에 없습니다.**
+
+### 확인하지 못한 것
+
+`none`이 없다는 사실은 시사적이지만 **Desktop 클라이언트에 대한 결론은
+아닙니다.** discovery 문서는 OpenID Connect 용도로 광고되는 값이고, 설치형 앱의
+토큰 교환에서 `client_secret`이 필수인지 선택인지는 여기서 단정할 수 없습니다.
+`developers.google.com`은 이 저장소의 네트워크에서 차단되어 있어 공식
+네이티브 앱 문서를 직접 읽지 못했습니다.
+
+### 그래서 이렇게 설계했습니다 — 주장 대신 측정
+
+기본 동작은 **client_secret 없이 PKCE만으로 토큰을 교환하는 것**입니다.
+
+- 빌드에 secret이 없으면 `client_secret` 파라미터를 **아예 보내지 않습니다**
+  (빈 값으로 보내지 않습니다).
+- Google이 거부하면, 응답을 **그대로** 기록합니다: HTTP status, `error`,
+  `error_description`. 요약하지 않습니다 — `invalid_request`와
+  `invalid_client`는 다른 이야기이기 때문입니다.
+- 기록된 내용은 설정 화면과 `app.log`에 남고, `youtube_last_auth_diagnostic`
+  설정에도 보관됩니다.
+- fallback(`client_secret`을 함께 보내기)은 **기본값이 꺼져 있고**, 위 근거를
+  보고 판단한 뒤에만 켭니다.
+
+따라서 **3번 절차대로 secret 없이 성공하면, Production 빌드에 client_secret을
+넣지 않습니다.** `LOUVER_GOOGLE_CLIENT_SECRET` 없이 빌드하면 됩니다.
+
+### 실패했을 때 보고할 것
+
+연결이 실패하면 설정 → YouTube에 나오는 한 줄과 `app.log`의 해당 줄을 그대로
+알려주세요. 이런 모양입니다.
+
+```
+YouTube 연결 실패: LL-YOUTUBE-002 · HTTP 400 · invalid_request: client_secret is missing.
+```
+
+이 한 줄이 fallback이 필요한지 아닌지를 결정합니다. 토큰이나 비밀 값은 포함되지
+않습니다.
 
 ## 4. 검증 (verification)
 
@@ -127,7 +167,11 @@ PKCE를 쓰면 공개 클라이언트는 보통 secret 없이 토큰을 교환�
 
 | 항목 | 상태 |
 | --- | --- |
+| PKCE S256을 Google이 지원함 | **확인됨** — discovery 문서를 직접 받아 확인 |
 | PKCE S256, RFC 7636 테스트 벡터 일치 | **PASS** — 단위 테스트 |
+| 기본 동작이 client_secret 없는 교환 | **PASS** — 실제로 나간 폼 본문으로 확인 |
+| secret이 있을 때만 전송 | **PASS** — 같은 테스트 |
+| 거부 응답을 status·error·error_description 그대로 기록 | **PASS** — 단위 테스트 |
 | `code_verifier`가 브라우저 URL에 실리지 않음 | **PASS** — 단위 테스트 |
 | 매 요청마다 새 verifier·state, OS 난수원 사용 | **PASS** — 단위 테스트 |
 | 토큰 교환에 `code_verifier` 포함 | **PASS** — 단위 테스트 |
@@ -138,6 +182,7 @@ PKCE를 쓰면 공개 클라이언트는 보통 secret 없이 토큰을 교환�
 | 빌드 시 `LOUVER_GOOGLE_CLIENT_ID` 주입이 실제로 동작 | **PASS** — 주입 후 앱을 띄워 버튼이 활성화되는 것 확인 |
 | 브라우저를 열지 못하면 주소를 보여줌 | **PASS** — UI 테스트 |
 | 브라우저 열기 권한이 Google 동의 화면 한 곳으로 제한됨 | **PASS** — `capabilities/default.json`, Tauri가 빌드 시 검증 |
+| **client_secret 없이 실제 Google 토큰 교환 성공 여부** | **NOT TESTED** — Mac에서 확인할 핵심 항목 |
 | **실제 Google 계정으로 연결** | **NOT TESTED** — 클라이언트 생성 후 확인 |
 | **Google 검증 통과** | **NOT TESTED** |
 
@@ -145,5 +190,6 @@ PKCE를 쓰면 공개 클라이언트는 보통 secret 없이 토큰을 교환�
 
 - [OAuth 2.0 for iOS & Desktop Apps](https://developers.google.com/identity/protocols/oauth2/native-app)
 - [Sensitive scope verification](https://developers.google.com/identity/protocols/oauth2/production-readiness/sensitive-scope-verification)
-- [Desktop OAuth PKCE exchange requires a client secret (Google Developer forums)](https://discuss.google.dev/t/desktop-oauth-pkce-exchange-returns-invalid-request-after-successful-loopback-callback-with-no-client-secret/390526)
+- [Google OpenID Connect discovery 문서](https://accounts.google.com/.well-known/openid-configuration) — 이 저장소에서 직접 받아 확인한 유일한 1차 자료
+- [Desktop OAuth PKCE 관련 포럼 글](https://discuss.google.dev/t/desktop-oauth-pkce-exchange-returns-invalid-request-after-successful-loopback-callback-with-no-client-secret/390526) — **참고용. 공식 문서가 아니므로 근거로 쓰지 않습니다.**
 - [OAuth 2.0 for Mobile & Desktop Apps — YouTube Data API](https://developers.google.com/youtube/v3/guides/auth/installed-apps)

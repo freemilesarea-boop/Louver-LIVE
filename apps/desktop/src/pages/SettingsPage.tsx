@@ -569,6 +569,18 @@ function YoutubeAccountCard() {
             </p>
           )}
           {yt.connecting_error && <p className="mt-2 text-xs text-live">{yt.connecting_error}</p>}
+          {yt.last_auth_diagnostic && (
+            <div className="mt-2 rounded border border-ink-700 p-2">
+              <p className="text-[11px] uppercase tracking-wider text-ink-500">
+                마지막 토큰 응답
+              </p>
+              {/* Google's own words, unsummarised: this is what decides whether
+                  a client secret is needed at all. */}
+              <p className="mt-1 break-all font-mono text-[11px] text-ink-300">
+                {yt.last_auth_diagnostic}
+              </p>
+            </div>
+          )}
         </>
       )}
 
@@ -601,6 +613,14 @@ function YoutubeAccountCard() {
                 aria-label="OAuth 클라이언트 보안 비밀"
                 placeholder="클라이언트 보안 비밀"
                 onChange={(e) => setClientSecret(e.target.value)}
+              />
+              <Toggle
+                label="토큰 교환에 client_secret 함께 보내기"
+                hint="기본값은 꺼짐 — PKCE만으로 교환합니다. Google이 거부한 기록을 확인한 뒤에만 켜세요."
+                checked={yt.secret_fallback_enabled}
+                onChange={(v) => {
+                  api.youtubeSetSecretFallback(v).then(setYt).catch(reportError)
+                }}
               />
               <Button
                 size="sm"

@@ -43,6 +43,16 @@ pub fn youtube_switch_account(state: State<'_, AppState>) -> CmdResult<String> {
     state.youtube.begin_connect(true)
 }
 
+/// Send `client_secret` in the token exchange after all (§4).
+///
+/// Off by default. Turned on only after Google has been seen to refuse the
+/// PKCE-only exchange, which the app records verbatim.
+#[tauri::command]
+pub fn youtube_set_secret_fallback(state: State<'_, AppState>, enabled: bool) -> CmdResult<YoutubeStatus> {
+    state.youtube.set_secret_fallback(enabled)?;
+    Ok(state.youtube.status())
+}
+
 #[tauri::command]
 pub fn youtube_disconnect(state: State<'_, AppState>) -> CmdResult<YoutubeStatus> {
     state.youtube.disconnect()?;

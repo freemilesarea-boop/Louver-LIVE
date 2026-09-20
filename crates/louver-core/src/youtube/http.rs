@@ -89,27 +89,33 @@ impl TokenEndpoint for UreqClient {
         redirect_uri: &str,
         code_verifier: &str,
     ) -> Result<TokenResponse> {
-        // `client_secret` is here because Google requires it for installed-app
-        // clients even alongside PKCE. The verifier is what actually protects
-        // the code; the secret ships in the binary and protects nothing on its
-        // own, which is why the user is never asked for it.
-        self.post_token(&[
+        // PKCE is what protects the code. `client_secret` is sent only when
+        // this build actually carries one — a desktop application cannot keep
+        // a secret, so the default is to exchange without one and let Google's
+        // own answer decide, rather than shipping a secret on an assumption.
+        let mut form: Vec<(&str, &str)> = vec![
             ("code", code),
             ("client_id", &creds.client_id),
-            ("client_secret", &creds.client_secret),
             ("redirect_uri", redirect_uri),
             ("grant_type", "authorization_code"),
             ("code_verifier", code_verifier),
-        ])
+        ];
+        if !creds.client_secret.is_empty() {
+            form.push(("client_secret", &creds.client_secret));
+        }
+        self.post_token(&form)
     }
 
     fn refresh(&self, creds: &ClientCredentials, refresh_token: &str) -> Result<TokenResponse> {
-        self.post_token(&[
+        let mut form: Vec<(&str, &str)> = vec![
             ("refresh_token", refresh_token),
             ("client_id", &creds.client_id),
-            ("client_secret", &creds.client_secret),
             ("grant_type", "refresh_token"),
-        ])
+        ];
+        if !creds.client_secret.is_empty() {
+            form.push(("client_secret", &creds.client_secret));
+        }
+        self.post_token(&form)
     }
 }
 
@@ -124,12 +130,20 @@ impl UreqClient {
 
         match result {
             Ok(mut resp) => {
+                let status = resp.status().as_u16();
                 let text = resp.body_mut().read_to_string().unwrap_or_default();
-                serde_json::from_str(&text).map_err(|_| {
-                    // The body of a token failure names the reason, and it is
-                    // almost always an expired or revoked grant.
-                    LouverError::with_detail(ErrorCode::YoutubeAuthExpired, first_line_of_error(&text))
-                })
+                if let Ok(token) = serde_json::from_str::<TokenResponse>(&text) {
+                    return Ok(token);
+                }
+                // Keep everything Google said. Whether a desktop client can
+                // exchange a code without a client_secret is a question this
+                // project answers by measurement, and the answer is in this
+                // body: the status, `error` and `error_description`. None of
+                // it contains a token or a secret.
+                Err(LouverError::with_detail(
+                    ErrorCode::YoutubeAuthExpired,
+                    describe_token_failure(status, &text),
+                ))
             }
             Err(ureq::Error::StatusCode(code)) => Err(LouverError::with_detail(
                 ErrorCode::YoutubeAuthExpired,
@@ -148,9 +162,21 @@ fn form_encode(pairs: &[(&str, &str)]) -> String {
         .join("&")
 }
 
-fn first_line_of_error(body: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v["error_description"].as_str().or_else(|| v["error"].as_str()).map(str::to_string))
-        .unwrap_or_else(|| body.chars().take(120).collect())
+/// A one-line, complete account of why a token request failed.
+///
+/// Verbatim on purpose: `invalid_request` with "client_secret is missing" and
+/// `invalid_client` mean different things, and a summarised message loses the
+/// distinction this project needs in order to decide whether a secret is
+/// required at all.
+pub fn describe_token_failure(status: u16, body: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+    let field = |k: &str| parsed.as_ref().and_then(|v| v[k].as_str()).map(str::to_string).unwrap_or_default();
+    let error = field("error");
+    let description = field("error_description");
+    match (error.is_empty(), description.is_empty()) {
+        (true, true) => format!("HTTP {status} · {}", body.chars().take(200).collect::<String>()),
+        (false, true) => format!("HTTP {status} · {error}"),
+        (true, false) => format!("HTTP {status} · {description}"),
+        (false, false) => format!("HTTP {status} · {error}: {description}"),
+    }
 }

@@ -133,6 +133,7 @@ pub fn run() {
             commands::youtube::youtube_set_credentials,
             commands::youtube::youtube_begin_connect,
             commands::youtube::youtube_switch_account,
+            commands::youtube::youtube_set_secret_fallback,
             commands::youtube::youtube_disconnect,
             commands::youtube::youtube_get_metadata,
             commands::youtube::youtube_save_metadata,

@@ -55,6 +55,10 @@ pub struct YoutubeStatus {
     pub apply_on_start: bool,
     /// True when a developer has overridden the built-in OAuth client.
     pub using_custom_client: bool,
+    /// False means the token exchange is attempted with PKCE alone.
+    pub secret_fallback_enabled: bool,
+    /// The token endpoint's own words about the last failure, if any.
+    pub last_auth_diagnostic: Option<String>,
     /// Only the tail of the client id, and only in developer mode.
     pub client_id_hint: Option<String>,
     /// Where the refresh token is kept, so the user can see it is not the DB.
@@ -93,18 +97,54 @@ impl YoutubeService {
             if let Some(id) =
                 self.db.get_setting(keys::CLIENT_ID).ok().flatten().filter(|s| !s.trim().is_empty())
             {
-                return Ok(ClientCredentials {
+                return Ok(self.apply_secret_policy(ClientCredentials {
                     client_id: id.trim().to_string(),
                     client_secret: self.tokens.stored_client_secret().unwrap_or_default(),
-                });
+                }));
             }
         }
-        ClientCredentials::built_in().ok_or_else(|| {
+        ClientCredentials::built_in().map(|c| self.apply_secret_policy(c)).ok_or_else(|| {
             LouverError::with_detail(
                 ErrorCode::YoutubeNotConnected,
                 "이 빌드에는 Louver Live의 YouTube 클라이언트가 포함되어 있지 않습니다. 릴리스 빌드에는 자동으로 포함됩니다.",
             )
         })
+    }
+
+    /// Drop the client secret unless the fallback has been switched on.
+    ///
+    /// The product's position is that a desktop application cannot keep a
+    /// secret, so PKCE alone should carry the exchange. If Google turns out to
+    /// refuse that for this client, the refusal is recorded verbatim and this
+    /// switch is how the fallback gets enabled — deliberately, with evidence,
+    /// rather than by shipping a secret just in case.
+    fn apply_secret_policy(&self, mut creds: ClientCredentials) -> ClientCredentials {
+        if !self.secret_fallback_enabled() {
+            creds.client_secret.clear();
+        }
+        creds
+    }
+
+    pub fn secret_fallback_enabled(&self) -> bool {
+        self.db.get_setting_or(keys::ALLOW_SECRET_FALLBACK, "false") == "true"
+    }
+
+    pub fn set_secret_fallback(&self, enabled: bool) -> Result<()> {
+        self.db.set_setting(keys::ALLOW_SECRET_FALLBACK, if enabled { "true" } else { "false" })?;
+        self.logger.info(
+            LogTarget::App,
+            if enabled {
+                "YouTube 토큰 교환에 client_secret을 함께 보냅니다 (fallback 켜짐)"
+            } else {
+                "YouTube 토큰 교환을 PKCE만으로 시도합니다 (기본값)"
+            },
+        );
+        Ok(())
+    }
+
+    /// The last token-endpoint failure, verbatim, for reporting.
+    pub fn last_auth_diagnostic(&self) -> Option<String> {
+        self.db.get_setting(keys::LAST_AUTH_DIAGNOSTIC).ok().flatten().filter(|s| !s.is_empty())
     }
 
     fn developer_mode(&self) -> bool {
@@ -144,6 +184,8 @@ impl YoutubeService {
             channel_title: self.db.get_setting(keys::CHANNEL_TITLE).ok().flatten(),
             has_credentials: self.has_credentials(),
             apply_on_start: self.apply_on_start_enabled(),
+            secret_fallback_enabled: self.secret_fallback_enabled(),
+            last_auth_diagnostic: self.last_auth_diagnostic(),
             using_custom_client: self.developer_mode()
                 && client_id.as_deref().is_some_and(|c| !c.trim().is_empty()),
             // Only the tail, and only of the id, which is not a secret. Shown
@@ -220,6 +262,7 @@ impl YoutubeService {
 
                 match outcome {
                     Ok(ch) => {
+                        let _ = db.set_setting(keys::LAST_AUTH_DIAGNOSTIC, "");
                         let _ = db.set_setting(keys::CHANNEL_ID, &ch.id);
                         let _ = db.set_setting(keys::CHANNEL_TITLE, &ch.title);
                         // The channel name is not a secret; the token is, and
@@ -230,8 +273,17 @@ impl YoutubeService {
                         );
                     }
                     Err(e) => {
-                        *connecting.lock().unwrap() = Some(e.message.clone());
-                        logger.warn(LogTarget::App, &format!("YouTube 연결 실패: {}", e.code_str));
+                        // The detail is the token endpoint's own words: status,
+                        // error and error_description. Kept so the question of
+                        // whether this client needs a secret is settled by
+                        // evidence rather than by argument.
+                        let detail = e.detail.clone().unwrap_or_else(|| e.message.clone());
+                        let _ = db.set_setting(keys::LAST_AUTH_DIAGNOSTIC, &detail);
+                        *connecting.lock().unwrap() = Some(format!("{} ({})", e.message, detail));
+                        logger.warn(
+                            LogTarget::App,
+                            &format!("YouTube 연결 실패: {} · {}", e.code_str, detail),
+                        );
                     }
                 }
             })
