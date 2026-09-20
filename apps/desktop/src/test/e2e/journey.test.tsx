@@ -607,3 +607,83 @@ describe('broadcast settings and the chat bot', () => {
     expect(await screen.findByRole('button', { name: 'YouTube 계정 연결' }, polled)).toBeInTheDocument()
   })
 })
+
+describe('broadcasting without a Google account', () => {
+  it('puts the stream key first and marks the YouTube card optional', async () => {
+    const user = userEvent.setup()
+    mount({ hasStreamKey: false })
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '설정')
+
+    // The basic card is what a broadcast actually needs, so it comes first and
+    // says out loud that nothing else is required.
+    const basic = await screen.findByRole('heading', { name: '기본 송출' })
+    expect(screen.getByText(/방송에 필요한 것은 스트림 키 하나뿐입니다/)).toBeInTheDocument()
+    expect(screen.getByLabelText('YouTube 스트림 키')).toBeInTheDocument()
+
+    const advanced = screen.getByRole('heading', { name: 'YouTube 고급 기능 (선택)' })
+    expect(screen.getByText(/선택 기능입니다\. 방송만 사용하려면 연결할 필요가 없습니다\./))
+      .toBeInTheDocument()
+
+    // Order matters as much as wording: the optional card must not be the
+    // first thing a new user meets.
+    expect(basic.compareDocumentPosition(advanced))
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+  })
+
+  it('goes live with nothing but a stream key, never connecting an account', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    expect((backend('youtube_status', {}) as { connected: boolean }).connected).toBe(false)
+
+    await buildPlaylist(user)
+    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
+    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
+    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
+
+    await gotoPage(user, '대시보드')
+    await user.click(await screen.findByRole('button', { name: /방송 시작/ }))
+    await user.click(await screen.findByRole('button', { name: '확인하고 시작' }))
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+    })
+    // Three steps — 영상 추가, 스트림 키, 방송 시작 — and no Google consent in
+    // between. The account is still disconnected on a live stream.
+    expect((backend('youtube_status', {}) as { connected: boolean }).connected).toBe(false)
+    expect(screen.queryByText(/Google/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/계정을 연결/)).not.toBeInTheDocument()
+  })
+
+  it('keeps the broadcast running when the YouTube side fails', async () => {
+    const user = userEvent.setup()
+    mount({ youtubeApiFails: true })
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
+    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
+    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
+
+    await gotoPage(user, '대시보드')
+    await user.click(await screen.findByRole('button', { name: /방송 시작/ }))
+    await user.click(await screen.findByRole('button', { name: '확인하고 시작' }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+    })
+
+    // Connect the optional half, then let its API fail. §12: metadata and chat
+    // are the only casualties — FFmpeg is not one of them.
+    await gotoPage(user, '설정')
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    await screen.findByRole('button', { name: '연결 해제' }, { timeout: 6000 })
+
+    await gotoPage(user, '방송 설정')
+    await user.click(await screen.findByRole('button', { name: /지금 YouTube에 적용/ }))
+    expect(await screen.findByText('LL-YOUTUBE-004')).toBeInTheDocument()
+    await user.click(screen.getAllByRole('button', { name: '알림 닫기' })[0]!)
+
+    await gotoPage(user, '대시보드')
+    expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+  })
+})

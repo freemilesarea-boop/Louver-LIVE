@@ -47,7 +47,10 @@ export function SettingsPage() {
         />
       </Card>
 
-      <Card title="송출">
+      <Card title="기본 송출">
+        <p className="mb-3 text-xs text-ink-500">
+          방송에 필요한 것은 스트림 키 하나뿐입니다. Google 로그인도, 개발자 설정도 필요하지 않습니다.
+        </p>
         <Field label="RTMPS 서버 주소">
           <Input
             aria-label="RTMPS 서버 주소"
@@ -137,6 +140,8 @@ export function SettingsPage() {
         />
       </Card>
 
+      <YoutubeAccountCard />
+
       <Card title="저장공간">
         <Field label="캐시 위치"><Input readOnly value={s.cache_location} aria-label="캐시 위치" /></Field>
         <div className="flex items-center justify-between py-2">
@@ -153,8 +158,6 @@ export function SettingsPage() {
           </Button>
         </div>
       </Card>
-
-      <YoutubeAccountCard />
 
       <Card title="라이선스">
         <div className="flex items-start justify-between gap-4">
@@ -494,7 +497,13 @@ function YoutubeAccountCard() {
   }
 
   return (
-    <Card title="YouTube">
+    <Card title="YouTube 고급 기능 (선택)">
+      {/* The whole point of this card is that it can be ignored. A person who
+          only wants to broadcast has already finished above. */}
+      <p className="mb-3 text-xs text-ink-500">
+        연결하면 방송 제목·설명·태그를 앱에서 바꾸고, 자동 라이브 채팅을 쓸 수 있습니다.
+        <span className="text-ink-400"> 선택 기능입니다. 방송만 사용하려면 연결할 필요가 없습니다.</span>
+      </p>
       {yt.connected ? (
         <>
           <dl className="space-y-2">
@@ -529,12 +538,8 @@ function YoutubeAccountCard() {
           <dl className="space-y-2">
             <Row label="상태" value={<span className="text-ink-400">연결되지 않음</span>} />
           </dl>
-          <p className="mt-2 text-xs text-ink-500">
-            연결하면 방송 제목·설명·태그를 앱에서 바꾸고 자동 채팅을 쓸 수 있습니다.
-            영상 송출은 연결과 상관없이 그대로 동작합니다.
-          </p>
           <div className="mt-3 border-t border-ink-700 pt-3">
-            <Button variant="primary" onClick={() => void connect(false)} disabled={!yt.has_credentials || waiting}>
+            <Button onClick={() => void connect(false)} disabled={!yt.has_credentials || waiting}>
               {waiting ? '브라우저에서 진행 중…' : 'YouTube 계정 연결'}
             </Button>
           </div>

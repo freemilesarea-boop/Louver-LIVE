@@ -3,15 +3,22 @@
 여러 개의 완성된 음악 영상을 넣어두면, 지정한 시간 동안 자동으로 순차 반복하며
 YouTube Live로 송출하는 데스크톱 프로그램입니다.
 
-OBS 같은 범용 방송 프로그램이 아닙니다. 사용하는 방법은 네 단계뿐입니다.
+OBS 같은 범용 방송 프로그램이 아닙니다. 기본 사용법은 세 단계뿐입니다.
 
 1. 영상 넣기
-2. 순서 정하기
-3. 방송 시간 정하기
-4. 방송 시작
+2. YouTube 스트림 키 입력
+3. 방송 시작
 
-방송 제목·설명·태그와 자동 라이브 채팅은 앱 안에서 설정합니다 (YouTube Studio를
-열 필요가 없습니다). 준비 방법은 [YOUTUBE_SETUP.md](YOUTUBE_SETUP.md).
+이게 전부입니다. **Google 로그인, OAuth, YouTube Data API, Google Cloud 설정은
+하나도 필요하지 않습니다.** 방송은 스트림 키 하나로 RTMPS 송출합니다.
+
+### 고급 기능 (선택)
+
+방송 제목·설명·태그를 앱에서 바꾸거나 자동 라이브 채팅을 쓰고 싶을 때만,
+`설정 → YouTube 고급 기능`에서 `[YouTube 계정 연결]`을 누릅니다. 선택 기능이며
+연결하지 않아도 방송은 100% 정상 동작합니다. 연결 후 OAuth나 API에서 오류가
+나더라도 송출은 멈추지 않고, 제목·채팅 기능만 비활성화됩니다.
+준비 방법은 [YOUTUBE_SETUP.md](YOUTUBE_SETUP.md).
 
 ## 직접 써보기
 
@@ -125,7 +132,7 @@ node scripts/fetch-ffmpeg.mjs --require-download --force
 
 1. YouTube Studio → 만들기 → 실시간 스트리밍 시작
 2. "스트림 키" 항목의 값을 복사
-3. Louver Live → 설정 → 송출 → YouTube 스트림 키에 붙여넣고 저장
+3. Louver Live → 설정 → 기본 송출 → YouTube 스트림 키에 붙여넣고 저장
 
 스트림 키는 운영체제의 보안 저장소에 저장됩니다.
 

@@ -23,6 +23,11 @@ export interface MockOptions {
   seedSettings?: Record<string, string>
   /** Simulate a machine where no browser can be opened. */
   failOpener?: boolean
+  /**
+   * Make every YouTube Data API call fail. Used to check that the optional
+   * half can break without taking the broadcast with it.
+   */
+  youtubeApiFails?: boolean
 }
 
 export function createMockBackend(opts: MockOptions = {}) {
@@ -529,6 +534,12 @@ export function createMockBackend(opts: MockOptions = {}) {
       return youtube.metadata
     },
     youtube_apply_metadata: () => {
+      if (opts.youtubeApiFails) {
+        throw {
+          code_str: 'LL-YOUTUBE-004',
+          message: 'YouTube에 연결하지 못했습니다. 방송 송출은 계속됩니다.',
+        }
+      }
       youtube.applied = { ...youtube.metadata }
       return {
         id: 'bcast-1',

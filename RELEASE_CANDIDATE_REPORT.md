@@ -472,12 +472,26 @@ recovery are unchanged. Two additions were made during RC verification because
 §13 and §18 asked for them: the live-command diagnostic panel, and the FFmpeg
 error classifier.
 
-### YouTube OAuth was moved into V1 by decision
+### YouTube OAuth is in V1, but off the default path
 
 §20 originally listed **YouTube OAuth, 썸네일 자동 변경 and 제목 자동 변경** as
 excluded from V1. The product owner reversed that on 2026-09-20 and asked for
 broadcast metadata and automatic live chat to be built. This report records the
 decision rather than the original list.
+
+Later the same day the owner set the shape that decision has to take: the
+**default product is three steps — 영상 추가 → 스트림 키 입력 → 방송 시작** — and
+OAuth is an optional extra behind a button, not a step. What that means in the
+build, and what was checked:
+
+| Requirement | Where it is enforced | Evidence |
+| --- | --- | --- |
+| The broadcast path contains no OAuth | `streaming/preflight.rs`, `runtime.rs`, `commands/streaming.rs` | No `youtube::` import and no OAuth symbol in any of the three; the only "youtube" string in preflight is the default RTMPS host |
+| A first run never meets Google | First-run wizard steps are 소개 · 스트림 키 · 송출 품질 · 자동 시작 · 완료 | e2e `first run` |
+| Settings leads with the stream key and marks YouTube optional | `SettingsPage.tsx` — `기본 송출` card, then `YouTube 고급 기능 (선택)` | e2e *puts the stream key first and marks the YouTube card optional*, which also asserts the DOM order |
+| A broadcast goes LIVE with no account connected | — | e2e *goes live with nothing but a stream key, never connecting an account*: `youtube_status.connected` is `false` before and during LIVE |
+| An API failure does not touch FFmpeg | `youtube_follow_broadcast` runs off the tick; `applyNow` reports and returns | e2e *keeps the broadcast running when the YouTube side fails*: apply fails with `LL-YOUTUBE-004`, the pill is still `LIVE` |
+| No ordinary user is asked for a Client ID, Secret, API enablement or quota | Credentials are built in; the custom-client fields live in developer Advanced Mode only | e2e *never asks an ordinary user for a Client ID or Secret* |
 
 What that decision admitted to V1:
 

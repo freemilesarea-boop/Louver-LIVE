@@ -43,7 +43,7 @@ function tagsCost(tags: string[]): number {
 
 /** 방송 설정 — everything that would otherwise mean opening YouTube Studio. */
 export function BroadcastPage() {
-  const { reportError, toast, status } = useAppStore()
+  const { reportError, toast, status, setPage } = useAppStore()
 
   const [meta, setMeta] = useState<BroadcastMetadata | null>(null)
   const [presets, setPresets] = useState<BroadcastPreset[]>([])
@@ -159,14 +159,23 @@ export function BroadcastPage() {
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-lg font-semibold text-ink-100">방송 설정</h1>
-        {!connected && <Badge tone="warn">YouTube 계정 미연결</Badge>}
+        {!connected && <Badge>선택 기능 · 미연결</Badge>}
       </div>
 
       {!connected && (
-        <p className="rounded-lg border border-warn-dim bg-warn-dim/10 p-3 text-xs text-warn">
-          설정 → YouTube에서 계정을 연결하면 여기에서 입력한 정보를 실제 방송에 반영할 수 있습니다.
-          연결 전에도 내용은 저장해 둘 수 있습니다.
-        </p>
+        <div className="rounded-lg border border-ink-700 bg-ink-800/40 p-3">
+          <p className="text-xs text-ink-300">
+            이 페이지는 <span className="text-ink-100">선택 기능</span>입니다.
+            영상 송출은 스트림 키만으로 동작하며, 여기를 쓰지 않아도 방송에는 아무 문제가 없습니다.
+          </p>
+          <p className="mt-1 text-xs text-ink-500">
+            연결하면 방송 제목·설명·태그를 앱에서 바꾸고 자동 라이브 채팅을 쓸 수 있습니다.
+            연결 전에도 내용은 저장해 둘 수 있습니다.
+          </p>
+          <Button className="mt-2" size="sm" onClick={() => setPage('settings')}>
+            설정에서 YouTube 연결하기
+          </Button>
+        </div>
       )}
 
       <Card title="방송 정보">
