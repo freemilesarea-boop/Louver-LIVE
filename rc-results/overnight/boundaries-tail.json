@@ -1,0 +1,21 @@
+{
+  "file": "/home/user/Louver-LIVE/rc-results/overnight/ingest/session-001-seg-00051.flv",
+  "starts_at_seconds": 30600.95,
+  "duration_seconds": 599.09,
+  "playlist_cycle_seconds": 415,
+  "cycles_completed": 1.44,
+  "boundaries_crossed": 7,
+  "video_frames": 17970,
+  "expected_frames": 17973,
+  "duplicate_timestamps": 0,
+  "backwards_timestamps": 0,
+  "freezes_over_2_5_frames": 0,
+  "worst_freeze_ms": 0,
+  "worst_freeze_at_seconds": null,
+  "worst_freeze_is_at_piece_edge": false,
+  "av_skew_max_ms": 20,
+  "av_skew_first_ms": 14,
+  "av_skew_last_ms": 4,
+  "keyframe_interval_max_s": 2.02,
+  "boundary_findings": []
+}

@@ -204,8 +204,40 @@ monotonic, capped at 60 s, reset after a successful reconnect.
 ## 6. Long-run stability
 
 <!-- LONG-RUN:BEGIN -->
-*(No long run has completed yet. `scripts/overnight-soak.mjs` writes this
-section from the measured result when one does; nothing here is projected.)*
+### 8h 52m, 2026-09-20 02:34:37 KST → 2026-09-20 11:26:47 KST
+
+Real RTMP ingest, 1080p30 stream copy, one continuous FFmpeg session, run
+unattended by `npm run soak:overnight`. **Result: PASS.**
+
+| Metric | Measured |
+| --- | --- |
+| Runtime | 8h 52m (31930s) |
+| FFmpeg CPU | mean **0.61 %**, peak **0.93 %** |
+| Runtime CPU | mean 0.04 %, peak 0.34 % |
+| FFmpeg RSS | 56.0 MB → 62.2 MB, peak 62.2 MB |
+| FFmpeg steady-state growth | **0 %** |
+| Runtime RSS | 10.3 MB → 10.4 MB, peak 10.4 MB |
+| Runtime steady-state growth | **0.11 %** |
+| Reconnects / restarts | **0 / 0** |
+| Samples not LIVE | 0 of 107 |
+| FFmpeg errors | 0 |
+| Playlist loops | **76.9** (380 media boundaries) |
+| RTMP publisher sessions | 1 |
+| Longest gap without progress | 0s |
+| Zombie / orphan processes | 0 / 0 |
+| Data sent | 20.38 GB at 5.11 Mbps |
+| A/V skew, first window (0s) | max 20 ms |
+| A/V skew, last window (31200.07s) | max 20 ms |
+
+Capture is a rolling window of standalone FLV pieces; a full capture of this
+run would have been ~20 GB. The first and last pieces are kept, which is
+what makes the two A/V rows above a before-and-after rather than a single
+reading.
+
+Full detail, per-sample CSV and the criteria table: `rc-results/overnight/FINAL_RESULT.md`.
+
+Still **NOT TESTED**: macOS, Windows, YouTube ingest, and any run longer than
+this one. Nothing above is extrapolated.
 <!-- LONG-RUN:END -->
 
 ## 7. Test suite runtime
