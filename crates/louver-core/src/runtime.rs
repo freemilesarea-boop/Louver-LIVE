@@ -89,6 +89,10 @@ pub struct RuntimeStatus {
     /// Where the next scheduled broadcast begins.
     pub next_scheduled_start: Option<String>,
     pub cycle_duration_secs: f64,
+    /// Why the last attempt to start failed, if it did. Cleared by the next
+    /// successful start. Without this a scheduled start that failed left the
+    /// dashboard reading OFFLINE with nothing to say for itself.
+    pub last_start_error: Option<LouverError>,
 }
 
 impl RuntimeStatus {
@@ -188,6 +192,12 @@ pub struct StreamDiagnostics {
     pub local_test_sink: LocalTestSink,
 }
 
+/// How long to wait before retrying a scheduled start that failed.
+///
+/// Long enough that a broken schedule does not fill the log, short enough that
+/// fixing the cause during the window still gets a broadcast out of it.
+const SCHEDULE_RETRY: Duration = Duration::from_secs(60);
+
 /// Video-encoder arguments that must never appear in a stream-copy command.
 const VIDEO_ENCODER_MARKERS: &[&str] = &[
     "-c:v",
@@ -204,6 +214,19 @@ const VIDEO_ENCODER_MARKERS: &[&str] = &[
     "h264_videotoolbox",
 ];
 
+/// Work that has to succeed before FFmpeg is launched.
+///
+/// This exists so that manual and scheduled starts cannot drift apart: both
+/// reach FFmpeg through [`BroadcastRuntime::start`], so both run whatever is
+/// installed here, in the same place in the sequence. The desktop app uses it
+/// to put the broadcast's YouTube metadata in place *before* the stream
+/// connects — applying it afterwards means YouTube goes live under the
+/// channel's default title first, which is what viewers and the watch page
+/// see.
+pub trait PreStartHook: Send + Sync + std::fmt::Debug {
+    fn before_stream(&self, opts: &StartOptions) -> Result<()>;
+}
+
 /// Options for one broadcast.
 #[derive(Debug, Clone)]
 pub struct StartOptions {
@@ -215,6 +238,9 @@ pub struct StartOptions {
     pub occurrence: Option<Occurrence>,
     /// Reuse a previous session's order after a crash (§32).
     pub order_seed: Option<i64>,
+    /// Skip the pre-start hook. Set when the user has been shown that the
+    /// YouTube side cannot be applied and has chosen to broadcast anyway.
+    pub skip_pre_start: bool,
 }
 
 /// The broadcast loop.
@@ -248,6 +274,17 @@ pub struct BroadcastRuntime {
     /// Suppresses scheduler-driven starts after the user stops manually inside
     /// a window, until that window ends.
     suppressed_occurrence: Option<Occurrence>,
+    /// Why the last start attempt failed, kept so the UI can say so instead of
+    /// leaving the dashboard reading OFFLINE with no explanation.
+    last_start_error: Option<LouverError>,
+    pre_start: Option<Arc<dyn PreStartHook>>,
+    /// The scheduled occurrence whose start failed, and when to try it again.
+    ///
+    /// The tick runs once a second; without this a schedule pointing at an
+    /// empty playlist would attempt — and log — a failed start every second
+    /// for the length of the window. Retrying is still wanted, because the
+    /// user may add a video mid-window and expect the broadcast to pick up.
+    failed_occurrence: Option<(Occurrence, Instant)>,
 }
 
 impl BroadcastRuntime {
@@ -289,7 +326,15 @@ impl BroadcastRuntime {
             restart_due: None,
             last_args: Vec::new(),
             suppressed_occurrence: None,
+            last_start_error: None,
+            pre_start: None,
+            failed_occurrence: None,
         }
+    }
+
+    /// Install the work that runs before every broadcast, manual or scheduled.
+    pub fn set_pre_start(&mut self, hook: Arc<dyn PreStartHook>) {
+        self.pre_start = Some(hook);
     }
 
     pub fn state(&self) -> StreamState {
@@ -338,6 +383,7 @@ impl BroadcastRuntime {
             dry_run: self.dry_run,
             next_scheduled_start: self.next_scheduled_start(),
             cycle_duration_secs: self.plan.as_ref().map(|p| p.total_duration_secs).unwrap_or(0.0),
+            last_start_error: self.last_start_error.clone(),
         }
     }
 
@@ -367,15 +413,65 @@ impl BroadcastRuntime {
     // -- starting ----------------------------------------------------------
 
     /// Start a broadcast. The caller is expected to have run preflight (§29).
+    ///
+    /// Everything fallible is in `start_inner`, because the supervisor moves to
+    /// PREPARING partway through and PREPARING counts as *active*. A failure
+    /// that left it there made `is_active()` permanently true, and the
+    /// scheduler — which skips its tick while the runtime is active — then sat
+    /// out the rest of the window and reported tomorrow as the next broadcast.
+    /// So any failure after `begin()` ends the session properly, in ERROR.
     pub fn start(&mut self, opts: StartOptions) -> Result<()> {
         if self.is_active() {
             return Err(LouverError::new(ErrorCode::StreamAlreadyRunning));
         }
+        match self.start_inner(opts) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.state() == StreamState::Preparing {
+                    self.abandon_start(&e);
+                }
+                Err(e)
+            }
+        }
+    }
 
-        let playlist = self
-            .db
-            .get_playlist(opts.playlist_id)?
-            .ok_or_else(|| LouverError::with_detail(ErrorCode::StreamEmptyPlaylist, "playlist not found"))?;
+    /// Roll back a start that never reached a process.
+    fn abandon_start(&mut self, e: &LouverError) {
+        self.supervisor.abort(e.clone());
+        if let Some(id) = self.session_id.take() {
+            let _ = self.db.update_session_state(id, StreamState::Error, 0, false, Some(&e.to_string()));
+        }
+        self.plan = None;
+        self.session_state = None;
+        self.started_at = None;
+        self.start_wall = None;
+        self.scheduled_end = None;
+        self.reason = None;
+        // A scheduled window retries once a minute, so the same cause would
+        // otherwise write the same line for the length of the window.
+        let repeat = self.last_start_error.as_ref().map(|p| p.to_string()) == Some(e.to_string());
+        self.last_start_error = Some(e.clone());
+        let _ = self.sleep.allow_sleep();
+        let _ = self.session_store.clear();
+        if !repeat {
+            self.log_err(e);
+        }
+        self.publish();
+    }
+
+    fn start_inner(&mut self, opts: StartOptions) -> Result<()> {
+        // Named separately from the empty case: a schedule whose playlist was
+        // deleted is a different problem from one whose playlist has no usable
+        // video, and telling the user "no broadcastable videos" about a
+        // playlist that is not there sends them looking in the wrong place.
+        let playlist = self.db.get_playlist(opts.playlist_id)?.ok_or_else(|| {
+            let code = if opts.occurrence.is_some() {
+                ErrorCode::SchedulePlaylistMissing
+            } else {
+                ErrorCode::PlaylistMissing
+            };
+            LouverError::with_detail(code, format!("playlist id {}", opts.playlist_id))
+        })?;
         let items = self.db.list_playlist_items(opts.playlist_id)?;
         let seed = opts.order_seed.unwrap_or_else(new_order_seed);
 
@@ -397,7 +493,14 @@ impl BroadcastRuntime {
             mode,
             seed,
             &self.manifest_path,
-        )?;
+        )
+        .map_err(|e| {
+            if opts.occurrence.is_some() && e.code == ErrorCode::StreamEmptyPlaylist {
+                LouverError::with_detail(ErrorCode::SchedulePlaylistEmpty, playlist.name.clone())
+            } else {
+                e
+            }
+        })?;
 
         let destination = if opts.dry_run {
             self.local_test_destination()?
@@ -425,6 +528,7 @@ impl BroadcastRuntime {
         self.dry_run = opts.dry_run;
         self.restart_due = None;
         self.suppressed_occurrence = None;
+        self.last_start_error = None;
 
         // Keep the machine awake for the whole broadcast (§23).
         if !opts.dry_run {
@@ -459,6 +563,14 @@ impl BroadcastRuntime {
                 opts.reason
             ),
         );
+
+        // Before FFmpeg, not after: once the stream connects, YouTube is live
+        // under whatever title the resource already had.
+        if !opts.dry_run && !opts.skip_pre_start {
+            if let Some(hook) = self.pre_start.clone() {
+                hook.before_stream(&opts)?;
+            }
+        }
 
         self.spawn_now()?;
         self.persist();
@@ -630,6 +742,15 @@ impl BroadcastRuntime {
                 if self.suppressed_occurrence.as_ref() == Some(&occurrence) {
                     return; // the user stopped this window on purpose
                 }
+                // A window whose start failed is retried, not abandoned: the
+                // usual cause is something the user can fix without touching
+                // the schedule (add a video, enter the stream key), and the
+                // window should pick up as soon as they do.
+                if let Some((failed, next_try)) = &self.failed_occurrence {
+                    if failed == &occurrence && Instant::now() < *next_try {
+                        return;
+                    }
+                }
                 self.begin_scheduled(&occurrence, &schedules);
             }
             ScheduleDecision::ShouldStop { .. } => {
@@ -649,6 +770,14 @@ impl BroadcastRuntime {
         }
     }
 
+    /// Clear the retry delay on the window that failed, for tests and for a
+    /// user action that plainly changed the cause (adding videos, saving a key).
+    pub fn retry_failed_occurrence_now(&mut self) {
+        if let Some((o, _)) = self.failed_occurrence.take() {
+            self.failed_occurrence = Some((o, Instant::now()));
+        }
+    }
+
     fn begin_scheduled(&mut self, occurrence: &Occurrence, _schedules: &[Schedule]) {
         let end_utc = local_to_utc(occurrence.end);
         let opts = StartOptions {
@@ -658,9 +787,13 @@ impl BroadcastRuntime {
             scheduled_end: Some(end_utc),
             occurrence: Some(occurrence.clone()),
             order_seed: None,
+            skip_pre_start: false,
         };
-        if let Err(e) = self.start(opts) {
-            self.log_err(&e);
+        match self.start(opts) {
+            // `start` has already logged and rolled the state machine back to
+            // ERROR; all that is left is to space out the retry.
+            Err(_) => self.failed_occurrence = Some((occurrence.clone(), Instant::now() + SCHEDULE_RETRY)),
+            Ok(()) => self.failed_occurrence = None,
         }
     }
 
@@ -697,9 +830,11 @@ impl BroadcastRuntime {
                 scheduled_end: Some(local_to_utc(o.end)),
                 occurrence: Some(o),
                 order_seed: seed,
+                skip_pre_start: false,
             };
             if let Err(e) = self.start(opts) {
-                self.log_err(&e);
+                // `start` has already logged it; this only passes the message
+                // to the launch notice the UI shows.
                 return Some(e.message);
             }
         }

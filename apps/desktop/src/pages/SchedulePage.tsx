@@ -133,10 +133,27 @@ export function SchedulePage() {
                     <span className="text-xs text-ink-400">{s.playlist_name ?? `#${s.playlist_id}`}</span>
                   </div>
                   <div className="mt-1 text-[11px] text-ink-500">
-                    {s.enabled && s.next_start
-                      ? `다음 방송 ${s.next_start} · ${s.window_duration_label} 방송`
-                      : '사용 안 함'}
+                    {/* An open window is not a "next" broadcast. Showing only
+                        next_start meant a 17:14→17:40 schedule read at 17:17
+                        announced *tomorrow*, which looked like a skip. */}
+                    {!s.enabled ? '사용 안 함'
+                      : s.active_now ? (
+                        <span className="text-ok">
+                          지금 방송 시간입니다 · {s.active_until}에 종료
+                        </span>
+                      ) : s.next_start
+                        ? `다음 방송 ${s.next_start} · ${s.window_duration_label} 방송`
+                        : '예정된 방송이 없습니다'}
                   </div>
+                  {s.playlist_missing ? (
+                    <div className="mt-1 text-[11px] text-live">
+                      예약에 연결된 플레이리스트를 찾을 수 없습니다.
+                    </div>
+                  ) : s.enabled && s.playlist_ready_count === 0 ? (
+                    <div className="mt-1 text-[11px] text-warn">
+                      예약된 플레이리스트에 방송 가능한 영상이 없습니다.
+                    </div>
+                  ) : null}
                 </div>
                 <div className="flex items-center gap-3">
                   <div className="w-28">

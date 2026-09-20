@@ -27,6 +27,7 @@ pub enum ErrorCode {
     StreamInvalidTransition,
     StreamNoStreamKey,
     StreamKeyRejected,
+    PlaylistMissing,
     // LL-NETWORK-0xx
     NetworkUnreachable,
     NetworkRtmpRejected,
@@ -61,6 +62,8 @@ pub enum ErrorCode {
     ChatMessageTooLong,
     ScheduleInvalidTime,
     ScheduleNoDays,
+    SchedulePlaylistMissing,
+    SchedulePlaylistEmpty,
     // LL-CONFIG-0xx
     ConfigInvalid,
     FfmpegNotFound,
@@ -85,6 +88,7 @@ impl ErrorCode {
             StreamInvalidTransition => "LL-STREAM-006",
             StreamNoStreamKey => "LL-STREAM-007",
             StreamKeyRejected => "LL-STREAM-008",
+            PlaylistMissing => "LL-STREAM-009",
             NetworkUnreachable => "LL-NETWORK-001",
             NetworkRtmpRejected => "LL-NETWORK-002",
             StorageInsufficientSpace => "LL-STORAGE-001",
@@ -112,6 +116,8 @@ impl ErrorCode {
             ChatMessageTooLong => "LL-CHAT-004",
             ScheduleInvalidTime => "LL-SCHED-001",
             ScheduleNoDays => "LL-SCHED-002",
+            SchedulePlaylistMissing => "LL-SCHED-003",
+            SchedulePlaylistEmpty => "LL-SCHED-004",
             ConfigInvalid => "LL-CONFIG-001",
             FfmpegNotFound => "LL-CONFIG-002",
         }
@@ -139,6 +145,7 @@ impl ErrorCode {
             StreamKeyRejected => {
                 "YouTube가 스트림 키를 거부했습니다. 설정에서 스트림 키를 다시 확인해주세요."
             }
+            PlaylistMissing => "플레이리스트를 찾을 수 없습니다. 삭제되었을 수 있습니다.",
             NetworkUnreachable => "인터넷에 연결할 수 없습니다. 네트워크 연결을 확인해주세요.",
             NetworkRtmpRejected => {
                 "유튜브 서버에 연결하지 못했습니다. 스트림 키와 인터넷 연결을 확인해주세요."
@@ -170,6 +177,8 @@ impl ErrorCode {
             ChatMessageTooLong => "채팅 메시지가 너무 깁니다. 200자 이내로 입력해주세요.",
             ScheduleInvalidTime => "예약 시간이 올바르지 않습니다.",
             ScheduleNoDays => "반복할 요일을 하나 이상 선택해주세요.",
+            SchedulePlaylistMissing => "예약에 연결된 플레이리스트를 찾을 수 없습니다.",
+            SchedulePlaylistEmpty => "예약된 플레이리스트에 방송 가능한 영상이 없습니다.",
             ConfigInvalid => "설정 값이 올바르지 않습니다.",
             FfmpegNotFound => "방송 엔진(FFmpeg)을 찾을 수 없습니다. 프로그램을 다시 설치해주세요.",
         }
@@ -263,6 +272,7 @@ pub const ALL_ERROR_CODES: &[ErrorCode] = {
         StreamInvalidTransition,
         StreamNoStreamKey,
         StreamKeyRejected,
+        PlaylistMissing,
         NetworkUnreachable,
         NetworkRtmpRejected,
         StorageInsufficientSpace,
@@ -290,6 +300,8 @@ pub const ALL_ERROR_CODES: &[ErrorCode] = {
         ChatMessageTooLong,
         ScheduleInvalidTime,
         ScheduleNoDays,
+        SchedulePlaylistMissing,
+        SchedulePlaylistEmpty,
         ConfigInvalid,
         FfmpegNotFound,
     ]

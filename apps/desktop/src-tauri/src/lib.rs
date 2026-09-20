@@ -29,7 +29,14 @@ const TICK: Duration = Duration::from_secs(1);
 /// Called once a second from the broadcast loop, and never blocks it: the
 /// lookup that needs the network runs on its own thread, and at most one runs
 /// at a time.
-fn youtube_follow_broadcast(state: &AppState, live: bool) {
+///
+/// Metadata is *not* applied here. It used to be, gated on the stream already
+/// being LIVE, which meant YouTube went live under the channel's default title
+/// and the user's title arrived seconds later if at all. It now happens in the
+/// runtime's pre-start hook, before FFmpeg connects. What is left here is the
+/// chat bot, which genuinely cannot start earlier: `activeLiveChatId` does not
+/// exist until the broadcast is live.
+fn youtube_follow_broadcast(state: &AppState, live: bool, broadcasting: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WORKING: AtomicBool = AtomicBool::new(false);
 
@@ -37,18 +44,20 @@ fn youtube_follow_broadcast(state: &AppState, live: bool) {
         if state.youtube.bot_broadcast_id().is_some() {
             state.youtube.stop_bot();
         }
-        // The next Start is a new broadcast, and gets its metadata applied and
-        // its chat resolved from scratch.
-        state.youtube.reset_live_session();
+        // Only once the broadcast is really over. A dropped connection is not
+        // the end of one: clearing here on every non-LIVE tick would wipe the
+        // record of what happened to the metadata the moment the stream went
+        // into RECONNECTING, which is exactly when the user goes looking.
+        if !broadcasting {
+            state.youtube.reset_live_session();
+        }
         return;
     }
     if !state.youtube.status().connected {
         return;
     }
 
-    let apply_pending = state.youtube.apply_on_start_pending();
-    let want_bot = state.youtube.chat_settings().enabled && !state.youtube.bot_is_running();
-    if !apply_pending && !want_bot {
+    if !state.youtube.chat_settings().enabled || state.youtube.bot_is_running() {
         return;
     }
     if WORKING.swap(true, Ordering::SeqCst) {
@@ -58,18 +67,29 @@ fn youtube_follow_broadcast(state: &AppState, live: bool) {
     let youtube = std::sync::Arc::clone(&state.youtube);
     let messages = state.db.list_chat_messages().unwrap_or_default();
     std::thread::spawn(move || {
-        if apply_pending {
-            youtube.apply_on_start();
-        }
-        if want_bot {
-            // Looked up fresh every time, so the chat id belongs to the
-            // broadcast that is on air now (§7).
-            if let Ok(b) = youtube.current_broadcast() {
-                youtube.start_bot_for(&b.id, messages);
-            }
+        // Looked up fresh every time, so the chat id belongs to the broadcast
+        // that is on air now (§7) — never the one before it.
+        if let Ok(b) = youtube.current_broadcast() {
+            youtube.start_bot_for(&b.id, messages);
         }
         WORKING.store(false, Ordering::SeqCst);
     });
+}
+
+/// Runs the YouTube side of a broadcast before FFmpeg is launched.
+///
+/// Installed on the runtime, so the manual Start button and the scheduler go
+/// through it identically (§B-7).
+#[derive(Debug)]
+struct YoutubePreStart(std::sync::Arc<youtube_service::YoutubeService>);
+
+impl louver_core::runtime::PreStartHook for YoutubePreStart {
+    fn before_stream(&self, opts: &louver_core::runtime::StartOptions) -> louver_core::error::Result<()> {
+        // A manual start can be asked what to do about a failure; a scheduled
+        // one cannot, so it follows the policy set in advance.
+        let scheduled = opts.reason != louver_core::runtime::StartReason::Manual;
+        self.0.prepare_for_broadcast_reason(scheduled)
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -139,6 +159,10 @@ pub fn run() {
             commands::youtube::youtube_save_metadata,
             commands::youtube::youtube_apply_metadata,
             commands::youtube::youtube_set_apply_on_start,
+            commands::youtube::youtube_apply_state,
+            commands::youtube::youtube_set_schedule_holds,
+            commands::youtube::youtube_schedule_holds,
+            commands::youtube::youtube_apply_plan,
             commands::youtube::youtube_current_broadcast,
             commands::youtube::youtube_list_presets,
             commands::youtube::youtube_save_preset,
@@ -170,6 +194,9 @@ pub fn run() {
             // resume the previous broadcast (§32, §33).
             {
                 let mut rt = state.runtime.lock().unwrap();
+                // Installed before recovery, so a broadcast resumed at launch
+                // gets its metadata applied like any other (§B-7).
+                rt.set_pre_start(std::sync::Arc::new(YoutubePreStart(std::sync::Arc::clone(&state.youtube))));
                 if let Some(pid) = rt.clean_orphan_process() {
                     state.logger.warn(LogTarget::App, &format!("이전 실행의 FFmpeg({pid})를 정리했습니다"));
                 }
@@ -196,17 +223,21 @@ pub fn run() {
             std::thread::spawn(move || loop {
                 std::thread::sleep(TICK);
                 if let Some(s) = tick_handle.try_state::<AppState>() {
-                    let live = if let Ok(mut rt) = s.runtime.lock() {
+                    let (live, broadcasting) = if let Ok(mut rt) = s.runtime.lock() {
                         rt.tick();
-                        rt.state() == louver_core::streaming::state::StreamState::Live && !rt.status().dry_run
+                        let real = !rt.status().dry_run;
+                        (
+                            rt.state() == louver_core::streaming::state::StreamState::Live && real,
+                            rt.is_active() && real,
+                        )
                     } else {
-                        false
+                        (false, false)
                     };
                     // The chat bot follows the broadcast (§7). Starting it is
                     // handed to another thread because finding the broadcast
                     // means calling Google, and this loop must never wait on
                     // the network — it is the loop that keeps FFmpeg alive.
-                    youtube_follow_broadcast(&s, live);
+                    youtube_follow_broadcast(&s, live, broadcasting);
                 }
             });
 

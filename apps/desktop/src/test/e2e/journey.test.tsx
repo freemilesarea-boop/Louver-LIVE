@@ -6,7 +6,7 @@
  * run, see the live state, stop, change settings, restart and find them
  * restored.
  */
-import { describe, expect, it, beforeEach } from 'vitest'
+import { describe, expect, it, afterEach, beforeEach } from 'vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { App } from '@/App'
@@ -18,6 +18,7 @@ type Backend = ReturnType<typeof createMockBackend>
 let backend: Backend
 
 function mount(opts: Parameters<typeof createMockBackend>[0] = {}) {
+  backend?.stop()
   backend = createMockBackend({ seedSettings: { first_run_complete: 'true' }, ...opts })
   setMockBackend(backend)
   return render(<App />)
@@ -36,8 +37,27 @@ beforeEach(() => {
   resetStore()
 })
 
+// The mock keeps a one-second interval running for as long as a broadcast is
+// "live". Left behind, those pile up across the suite and slow later tests
+// enough to time out queries that are correct.
+afterEach(() => {
+  backend?.stop()
+})
+
 async function gotoPage(user: ReturnType<typeof userEvent.setup>, label: string) {
   await user.click(screen.getByRole('button', { name: label }))
+}
+
+/**
+ * Press 방송 시작 for a test that is not about the uptime warning.
+ *
+ * The warning is shown once per install and only once the settings have
+ * loaded, so waiting on it here is a race. It has a test of its own; every
+ * other test marks it seen first and goes straight to the broadcast.
+ */
+async function startLive(user: ReturnType<typeof userEvent.setup>) {
+  localStorage.setItem('louver.warned', '1')
+  await user.click(await screen.findByRole('button', { name: /방송 시작/ }))
 }
 
 /** Create a playlist and add three videos to it. */
@@ -643,8 +663,7 @@ describe('broadcasting without a Google account', () => {
     await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
 
     await gotoPage(user, '대시보드')
-    await user.click(await screen.findByRole('button', { name: /방송 시작/ }))
-    await user.click(await screen.findByRole('button', { name: '확인하고 시작' }))
+    await startLive(user)
 
     await waitFor(() => {
       expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
@@ -666,8 +685,7 @@ describe('broadcasting without a Google account', () => {
     await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
 
     await gotoPage(user, '대시보드')
-    await user.click(await screen.findByRole('button', { name: /방송 시작/ }))
-    await user.click(await screen.findByRole('button', { name: '확인하고 시작' }))
+    await startLive(user)
     await waitFor(() => {
       expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
     })
@@ -685,5 +703,178 @@ describe('broadcasting without a Google account', () => {
 
     await gotoPage(user, '대시보드')
     expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+  })
+})
+
+describe('the YouTube side of a broadcast is reported on its own', () => {
+  /** Save a title so automatic apply has something to do. */
+  async function saveTitle(user: ReturnType<typeof userEvent.setup>, title: string) {
+    await gotoPage(user, '방송 설정')
+    await user.type(await screen.findByLabelText('방송 제목'), title)
+    await user.click(screen.getByRole('button', { name: '저장' }))
+    await screen.findByText(/방송 정보를 저장했습니다/)
+  }
+
+  async function readyPlaylist(user: ReturnType<typeof userEvent.setup>) {
+    await buildPlaylist(user)
+    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
+    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
+    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
+  }
+
+  it('does not claim settings will be applied when no account is connected', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '방송 설정')
+
+    // §B-2: stream-key RTMPS cannot change a title, so the switch must not
+    // say it will. Saying so is how a stream went live as "Playlist".
+    expect(await screen.findByText(/방송 설정 자동 적용을 사용하려면 YouTube 계정 연결이 필요합니다/))
+      .toBeInTheDocument()
+    expect(screen.queryByText(/방송이 시작되면 저장된 제목·설명·태그/)).not.toBeInTheDocument()
+    expect(screen.getByTestId('auto-apply-warning')).toBeInTheDocument()
+  })
+
+  it('promises the apply only once an account is there to do it with', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '설정')
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    await screen.findByRole('button', { name: '연결 해제' }, { timeout: 6000 })
+
+    await gotoPage(user, '방송 설정')
+    expect(await screen.findByText(/방송이 시작되면 저장된 제목·설명·태그/)).toBeInTheDocument()
+    expect(screen.queryByTestId('auto-apply-warning')).not.toBeInTheDocument()
+  })
+
+  it('asks before going live under whatever title YouTube already has', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+
+    // §B-9: not a silent start. The user is told, and chooses.
+    expect(await screen.findByText('방송 설정을 YouTube에 적용하지 못했습니다')).toBeInTheDocument()
+    expect(screen.getByText(/방송 설정 자동 적용을 사용하려면 YouTube 계정 연결이 필요합니다/))
+      .toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '다시 시도' })).toBeInTheDocument()
+    expect(screen.getAllByTestId('status-pill')[0]).not.toHaveAttribute('data-state', 'LIVE')
+
+    // Taking the offer starts the stream, and only the stream.
+    await user.click(screen.getByRole('button', { name: '설정 없이 방송 시작' }))
+    await waitFor(() => {
+      expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+    })
+  })
+
+  it('reports each field from what YouTube says afterwards, not from the status code', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await gotoPage(user, '설정')
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    await screen.findByRole('button', { name: '연결 해제' }, { timeout: 6000 })
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+    await waitFor(() => {
+      expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+    })
+
+    // §B-10: a row per field, each one an answer to "did this take".
+    const report = await screen.findByTestId('metadata-report')
+    for (const field of ['제목', '설명', '태그', '카테고리', '공개범위']) {
+      expect(within(report).getByText(field)).toBeInTheDocument()
+    }
+    expect(within(report).getAllByText('적용 완료').length).toBe(5)
+    expect(within(report).queryByText('적용 실패')).not.toBeInTheDocument()
+  })
+
+  it('says 적용 실패 when YouTube keeps its own title despite a 200', async () => {
+    const user = userEvent.setup()
+    // The reported failure exactly: the calls succeed, the watch page still
+    // reads "Playlist".
+    mount({ youtubeIgnoresTitle: true })
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await gotoPage(user, '설정')
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    await screen.findByRole('button', { name: '연결 해제' }, { timeout: 6000 })
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+
+    const report = await screen.findByTestId('metadata-report')
+    expect(within(report).getByText('적용 실패')).toBeInTheDocument()
+    // And it says what YouTube actually has, which is the useful part.
+    expect(within(report).getByText(/현재 Playlist/)).toBeInTheDocument()
+  })
+
+  it('keeps FFmpeg alive when the metadata call fails after the user opts to start anyway', async () => {
+    const user = userEvent.setup()
+    mount({ youtubeApiFails: true })
+    await screen.findByRole('button', { name: '대시보드' })
+    await saveTitle(user, 'COLORIST 24시간 편집샵 느낌 플레이리스트')
+    await gotoPage(user, '설정')
+    await user.click(await screen.findByRole('button', { name: 'YouTube 계정 연결' }))
+    await screen.findByRole('button', { name: '연결 해제' }, { timeout: 6000 })
+    await readyPlaylist(user)
+
+    await gotoPage(user, '대시보드')
+    await startLive(user)
+    expect(await screen.findByText('방송 설정을 YouTube에 적용하지 못했습니다')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '설정 없이 방송 시작' }))
+
+    await waitFor(() => {
+      expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+    })
+    // §12 still holds: the stream is not a casualty of the YouTube half.
+    await new Promise((r) => setTimeout(r, 1200))
+    expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE')
+  })
+})
+
+describe('the schedule list', () => {
+  async function makeSchedule(user: ReturnType<typeof userEvent.setup>) {
+    await gotoPage(user, '방송 예약')
+    await user.clear(await screen.findByLabelText('시작 시간'))
+    await user.type(screen.getByLabelText('시작 시간'), '17:14')
+    await user.clear(screen.getByLabelText('종료 시간'))
+    await user.type(screen.getByLabelText('종료 시간'), '17:40')
+    await user.click(screen.getByRole('button', { name: /예약 추가/ }))
+    await screen.findByText('17:14 → 17:40')
+  }
+
+  it('says the window is open now rather than announcing tomorrow', async () => {
+    const user = userEvent.setup()
+    mount({ scheduleActiveNow: true })
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await makeSchedule(user)
+
+    // The reported confusion: at 17:17, a 17:14→17:40 schedule showed only
+    // "다음 방송 <tomorrow>", which reads as a window that was skipped.
+    expect(await screen.findByText(/지금 방송 시간입니다/)).toBeInTheDocument()
+    expect(screen.queryByText(/^다음 방송 내일/)).not.toBeInTheDocument()
+  })
+
+  it('still shows the next repeat when no window is open', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+    await makeSchedule(user)
+
+    expect(await screen.findByText(/다음 방송 내일 17:14/)).toBeInTheDocument()
+    expect(screen.queryByText(/지금 방송 시간입니다/)).not.toBeInTheDocument()
   })
 })

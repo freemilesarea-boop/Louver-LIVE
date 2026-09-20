@@ -53,6 +53,7 @@ export function BroadcastPage() {
   const [applying, setApplying] = useState(false)
   const [connected, setConnected] = useState(false)
   const [applyOnStart, setApplyOnStart] = useState(true)
+  const [scheduleHolds, setScheduleHolds] = useState(true)
 
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [chat, setChat] = useState<ChatSettings | null>(null)
@@ -68,6 +69,7 @@ export function BroadcastPage() {
       ])
       setMeta(m); setPresets(p); setMessages(msgs); setChat(cs)
       setConnected(yt.connected); setMinInterval(min); setApplyOnStart(yt.apply_on_start)
+      api.youtubeScheduleHolds().then(setScheduleHolds).catch(() => {})
     } catch (e) {
       reportError(e)
     }
@@ -116,8 +118,22 @@ export function BroadcastPage() {
   async function applyNow() {
     setApplying(true)
     try {
-      const b = await api.youtubeApplyMetadata()
-      toast({ kind: 'success', message: `YouTube 방송에 적용했습니다: ${b.title}` })
+      // Reported from the read-back, not from the HTTP status: every call can
+      // answer 200 and the watch page still show the old title (§B-5).
+      const { broadcast, verification } = await api.youtubeApplyMetadata()
+      const missing = [
+        ['제목', verification.title], ['설명', verification.description],
+        ['태그', verification.tags], ['카테고리', verification.category],
+        ['공개범위', verification.privacy],
+      ].filter(([, c]) => !(c as { applied: boolean }).applied).map(([n]) => n)
+      if (missing.length === 0) {
+        toast({ kind: 'success', message: `YouTube 방송에 적용하고 확인했습니다: ${broadcast.title}` })
+      } else {
+        toast({
+          kind: 'error',
+          message: `YouTube가 다음 항목을 반영하지 않았습니다: ${missing.join(', ')}`,
+        })
+      }
     } catch (e) { reportError(e) } finally { setApplying(false) }
   }
 
@@ -274,13 +290,39 @@ export function BroadcastPage() {
         </div>
         <Toggle
           label="방송을 시작할 때 자동으로 적용"
-          hint="방송이 시작되면 저장된 제목·설명·태그·카테고리·공개범위를 YouTube에 한 번 적용합니다."
+          // Stream-key RTMPS cannot change a title: without an account this
+          // switch can promise nothing, and saying otherwise is how a stream
+          // went live as "Playlist" while the app claimed it had applied the
+          // user's title (§B-2).
+          hint={connected
+            ? '방송이 시작되면 저장된 제목·설명·태그·카테고리·공개범위를 YouTube에 한 번 적용합니다.'
+            : '방송 설정 자동 적용을 사용하려면 YouTube 계정 연결이 필요합니다. 연결 없이도 스트림 키 방송은 그대로 동작합니다.'}
           checked={applyOnStart}
           onChange={(v) => {
             setApplyOnStart(v)
             api.youtubeSetApplyOnStart(v).catch(reportError)
           }}
         />
+        {!connected && applyOnStart && (
+          <p className="mt-2 text-xs text-warn" data-testid="auto-apply-warning">
+            지금은 YouTube 계정이 연결되어 있지 않아 이 설정이 실제 방송에 적용되지 않습니다.
+          </p>
+        )}
+        {applyOnStart && (
+          <Toggle
+            label="예약 방송도 적용에 실패하면 시작하지 않음"
+            // A manual start can be asked what to do; a scheduled one has
+            // nobody at the keyboard, so the answer is set here in advance.
+            hint={scheduleHolds
+              ? '예약 시간이 되어도 방송 설정을 적용하지 못하면 방송을 시작하지 않습니다. 잘못된 제목으로 나가지 않습니다.'
+              : '예약 방송은 설정을 적용하지 못해도 영상 송출을 계속합니다. 실패는 대시보드와 로그에 남습니다.'}
+            checked={scheduleHolds}
+            onChange={(v) => {
+              setScheduleHolds(v)
+              api.youtubeSetScheduleHolds(v).catch(reportError)
+            }}
+          />
+        )}
       </Card>
 
       <Card title="프리셋">

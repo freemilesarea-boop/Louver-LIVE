@@ -214,6 +214,7 @@ fn a_manual_broadcast_starts_and_stops() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .unwrap();
 
@@ -244,6 +245,7 @@ fn the_live_command_carries_the_stream_key_but_the_logs_do_not() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .unwrap();
 
@@ -268,6 +270,7 @@ fn a_dry_run_writes_to_a_file_and_needs_no_key() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .unwrap();
     let args = h.launcher.last_args();
@@ -350,6 +353,7 @@ fn the_scheduler_does_not_stop_a_manual_broadcast() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .unwrap();
     mark_connected(&mut h.rt);
@@ -438,6 +442,7 @@ fn an_explicit_stop_is_never_undone_by_the_reconnect_logic() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .unwrap();
     mark_connected(&mut h.rt);
@@ -578,6 +583,7 @@ fn a_dangling_database_session_is_closed_at_startup() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .unwrap();
     h.rt.tick();
@@ -602,9 +608,360 @@ fn a_launch_failure_is_reported_and_retried_rather_than_crashing() {
             scheduled_end: None,
             occurrence: None,
             order_seed: Some(1),
+            skip_pre_start: false,
         })
         .unwrap_err();
     assert_eq!(err.code_str, "LL-STREAM-001");
     assert_eq!(h.rt.state(), StreamState::Error);
     assert!(h.events.logs().contains("LL-STREAM-001"));
+}
+
+// --- schedule catch-up and failed starts (BUG A) ----------------------------
+
+/// Strip a playlist of anything broadcastable, the way a user who deleted the
+/// videos but kept the schedule would.
+fn empty_the_playlist(h: &Harness) {
+    for it in h.db.list_playlist_items(h.playlist_id).unwrap() {
+        h.db.remove_playlist_item(it.id).unwrap();
+    }
+}
+
+#[test]
+fn starting_inside_a_window_that_already_began_broadcasts_at_once() {
+    // The reported case, to the minute: 17:14 → 17:40, app running at 17:17.
+    let mut h = harness(&format!("{MON} 17:17:00"));
+    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+
+    h.rt.tick();
+    assert!(h.rt.is_active(), "17:17 is inside 17:14→17:40 and must broadcast now");
+    let st = h.rt.status();
+    assert_eq!(st.remaining_secs, Some(23 * 60), "and must still end at 17:40");
+    assert!(st.next_scheduled_start.is_none(), "an active window is not 'next'");
+}
+
+#[test]
+fn starting_after_the_window_closed_waits_for_the_next_repeat() {
+    let mut h = harness(&format!("{MON} 17:50:00"));
+    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+
+    h.rt.tick();
+    assert!(!h.rt.is_active(), "17:50 is past 17:40; today's window is over");
+    assert_eq!(h.rt.status().next_scheduled_start.as_deref(), Some("2026-03-03 17:14"));
+}
+
+#[test]
+fn a_restart_inside_the_window_picks_the_broadcast_back_up() {
+    let mut h = harness(&format!("{MON} 17:17:00"));
+    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+
+    // Same as an OS reboot or a launch-at-startup: nothing running, mid-window.
+    h.rt.recover_on_startup();
+    assert!(h.rt.is_active());
+    assert_eq!(h.launcher.launch_count(), 1);
+}
+
+#[test]
+fn a_scheduled_start_that_fails_does_not_strand_the_runtime_in_preparing() {
+    // This is what lost the real 17:14 window: `start` moved the machine to
+    // PREPARING, then failed on the empty playlist and left it there. PREPARING
+    // reads as active, so every later tick returned early and the window was
+    // never retried — the UI then showed tomorrow as the next broadcast.
+    let mut h = harness(&format!("{MON} 17:17:00"));
+    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    empty_the_playlist(&h);
+
+    h.rt.tick();
+    assert_eq!(h.rt.state(), StreamState::Error, "a failed start must end, not hang in PREPARING");
+    assert!(!h.rt.is_active(), "and must not keep the scheduler out of its own window");
+
+    let st = h.rt.status();
+    let e = st.last_start_error.expect("the dashboard has to be able to say why");
+    assert_eq!(e.code_str, "LL-SCHED-004");
+    assert_eq!(e.message, "예약된 플레이리스트에 방송 가능한 영상이 없습니다.");
+    assert_eq!(st.item_count, 0);
+    assert!(st.playlist_name.is_none(), "no plan means no playlist to report as live");
+}
+
+#[test]
+fn a_schedule_whose_playlist_was_deleted_says_so_rather_than_reporting_it_empty() {
+    let mut h = harness(&format!("{MON} 17:17:00"));
+    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    h.db.delete_playlist(h.playlist_id).unwrap();
+
+    h.rt.tick();
+    // ON DELETE CASCADE should have taken the schedule with it; if a build ever
+    // loses that, the error must still name the real problem.
+    if let Some(e) = h.rt.status().last_start_error {
+        assert_eq!(e.code_str, "LL-SCHED-003");
+        assert_eq!(e.message, "예약에 연결된 플레이리스트를 찾을 수 없습니다.");
+    } else {
+        assert!(h.db.list_schedules().unwrap().is_empty(), "a deleted playlist must not leave a schedule");
+    }
+}
+
+#[test]
+fn deleting_a_playlist_takes_its_schedules_with_it() {
+    // A-4: there is no name matching anywhere, and no stale id survives —
+    // the foreign key is ON DELETE CASCADE and the pragma is on.
+    let h = harness(&format!("{MON} 12:00:00"));
+    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    assert_eq!(h.db.list_schedules().unwrap().len(), 1);
+
+    h.db.delete_playlist(h.playlist_id).unwrap();
+    assert!(h.db.list_schedules().unwrap().is_empty());
+
+    // Re-creating a playlist with the same name gets a new id and no schedule.
+    let again =
+        h.db.create_playlist("Night Jazz", PlaybackMode::Sequential, OutputProfile::P1080p30).unwrap();
+    assert_ne!(again, h.playlist_id);
+    assert!(h.db.list_schedules().unwrap().is_empty());
+}
+
+#[test]
+fn a_failed_window_is_retried_rather_than_abandoned() {
+    let mut h = harness(&format!("{MON} 17:17:00"));
+    schedule(&h, DaysOfWeek::everyday(), "17:14", "17:40");
+    empty_the_playlist(&h);
+
+    h.rt.tick();
+    assert_eq!(h.rt.state(), StreamState::Error);
+    let after_first = h.events.logs().matches("LL-SCHED-004").count();
+    assert_eq!(after_first, 1);
+
+    // The next second must not produce a second failure: a one-second retry
+    // would write a log line per second for the whole window.
+    h.rt.tick();
+    h.rt.tick();
+    assert_eq!(h.events.logs().matches("LL-SCHED-004").count(), 1, "the retry has to be spaced out");
+
+    // Once the user fixes the cause the window still has time left, and the
+    // broadcast picks up on the next attempt.
+    h.rt.retry_failed_occurrence_now();
+    let m = h.db.list_media().unwrap()[0].id;
+    h.db.add_playlist_item(h.playlist_id, m).unwrap();
+    h.rt.tick();
+    assert!(h.rt.is_active(), "a window with time left must still broadcast once it can");
+}
+
+// --- the pre-start hook (BUG B: same lifecycle, and before FFmpeg) ----------
+
+/// Stands in for the YouTube metadata apply, recording when it ran.
+#[derive(Debug, Default)]
+struct RecordingHook {
+    calls: Mutex<Vec<String>>,
+    fail_with: Mutex<Option<louver_core::error::LouverError>>,
+}
+
+impl RecordingHook {
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().unwrap().clone()
+    }
+    fn fail(&self, e: louver_core::error::LouverError) {
+        *self.fail_with.lock().unwrap() = Some(e);
+    }
+}
+
+impl louver_core::runtime::PreStartHook for RecordingHook {
+    fn before_stream(&self, opts: &StartOptions) -> Result<()> {
+        self.calls.lock().unwrap().push(format!("{:?}", opts.reason));
+        match self.fail_with.lock().unwrap().clone() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+fn not_connected() -> louver_core::error::LouverError {
+    louver_core::error::LouverError::with_detail(
+        louver_core::error::ErrorCode::YoutubeNotConnected,
+        "방송 설정 자동 적용을 사용하려면 YouTube 계정 연결이 필요합니다.",
+    )
+}
+
+#[test]
+fn a_manual_start_runs_the_pre_start_work_before_ffmpeg() {
+    let mut h = harness(&format!("{MON} 12:00:00"));
+    let hook = Arc::new(RecordingHook::default());
+    h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
+
+    h.rt.start(StartOptions {
+        playlist_id: h.playlist_id,
+        reason: StartReason::Manual,
+        dry_run: false,
+        scheduled_end: None,
+        occurrence: None,
+        order_seed: None,
+        skip_pre_start: false,
+    })
+    .unwrap();
+
+    assert_eq!(hook.calls(), vec!["Manual"]);
+    assert_eq!(h.launcher.launch_count(), 1);
+}
+
+#[test]
+fn a_scheduled_start_runs_exactly_the_same_pre_start_work() {
+    // §B-7: the scheduler must not be a second, quieter code path.
+    let mut h = harness(&format!("{MON} 20:05:00"));
+    let hook = Arc::new(RecordingHook::default());
+    h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
+    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+
+    h.rt.tick();
+    assert!(h.rt.is_active());
+    assert_eq!(hook.calls(), vec!["Scheduled"]);
+}
+
+#[test]
+fn the_stream_does_not_start_when_the_metadata_could_not_be_applied() {
+    // §B-9: going live under YouTube's own defaults while the app claims the
+    // user's title was applied is the failure being replaced. FFmpeg is never
+    // launched, so nothing goes out under the wrong title.
+    let mut h = harness(&format!("{MON} 12:00:00"));
+    let hook = Arc::new(RecordingHook::default());
+    hook.fail(not_connected());
+    h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
+
+    let e =
+        h.rt.start(StartOptions {
+            playlist_id: h.playlist_id,
+            reason: StartReason::Manual,
+            dry_run: false,
+            scheduled_end: None,
+            occurrence: None,
+            order_seed: None,
+            skip_pre_start: false,
+        })
+        .unwrap_err();
+
+    assert_eq!(e.code_str, "LL-YOUTUBE-001");
+    assert_eq!(h.launcher.launch_count(), 0, "FFmpeg must not have been launched");
+    assert_eq!(h.rt.state(), StreamState::Error, "and the runtime must not hang in PREPARING");
+    assert!(!h.rt.is_active());
+}
+
+#[test]
+fn the_user_can_choose_to_broadcast_without_the_youtube_settings() {
+    // The other half of §B-9: the choice is offered, and taking it starts the
+    // stream — it is just never made silently on the user's behalf.
+    let mut h = harness(&format!("{MON} 12:00:00"));
+    let hook = Arc::new(RecordingHook::default());
+    hook.fail(not_connected());
+    h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
+
+    h.rt.start(StartOptions {
+        playlist_id: h.playlist_id,
+        reason: StartReason::Manual,
+        dry_run: false,
+        scheduled_end: None,
+        occurrence: None,
+        order_seed: None,
+        skip_pre_start: true,
+    })
+    .unwrap();
+
+    assert!(hook.calls().is_empty());
+    assert_eq!(h.launcher.launch_count(), 1);
+}
+
+#[test]
+fn a_local_test_never_touches_youtube() {
+    let mut h = harness(&format!("{MON} 12:00:00"));
+    let hook = Arc::new(RecordingHook::default());
+    hook.fail(not_connected());
+    h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
+
+    h.rt.start(StartOptions {
+        playlist_id: h.playlist_id,
+        reason: StartReason::Manual,
+        dry_run: true,
+        scheduled_end: None,
+        occurrence: None,
+        order_seed: None,
+        skip_pre_start: false,
+    })
+    .unwrap();
+
+    assert!(hook.calls().is_empty(), "a local test sends nothing to YouTube");
+    assert_eq!(h.launcher.launch_count(), 1);
+}
+
+#[test]
+fn a_reconnect_does_not_re_apply_the_metadata() {
+    // The hook belongs to starting a broadcast, not to keeping one alive: a
+    // dropped connection must not spend an API call re-writing the title.
+    let mut h = harness(&format!("{MON} 20:05:00"));
+    let hook = Arc::new(RecordingHook::default());
+    h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
+    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+
+    h.rt.tick();
+    mark_connected(&mut h.rt);
+    assert_eq!(hook.calls().len(), 1);
+
+    h.launcher.crash();
+    for _ in 0..40 {
+        h.rt.tick();
+        if h.launcher.launch_count() > 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(60));
+    }
+    assert!(h.launcher.launch_count() > 1, "the supervisor should have relaunched");
+    assert_eq!(hook.calls().len(), 1, "a relaunch is not a new broadcast");
+}
+
+/// A hook that fails only for scheduled starts, the way the desktop's policy
+/// switch makes it behave.
+#[derive(Debug)]
+struct SchedulePolicyHook {
+    hold: bool,
+    skipped: Mutex<u32>,
+}
+
+impl louver_core::runtime::PreStartHook for SchedulePolicyHook {
+    fn before_stream(&self, opts: &StartOptions) -> Result<()> {
+        let scheduled = opts.reason != StartReason::Manual;
+        if scheduled && !self.hold {
+            *self.skipped.lock().unwrap() += 1;
+            return Ok(()); // recorded elsewhere, but the channel stays on air
+        }
+        Err(not_connected())
+    }
+}
+
+#[test]
+fn an_unattended_window_holds_by_default_rather_than_going_out_wrong() {
+    let mut h = harness(&format!("{MON} 20:05:00"));
+    h.rt.set_pre_start(Arc::new(SchedulePolicyHook { hold: true, skipped: Mutex::new(0) }));
+    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+
+    h.rt.tick();
+    assert_eq!(h.launcher.launch_count(), 0, "nobody is there to be asked, so it does not go out");
+    assert_eq!(h.rt.state(), StreamState::Error);
+    assert_eq!(h.rt.status().last_start_error.unwrap().code_str, "LL-YOUTUBE-001");
+}
+
+#[test]
+fn a_channel_that_would_rather_stay_on_air_can_say_so() {
+    let mut h = harness(&format!("{MON} 20:05:00"));
+    let hook = Arc::new(SchedulePolicyHook { hold: false, skipped: Mutex::new(0) });
+    h.rt.set_pre_start(Arc::clone(&hook) as Arc<dyn louver_core::runtime::PreStartHook>);
+    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+
+    h.rt.tick();
+    assert!(h.rt.is_active(), "a 24/7 channel keeps broadcasting");
+    assert_eq!(*hook.skipped.lock().unwrap(), 1, "and the skip is counted, not hidden");
+}
+
+#[test]
+fn the_same_failure_is_not_logged_once_a_second_for_the_whole_window() {
+    let mut h = harness(&format!("{MON} 20:05:00"));
+    h.rt.set_pre_start(Arc::new(SchedulePolicyHook { hold: true, skipped: Mutex::new(0) }));
+    schedule(&h, DaysOfWeek::everyday(), "20:00", "23:00");
+
+    for _ in 0..5 {
+        h.rt.tick();
+    }
+    assert_eq!(h.events.logs().matches("LL-YOUTUBE-001").count(), 1);
 }

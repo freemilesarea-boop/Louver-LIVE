@@ -15,7 +15,7 @@ import type {
   Media, Playlist, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
   SettingsView, StreamDiagnostics, StreamEvent,
   BroadcastMetadata, BroadcastPreset, ChatMessage, ChatSettings, ChatStatus,
-  LiveBroadcast, YoutubeStatus,
+  LiveBroadcast, YoutubeStatus, MetadataOutcome, MetadataApplyState, ApplyPlan,
 } from '@/types'
 
 export type MockBackend = (cmd: string, args: Record<string, unknown>) => unknown | Promise<unknown>
@@ -114,7 +114,8 @@ export const api = {
   getStatus: () => call<RuntimeStatus>('get_status'),
   runPreflight: (playlistId: number, dryRun: boolean) =>
     call<PreflightReport>('run_preflight', { playlistId, dryRun }),
-  startBroadcast: (playlistId: number) => call<RuntimeStatus>('start_broadcast', { playlistId }),
+  startBroadcast: (playlistId: number, skipYoutube = false) =>
+    call<RuntimeStatus>('start_broadcast', { playlistId, skipYoutube }),
   stopBroadcast: () => call<RuntimeStatus>('stop_broadcast'),
   startDryRun: (playlistId: number) => call<RuntimeStatus>('start_dry_run', { playlistId }),
   streamModeLabel: () => call<string>('stream_mode_label'),
@@ -152,7 +153,11 @@ export const api = {
   youtubeGetMetadata: () => call<BroadcastMetadata>('youtube_get_metadata'),
   youtubeSaveMetadata: (metadata: BroadcastMetadata) =>
     call<BroadcastMetadata>('youtube_save_metadata', { metadata }),
-  youtubeApplyMetadata: () => call<LiveBroadcast>('youtube_apply_metadata'),
+  youtubeApplyMetadata: () => call<MetadataOutcome>('youtube_apply_metadata'),
+  youtubeApplyState: () => call<MetadataApplyState>('youtube_apply_state'),
+  youtubeScheduleHolds: () => call<boolean>('youtube_schedule_holds'),
+  youtubeSetScheduleHolds: (holds: boolean) => call<void>('youtube_set_schedule_holds', { holds }),
+  youtubeApplyPlan: () => call<ApplyPlan>('youtube_apply_plan'),
   youtubeSetApplyOnStart: (enabled: boolean) =>
     call<void>('youtube_set_apply_on_start', { enabled }),
   youtubeCurrentBroadcast: () => call<LiveBroadcast>('youtube_current_broadcast'),

@@ -173,6 +173,7 @@ fn the_runtime_drives_real_ffmpeg_and_produces_a_playable_broadcast() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(7),
+        skip_pre_start: false,
     })
     .expect("the runtime failed to start a broadcast");
 
@@ -271,6 +272,7 @@ fn a_broadcast_that_loses_its_ffmpeg_comes_back_on_its_own() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .unwrap();
 

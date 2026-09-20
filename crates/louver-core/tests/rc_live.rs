@@ -387,6 +387,7 @@ fn rc_broadcast() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .expect("failed to start the broadcast");
 
@@ -641,6 +642,7 @@ fn rc_network_interruption() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .expect("failed to start");
 
@@ -847,6 +849,7 @@ fn rc_application_restart_recovery() {
             scheduled_end: None,
             occurrence: None,
             order_seed: Some(4242),
+            skip_pre_start: false,
         })
         .expect("failed to start");
 
@@ -956,6 +959,7 @@ fn rc_ffmpeg_crash_recovery() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .expect("failed to start");
 

@@ -29,6 +29,10 @@ pub mod keys {
     pub const METADATA_CATEGORY: &str = "youtube_meta_category";
     pub const METADATA_PRIVACY: &str = "youtube_meta_privacy";
     pub const APPLY_ON_START: &str = "youtube_apply_on_start";
+    /// What a *scheduled* start does when the metadata cannot be applied:
+    /// `hold` (default — do not broadcast under YouTube's own settings) or
+    /// `broadcast` (keep the channel on air and record the failure).
+    pub const SCHEDULE_ON_METADATA_FAILURE: &str = "youtube_schedule_on_metadata_failure";
     pub const CHAT_ENABLED: &str = "youtube_chat_enabled";
     pub const CHAT_ORDER: &str = "youtube_chat_order";
     pub const CHAT_INTERVAL: &str = "youtube_chat_interval";

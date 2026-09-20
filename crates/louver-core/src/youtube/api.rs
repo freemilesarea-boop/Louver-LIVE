@@ -186,25 +186,36 @@ impl<'a> YoutubeApi<'a> {
         Ok(())
     }
 
-    /// Also apply the category, which lives on the video rather than the
-    /// broadcast. Merged the same way, for the same reason.
+    /// Apply tags and the category, which live on the video rather than the
+    /// broadcast — and the title and description, which live on both.
+    ///
+    /// The title matters here. `liveBroadcasts.update` sets the broadcast's
+    /// title, but the watch page and YouTube Studio read the *video*, and the
+    /// two are separate resources that Google reconciles in its own time. This
+    /// call reads the video snippet and writes it back; leaving the title out
+    /// of the merge therefore wrote whatever the video still said — typically
+    /// the channel's default stream title, "Playlist" — straight back over the
+    /// title that had just been set. Everything the user did not choose
+    /// (`defaultLanguage` and the rest) still survives, which is the reason
+    /// the read comes first.
     pub fn update_video_snippet(&self, token: &str, video_id: &str, meta: &BroadcastMetadata) -> Result<()> {
-        let existing = self.call("GET", &format!("/videos?part=snippet&id={video_id}"), token, None)?;
-        let snippet =
-            existing["items"].as_array().and_then(|i| i.first()).map(|i| i["snippet"].clone()).ok_or_else(
-                || {
-                    LouverError::with_detail(
-                        ErrorCode::YoutubeNoActiveBroadcast,
-                        format!("영상 {video_id}을 찾지 못했습니다"),
-                    )
-                },
-            )?;
-
-        let mut merged = merge_tags_into_snippet(&snippet, &meta.tags);
-        merged["categoryId"] = serde_json::Value::String(meta.category_id.clone());
-        let body = serde_json::json!({ "id": video_id, "snippet": merged });
+        let snippet = self.video_snippet(token, video_id)?;
+        let body =
+            serde_json::json!({ "id": video_id, "snippet": merge_metadata_into_snippet(&snippet, meta) });
         self.call("PUT", "/videos?part=snippet", token, Some(body))?;
         Ok(())
+    }
+
+    /// The video's current snippet, as Google has it.
+    pub fn video_snippet(&self, token: &str, video_id: &str) -> Result<serde_json::Value> {
+        let existing =
+            self.call("GET", &format!("/videos?part=snippet,status&id={video_id}"), token, None)?;
+        existing["items"].as_array().and_then(|i| i.first()).map(|i| i["snippet"].clone()).ok_or_else(|| {
+            LouverError::with_detail(
+                ErrorCode::YoutubeNoActiveBroadcast,
+                format!("영상 {video_id}을 찾지 못했습니다"),
+            )
+        })
     }
 
     /// Post one message to the live chat.
@@ -236,6 +247,102 @@ pub fn merge_tags_into_snippet(existing: &serde_json::Value, tags: &[String]) ->
     merged["tags"] =
         serde_json::Value::Array(tags.iter().map(|t| serde_json::Value::String(t.clone())).collect());
     merged
+}
+
+/// Every field the user chose, written over the video's current snippet.
+///
+/// The fields the user did not choose are carried through untouched, because
+/// `videos.update` replaces the whole `snippet` part.
+pub fn merge_metadata_into_snippet(
+    existing: &serde_json::Value,
+    meta: &BroadcastMetadata,
+) -> serde_json::Value {
+    let mut merged = merge_tags_into_snippet(existing, &meta.tags);
+    merged["title"] = serde_json::Value::String(meta.title.clone());
+    merged["description"] = serde_json::Value::String(meta.description.clone());
+    merged["categoryId"] = serde_json::Value::String(meta.category_id.clone());
+    merged
+}
+
+/// Which fields of a metadata apply actually took, read back from Google.
+///
+/// A 200 is not the answer to "did the title change": `liveBroadcasts.update`
+/// answers 200 and the watch page can still read "Playlist". This is the
+/// resource as Google returns it afterwards, compared field by field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct MetadataVerification {
+    pub title: FieldCheck,
+    pub description: FieldCheck,
+    pub tags: FieldCheck,
+    pub category: FieldCheck,
+    pub privacy: FieldCheck,
+}
+
+impl MetadataVerification {
+    pub fn all_applied(&self) -> bool {
+        [&self.title, &self.description, &self.tags, &self.category, &self.privacy].iter().all(|f| f.applied)
+    }
+
+    /// The fields that came back different, for the message the user reads.
+    pub fn mismatches(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        for (name, f) in [
+            ("제목", &self.title),
+            ("설명", &self.description),
+            ("태그", &self.tags),
+            ("카테고리", &self.category),
+            ("공개범위", &self.privacy),
+        ] {
+            if !f.applied {
+                v.push(name);
+            }
+        }
+        v
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct FieldCheck {
+    pub applied: bool,
+    /// What Google reports now. Shown next to what was asked for.
+    pub actual: String,
+}
+
+impl FieldCheck {
+    fn compare(requested: &str, actual: &str) -> Self {
+        Self { applied: requested == actual, actual: actual.to_string() }
+    }
+}
+
+/// Compare what was asked for against the video snippet and broadcast status
+/// Google returns after the update.
+pub fn verify_metadata(
+    meta: &BroadcastMetadata,
+    snippet: &serde_json::Value,
+    privacy_status: &str,
+) -> MetadataVerification {
+    let text = |k: &str| snippet[k].as_str().unwrap_or_default().to_string();
+    let actual_tags: Vec<String> = snippet["tags"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+        .unwrap_or_default();
+    MetadataVerification {
+        title: FieldCheck::compare(&meta.title, &text("title")),
+        description: FieldCheck::compare(&meta.description, &text("description")),
+        // Order is YouTube's to keep, so the comparison is by set, not by list.
+        tags: FieldCheck {
+            applied: {
+                let mut a = actual_tags.clone();
+                let mut b = meta.tags.clone();
+                a.sort();
+                b.sort();
+                a == b
+            },
+            actual: actual_tags.join(", "),
+        },
+        category: FieldCheck::compare(&meta.category_id, &text("categoryId")),
+        privacy: FieldCheck::compare(meta.privacy.as_api(), privacy_status),
+    }
 }
 
 fn parse_broadcast(item: &serde_json::Value) -> LiveBroadcast {

@@ -373,6 +373,87 @@ server came straight back; a soak that ran unpaced and measured the disk.
 
 ---
 
+## 14b. Defects found in real use on macOS + real YouTube (2026-09-20)
+
+Two release blockers reported from a real Mac against a real YouTube channel.
+Both are fixed; each has a regression test that fails against the old code.
+
+### A. A scheduled window was skipped, and the app reported tomorrow
+
+Reported: a `17:14 → 17:40` daily schedule; at ~17:17 the app was not
+broadcasting, the schedule read `다음 방송 2026-09-21 17:14`, and the dashboard
+sat at `PREPARING · FFmpeg Stopped · playlist: night · 0개 영상`.
+
+| | Cause |
+| --- | --- |
+| Skipped window | `BroadcastRuntime::start` called `supervisor.begin()` — which moves the machine to PREPARING — *before* `build_plan`, the stream-key lookup, `create_session` and `spawn_now`. Any failure after that point returned early and left the machine in PREPARING. `StreamState::is_active()` counts PREPARING as active, and `tick_scheduler` returns early while the runtime is active. One failed start therefore locked the scheduler out for the rest of the window |
+| "tomorrow" | The schedule list rendered `next_occurrence` only, which by definition begins *after* now. Inside an open window that is the next day. The row had no way to say "this window is open" |
+| `0개 영상` | The dashboard reads `status.item_count` whenever the state looks live, and PREPARING looks live. `item_count` comes from `self.plan`, which the failed start never set. The name came from the separately-held UI selection, so the two disagreed |
+| `PREPARING` forever | Same single cause as the skipped window — nothing moved the machine out |
+
+Not a cause: stale playlist ids. `schedules.playlist_id` is
+`REFERENCES playlists(id) ON DELETE CASCADE` with `PRAGMA foreign_keys=ON`, so
+deleting a playlist deletes its schedules; re-creating one with the same name
+gets a new id and no schedule. There is no name matching anywhere in the
+scheduler. `deleting_a_playlist_takes_its_schedules_with_it` pins this.
+
+**Fixed by** rolling a failed start back to ERROR (`StreamSupervisor::abort`),
+retrying the window once a minute rather than abandoning it, new codes
+`LL-SCHED-003` / `LL-SCHED-004` / `LL-STREAM-009`, `last_start_error` on
+`RuntimeStatus`, and an active-window row in the schedule list.
+
+**Verified in the real app** under Xvfb: with the app closed across the start
+of an `08:55 → 09:03` window, launching at 08:57 attempted the start at once,
+failed on the missing stream key, showed `STATUS ERROR` with
+`LL-STREAM-007` (not PREPARING), and the schedule row read
+`지금 방송 시간입니다 · 2026-09-20 09:03에 종료`. Entering the key led to a retry
+60 s later that launched FFmpeg with `예약 시작` and `예약 종료까지 00:03:52`.
+
+### B. The broadcast went live under YouTube's own title
+
+Reported: title, description, six tags, category 음악 and 일부공개 were set in
+the app, and the live broadcast started as "Playlist".
+
+| | Cause |
+| --- | --- |
+| Applied too late | Metadata was pushed from the one-second broadcast tick, gated on `rt.state() == Live`. By then FFmpeg had connected and YouTube was already live under whatever the resource said |
+| Applied never, silently | The same tick returned early when no account was connected, while 방송 설정 promised "방송이 시작되면 … 적용합니다". A stream-key-only build can never change a title over RTMPS |
+| The old title written back | `update_video_snippet` read the *video* snippet and wrote it back with only `tags` and `categoryId` replaced. The watch page and Studio read the video, not the broadcast, so this put the stale title — the channel's default, "Playlist" — back over the one `liveBroadcasts.update` had just set |
+| Never checked | A 2xx was treated as success. Nothing read the resource back |
+
+**Fixed by** a `PreStartHook` on `BroadcastRuntime::start`, which both the
+manual button and the scheduler go through, running before `spawn_now`;
+`merge_metadata_into_snippet`, which writes title and description as well as
+tags and category while keeping `defaultLanguage` and everything else;
+`verify_metadata`, which re-reads the video and the broadcast and compares
+five fields; a start-time choice (`다시 시도` / `설정 없이 방송 시작`) instead of a
+silent start; and a per-field panel on the dashboard.
+
+| Requirement | Evidence |
+| --- | --- |
+| §B-1 stream and metadata reported separately | `MetadataApplyState` is independent of `SupervisorStatus`; seen on screen reading `not_connected` while the stream was RECONNECTING |
+| §B-2 no false promise without an account | e2e *does not claim settings will be applied when no account is connected* |
+| §B-3 the user chooses | e2e *asks before going live under whatever title YouTube already has* |
+| §B-4 metadata before FFmpeg | `a_manual_start_runs_the_pre_start_work_before_ffmpeg`, and `the_stream_does_not_start_when_the_metadata_could_not_be_applied` (launch count 0) |
+| §B-5 read-back | `a_two_hundred_is_not_evidence_that_the_title_changed` |
+| §B-6 tags merge safety | `the_video_write_carries_the_new_title_and_keeps_what_the_user_did_not_choose` |
+| §B-7 one lifecycle | `a_scheduled_start_runs_exactly_the_same_pre_start_work` |
+| §B-8 fresh `activeLiveChatId` | `ChatBot::start` resolves it from the pinned broadcast id every time; `start_bot_for` stops a bot pinned to a different one |
+| §B-9 no silent default | `the_user_can_choose_to_broadcast_without_the_youtube_settings` and the two schedule-policy tests |
+| §B-10 per-field display | e2e *reports each field from what YouTube says afterwards* |
+
+**Unattended windows.** A scheduled start has nobody to ask. The default is
+the same as a cancelled manual start — hold, do not broadcast under settings
+the user did not choose — and 방송 설정 carries a switch for a 24/7 channel that
+would rather stay on air and have the failure recorded instead.
+
+**NOT TESTED:** everything above was checked against a stand-in for the
+YouTube API and in the real app under Xvfb. TEST 1–5 against a real Google
+account and a real live broadcast — read-back of the real `videos.update`, the
+real `activeLiveChatId` rotation, and the real OAuth failure path — have not
+been run here and remain **NOT TESTED**. `rc-results/youtube-test.md` is where
+those results go.
+
 ## 15. Known issues
 
 1. **Real YouTube broadcasting is unverified.** Everything up to the socket is

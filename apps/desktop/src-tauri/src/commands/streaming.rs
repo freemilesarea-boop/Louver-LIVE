@@ -52,8 +52,16 @@ pub fn run_preflight(
 }
 
 /// 방송 시작 (§26). Preflight must pass first.
+///
+/// `skip_youtube` is the user's answer to "we could not apply your broadcast
+/// settings — start anyway?". It is never a default: the caller has to have
+/// been told what it gives up.
 #[tauri::command]
-pub fn start_broadcast(state: State<'_, AppState>, playlist_id: i64) -> CmdResult<RuntimeStatus> {
+pub fn start_broadcast(
+    state: State<'_, AppState>,
+    playlist_id: i64,
+    skip_youtube: Option<bool>,
+) -> CmdResult<RuntimeStatus> {
     let report = run_preflight(state.clone(), playlist_id, false)?;
     if !report.can_broadcast {
         let f = report.first_failure().expect("a blocked report must name a failure");
@@ -71,6 +79,7 @@ pub fn start_broadcast(state: State<'_, AppState>, playlist_id: i64) -> CmdResul
         scheduled_end: None,
         occurrence: None,
         order_seed: None,
+        skip_pre_start: skip_youtube.unwrap_or(false),
     })?;
     Ok(rt.status())
 }
@@ -103,6 +112,7 @@ pub fn start_dry_run(state: State<'_, AppState>, playlist_id: i64) -> CmdResult<
         scheduled_end: None,
         occurrence: None,
         order_seed: None,
+        skip_pre_start: true,
     })?;
     Ok(rt.status())
 }

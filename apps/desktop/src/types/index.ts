@@ -82,6 +82,11 @@ export interface ScheduleView {
   next_start?: string | null
   next_end?: string | null
   window_duration_label: string
+  /** The window is open right now — which `next_start` alone cannot say. */
+  active_now: boolean
+  active_until?: string | null
+  playlist_missing: boolean
+  playlist_ready_count: number
 }
 
 export interface StreamProgress {
@@ -120,6 +125,8 @@ export interface RuntimeStatus {
   dry_run: boolean
   next_scheduled_start?: string | null
   cycle_duration_secs: number
+  /** Why the last start attempt failed. Cleared by the next successful start. */
+  last_start_error?: LouverError | null
 }
 
 export interface StreamDiagnostics {
@@ -293,6 +300,47 @@ export interface LiveBroadcast {
   privacy: Privacy
   active_live_chat_id?: string | null
   life_cycle_status: string
+}
+
+/** One field of the metadata, as Google reports it back after the update. */
+export interface FieldCheck {
+  applied: boolean
+  actual: string
+}
+
+export interface MetadataVerification {
+  title: FieldCheck
+  description: FieldCheck
+  tags: FieldCheck
+  category: FieldCheck
+  privacy: FieldCheck
+}
+
+export interface MetadataOutcome {
+  broadcast: LiveBroadcast
+  verification: MetadataVerification
+}
+
+export type ApplyStage =
+  | 'off' | 'not_connected' | 'applying' | 'applied' | 'mismatch' | 'failed'
+
+/**
+ * The YouTube half of a broadcast, tracked separately from the stream's own
+ * state: a connected RTMPS stream says nothing about whether the title changed.
+ */
+export interface MetadataApplyState {
+  stage: ApplyStage
+  broadcast_id?: string | null
+  requested?: BroadcastMetadata | null
+  verification?: MetadataVerification | null
+  error?: LouverError | null
+}
+
+/** Whether the next Start can do the YouTube work the user asked for. */
+export interface ApplyPlan {
+  wanted: boolean
+  connected: boolean
+  chat_enabled: boolean
 }
 
 export interface ChatMessage {

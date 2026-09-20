@@ -5,7 +5,7 @@
 
 use super::CmdResult;
 use crate::state::AppState;
-use crate::youtube_service::YoutubeStatus;
+use crate::youtube_service::{MetadataApplyState, MetadataOutcome, YoutubeStatus};
 use louver_core::youtube::chat::{ChatSettings, ChatStatus};
 use louver_core::youtube::{keys, BroadcastMetadata, BroadcastPreset, LiveBroadcast, Privacy};
 use tauri::State;
@@ -81,17 +81,62 @@ pub fn youtube_save_metadata(
     Ok(m)
 }
 
-/// Push the saved metadata to the live broadcast (§3).
+/// Push the saved metadata to the live broadcast, and report what Google says
+/// afterwards rather than what the HTTP status said (§3, §B-5).
 #[tauri::command]
-pub fn youtube_apply_metadata(state: State<'_, AppState>) -> CmdResult<LiveBroadcast> {
+pub fn youtube_apply_metadata(state: State<'_, AppState>) -> CmdResult<MetadataOutcome> {
     let m = stored_metadata(&state);
     state.youtube.apply_metadata(&m)
+}
+
+/// What the automatic apply did for the broadcast in progress (§B-10).
+#[tauri::command]
+pub fn youtube_apply_state(state: State<'_, AppState>) -> CmdResult<MetadataApplyState> {
+    Ok(state.youtube.apply_state())
+}
+
+/// Would an automatic apply happen on the next Start, and can it?
+///
+/// The UI asks before it promises anything: saying "this is applied when the
+/// broadcast starts" with no account connected is a lie the user only finds
+/// out about by watching their stream go live under the wrong title.
+#[tauri::command]
+pub fn youtube_apply_plan(state: State<'_, AppState>) -> CmdResult<ApplyPlan> {
+    Ok(ApplyPlan {
+        wanted: state.youtube.apply_on_start_wanted(),
+        connected: state.youtube.status().connected,
+        chat_enabled: state.youtube.chat_settings().enabled,
+    })
+}
+
+/// Whether the YouTube half of the next Start can do what the user asked for.
+#[derive(serde::Serialize)]
+pub struct ApplyPlan {
+    /// Automatic apply is on and there is something saved to apply.
+    pub wanted: bool,
+    pub connected: bool,
+    pub chat_enabled: bool,
 }
 
 /// Whether metadata is pushed automatically when a broadcast starts.
 #[tauri::command]
 pub fn youtube_set_apply_on_start(state: State<'_, AppState>, enabled: bool) -> CmdResult<()> {
     state.db.set_setting(keys::APPLY_ON_START, if enabled { "true" } else { "false" })
+}
+
+/// What a scheduled start does when the metadata cannot be applied.
+///
+/// `true` holds the broadcast (the default, and what a manual start does when
+/// the user cancels); `false` keeps a 24/7 channel on air and records the
+/// failure instead.
+#[tauri::command]
+pub fn youtube_set_schedule_holds(state: State<'_, AppState>, holds: bool) -> CmdResult<()> {
+    state.db.set_setting(keys::SCHEDULE_ON_METADATA_FAILURE, if holds { "hold" } else { "broadcast" })
+}
+
+#[tauri::command]
+pub fn youtube_schedule_holds(state: State<'_, AppState>) -> CmdResult<bool> {
+    Ok(state.youtube.schedule_holds_on_failure())
 }
 
 #[tauri::command]

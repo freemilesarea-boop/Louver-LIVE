@@ -196,6 +196,26 @@ impl StreamSupervisor {
         Ok(())
     }
 
+    /// Give up on a session that never got as far as a process.
+    ///
+    /// [`Self::begin`] moves to PREPARING, and everything between that and the
+    /// first [`Self::attach`] can fail: an empty playlist, a missing stream
+    /// key, a file that has gone. Without this the machine stays PREPARING,
+    /// which reads as *active* — the scheduler then refuses to start anything
+    /// and the window is lost, which is exactly what happened to a real
+    /// 17:14→17:40 schedule.
+    pub fn abort(&mut self, err: LouverError) {
+        self.last_error = Some(err);
+        if let Some(mut c) = self.child.take() {
+            let _ = c.terminate();
+        }
+        // Only PREPARING and CONNECTING reach ERROR directly; from anywhere
+        // else the ordinary stop path is the right one.
+        if self.machine.transition(StreamState::Error).is_err() {
+            let _ = self.stop();
+        }
+    }
+
     /// Attach a freshly started process and move to CONNECTING.
     pub fn attach(&mut self, child: Box<dyn ProcessHandle>) -> Result<()> {
         self.child = Some(child);

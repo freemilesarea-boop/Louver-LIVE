@@ -11,7 +11,7 @@ import { emitLocal } from '@/services/ipc'
 import type {
   DashboardMetrics, DiskEstimate, ImportResult, LicenseState, Media, Playlist,
   PlaylistItemView, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
-  SettingsView, StreamEvent, StreamState,
+  SettingsView, StreamEvent, StreamState, MetadataApplyState, MetadataOutcome,
 } from '@/types'
 
 export interface MockOptions {
@@ -23,6 +23,13 @@ export interface MockOptions {
   seedSettings?: Record<string, string>
   /** Simulate a machine where no browser can be opened. */
   failOpener?: boolean
+  /** Report new schedules as being inside their window right now. */
+  scheduleActiveNow?: boolean
+  /**
+   * YouTube answers 200 but keeps its own title — the reported failure, and
+   * the only thing read-back catches.
+   */
+  youtubeIgnoresTitle?: boolean
   /**
    * Make every YouTube Data API call fail. Used to check that the optional
    * half can break without taking the broadcast with it.
@@ -46,6 +53,8 @@ export function createMockBackend(opts: MockOptions = {}) {
       privacy: 'unlisted' as const,
     },
     applied: null as null | Record<string, unknown>,
+    applyState: { stage: 'off' } as MetadataApplyState,
+    scheduleHolds: true,
     presets: [] as { id: number; name: string; title: string; description: string; tags: string[]; category_id: string; privacy: string }[],
     messages: [] as { id: number; position: number; text: string; enabled: boolean }[],
     chat: {
@@ -139,6 +148,29 @@ export function createMockBackend(opts: MockOptions = {}) {
 
   function durationOf(m: Media) {
     return m.normalized_duration_secs ?? m.duration_secs
+  }
+
+  /** The apply, as Google reports it back afterwards. */
+  function applyOutcome(ignoresTitle: boolean): MetadataOutcome {
+    const m = youtube.metadata
+    const actualTitle = ignoresTitle ? 'Playlist' : m.title
+    const ok = (actual: string, applied = true) => ({ applied, actual })
+    return {
+      broadcast: {
+        id: 'bcast-1',
+        title: actualTitle,
+        privacy: m.privacy,
+        active_live_chat_id: 'chat-1',
+        life_cycle_status: 'live',
+      },
+      verification: {
+        title: { applied: actualTitle === m.title, actual: actualTitle },
+        description: ok(m.description),
+        tags: ok(m.tags.join(', ')),
+        category: ok(m.category_id),
+        privacy: ok(m.privacy),
+      },
+    }
   }
 
   function startBroadcast(playlistId: number, dryRun: boolean) {
@@ -399,6 +431,11 @@ export function createMockBackend(opts: MockOptions = {}) {
         crosses_midnight: overnight,
         next_start: `내일 ${start}`, next_end: `${overnight ? '모레' : '내일'} ${end}`,
         window_duration_label: '12시간 00분 00초',
+        // The fake clock is not inside any window unless a test says so.
+        active_now: Boolean(opts.scheduleActiveNow),
+        active_until: opts.scheduleActiveNow ? `오늘 ${end}` : null,
+        playlist_missing: !playlists.some((p) => p.id === a.playlistId),
+        playlist_ready_count: items.filter((i) => i.playlist_id === a.playlistId).length,
       }
       schedules.push(s)
       return s.id
@@ -425,6 +462,48 @@ export function createMockBackend(opts: MockOptions = {}) {
       if (!r.can_broadcast) {
         const f = r.checks.find((c) => c.outcome === 'fail')!
         throw { code_str: f.code, message: f.detail }
+      }
+      // The real backend runs the YouTube work here, before FFmpeg, and
+      // refuses the start if it cannot be done (§B-4, §B-9).
+      if (!a.skipYoutube) {
+        const wanted = youtube.applyOnStart && youtube.metadata.title.trim() !== ''
+        if (wanted && !youtube.connected) {
+          youtube.applyState = {
+            stage: 'not_connected',
+            requested: { ...youtube.metadata },
+          }
+          throw {
+            code_str: 'LL-YOUTUBE-001',
+            message: 'YouTube 계정이 연결되지 않았습니다. 설정에서 연결해주세요.',
+            detail: '방송 설정 자동 적용을 사용하려면 YouTube 계정 연결이 필요합니다.',
+          }
+        }
+        if (wanted) {
+          if (opts.youtubeApiFails) {
+            youtube.applyState = {
+              stage: 'failed',
+              requested: { ...youtube.metadata },
+              error: {
+                code_str: 'LL-YOUTUBE-004',
+                message: 'YouTube에 연결하지 못했습니다. 잠시 후 다시 시도합니다.',
+              },
+            }
+            throw {
+              code_str: 'LL-YOUTUBE-004',
+              message: 'YouTube에 연결하지 못했습니다. 잠시 후 다시 시도합니다.',
+              detail: '방송 설정을 YouTube에 적용하지 못했습니다.',
+            }
+          }
+          const outcome = applyOutcome(opts.youtubeIgnoresTitle === true)
+          youtube.applyState = {
+            stage: outcome.verification.title.applied ? 'applied' : 'mismatch',
+            broadcast_id: outcome.broadcast.id,
+            requested: { ...youtube.metadata },
+            verification: outcome.verification,
+          }
+        }
+      } else {
+        youtube.applyState = { stage: 'off' }
       }
       startBroadcast(a.playlistId as number, false)
       return status
@@ -541,18 +620,30 @@ export function createMockBackend(opts: MockOptions = {}) {
         }
       }
       youtube.applied = { ...youtube.metadata }
-      return {
-        id: 'bcast-1',
-        title: youtube.metadata.title,
-        privacy: youtube.metadata.privacy,
-        active_live_chat_id: 'chat-1',
-        life_cycle_status: 'live',
+      const outcome = applyOutcome(opts.youtubeIgnoresTitle === true)
+      youtube.applyState = {
+        stage: outcome.verification.title.applied ? 'applied' : 'mismatch',
+        broadcast_id: outcome.broadcast.id,
+        requested: { ...youtube.metadata },
+        verification: outcome.verification,
+        error: null,
       }
+      return outcome
     },
     youtube_set_apply_on_start: (a: Record<string, unknown>) => {
       youtube.applyOnStart = Boolean(a.enabled)
       return undefined
     },
+    youtube_apply_state: () => youtube.applyState,
+    youtube_schedule_holds: () => youtube.scheduleHolds,
+    youtube_set_schedule_holds: (a: Record<string, unknown>) => {
+      youtube.scheduleHolds = Boolean(a.holds)
+    },
+    youtube_apply_plan: () => ({
+      wanted: youtube.applyOnStart && youtube.metadata.title.trim() !== '',
+      connected: youtube.connected,
+      chat_enabled: youtube.chat.enabled,
+    }),
     youtube_current_broadcast: () => ({
       id: 'bcast-1',
       title: youtube.metadata.title,

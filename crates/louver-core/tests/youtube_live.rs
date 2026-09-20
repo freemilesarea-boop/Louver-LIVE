@@ -167,9 +167,17 @@ fn the_channel_is_read_with_the_bearer_token() {
 }
 
 #[test]
-fn updating_tags_preserves_everything_else_on_the_video() {
-    // The rule §3 is explicit about: read the resource, merge, then write.
-    // Asserted on the bytes that actually went over the socket.
+fn the_video_write_carries_the_new_title_and_keeps_what_the_user_did_not_choose() {
+    // Two rules at once, both checked on the bytes that went over the socket.
+    //
+    // §3: read the resource, merge, then write — so `defaultLanguage`,
+    // `channelId` and the thumbnails survive a tag change.
+    //
+    // And the one that cost a real broadcast: the *video* is what the watch
+    // page and YouTube Studio show, and this write replaces its whole snippet.
+    // Carrying the title through from the GET meant writing the channel's
+    // default stream title — "Playlist" — back over the title that had just
+    // been set on the broadcast.
     let fake = FakeYoutube::start(vec![
         ("GET /videos", 200, EXISTING_VIDEO.into()),
         ("PUT /videos", 200, r#"{"id":"bcast-1"}"#.into()),
@@ -186,13 +194,82 @@ fn updating_tags_preserves_everything_else_on_the_video() {
 
     let sent = &reqs[1].body["snippet"];
     assert_eq!(sent["tags"], serde_json::json!(["lofi", "jazz", "chill"]));
-    // The fields that would have been destroyed by a naive update:
-    assert_eq!(sent["title"], "ROOM. 24/7");
-    assert_eq!(sent["description"], "original description");
+    // What the user asked for:
+    assert_eq!(sent["title"], meta().title);
+    assert_ne!(sent["title"], "ROOM. 24/7", "the stale title must not be written back");
+    assert_eq!(sent["description"], meta().description);
     assert_eq!(sent["categoryId"], "10");
+    // What the user never touched, and would have lost to a naive update:
     assert_eq!(sent["defaultLanguage"], "ko");
     assert_eq!(sent["channelId"], "UC-room");
     assert!(sent["thumbnails"].is_object(), "thumbnails survived");
+}
+
+#[test]
+fn update_video_tags_alone_still_leaves_the_title_where_it_was() {
+    // The tags-only entry point is a different promise from the full apply:
+    // it changes tags and nothing else.
+    let fake = FakeYoutube::start(vec![
+        ("GET /videos", 200, EXISTING_VIDEO.into()),
+        ("PUT /videos", 200, r#"{"id":"bcast-1"}"#.into()),
+    ]);
+    let http = client();
+    let api = YoutubeApi::with_base(&http, fake.base.clone());
+
+    api.update_video_tags("tok", "bcast-1", &["lofi".into()]).unwrap();
+
+    let put = fake.requests().into_iter().find(|r| r.method == "PUT").unwrap();
+    assert_eq!(put.body["snippet"]["tags"], serde_json::json!(["lofi"]));
+    assert_eq!(put.body["snippet"]["title"], "ROOM. 24/7");
+}
+
+#[test]
+fn a_two_hundred_is_not_evidence_that_the_title_changed() {
+    use louver_core::youtube::api::verify_metadata;
+
+    // Exactly the reported failure: every call succeeded, and the watch page
+    // still said "Playlist". Read-back is the only thing that catches it.
+    let still_default = serde_json::json!({
+        "title": "Playlist",
+        "description": meta().description,
+        "categoryId": "10",
+        "tags": ["lofi", "jazz", "chill"],
+    });
+    let v = verify_metadata(&meta(), &still_default, "public");
+    assert!(!v.all_applied());
+    assert_eq!(v.mismatches(), vec!["제목"]);
+    assert_eq!(v.title.actual, "Playlist");
+    assert!(v.description.applied && v.tags.applied && v.category.applied && v.privacy.applied);
+}
+
+#[test]
+fn read_back_passes_when_google_agrees_with_what_was_asked_for() {
+    use louver_core::youtube::api::verify_metadata;
+    let m = meta();
+    let applied = serde_json::json!({
+        "title": m.title,
+        "description": m.description,
+        // YouTube is free to reorder tags, and that is not a failure.
+        "tags": ["jazz", "chill", "lofi"],
+        "categoryId": m.category_id,
+    });
+    let v = verify_metadata(&m, &applied, "public");
+    assert!(v.all_applied(), "mismatches: {:?}", v.mismatches());
+    assert!(v.mismatches().is_empty());
+}
+
+#[test]
+fn read_back_names_every_field_that_did_not_take() {
+    use louver_core::youtube::api::verify_metadata;
+    let wrong = serde_json::json!({
+        "title": "Playlist",
+        "description": "",
+        "tags": [],
+        "categoryId": "22",
+    });
+    let v = verify_metadata(&meta(), &wrong, "private");
+    assert_eq!(v.mismatches(), vec!["제목", "설명", "태그", "카테고리", "공개범위"]);
+    assert_eq!(v.privacy.actual, "private");
 }
 
 #[test]

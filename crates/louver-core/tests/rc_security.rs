@@ -206,6 +206,7 @@ fn a_real_broadcast_attempt_leaks_the_stream_key_nowhere() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .expect("start failed");
 
@@ -394,6 +395,7 @@ fn diagnostics_prove_a_live_session_is_stream_copy() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .expect("start failed");
 
@@ -477,6 +479,7 @@ fn diagnostics_report_compatibility_mode_as_encoding() {
         scheduled_end: None,
         occurrence: None,
         order_seed: Some(1),
+        skip_pre_start: false,
     })
     .expect("start failed");
 

@@ -5,7 +5,7 @@ import { api } from '@/services/ipc'
 import { formatDuration, formatMbps } from '@/services/format'
 import { Badge, Button, Card, Modal, Stat } from '@/components/ui'
 import { StatusPill } from '@/components/StatusPill'
-import type { PreflightReport } from '@/types'
+import type { ApplyPlan, MetadataApplyState, PreflightReport } from '@/types'
 
 /** Main dashboard (§24, §26, §28). */
 export function Dashboard() {
@@ -19,14 +19,25 @@ export function Dashboard() {
   const [warnings, setWarnings] = useState<string[] | null>(null)
   const [pendingStart, setPendingStart] = useState<'live' | 'test' | null>(null)
   const [busy, setBusy] = useState(false)
+  const [applyState, setApplyState] = useState<MetadataApplyState | null>(null)
+  const [plan, setPlan] = useState<ApplyPlan | null>(null)
+  /** The YouTube side could not be done; the user has to choose (§B-9). */
+  const [youtubeBlocked, setYoutubeBlocked] = useState<string | null>(null)
 
   useEffect(() => {
     const t = setInterval(() => {
       void refreshStatus()
       void refreshMetrics()
+      // Kept apart from the stream's own state on purpose (§B-1): RTMPS being
+      // connected is no evidence that the title was applied.
+      api.youtubeApplyState().then(setApplyState).catch(() => {})
     }, 1000)
     return () => clearInterval(t)
   }, [refreshStatus, refreshMetrics])
+
+  useEffect(() => {
+    api.youtubeApplyPlan().then(setPlan).catch(() => setPlan(null))
+  }, [])
 
   const state = status?.supervisor.state ?? 'IDLE'
   const isLive = state === 'LIVE' || state === 'CONNECTING' || state === 'RECONNECTING' || state === 'PREPARING'
@@ -57,21 +68,31 @@ export function Dashboard() {
     }
   }
 
-  async function doStart(kind: 'live' | 'test') {
+  async function doStart(kind: 'live' | 'test', skipYoutube = false) {
     if (activePlaylistId == null) return
     setBusy(true)
     try {
       if (kind === 'live') {
-        await api.startBroadcast(activePlaylistId)
+        await api.startBroadcast(activePlaylistId, skipYoutube)
         toast({ kind: 'success', message: '방송을 시작했습니다.' })
       } else {
         await api.startDryRun(activePlaylistId)
         toast({ kind: 'info', message: '로컬 테스트 송출을 시작했습니다.' })
       }
       setPreflight(null)
+      setYoutubeBlocked(null)
       await refreshStatus()
     } catch (e) {
-      reportError(e)
+      // A YouTube failure is the user's decision to make, not ours: starting
+      // anyway means going live under whatever title YouTube already has, and
+      // that must never happen behind their back (§B-9).
+      const code = (e as { code_str?: string } | null)?.code_str ?? ''
+      if (kind === 'live' && !skipYoutube && code.startsWith('LL-YOUTUBE-')) {
+        setYoutubeBlocked((e as { detail?: string; message: string }).detail
+          ?? (e as { message: string }).message)
+      } else {
+        reportError(e)
+      }
     } finally {
       setBusy(false)
     }
@@ -101,6 +122,16 @@ export function Dashboard() {
               ? `다음 예약 방송: ${status.next_scheduled_start}`
               : '예약된 방송이 없습니다'}
           </p>
+          {/* A start that failed used to leave this screen reading OFFLINE with
+              nothing to say for itself. */}
+          {status?.last_start_error && (
+            <p className="mt-1 text-xs text-live" data-testid="start-error">
+              {status.last_start_error.message}
+              <span className="ml-2 font-mono text-[10px] text-ink-600">
+                {status.last_start_error.code_str}
+              </span>
+            </p>
+          )}
         </div>
         <StatusPill state={state} dryRun={status?.dry_run} />
       </div>
@@ -127,8 +158,12 @@ export function Dashboard() {
             </div>
             <div className="mt-1 text-xs text-ink-500">
               {/* item_count is 0 while idle, so `??` would keep the zero. The
-                  selected playlist is the right source when nothing is live. */}
-              {(isLive ? status?.item_count : activePlaylist?.items.length) ?? 0}개 영상
+                  selected playlist is the right source when nothing is live.
+                  A live state with no plan is a start that failed partway and
+                  would otherwise read as a real playlist with no videos. */}
+              {(isLive && status?.playlist_id != null
+                ? status.item_count
+                : activePlaylist?.items.length) ?? 0}개 영상
               {status?.dry_run && <span className="ml-2 text-warn">· 로컬 테스트 모드</span>}
             </div>
           </div>
@@ -207,6 +242,86 @@ export function Dashboard() {
           </p>
         </Card>
       </div>
+
+      {/* §B-1/§B-10: the YouTube side of the broadcast, reported separately
+          from the stream. Shown only when the user asked for it. */}
+      {(plan?.wanted || applyState?.stage === 'not_connected' || applyState?.stage === 'failed') && (
+        <Card title="YouTube 방송 설정">
+          {applyState?.stage === 'not_connected' ? (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-xs text-warn">
+                방송 설정 자동 적용을 사용하려면 YouTube 계정 연결이 필요합니다.
+                영상 송출은 스트림 키만으로 계속 동작합니다.
+              </p>
+              <Button size="sm" onClick={() => setPage('settings')}>설정에서 연결하기</Button>
+            </div>
+          ) : applyState?.stage === 'failed' ? (
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <p className="text-xs text-live">
+                {applyState.error?.message ?? '방송 설정을 YouTube에 적용하지 못했습니다.'}
+              </p>
+              <Button size="sm" onClick={() => setPage('broadcast')}>방송 설정 열기</Button>
+            </div>
+          ) : applyState?.stage === 'applying' ? (
+            <p className="text-xs text-ink-400">방송 설정을 YouTube에 적용하는 중입니다…</p>
+          ) : applyState?.verification ? (
+            <dl className="space-y-1.5" data-testid="metadata-report">
+              {([
+                ['제목', applyState.verification.title, applyState.requested?.title],
+                ['설명', applyState.verification.description, applyState.requested?.description],
+                ['태그', applyState.verification.tags, applyState.requested?.tags.join(', ')],
+                ['카테고리', applyState.verification.category, applyState.requested?.category_id],
+                ['공개범위', applyState.verification.privacy, applyState.requested?.privacy],
+              ] as const).map(([label, check, requested]) => (
+                <div key={label} className="flex items-baseline justify-between gap-4 text-xs">
+                  <dt className="shrink-0 text-ink-400">{label}</dt>
+                  <dd className="min-w-0 truncate text-right">
+                    <span className={check.applied ? 'text-ok' : 'text-live'}>
+                      {check.applied ? '적용 완료' : '적용 실패'}
+                    </span>
+                    {/* What Google says now, which is the only thing that
+                        settles it — a 200 does not. */}
+                    <span className="ml-2 text-ink-500">
+                      {check.applied ? check.actual : `현재 ${check.actual || '(없음)'} · 요청 ${requested}`}
+                    </span>
+                  </dd>
+                </div>
+              ))}
+              <div className="flex items-baseline justify-between gap-4 border-t border-ink-700 pt-2 text-xs">
+                <dt className="text-ink-400">라이브 채팅</dt>
+                <dd className="text-ink-300">
+                  {plan?.chat_enabled ? (isLive ? '연결 대기' : '방송 시작 후 연결') : '사용 안 함'}
+                </dd>
+              </div>
+            </dl>
+          ) : (
+            <p className="text-xs text-ink-500">방송을 시작하면 저장된 방송 설정을 적용합니다.</p>
+          )}
+        </Card>
+      )}
+
+      {/* §B-9: the YouTube work could not be done. The user decides — the app
+          never quietly goes live under YouTube's own defaults. */}
+      <Modal
+        open={youtubeBlocked != null}
+        title="방송 설정을 YouTube에 적용하지 못했습니다"
+        onClose={() => setYoutubeBlocked(null)}
+        footer={
+          <>
+            <Button onClick={() => setYoutubeBlocked(null)}>취소</Button>
+            <Button onClick={() => { setYoutubeBlocked(null); void doStart('live') }}>다시 시도</Button>
+            <Button variant="live" onClick={() => { setYoutubeBlocked(null); void doStart('live', true) }}>
+              설정 없이 방송 시작
+            </Button>
+          </>
+        }
+      >
+        <p className="text-sm text-ink-200">{youtubeBlocked}</p>
+        <p className="mt-3 text-xs text-ink-500">
+          설정 없이 시작하면 영상은 정상 송출되지만, YouTube 방송 제목·설명·태그는
+          지금 YouTube에 저장된 값 그대로 남습니다.
+        </p>
+      </Modal>
 
       {/* Preflight (§29) */}
       <Modal
