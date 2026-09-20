@@ -18,4 +18,5 @@ soak-results/
 private_key*
 license-signing-key*
 rc-results/
+!rc-results/youtube-test.md
 tests/fixtures/rc/

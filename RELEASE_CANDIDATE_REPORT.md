@@ -83,6 +83,7 @@ not YouTube, and this report never claims otherwise.
 | 12 | Stream key security | **PASS** |
 | 13 | macOS installer | **BUILD READY** — `.github/workflows/release.yml`, never run on macOS hardware |
 | 14 | Windows installer | **BUILD READY** — same workflow, never run on Windows hardware |
+| 15 | YouTube metadata and live chat (V1 by decision, §17) | **NOT TESTED** against real YouTube — see §16 |
 
 ---
 
@@ -389,7 +390,34 @@ server came straight back; a soak that ran unpaced and measured the disk.
 
 ---
 
-## 16. Release blockers
+## 16. YouTube metadata and live chat — verification status
+
+Everything below the line was executed. Everything above it needs a Google
+account and a live broadcast, which this machine does not have.
+
+| Check | Result |
+| --- | --- |
+| Metadata limits: 100-character title, 5000-character description, 500-character tag budget | **PASS** — unit tests, counting characters not bytes, so a 100-character Korean title is legal |
+| A spaced tag costs two extra characters, as YouTube quotes it | **PASS** — unit test, and visible in the live UI (`lofi, work music, jazz` reads 22/500) |
+| `videos.update` merges instead of replacing | **PASS** — asserted on the request body sent over a socket: title, description, categoryId, defaultLanguage and thumbnails all survive a tag change |
+| YouTube error reasons map to user-facing codes | **PASS** — five failure bodies, each reaching the right `LL-CHAT-*` / `LL-YOUTUBE-*` code |
+| Chat order, interval floor, no-repeat, rotation reset on a new broadcast | **PASS** — unit tests |
+| OAuth token caching, refresh-token rotation, disconnect | **PASS** — unit tests against a stand-in token endpoint |
+| Tokens absent from SQLite, logs and the UI | **PASS** — `rc_security`, the secret scanner, and a UI test asserting no token-shaped text renders |
+| Broadcast engine unaffected | **PASS** — `npm run verify` green; the YouTube module is unreachable from the broadcast tick |
+| — | — |
+| **Real Google OAuth consent** | **NOT TESTED** |
+| **Real title / description / tag / category change on a live broadcast** | **NOT TESTED** |
+| **Real live chat messages, in order** | **NOT TESTED** |
+| **Stop → Start with no stale `liveChatId`** | **NOT TESTED** |
+
+`YOUTUBE_SETUP.md` has the Google Cloud setup and the twelve-step procedure.
+Results go in `rc-results/youtube-test.md`; until they do, the four rows above
+stay NOT TESTED and no claim is made about them.
+
+---
+
+## 17. Release blockers
 
 Ordered by what retires the most risk.
 
@@ -437,13 +465,33 @@ platforms, and run a 24-hour soak on target-class hardware.
 
 ---
 
-## 17. What was deliberately not done
+## 18. Scope: what is in, and what stays out
 
-No new features were added during this phase. The stream-copy architecture,
-scheduler, supervisor, reconnect and session recovery are unchanged except for
-the four bug fixes above. Nothing from the §20 exclusion list — OAuth, AI,
-thumbnails, titles, other platforms, scenes, camera, overlay, multi-stream,
-cloud — was implemented or begun.
+The stream-copy architecture, scheduler, supervisor, reconnect and session
+recovery are unchanged. Two additions were made during RC verification because
+§13 and §18 asked for them: the live-command diagnostic panel, and the FFmpeg
+error classifier.
 
-Two additions were made because §13 and §18 asked for them: the live-command
-diagnostic panel, and the FFmpeg error classifier.
+### YouTube OAuth was moved into V1 by decision
+
+§20 originally listed **YouTube OAuth, 썸네일 자동 변경 and 제목 자동 변경** as
+excluded from V1. The product owner reversed that on 2026-09-20 and asked for
+broadcast metadata and automatic live chat to be built. This report records the
+decision rather than the original list.
+
+What that decision admitted to V1:
+
+| In V1 now | Why it is not a risk to the broadcast |
+| --- | --- |
+| YouTube OAuth (one scope, `youtube.force-ssl`) | Used only for metadata and chat. Video still reaches YouTube over RTMPS with a stream key, exactly as before |
+| Title, description, tags, category, privacy | Applied through the API after the broadcast is up; a failure changes nothing about the stream |
+| Metadata presets | Local data only |
+| Automatic live chat messages | Runs on its own thread. It cannot start, stop or delay FFmpeg, and an API failure pauses the bot alone |
+
+**Still excluded, and not begun:** AI of any kind, automatic comment replies,
+viewer analytics, moderation, automatic thumbnail changes, automatic broadcast
+creation, Twitch, TikTok, scenes, camera, overlay, multi-stream and cloud.
+
+The rule the decision did not change: nothing in the YouTube module is reachable
+from the broadcast tick. `youtube_follow_broadcast` hands every network call to
+another thread, so the loop that keeps FFmpeg alive never waits on Google.

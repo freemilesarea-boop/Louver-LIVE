@@ -52,6 +52,7 @@ export function BroadcastPage() {
   const [saving, setSaving] = useState(false)
   const [applying, setApplying] = useState(false)
   const [connected, setConnected] = useState(false)
+  const [applyOnStart, setApplyOnStart] = useState(true)
 
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [chat, setChat] = useState<ChatSettings | null>(null)
@@ -66,7 +67,7 @@ export function BroadcastPage() {
         api.chatGetSettings(), api.youtubeStatus(), api.chatMinIntervalSecs(),
       ])
       setMeta(m); setPresets(p); setMessages(msgs); setChat(cs)
-      setConnected(yt.connected); setMinInterval(min)
+      setConnected(yt.connected); setMinInterval(min); setApplyOnStart(yt.apply_on_start)
     } catch (e) {
       reportError(e)
     }
@@ -261,10 +262,16 @@ export function BroadcastPage() {
           <Button onClick={() => void applyNow()} disabled={!connected || applying}>
             <span className="inline-flex items-center gap-2"><Upload size={15} /> 지금 YouTube에 적용</span>
           </Button>
-          <span className="self-center text-xs text-ink-500">
-            방송 시작 시 저장된 정보가 자동으로 적용됩니다.
-          </span>
         </div>
+        <Toggle
+          label="방송을 시작할 때 자동으로 적용"
+          hint="방송이 시작되면 저장된 제목·설명·태그·카테고리·공개범위를 YouTube에 한 번 적용합니다."
+          checked={applyOnStart}
+          onChange={(v) => {
+            setApplyOnStart(v)
+            api.youtubeSetApplyOnStart(v).catch(reportError)
+          }}
+        />
       </Card>
 
       <Card title="프리셋">

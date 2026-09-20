@@ -32,6 +32,9 @@ pub struct YoutubeService {
     bot_broadcast: Mutex<Option<String>>,
     /// Set while a consent flow is in progress, for the UI to show.
     connecting: Arc<Mutex<Option<String>>>,
+    /// True once metadata has been pushed for the live session in progress, so
+    /// it is applied once per broadcast rather than once per tick.
+    applied_this_session: Arc<Mutex<bool>>,
 }
 
 impl std::fmt::Debug for YoutubeService {
@@ -48,6 +51,8 @@ pub struct YoutubeStatus {
     pub channel_title: Option<String>,
     /// False when no OAuth client has been configured yet.
     pub has_credentials: bool,
+    /// Whether saved metadata is pushed automatically when a broadcast starts.
+    pub apply_on_start: bool,
     pub client_id_hint: Option<String>,
     /// Where the refresh token is kept, so the user can see it is not the DB.
     pub secret_backend: String,
@@ -66,6 +71,7 @@ impl YoutubeService {
             bot: Mutex::new(None),
             bot_broadcast: Mutex::new(None),
             connecting: Arc::new(Mutex::new(None)),
+            applied_this_session: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -124,6 +130,7 @@ impl YoutubeService {
             channel_id: self.db.get_setting(keys::CHANNEL_ID).ok().flatten(),
             channel_title: self.db.get_setting(keys::CHANNEL_TITLE).ok().flatten(),
             has_credentials: self.has_credentials(),
+            apply_on_start: self.apply_on_start_enabled(),
             // Only the tail, and only of the id, which is not a secret.
             client_id_hint: client_id.map(|c| {
                 let n = c.chars().count();
@@ -252,6 +259,66 @@ impl YoutubeService {
     pub fn current_broadcast(&self) -> Result<louver_core::youtube::LiveBroadcast> {
         let token = self.token()?;
         YoutubeApi::with_base(self.http.as_ref(), self.api_base()).active_broadcast(&token)
+    }
+
+    // --- metadata on start ------------------------------------------------
+
+    pub fn apply_on_start_enabled(&self) -> bool {
+        self.db.get_setting_or(keys::APPLY_ON_START, "true") == "true"
+    }
+
+    /// Is there an automatic apply still owed for the broadcast in progress?
+    pub fn apply_on_start_pending(&self) -> bool {
+        self.apply_on_start_enabled() && !*self.applied_this_session.lock().unwrap()
+    }
+
+    /// Forget what was done for the last broadcast. Called when the app is no
+    /// longer live, so the next Start applies again.
+    pub fn reset_live_session(&self) {
+        *self.applied_this_session.lock().unwrap() = false;
+    }
+
+    /// The metadata the user saved in 방송 설정.
+    pub fn saved_metadata(&self) -> BroadcastMetadata {
+        BroadcastMetadata {
+            title: self.db.get_setting_or(keys::METADATA_TITLE, ""),
+            description: self.db.get_setting_or(keys::METADATA_DESCRIPTION, ""),
+            tags: self
+                .db
+                .get_setting_or(keys::METADATA_TAGS, "")
+                .lines()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect(),
+            category_id: self.db.get_setting_or(keys::METADATA_CATEGORY, "10"),
+            privacy: louver_core::youtube::Privacy::from_api(
+                &self.db.get_setting_or(keys::METADATA_PRIVACY, "unlisted"),
+            ),
+        }
+    }
+
+    /// Push the saved metadata once for this broadcast.
+    ///
+    /// Marked done whether it worked or not: retrying every second would spend
+    /// the day's API quota on a broadcast that is not there. The failure is
+    /// logged, and 지금 YouTube에 적용 is always available.
+    pub fn apply_on_start(&self) {
+        *self.applied_this_session.lock().unwrap() = true;
+        let meta = self.saved_metadata();
+        if meta.title.trim().is_empty() {
+            return; // nothing saved yet; not a failure worth reporting
+        }
+        match self.apply_metadata(&meta) {
+            Ok(b) => self.logger.info(
+                LogTarget::App,
+                &format!("YOUTUBE_METADATA_UPDATED: 방송 시작과 함께 적용했습니다 ({})", b.id),
+            ),
+            Err(e) => self.logger.warn(
+                LogTarget::App,
+                &format!("방송 정보를 적용하지 못했습니다: {} ({})", e.message, e.code_str),
+            ),
+        }
     }
 
     // --- chat bot ---------------------------------------------------------

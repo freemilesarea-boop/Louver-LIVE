@@ -525,6 +525,26 @@ describe('broadcast settings and the chat bot', () => {
     await waitFor(() => expect(screen.queryByLabelText('메시지 2')).not.toBeInTheDocument())
   })
 
+  it('offers automatic apply on start, and remembers the choice', async () => {
+    const user = userEvent.setup()
+    mount()
+    await screen.findByRole('button', { name: '대시보드' })
+    await gotoPage(user, '방송 설정')
+
+    // The page claims metadata is applied when a broadcast starts, so the
+    // switch that controls it has to be visible and real.
+    const toggle = await screen.findByLabelText('방송을 시작할 때 자동으로 적용')
+    expect(toggle).toBeChecked()
+    await user.click(toggle)
+    await waitFor(() => expect(toggle).not.toBeChecked())
+
+    await gotoPage(user, '대시보드')
+    await gotoPage(user, '방송 설정')
+    await waitFor(() => {
+      expect(screen.getByLabelText('방송을 시작할 때 자동으로 적용')).not.toBeChecked()
+    })
+  })
+
   it('connects a YouTube account and shows the channel rather than the token', async () => {
     const user = userEvent.setup()
     mount()

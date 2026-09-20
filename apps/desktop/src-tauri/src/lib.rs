@@ -31,33 +31,44 @@ const TICK: Duration = Duration::from_secs(1);
 /// at a time.
 fn youtube_follow_broadcast(state: &AppState, live: bool) {
     use std::sync::atomic::{AtomicBool, Ordering};
-    static LOOKING: AtomicBool = AtomicBool::new(false);
+    static WORKING: AtomicBool = AtomicBool::new(false);
 
     if !live {
         if state.youtube.bot_broadcast_id().is_some() {
             state.youtube.stop_bot();
         }
+        // The next Start is a new broadcast, and gets its metadata applied and
+        // its chat resolved from scratch.
+        state.youtube.reset_live_session();
         return;
     }
-    if !state.youtube.chat_settings().enabled || !state.youtube.status().connected {
+    if !state.youtube.status().connected {
         return;
     }
-    if state.youtube.bot_is_running() {
+
+    let apply_pending = state.youtube.apply_on_start_pending();
+    let want_bot = state.youtube.chat_settings().enabled && !state.youtube.bot_is_running();
+    if !apply_pending && !want_bot {
         return;
     }
-    if LOOKING.swap(true, Ordering::SeqCst) {
-        return; // a lookup is already in flight
+    if WORKING.swap(true, Ordering::SeqCst) {
+        return; // one round at a time
     }
 
     let youtube = std::sync::Arc::clone(&state.youtube);
     let messages = state.db.list_chat_messages().unwrap_or_default();
     std::thread::spawn(move || {
-        // A fresh lookup every time, so the chat id always belongs to the
-        // broadcast that is on air now (§7).
-        if let Ok(b) = youtube.current_broadcast() {
-            youtube.start_bot_for(&b.id, messages);
+        if apply_pending {
+            youtube.apply_on_start();
         }
-        LOOKING.store(false, Ordering::SeqCst);
+        if want_bot {
+            // Looked up fresh every time, so the chat id belongs to the
+            // broadcast that is on air now (§7).
+            if let Ok(b) = youtube.current_broadcast() {
+                youtube.start_bot_for(&b.id, messages);
+            }
+        }
+        WORKING.store(false, Ordering::SeqCst);
     });
 }
 

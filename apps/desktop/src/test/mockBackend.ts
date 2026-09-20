@@ -26,6 +26,7 @@ export interface MockOptions {
 export function createMockBackend(opts: MockOptions = {}) {
   const youtube = {
     connected: false,
+    applyOnStart: true,
     nextPresetId: 1,
     nextMessageId: 1,
     metadata: {
@@ -490,6 +491,7 @@ export function createMockBackend(opts: MockOptions = {}) {
       channel_id: youtube.connected ? 'UC-room' : null,
       channel_title: youtube.connected ? 'ROOM.' : null,
       has_credentials: true,
+      apply_on_start: youtube.applyOnStart,
       client_id_hint: '…googleusercontent.com',
       secret_backend: 'macOS 키체인',
       secret_backend_is_secure: true,
@@ -521,7 +523,10 @@ export function createMockBackend(opts: MockOptions = {}) {
         life_cycle_status: 'live',
       }
     },
-    youtube_set_apply_on_start: () => undefined,
+    youtube_set_apply_on_start: (a: Record<string, unknown>) => {
+      youtube.applyOnStart = Boolean(a.enabled)
+      return undefined
+    },
     youtube_current_broadcast: () => ({
       id: 'bcast-1',
       title: youtube.metadata.title,
