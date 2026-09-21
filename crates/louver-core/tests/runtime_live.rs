@@ -214,10 +214,19 @@ fn the_runtime_drives_real_ffmpeg_and_produces_a_playable_broadcast() {
         rt.tick();
         assert_eq!(rt.state(), StreamState::Live, "broadcast dropped out mid-run");
     }
-    // Stream copy encodes nothing, so FFmpeg reports no frame count. Bytes and
-    // media time are the real signals that data is flowing.
+    // The guarantee is that no encoder ran, and the command line is where that
+    // is true or false. `frame=` used to stand in for it here, on the belief
+    // that stream copy reports no frame count — but FFmpeg counts *muxed*
+    // frames in that field, and whether it prints them is a property of the
+    // build: the Linux static build reports 0 and macOS's reports the real
+    // number, which failed this test while copying perfectly well. Asserting
+    // the argv checks the thing itself rather than a side effect of it.
+    let d = rt.diagnostics();
+    assert!(d.argv_is_stream_copy, "the live path invoked an encoder: {:?}", d.video_encoder_args);
+    assert!(d.video_encoder_args.is_empty(), "stream copy carried encoder args: {:?}", d.video_encoder_args);
+
+    // Bytes and media time are the signals that data is actually flowing.
     let p = rt.status().supervisor.progress;
-    assert_eq!(p.frames, 0, "stream copy should not be encoding frames");
     assert!(p.total_bytes > 0, "ffmpeg pushed no bytes: {p:?}");
     assert!(p.out_time_ms > 0, "ffmpeg reported no media time: {p:?}");
     assert!(p.bitrate_kbps > 0.0, "no bitrate reported: {p:?}");

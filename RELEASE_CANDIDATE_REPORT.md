@@ -766,6 +766,24 @@ is why no Windows installer has ever been buildable:
   `cargo clean -p louver-desktop`, which fails exactly as the runner did, and
   the reordered run is green from a clean tree.
 
+And with the runners finally reaching the test suite, two more that had never
+run anywhere but Linux:
+
+- **A fixture race** (Windows). `make_fixture` checked `is_file()` and then had
+  FFmpeg write straight to the shared path, so a second test binary — cargo
+  runs them in parallel — could see `video_c.mp4` exist and probe it while the
+  first was still encoding. `moov atom not found`, because the moov atom is
+  written last. It writes to a private temporary name and renames into place
+  now, so the shared path is absent or complete and never in between. Nothing
+  but timing had kept this passing elsewhere.
+- **`frame=0` is not what "not encoding" means** (macOS).
+  `runtime_live` asserted FFmpeg reported no frames during stream copy. That
+  field counts *muxed* frames and whether a build prints them varies: the Linux
+  static build says 0, macOS's says 304, and both were copying perfectly well.
+  The test asserts `argv_is_stream_copy` and an empty encoder-args list
+  instead — the guarantee itself rather than a side effect of it, and the same
+  thing four other tests already check on the command line.
+
 The matrix is now Windows x64, macOS Apple Silicon, macOS Intel and Linux x64.
 Linux builds on `ubuntu-22.04` deliberately: glibc is forward-compatible only,
 so a `.deb` built on an older distribution installs on newer ones and not the

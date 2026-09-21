@@ -120,11 +120,28 @@ pub fn loop_fixtures() -> Vec<FixtureSpec> {
 }
 
 /// Generate one fixture with FFmpeg. Returns the path.
+///
+/// Written to a private temporary name and renamed into place, so the file at
+/// the shared path is either absent or complete and never half-written. The
+/// obvious version — check `is_file()`, then have FFmpeg write straight to the
+/// shared path — is a race between test binaries, which cargo runs in
+/// parallel: one starts encoding `video_c.mp4`, another sees the file exists
+/// and probes it, and gets `moov atom not found`, because the moov atom is
+/// written last. It failed on Windows, where the encode is slow enough to lose,
+/// and nothing but timing kept it passing elsewhere.
 pub fn make_fixture(tools: &FfmpegTools, dir: &Path, s: &FixtureSpec) -> PathBuf {
     let out = dir.join(format!("{}.mp4", s.name));
     if out.is_file() {
         return out;
     }
+    let tmp = dir.join(format!(
+        // `.mp4` stays last: FFmpeg picks the muxer from the extension, and
+        // a name ending in `.part` makes it refuse to open the file at all.
+        ".{}-{}-{}.part.mp4",
+        s.name,
+        std::process::id(),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+    ));
     let video_src = if s.pattern.starts_with("color=") {
         format!("{}:size={}:rate={}:duration={}", s.pattern, s.size, s.fps, s.duration)
     } else {
@@ -158,10 +175,18 @@ pub fn make_fixture(tools: &FfmpegTools, dir: &Path, s: &FixtureSpec) -> PathBuf
             &s.channels.to_string(),
             "-shortest",
         ])
-        .arg(&out)
+        .arg(&tmp)
         .status()
         .expect("failed to run ffmpeg for fixture generation");
     assert!(status.success(), "fixture generation failed for {}", s.name);
+
+    // Whoever gets there first wins; the loser throws its copy away rather
+    // than replacing a file another test may already be reading. (Windows
+    // refuses a rename onto an existing file, which is the same outcome.)
+    if out.is_file() || std::fs::rename(&tmp, &out).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    assert!(out.is_file(), "fixture {} was not created", s.name);
     out
 }
 
