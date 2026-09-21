@@ -105,6 +105,10 @@ pub struct StreamSupervisor {
     last_error: Option<LouverError>,
     /// Tail of FFmpeg stderr, already masked, for the error disclosure (§35).
     stderr_tail: Arc<Mutex<Vec<String>>>,
+    /// Set when the stderr reader reaches the end of the pipe, which happens
+    /// when FFmpeg exits. The diagnosis is read out of that tail, so it has to
+    /// be complete before anything classifies it.
+    stderr_drained: Arc<AtomicBool>,
     saw_data: Arc<AtomicBool>,
     data_epoch_ms: Arc<AtomicU64>,
     /// Consider the stream stalled after this long without progress.
@@ -123,6 +127,7 @@ impl StreamSupervisor {
             progress: Arc::new(Mutex::new(StreamProgress::default())),
             last_error: None,
             stderr_tail: Arc::new(Mutex::new(Vec::new())),
+            stderr_drained: Arc::new(AtomicBool::new(false)),
             saw_data: Arc::new(AtomicBool::new(false)),
             data_epoch_ms: Arc::new(AtomicU64::new(0)),
             stall_timeout: Duration::from_secs(30),
@@ -192,6 +197,7 @@ impl StreamSupervisor {
         self.reconnect_count = 0;
         self.last_error = None;
         self.stderr_tail.lock().unwrap().clear();
+        self.stderr_drained.store(false, Ordering::SeqCst);
         *self.progress.lock().unwrap() = StreamProgress::default();
         Ok(())
     }
@@ -351,6 +357,14 @@ impl StreamSupervisor {
                     // Classify from the whole captured tail, not just the last
                     // line: the root cause is usually the first line of the
                     // failure and the rest is FFmpeg unwinding (§18).
+                    //
+                    // Waited for first. The reader is a thread of its own, so
+                    // noticing the exit and having read what FFmpeg said about
+                    // it are different events — and under load the tail can
+                    // still be empty here, which turns "영상 파일을 찾을 수
+                    // 없습니다" into "방송이 예기치 않게 중단되었습니다" and
+                    // sends the user looking at their network.
+                    self.await_stderr();
                     let tail = self.stderr_tail();
                     self.last_error = Some(if tail.is_empty() {
                         LouverError::with_detail(ErrorCode::StreamFfmpegExit, "ffmpeg exited")
@@ -363,6 +377,20 @@ impl StreamSupervisor {
                 )))
             }
             _ => SupervisorAction::Running,
+        }
+    }
+
+    /// Give the stderr reader a moment to finish the pipe it is draining.
+    ///
+    /// Bounded: a diagnosis is worth a short wait and nothing is worth hanging
+    /// the broadcast loop for. The pipe closes when FFmpeg exits, so in
+    /// practice this returns almost immediately; the bound is for the case
+    /// where it does not.
+    fn await_stderr(&self) {
+        const LIMIT: Duration = Duration::from_millis(2_000);
+        let until = Instant::now() + LIMIT;
+        while !self.stderr_drained.load(Ordering::SeqCst) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -413,6 +441,8 @@ impl StreamSupervisor {
         }
 
         let tail = Arc::clone(&self.stderr_tail);
+        let drained = Arc::clone(&self.stderr_drained);
+        self.stderr_drained.store(false, Ordering::SeqCst);
         if let Some(err) = child.stderr.take() {
             std::thread::spawn(move || {
                 for line in BufReader::new(err).lines().map_while(std::result::Result::ok) {
@@ -424,7 +454,11 @@ impl StreamSupervisor {
                         t.remove(0);
                     }
                 }
+                drained.store(true, Ordering::SeqCst);
             });
+        } else {
+            // No pipe to read, so there is nothing to wait for.
+            self.stderr_drained.store(true, Ordering::SeqCst);
         }
 
         Ok(Box::new(OsProcess { child: Some(child) }))
