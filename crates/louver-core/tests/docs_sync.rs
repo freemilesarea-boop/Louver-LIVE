@@ -12,6 +12,11 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// The document's text, or None when it is not in this checkout.
+fn try_read(name: &str) -> Option<String> {
+    std::fs::read_to_string(repo_root().join(name)).ok()
+}
+
 fn read(name: &str) -> String {
     std::fs::read_to_string(repo_root().join(name)).unwrap_or_else(|e| panic!("cannot read {name}: {e}"))
 }
@@ -100,8 +105,13 @@ fn no_document_sends_a_mac_user_to_a_folder_the_app_never_writes() {
     // to. `AppPaths` puts them under the application support directory, named
     // for the app rather than for the bundle identifier.
     let wrong = ["Library/Logs/com.louver.live", "Application Support/com.louver.live"];
+    let mut checked = 0;
     for doc in DOCS_WITH_PATHS {
-        let text = read(doc);
+        // Skip one that is not in this checkout rather than failing: some of
+        // these live under `rc-results/`, where everything but the checklist
+        // itself is local test output. A missing document is not a wrong path.
+        let Some(text) = try_read(doc) else { continue };
+        checked += 1;
         for w in wrong {
             assert!(
                 !text.contains(w),
@@ -109,6 +119,8 @@ fn no_document_sends_a_mac_user_to_a_folder_the_app_never_writes() {
             );
         }
     }
+    // And the list itself has not rotted away to nothing.
+    assert!(checked >= 4, "only {checked} of the path documents were found");
 }
 
 #[test]
@@ -116,7 +128,10 @@ fn the_readme_names_the_path_the_code_actually_builds() {
     // Derived from the same function the app calls, so the table cannot drift
     // from the binary.
     let paths = louver_core::AppPaths::new("/Users/me/Library/Application Support/LouverLive");
-    let logs = paths.logs_dir().to_string_lossy().replace("/Users/me", "~");
+    // `join` uses the host separator, so on Windows this comes back as
+    // `…/LouverLive\logs` and would never match a document written for a Mac.
+    // The documented path is the macOS one whatever machine runs the test.
+    let logs = paths.logs_dir().to_string_lossy().replace('\\', "/").replace("/Users/me", "~");
     let readme = read("README.md");
     assert!(readme.contains(&logs), "README.md does not document {logs}");
     // The identifier is still right for the keychain item, so it is only the

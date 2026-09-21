@@ -17,6 +17,11 @@ soak-results/
 *.pem
 private_key*
 license-signing-key*
-rc-results/
+# The results directory is local, except for the one file that is a checklist
+# rather than a result. Written as `rc-results/*` and not `rc-results/`,
+# because git never descends into an excluded directory — with the directory
+# itself ignored the negation below can never match, and the checklist could
+# not be committed at all.
+rc-results/*
 !rc-results/youtube-test.md
 tests/fixtures/rc/
