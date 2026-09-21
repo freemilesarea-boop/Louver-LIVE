@@ -706,6 +706,41 @@ scheduled broadcast. The next real Mac run should show
 `YOUTUBE_BROADCAST_LIST_OK`; whatever `_FAIL` comes after it, if any, is the
 next thing to fix.
 
+## 14g. Shipping it (2026-09-21)
+
+The release workflow built three of the four platforms the product supports,
+and would have uploaded nothing for any of them.
+
+| Defect | Why it mattered |
+| --- | --- |
+| Linux was not in the matrix | `.deb` and `.AppImage` are in `tauri.conf.json`'s bundle targets and `fetch-ffmpeg.mjs` has had a Linux source all along; nothing built them |
+| Every artifact path was wrong | They read `apps/desktop/src-tauri/target/<triple>/release/bundle/...`. This is a cargo workspace, so the target directory is the repository root. A tag push would have produced four green jobs and four empty artifacts |
+| A tag published nothing | Run artifacts expire in 30 days and need a GitHub login to download, so they are not something a user can be sent to |
+| `--require-download` accepted the development fallback | The "already present, use --force" check ran *before* the release check, so a runner with a cached workspace could ship the machine's own FFmpeg — dynamically linked against 215 libraries, and unable to run anywhere else |
+
+The last one had a second line of defence that did work: `ffmpeg-manifest.mjs
+--check` reads the binaries and refuses a dynamically linked one. Confirmed
+here — it exits 1 on the fallback sidecar with "it will not run on a user's
+machine". Both gates now agree, and the release step passes `--force` so a
+cached workspace cannot supply a stale one either.
+
+The matrix is now Windows x64, macOS Apple Silicon, macOS Intel and Linux x64.
+Linux builds on `ubuntu-22.04` deliberately: glibc is forward-compatible only,
+so a `.deb` built on an older distribution installs on newer ones and not the
+reverse. Each job collects its installers into one directory and **fails if it
+produced none**, which is the check that would have caught the path bug.
+
+A `v*` tag now publishes a **draft** GitHub Release with every installer and
+each build's `BUILD-INFO-<target>.txt` — commit, whether it was signed, and
+whether it carries an OAuth client. Draft rather than public because of §15
+below: nothing here has been run against a real YouTube channel, and macOS and
+Windows have never been executed at all. A person decides when it goes out.
+
+`RELEASING.md` is the procedure, including what each missing secret costs — an
+unsigned macOS build makes the user Control-click to open it, and a release
+without `LOUVER_GOOGLE_CLIENT_ID`/`_SECRET` has a YouTube button that cannot
+work.
+
 ## 15. Known issues
 
 1. **Real YouTube broadcasting is unverified.** Everything up to the socket is

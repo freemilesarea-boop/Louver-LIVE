@@ -61,11 +61,24 @@ FFmpeg가 비정상 종료되어도, PC가 재부팅되어도 방송은 자동�
 
 ### 사용자
 
-릴리스에서 운영체제에 맞는 설치 파일을 내려받아 실행합니다.
-FFmpeg는 프로그램에 포함되어 있으므로 따로 설치할 필요가 없습니다.
+[릴리스](https://github.com/freemilesarea-boop/Louver-LIVE/releases)에서
+운영체제에 맞는 파일을 내려받아 실행합니다. FFmpeg는 프로그램에 들어 있으므로
+따로 설치하지 않으셔도 됩니다.
 
-- Windows 10/11 (x64) — `.msi` 또는 `.exe`
-- macOS 11 이상 (Apple Silicon / Intel) — `.dmg`
+| 쓰시는 컴퓨터 | 받으실 파일 |
+| --- | --- |
+| Windows 10 또는 11 (64비트) | `.exe` — 쉬운 쪽입니다. `.msi`는 회사에서 일괄 배포할 때 씁니다 |
+| Mac — M1·M2·M3 이후 | 파일 이름에 `aarch64`가 있는 `.dmg` |
+| Mac — 2020년 이전 (Intel) | 파일 이름에 `x64`가 있는 `.dmg` |
+| Linux — 우분투·민트·데비안 | `.deb` |
+| Linux — 그 밖의 배포판 | `.AppImage` (내려받아 실행 권한만 주면 됩니다) |
+
+**Mac이 어느 쪽인지 모르시겠다면**: 화면 왼쪽 위 사과 모양 → `이 Mac에 관하여`.
+"칩"이라고 적혀 있으면 Apple Silicon, "프로세서"라고 적혀 있으면 Intel입니다.
+
+서명 인증서가 아직 없는 빌드를 받으셨다면 처음 한 번 경고가 뜹니다.
+Mac은 응용 프로그램 폴더에서 **제어(Control) 키를 누른 채 클릭 → 열기 → 열기**,
+Windows는 **추가 정보 → 실행**을 누르시면 됩니다. 다음부터는 뜨지 않습니다.
 
 ### 개발자
 
@@ -125,8 +138,15 @@ node scripts/fetch-ffmpeg.mjs --require-download --force
 ```
 
 이 옵션 없이 빌드하면 개발 편의를 위해 시스템에 설치된 FFmpeg를 복사합니다.
-그 바이너리는 재배포 라이선스가 확인되지 않았습니다.
-([LICENSES.md](LICENSES.md) 참고)
+그 바이너리는 재배포 라이선스가 확인되지 않았고, 동적 링크라 다른 컴퓨터에서
+실행되지 않습니다. ([LICENSES.md](LICENSES.md) 참고)
+
+릴리스 빌드에는 두 겹의 잠금장치가 있습니다. `--require-download`는 내려받기에
+실패하면 그 자리에서 멈추고, 이미 놓여 있던 개발용 사이드카도 받아들이지
+않습니다. 그리고 `node scripts/ffmpeg-manifest.mjs --check`가 실제 바이너리를
+읽어 라이선스·링크 방식·인코더·프로토콜을 확인하고, 동적 링크된 것이면 빌드를
+중단시킵니다. 네 플랫폼 설치 파일을 만드는 전체 절차는
+[RELEASING.md](RELEASING.md)에 있습니다.
 
 ---
 
@@ -335,12 +355,13 @@ The user is not enabled for live streaming.
 | [BENCHMARK.md](BENCHMARK.md) | 실측 성능 수치와 측정 방법 |
 | [LICENSES.md](LICENSES.md) | FFmpeg 및 서드파티 라이선스 |
 | [IMPLEMENTATION_REPORT.md](IMPLEMENTATION_REPORT.md) | 구현 현황과 실제 테스트 결과 |
+| [RELEASING.md](RELEASING.md) | 설치 파일을 만들어 배포하는 절차 |
 
 ## 지원 환경
 
 | | 최소 | 비고 |
 | --- | --- | --- |
-| OS | Windows 10/11 x64, macOS 11+ | Apple Silicon 및 Intel |
+| OS | Windows 10/11 x64, macOS 11+, Linux x86_64 | Mac은 Apple Silicon·Intel 모두. Linux는 `.deb`와 `.AppImage` |
 | CPU | Intel i5급 또는 Apple Silicon | 아직 최소 사양을 실측 검증하지 않았습니다 |
 | RAM | 8 GB | |
 | 저장공간 | 영상 1시간당 약 4.6 GB (1080p30) | 720p30은 약 1.9 GB |

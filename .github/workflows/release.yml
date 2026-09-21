@@ -1,21 +1,25 @@
 name: Release artifacts
 
-# Builds the installers that cannot be built here. This repository's own CI
-# runs on Linux, and a macOS .app or a Windows .exe can only be produced on
-# macOS and Windows respectively — so those artifacts come from this workflow
-# rather than from a developer's machine.
+# Builds the installers for every platform the product ships on. This
+# repository's own CI runs on Linux, and a macOS .app or a Windows .exe can
+# only be produced on macOS and Windows respectively — so those artifacts come
+# from this workflow rather than from a developer's machine.
 #
-# Run it from the Actions tab (workflow_dispatch) or by pushing a v* tag.
+# Run it from the Actions tab (workflow_dispatch) for a test build, or push a
+# v* tag to publish a GitHub Release with the installers attached.
 
 on:
   workflow_dispatch:
     inputs:
-      sign:
-        description: 'Sign and notarize the macOS build (needs the secrets below)'
+      publish:
+        description: 'Publish a draft GitHub Release as well as the run artifacts'
         type: boolean
         default: false
   push:
     tags: ['v*']
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -28,20 +32,15 @@ jobs:
           - label: macOS Apple Silicon
             os: macos-14           # arm64 runner
             target: aarch64-apple-darwin
-            artifacts: |
-              apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
-              apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app
           - label: macOS Intel
             os: macos-13
             target: x86_64-apple-darwin
-            artifacts: |
-              apps/desktop/src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
           - label: Windows x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-            artifacts: |
-              apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
-              apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+          - label: Linux x64
+            os: ubuntu-22.04       # oldest supported glibc, so the .deb installs widely
+            target: x86_64-unknown-linux-gnu
 
     steps:
       - uses: actions/checkout@v4
@@ -58,21 +57,35 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: . -> target
+          key: ${{ matrix.target }}
+
+      # Tauri's Linux build needs the webkit stack, and the AppImage bundler
+      # needs patchelf and fuse. The other runners need none of it.
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev patchelf file desktop-file-utils
 
       - run: npm ci
 
       # No development fallback in a release. If the download hosts cannot be
       # reached the build fails here rather than shipping the runner's own
       # FFmpeg, which is dynamically linked and would not run on a user's
-      # machine.
+      # machine. --force so a cached workspace cannot supply a stale one.
       - name: Fetch the FFmpeg sidecars
-        run: node scripts/fetch-ffmpeg.mjs --require-download --target ${{ matrix.target }}
+        run: node scripts/fetch-ffmpeg.mjs --require-download --force --target ${{ matrix.target }}
 
       # The licence, linkage, encoders, protocols and minimum version are read
       # out of the binaries themselves. A build that fails this does not ship.
       - name: Verify the FFmpeg sidecars
         run: node scripts/ffmpeg-manifest.mjs --check
 
+      # Everything the product claims about itself, on the platform it is
+      # about to be shipped for. A release is the wrong place to discover that
+      # a test only ever ran on Linux.
       - name: Verify the application
         run: npm run verify
 
@@ -105,24 +118,105 @@ jobs:
           args: --target ${{ matrix.target }}
 
       # What actually got built, recorded next to the artifact — so a tester
-      # can tell a signed build from an unsigned one without guessing.
+      # can tell a signed build from an unsigned one without guessing, and can
+      # see whether the release carries an OAuth client at all.
       - name: Describe the artifact
         shell: bash
         run: |
           {
-            echo "target: ${{ matrix.target }}"
-            echo "runner: ${{ matrix.os }}"
-            echo "commit: ${{ github.sha }}"
-            echo "signed: ${{ secrets.APPLE_SIGNING_IDENTITY != '' || secrets.WINDOWS_CERTIFICATE != '' }}"
-            echo "built:  $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "target:  ${{ matrix.target }}"
+            echo "runner:  ${{ matrix.os }}"
+            echo "commit:  ${{ github.sha }}"
+            echo "ref:     ${{ github.ref_name }}"
+            echo "signed:  ${{ secrets.APPLE_SIGNING_IDENTITY != '' || secrets.WINDOWS_CERTIFICATE != '' }}"
+            echo "oauth:   ${{ secrets.LOUVER_GOOGLE_CLIENT_ID != '' && secrets.LOUVER_GOOGLE_CLIENT_SECRET != '' }}"
+            echo "built:   $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           } > BUILD-INFO.txt
           cat BUILD-INFO.txt
           cat rc-results/ffmpeg-manifest.json >> BUILD-INFO.txt || true
+
+      # Collected into one directory so the upload does not have to know each
+      # bundler's layout, and so a bundler that produced nothing is caught
+      # here rather than by an empty release.
+      - name: Collect the installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          # Cargo puts a cross-compiled build under target/<triple>/release.
+          # The workspace target directory is the repository root, not
+          # apps/desktop/src-tauri — getting this wrong uploads nothing.
+          bundle="target/${{ matrix.target }}/release/bundle"
+          ls -R "$bundle" || true
+          found=0
+          for f in $(find "$bundle" -maxdepth 2 -type f \
+                       \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \
+                          -o -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) ); do
+            cp "$f" dist-release/
+            found=$((found + 1))
+          done
+          if [ "$found" -eq 0 ]; then
+            echo "::error::no installer was produced for ${{ matrix.target }}"
+            exit 1
+          fi
+          cp BUILD-INFO.txt "dist-release/BUILD-INFO-${{ matrix.target }}.txt"
+          ls -la dist-release
 
       - uses: actions/upload-artifact@v4
         with:
           name: louver-live-${{ matrix.target }}
           retention-days: 30
-          path: |
-            ${{ matrix.artifacts }}
-            BUILD-INFO.txt
+          path: dist-release/*
+
+  # A run artifact expires and needs a GitHub login to download, so it is not
+  # something a user can be sent to. A tag publishes a real Release instead.
+  publish:
+    name: Publish the release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: louver-live-*
+          merge-multiple: true
+
+      - name: List what is being published
+        run: ls -la artifacts
+
+      # A draft, not a live release. Every platform here is still marked
+      # NOT TESTED against a real YouTube channel in
+      # RELEASE_CANDIDATE_REPORT.md, so a person decides when it goes public.
+      - name: Publish a draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('draft-{0}', github.run_number) }}
+        run: |
+          set -euo pipefail
+          notes=$(cat <<'EOF'
+          ## 설치
+
+          | 운영체제 | 받을 파일 |
+          | --- | --- |
+          | Windows 10/11 (64비트) | `.exe` (권장) 또는 `.msi` |
+          | Mac (M1 이상, Apple Silicon) | `aarch64.dmg` |
+          | Mac (2020년 이전, Intel) | `x64.dmg` |
+          | Linux (Ubuntu/Debian 계열) | `.deb` |
+          | Linux (그 외) | `.AppImage` |
+
+          Mac에서 어느 쪽인지 모르시면 왼쪽 위 사과 → **이 Mac에 관하여**를 열어
+          "칩"이라고 적혀 있으면 Apple Silicon, "프로세서"라고 적혀 있으면 Intel입니다.
+
+          `BUILD-INFO-*.txt`에 각 빌드의 커밋, 서명 여부, FFmpeg 출처가 들어 있습니다.
+          EOF
+          )
+          gh release create "$TAG" \
+            --draft \
+            --title "Louver Live $TAG" \
+            --notes "$notes" \
+            artifacts/* \
+            || gh release upload "$TAG" artifacts/* --clobber
+          gh release view "$TAG" --json url --jq .url

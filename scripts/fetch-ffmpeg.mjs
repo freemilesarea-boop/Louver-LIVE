@@ -19,7 +19,7 @@
  *   node scripts/fetch-ffmpeg.mjs --require-download   # fail instead of falling back
  */
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, copyFileSync, chmodSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, copyFileSync, chmodSync, statSync, writeFileSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -131,7 +131,20 @@ function main() {
 
   const exe = spec.exe
   const already = ['ffmpeg', 'ffprobe'].every((n) => existsSync(join(OUT, `${n}-${target}${exe}`)))
-  if (already && !args.includes('--force')) {
+  // What the sidecars presently there actually are. A release must ship the
+  // downloaded, licence-cleared static build; the development fallback is the
+  // machine's own FFmpeg, dynamically linked against libraries a user's
+  // computer does not have, so shipping one produces an app that cannot
+  // broadcast at all.
+  const sourceFile = join(OUT, `SOURCE-${target}.txt`)
+  const provenance = existsSync(sourceFile) ? readFileSync(sourceFile, 'utf8') : ''
+  const isFallback = !provenance || provenance.includes('DEVELOPMENT ONLY')
+
+  if (already && requireDownload && isFallback) {
+    // Not an error yet: the download below may well succeed and replace them.
+    // An error here would fail a release build that was about to be correct.
+    console.log(`sidecars for ${target} are the development fallback; re-fetching for a release build`)
+  } else if (already && !args.includes('--force')) {
     console.log(`sidecars for ${target} already present; use --force to replace them`)
     return
   }
@@ -150,7 +163,10 @@ function main() {
   if (requireDownload) {
     console.error(
       '\nFAILED: no static build could be downloaded, and --require-download was set.\n' +
-        'Release builds must ship the downloaded, licence-cleared binaries. See LICENSES.md.',
+        'Release builds must ship the downloaded, licence-cleared binaries. See LICENSES.md.' +
+        (already && isFallback
+          ? '\nThe sidecars already in place are the development fallback and were NOT shipped.'
+          : ''),
     )
     process.exit(1)
   }
