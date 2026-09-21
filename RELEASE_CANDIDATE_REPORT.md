@@ -784,6 +784,25 @@ run anywhere but Linux:
   instead — the guarantee itself rather than a side effect of it, and the same
   thing four other tests already check on the command line.
 
+Then two more that were assumptions about the machine rather than about the
+product:
+
+- **A nine-second wall clock** (Windows). `runtime_live` ran the broadcast for
+  a fixed nine seconds and then required the output to be past the playlist's
+  six-second cycle. `-re` paces at wall-clock speed *from the moment FFmpeg is
+  up*, and on a slow runner the startup eats enough of those nine seconds to
+  leave the output short — "output is suspiciously small". It waits until
+  FFmpeg reports more than eight seconds of muxed media now, which is the
+  question the test actually means, with a 90-second cap so a genuinely stuck
+  broadcast still fails.
+- **`std::env::set_var` in a parallel test binary** (macOS). The provisioning
+  harness set the OAuth client in the process environment, which every other
+  test in that binary reads concurrently — undefined behaviour, and macOS is
+  where it showed: two of the eight failed with the refresh step erroring
+  while six passed. It uses the developer-mode override, which is per-service
+  state, so the tests now pass with the variables unset and with hostile
+  values set, both confirmed.
+
 The matrix is now Windows x64, macOS Apple Silicon, macOS Intel and Linux x64.
 Linux builds on `ubuntu-22.04` deliberately: glibc is forward-compatible only,
 so a `.deb` built on an older distribution installs on newer ones and not the

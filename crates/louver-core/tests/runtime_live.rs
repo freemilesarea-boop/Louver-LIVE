@@ -207,9 +207,20 @@ fn the_runtime_drives_real_ffmpeg_and_produces_a_playable_broadcast() {
     assert!(status.next_item.is_some());
 
     // Run past one full cycle so the loop seam is actually exercised. The
-    // playlist is 6s and `-re` paces at wall-clock speed.
-    let ran_until = Instant::now() + Duration::from_secs(9);
-    while Instant::now() < ran_until {
+    // playlist is 6s, so wait until FFmpeg has *muxed* more than that rather
+    // than until a wall clock says it should have: `-re` paces at wall-clock
+    // speed, but only from the moment FFmpeg is up, and on a slow runner the
+    // startup alone eats enough of a fixed nine seconds to leave the output
+    // short of one cycle. Waiting on media time asks the question the test
+    // means — has it looped — instead of a proxy for it that Windows failed.
+    const PAST_ONE_CYCLE_MS: u64 = 8_000;
+    let deadline = Instant::now() + Duration::from_secs(90);
+    while rt.status().supervisor.progress.out_time_ms < PAST_ONE_CYCLE_MS {
+        assert!(
+            Instant::now() < deadline,
+            "only {}ms of media in 90s — FFmpeg is not keeping up",
+            rt.status().supervisor.progress.out_time_ms
+        );
         std::thread::sleep(Duration::from_millis(250));
         rt.tick();
         assert_eq!(rt.state(), StreamState::Live, "broadcast dropped out mid-run");
@@ -251,8 +262,8 @@ fn the_runtime_drives_real_ffmpeg_and_produces_a_playable_broadcast() {
     assert_eq!(stream_field(&tools, &out, "v:0", "width"), PROFILE.width().to_string());
     assert_eq!(stream_field(&tools, &out, "v:0", "height"), PROFILE.height().to_string());
 
-    // It looped: the playlist is 6s and we ran for ~9s, so the output must
-    // contain more than one pass through the playlist.
+    // It looped: the playlist is 6s and we ran until more than 8s of media had
+    // been muxed, so the output must contain more than one pass through it.
     let dur = format_duration(&tools, &out);
     assert!(dur > 6.5, "output is {dur:.2}s — the playlist did not loop past its 6s cycle");
 }

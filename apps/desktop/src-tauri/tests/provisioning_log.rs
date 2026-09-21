@@ -155,12 +155,17 @@ impl Harness {
     /// A connected account, a saved stream key, saved metadata, and both
     /// Google endpoints pointed at local fakes.
     fn new(api: &Fake, token_endpoint: &Fake) -> Self {
-        // The build's OAuth client, read from the live environment exactly as
-        // the app reads it.
-        std::env::set_var("LOUVER_GOOGLE_CLIENT_ID", "test-client.apps.googleusercontent.com");
-        std::env::set_var("LOUVER_GOOGLE_CLIENT_SECRET", CLIENT_SECRET);
-
         let db = Database::open_in_memory().unwrap();
+        // The OAuth client, given to this service alone.
+        //
+        // Not `set_var`: the environment is process-global and cargo runs the
+        // tests in this binary on several threads at once, so one test's write
+        // races every other test's read. macOS is where that showed — two of
+        // these failed there with the refresh step erroring while six passed,
+        // which is exactly the shape of a racing `setenv`. The developer-mode
+        // override is per-service state and needs no such coordination.
+        db.set_setting(louver_core::settings_keys::DEVELOPER_MODE, "true").unwrap();
+        db.set_setting(keys::CLIENT_ID, "test-client.apps.googleusercontent.com").unwrap();
         db.set_setting(keys::API_BASE, &api.base).unwrap();
         db.set_setting(keys::TOKEN_ENDPOINT, &format!("{}/token", token_endpoint.base)).unwrap();
         db.set_setting(keys::APPLY_ON_START, "true").unwrap();
@@ -174,7 +179,9 @@ impl Harness {
         let keystore = Arc::new(StreamKeyStore::new(Arc::clone(&secrets)));
         keystore.set(STREAM_KEY).unwrap();
         // Connected, the way a user who finished consent weeks ago is.
-        TokenStore::new(Arc::clone(&secrets)).save_refresh_token(REFRESH_TOKEN).unwrap();
+        let tokens = TokenStore::new(Arc::clone(&secrets));
+        tokens.save_refresh_token(REFRESH_TOKEN).unwrap();
+        tokens.save_client_secret(CLIENT_SECRET).unwrap();
 
         let log_dir = tempfile::tempdir().unwrap();
         let logger = Logger::new(log_dir.path()).unwrap();
