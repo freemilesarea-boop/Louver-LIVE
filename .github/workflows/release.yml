@@ -165,10 +165,14 @@ jobs:
       # button says it carries no client — and every other check in this job
       # would still pass.
       - name: Check the OAuth client was compiled in
-        if: secrets.LOUVER_GOOGLE_CLIENT_ID != ''
         shell: bash
+        # `secrets` is not one of the contexts a step-level `if:` can read, so
+        # the presence comes in as an ordinary value and the decision is made
+        # in the script.
+        env:
+          EXPECTED: ${{ secrets.LOUVER_GOOGLE_CLIENT_ID != '' }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           bin="target/${{ matrix.target }}/release/louver-desktop"
           [ -f "$bin" ] || bin="$bin.exe"
           [ -f "$bin" ] || { echo "::error::no binary at $bin"; exit 1; }
@@ -177,6 +181,14 @@ jobs:
           # echo of this runner's variables. Prints whether, never what, and
           # exits non-zero when no client was compiled in.
           env -i "$PWD/$bin" --credential-check
+          got=$?
+          if [ "$EXPECTED" = "true" ] && [ "$got" -ne 0 ]; then
+            echo "::error::the secrets are set but no OAuth client reached the binary"
+            exit 1
+          fi
+          if [ "$EXPECTED" != "true" ]; then
+            echo "::warning::built with no OAuth client — YouTube account connection will not work in this build"
+          fi
 
       # What actually got built, recorded next to the artifact — so a tester
       # can tell a signed build from an unsigned one without guessing, and can
