@@ -850,6 +850,52 @@ unsigned macOS build makes the user Control-click to open it, and a release
 without `LOUVER_GOOGLE_CLIENT_ID`/`_SECRET` has a YouTube button that cannot
 work.
 
+## 14h. Making the release binary carry its OAuth client (2026-09-21)
+
+With the two secrets registered, the remaining question was whether they
+reach the *binary*. They are different claims, and only the second one
+matters to a customer.
+
+`option_env!` is resolved when `louver-core` compiles. A release built
+without the secrets present installs, broadcasts on a stream key, and passes
+every other check in the release job — and its YouTube connect button says
+the build carries no client. Nothing outside the binary can tell the two
+apart, and the workflow was asserting only that the secrets exist.
+
+Checked rather than assumed:
+
+| Question | Answer |
+| --- | --- |
+| Does cargo notice when the values change? | Yes. rustc records `option_env!` reads in its dep-info and cargo fingerprints them — verified absent→present, value→value and present→absent, all rebuilding. A restored `rust-cache` cannot serve a stale credential-free build |
+| Does a release work with no environment at all? | Yes. Built with the secrets and run under `env -i` — no shell, no exports, no `.env` — it reports both configured. That is the Finder double-click condition |
+| Is the priority order right? | runtime env → build-time → neither, and each half falls back on its own so one exported variable cannot pair a live id with the built-in secret. Five tests; `resolve_from` exists so they can run at all, since `option_env!` in a test binary can only ever be the empty case |
+
+`--credential-check` is how the release asks. It prints presence and never
+values — `OAuth Client ID: configured` — and exits non-zero when no client
+was compiled in, so the job fails on the exit code rather than parsed output.
+The workflow runs it with `env -i`. Two earlier attempts to check this by
+grepping the binary were discarded: neither an rlib nor a linked binary
+carries the string reliably, and a check that cannot fail is worse than none.
+
+One more latent defect found while wiring it: `secrets` is not a context a
+step-level `if:` can read, so gating the check on
+`secrets.LOUVER_GOOGLE_CLIENT_ID != ''` would have skipped it on every run —
+on the release whose whole point it is. The presence comes in as an env value
+and the script decides; all three paths exercised against real binaries.
+
+The release also now checks each sidecar's architecture with `file`
+(PE x86-64, Mach-O arm64, Mach-O x86_64, ELF x86-64) and refuses a
+provenance file marked `DEVELOPMENT ONLY`. A download served the wrong asset
+makes an installer that looks perfect and cannot spawn FFmpeg on the
+customer's machine.
+
+And the four places carrying the version are now checked against the crate,
+because the Tauri one names the installers and the crate names the About box.
+
+**CI is green on all three runners** — Windows, macOS arm64, Linux — at
+`d6608ca`. macOS Intel is built and verified only in the release job, which
+runs the same `npm run verify` on `macos-13`.
+
 ## 15. Known issues
 
 1. **Real YouTube broadcasting is unverified.** Everything up to the socket is
