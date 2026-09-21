@@ -752,10 +752,19 @@ is why no Windows installer has ever been buildable:
   an `assert!` as a redundant reference. Local clippy is 0.1.94; the runner's
   cites 1.98. Fixed rather than allowed.
 - **`FedericoCarboni/setup-ffmpeg@v3` has no arm64 macOS build** and fails in
-  under a second on `macos-latest`, which is arm64 now. It was never required
-  — `fetch-ffmpeg.mjs` downloads the same static build and
-  `FfmpegTools::discover` reads `binaries/` before `PATH` — so it is
-  `continue-on-error` now.
+  under a second on `macos-latest`, which is arm64 now. Each platform's own
+  package manager installs it instead — `apt`, `brew`, `choco` — because that
+  action was the only thing putting ffmpeg on `PATH`, and without it the
+  sidecar step had nothing to fall back to when the download failed.
+- **`npm run verify` could never have passed on a fresh checkout.**
+  `tauri::generate_context!()` reads `frontendDist` at compile time and panics
+  if `apps/desktop/dist` is absent — `proc macro panicked … this path doesn't
+  exist` — and `verify.mjs` ran `frontend build` *after* the Rust steps. It
+  passed on a developer's machine only because an earlier build had left a
+  `dist/` behind, which is why this survived to a release. The build now runs
+  before the Rust steps. Reproduced by deleting `apps/desktop/dist` and
+  `cargo clean -p louver-desktop`, which fails exactly as the runner did, and
+  the reordered run is green from a clean tree.
 
 The matrix is now Windows x64, macOS Apple Silicon, macOS Intel and Linux x64.
 Linux builds on `ubuntu-22.04` deliberately: glibc is forward-compatible only,

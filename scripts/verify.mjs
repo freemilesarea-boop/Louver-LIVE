@@ -21,10 +21,16 @@ const STEPS = [
   { name: 'frontend lint', cmd: 'npm', args: ['run', '--silent', 'lint'] },
   { name: 'frontend tests', cmd: 'npx', args: ['vitest', 'run'] },
   { name: 'UI e2e tests', cmd: 'npx', args: ['vitest', 'run', '--config', 'vitest.e2e.config.ts'] },
+  // Before the Rust steps, not after them. `tauri::generate_context!()` reads
+  // `frontendDist` at compile time and panics if `dist/` is not there, so on a
+  // fresh checkout — which is what CI always is — clippy failed with
+  // "proc macro panicked … this path doesn't exist" and the real work never
+  // ran. It passed on a developer's machine only because an earlier build had
+  // left a `dist/` behind.
+  { name: 'frontend build', cmd: 'npm', args: ['run', '--silent', 'build:web'] },
   { name: 'rust fmt check', cmd: 'cargo', args: ['fmt', '--all', '--', '--check'] },
   { name: 'rust clippy', cmd: 'cargo', args: ['clippy', '--workspace', '--all-targets', '--', '-D', 'warnings'] },
   { name: 'rust tests', cmd: 'cargo', args: ['test', '--workspace'] },
-  { name: 'frontend build', cmd: 'npm', args: ['run', '--silent', 'build:web'] },
 ]
 
 const only = process.argv.includes('--only') ? process.argv[process.argv.indexOf('--only') + 1] : null
