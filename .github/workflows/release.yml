@@ -88,6 +88,42 @@ jobs:
       - name: Verify the FFmpeg sidecars
         run: node scripts/ffmpeg-manifest.mjs --check
 
+      # The manifest checks what the binaries can do and whether they are
+      # self-contained. It cannot check that they are for the machine this
+      # installer is aimed at — a download served the wrong asset produces an
+      # installer that looks perfect and cannot spawn FFmpeg on the customer's
+      # computer. `file` reads the header and says.
+      - name: Check the sidecars are built for this target
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "${{ matrix.target }}" in
+            x86_64-pc-windows-msvc)    want="PE32\+ executable.*x86-64" ;;
+            aarch64-apple-darwin)      want="Mach-O.*arm64" ;;
+            x86_64-apple-darwin)       want="Mach-O.*x86_64" ;;
+            x86_64-unknown-linux-gnu)  want="ELF 64-bit.*x86-64" ;;
+            *) echo "::error::no architecture expectation for ${{ matrix.target }}"; exit 1 ;;
+          esac
+          for name in ffmpeg ffprobe; do
+            bin=$(ls apps/desktop/src-tauri/binaries/$name-${{ matrix.target }}* )
+            got=$(file -b "$bin")
+            echo "$name: $got"
+            grep -Eq "$want" <<<"$got" || {
+              echo "::error::$name is not $want — it is: $got"
+              exit 1
+            }
+          done
+          # And it is the downloaded build, not the runner's own. The
+          # provenance file says which, and fetch-ffmpeg writes the marker.
+          for f in apps/desktop/src-tauri/binaries/SOURCE-*.txt; do
+            cat "$f"
+            grep -q "DEVELOPMENT ONLY" "$f" && {
+              echo "::error::$f is the development fallback and must not ship"
+              exit 1
+            }
+          done
+          echo "sidecars are the downloaded build for ${{ matrix.target }}"
+
       # Everything the product claims about itself, on the platform it is
       # about to be shipped for. A release is the wrong place to discover that
       # a test only ever ran on Linux.
@@ -121,6 +157,26 @@ jobs:
           LOUVER_GOOGLE_CLIENT_SECRET: ${{ secrets.LOUVER_GOOGLE_CLIENT_SECRET }}
         with:
           args: --target ${{ matrix.target }}
+
+      # Proof that the secrets reached rustc, asked of the binary rather than
+      # assumed from the fact that the secrets exist. `option_env!` is
+      # resolved when louver-core compiles, so a build that saw nothing
+      # produces an app that is correct in every other way and whose connect
+      # button says it carries no client — and every other check in this job
+      # would still pass.
+      - name: Check the OAuth client was compiled in
+        if: secrets.LOUVER_GOOGLE_CLIENT_ID != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/louver-desktop"
+          [ -f "$bin" ] || bin="$bin.exe"
+          [ -f "$bin" ] || { echo "::error::no binary at $bin"; exit 1; }
+          # Asked of the binary, with an empty environment, so the answer is
+          # the one a customer gets from Finder or the Start menu and not an
+          # echo of this runner's variables. Prints whether, never what, and
+          # exits non-zero when no client was compiled in.
+          env -i "$PWD/$bin" --credential-check
 
       # What actually got built, recorded next to the artifact — so a tester
       # can tell a signed build from an unsigned one without guessing, and can

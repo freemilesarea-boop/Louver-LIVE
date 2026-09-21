@@ -89,6 +89,30 @@ artifact로만 남고 Release는 만들어지지 않습니다.
 만드는 방법은 `SIGNING.md`에 있습니다. Google OAuth 클라이언트는
 `YOUTUBE_OAUTH_PRODUCTION.md`에 있습니다.
 
+### 빌드에 OAuth 클라이언트가 실제로 들어갔는지 확인하기
+
+Secret이 등록되어 있다는 것과, 그 값이 **컴파일된 바이너리 안에 들어갔다는 것**은
+다른 이야기입니다. `option_env!`는 `louver-core`가 컴파일되는 순간에 결정되므로,
+secret 없이 만들어진 빌드는 다른 모든 검사를 통과하면서도 YouTube 연결 버튼만
+동작하지 않습니다.
+
+그래서 릴리스 워크플로는 방금 만든 바이너리에게 직접 물어봅니다:
+
+```bash
+# 환경변수를 전부 비운 상태로 실행합니다 — 사용자가 Finder에서
+# 더블클릭했을 때와 같은 조건입니다.
+env -i "/Applications/Louver Live.app/Contents/MacOS/louver-desktop" --credential-check
+```
+
+```
+OAuth Client ID: configured
+OAuth Client Secret: configured
+```
+
+`missing`이 나오면 그 빌드는 배포하면 안 됩니다. 이 명령은 **값이 아니라 유무만**
+출력하므로 고객에게 실행을 부탁해도 안전합니다. 클라이언트가 없으면 종료 코드가
+1이라, 워크플로는 출력을 해석하지 않고 실패시킵니다.
+
 `BUILD-INFO-<target>.txt`가 설치 파일 옆에 함께 올라갑니다. 그 파일의
 `signed:` 와 `oauth:` 줄이 이 빌드가 서명됐는지, OAuth 클라이언트를 품고
 있는지 알려줍니다 — 값 자체는 들어가지 않습니다.

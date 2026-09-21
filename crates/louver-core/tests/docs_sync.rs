@@ -158,3 +158,66 @@ fn every_provisioning_event_the_code_writes_is_in_the_readme() {
         assert!(readme.contains(step.event()), "{} is not documented in README.md", step.event());
     }
 }
+
+#[test]
+fn every_file_that_carries_the_version_agrees_with_the_crate() {
+    // Four places say the version, and the installer filenames come from the
+    // Tauri one while the About box comes from the crate. A release whose
+    // `.dmg` says 1.0.0 and whose window says 1.0.1 is a support call nobody
+    // can answer, so they are checked against each other rather than trusted.
+    let crate_version = env!("CARGO_PKG_VERSION");
+
+    let field = |file: &str, key: &str| -> String {
+        let text = read(file);
+        let at = text.find(key).unwrap_or_else(|| panic!("{file} has no {key}"));
+        let rest = &text[at + key.len()..];
+        let start = rest.find('"').expect("no opening quote") + 1;
+        let end = rest[start..].find('"').expect("no closing quote") + start;
+        rest[start..end].to_string()
+    };
+
+    assert_eq!(field("package.json", "\"version\":"), crate_version, "package.json");
+    assert_eq!(
+        field("apps/desktop/src-tauri/tauri.conf.json", "\"version\":"),
+        crate_version,
+        "tauri.conf.json — this one names the installers"
+    );
+
+    // The workspace version the desktop crate inherits.
+    let root = read("Cargo.toml");
+    let line = root
+        .lines()
+        .skip_while(|l| !l.starts_with("[workspace.package]"))
+        .find(|l| l.starts_with("version"))
+        .expect("Cargo.toml has no [workspace.package] version");
+    assert!(line.contains(crate_version), "Cargo.toml says {line}, crate says {crate_version}");
+}
+
+#[test]
+fn the_credential_check_reports_presence_and_never_a_value() {
+    // The one thing `--credential-check` exists to print, and the one thing
+    // it must never print. Asserted on the source because running it needs a
+    // built binary, and the format is a contract: the release workflow fails
+    // the build on its exit code, and a support conversation reads its output.
+    let main = read("apps/desktop/src-tauri/src/main.rs");
+    assert!(main.contains("--credential-check"), "the flag is gone");
+    assert!(main.contains("OAuth Client ID: {}"), "the ID line changed shape");
+    assert!(main.contains("OAuth Client Secret: {}"), "the secret line changed shape");
+    assert!(main.contains("credential_presence()"), "it must read the compiled-in presence");
+
+    // `credential_presence` returns two booleans and nothing else, so there
+    // is no value for the caller to print even by accident.
+    let oauth = read("crates/louver-core/src/youtube/oauth.rs");
+    assert!(
+        oauth.contains("pub fn credential_presence() -> (bool, bool)"),
+        "credential_presence must keep returning booleans, not the credentials"
+    );
+
+    // And the release workflow asks the binary rather than echoing secrets.
+    let wf = read(".github/workflows/release.yml");
+    assert!(wf.contains("--credential-check"), "the release no longer verifies the embedded client");
+    assert!(
+        !wf.contains("echo \"${{ secrets.LOUVER_GOOGLE_CLIENT_SECRET }}\""),
+        "the workflow echoes the client secret"
+    );
+}

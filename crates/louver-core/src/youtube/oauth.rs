@@ -106,13 +106,35 @@ impl ClientCredentials {
     /// A shipped release has nothing in its environment and falls through to
     /// the built-in pair.
     pub fn resolve() -> Option<Self> {
-        let id = from_live_env(&ID_VARS)
-            .or_else(|| BUILT_IN_CLIENT_ID.map(|v| v.trim().to_string()))
-            .filter(|v| !v.is_empty())?;
-        let secret = from_live_env(&SECRET_VARS)
-            .or_else(|| BUILT_IN_CLIENT_SECRET.map(|v| v.trim().to_string()))
-            .unwrap_or_default();
-        Some(Self { client_id: id, client_secret: secret })
+        Self::resolve_from(
+            from_live_env(&ID_VARS),
+            from_live_env(&SECRET_VARS),
+            BUILT_IN_CLIENT_ID,
+            BUILT_IN_CLIENT_SECRET,
+        )
+    }
+
+    /// [`Self::resolve`] with the two sources passed in.
+    ///
+    /// Split out so the order can be tested. It cannot be tested through
+    /// `resolve` itself: `option_env!` is fixed when this crate is compiled,
+    /// so a test binary built without the variables can only ever see the
+    /// empty case, and the one that matters for a shipped release — nothing
+    /// in the environment, credentials baked in — would never run.
+    pub fn resolve_from(
+        live_id: Option<String>,
+        live_secret: Option<String>,
+        built_id: Option<&str>,
+        built_secret: Option<&str>,
+    ) -> Option<Self> {
+        let pick = |live: Option<String>, built: Option<&str>| {
+            live.or_else(|| built.map(|v| v.trim().to_string())).filter(|v| !v.is_empty())
+        };
+        // The id decides whether there is a client at all. A secret without an
+        // id is not a client, and an id without a secret is one this build
+        // will find out about at the token endpoint.
+        let id = pick(live_id, built_id)?;
+        Some(Self { client_id: id, client_secret: pick(live_secret, built_secret).unwrap_or_default() })
     }
 
     /// Kept as the older name; [`Self::resolve`] is what it now does.
@@ -523,6 +545,89 @@ fn random_state() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The case a shipped release actually runs in: nothing exported, the
+    /// client compiled in. A customer double-clicks the app from Finder, and
+    /// their shell's variables — if they even have a shell open — are not
+    /// part of that process.
+    #[test]
+    fn a_release_with_nothing_in_its_environment_uses_the_client_it_was_built_with() {
+        let c = ClientCredentials::resolve_from(
+            None,
+            None,
+            Some("built.apps.googleusercontent.com"),
+            Some("GOCSPX-built"),
+        )
+        .expect("a build with an embedded client must resolve one");
+        assert_eq!(c.client_id, "built.apps.googleusercontent.com");
+        assert_eq!(c.client_secret, "GOCSPX-built");
+        assert!(c.has_secret());
+    }
+
+    /// The developer override, and only that: it is first so that exporting
+    /// the variables and launching an existing binary does what everyone
+    /// expects, which is how this project debugs the token exchange.
+    #[test]
+    fn the_environment_overrides_the_built_in_client_when_it_is_set() {
+        let c = ClientCredentials::resolve_from(
+            Some("live.apps.googleusercontent.com".into()),
+            Some("GOCSPX-live".into()),
+            Some("built.apps.googleusercontent.com"),
+            Some("GOCSPX-built"),
+        )
+        .unwrap();
+        assert_eq!(c.client_id, "live.apps.googleusercontent.com");
+        assert_eq!(c.client_secret, "GOCSPX-live");
+    }
+
+    /// Each half falls back on its own, so a half-set environment cannot
+    /// produce a mismatched pair — one variable exported for a diagnostic
+    /// must not silently pair a live id with the built-in secret's partner.
+    #[test]
+    fn each_half_falls_back_to_the_build_independently() {
+        let id_only = ClientCredentials::resolve_from(
+            Some("live.apps.googleusercontent.com".into()),
+            None,
+            Some("built.apps.googleusercontent.com"),
+            Some("GOCSPX-built"),
+        )
+        .unwrap();
+        assert_eq!(id_only.client_id, "live.apps.googleusercontent.com");
+        assert_eq!(id_only.client_secret, "GOCSPX-built");
+
+        let secret_only = ClientCredentials::resolve_from(
+            None,
+            Some("GOCSPX-live".into()),
+            Some("built.apps.googleusercontent.com"),
+            Some("GOCSPX-built"),
+        )
+        .unwrap();
+        assert_eq!(secret_only.client_id, "built.apps.googleusercontent.com");
+        assert_eq!(secret_only.client_secret, "GOCSPX-live");
+    }
+
+    /// Neither source has one: a configuration error the UI states plainly,
+    /// not a silent failure at the consent screen.
+    #[test]
+    fn a_build_with_no_client_anywhere_resolves_nothing() {
+        assert!(ClientCredentials::resolve_from(None, None, None, None).is_none());
+        // An empty string is not a client either — an unset secret in CI
+        // expands to one, and `Some("")` must not read as configured.
+        assert!(ClientCredentials::resolve_from(None, None, Some(""), Some("")).is_none());
+        assert!(ClientCredentials::resolve_from(Some(String::new()), None, Some(""), None).is_none());
+    }
+
+    /// An id with no secret still resolves: the build is usable enough to
+    /// reach Google and be told what it is missing, which is more useful than
+    /// refusing to start.
+    #[test]
+    fn an_id_without_a_secret_is_a_client_that_reports_itself_as_secretless() {
+        let c = ClientCredentials::resolve_from(None, None, Some("built.apps.googleusercontent.com"), None)
+            .unwrap();
+        assert!(!c.has_secret());
+        assert!(!c.client_id.is_empty());
+    }
+
     use crate::security::MemorySecretStore;
 
     #[test]
