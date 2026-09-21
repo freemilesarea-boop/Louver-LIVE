@@ -55,11 +55,21 @@ git push origin v1.0.0
 판단한 뒤 공개하라는 뜻입니다. GitHub의 Releases 탭에서 **Publish release**를
 누르면 공개됩니다.
 
-### 3. 시험 삼아 돌려보려면
+### 3. 태그를 밀 권한이 없을 때
 
-Actions 탭 → **Release artifacts** → **Run workflow**. `publish`를 켜지
-않으면 설치 파일이 30일짜리 run artifact로만 남고 Release는 만들어지지
-않습니다.
+Actions 탭 → **Release artifacts** → **Run workflow** 에서
+
+- `publish` 를 **켜고**
+- `tag` 에 `v1.0.0` 처럼 원하는 태그를 적으면
+
+같은 네 개 빌드가 돌고 그 태그로 초안 Release가 만들어집니다. **초안
+Release는 공개(Publish)하는 순간 그 태그를 직접 만듭니다** — `git push
+origin v1.0.0` 이 필요 없습니다.
+
+### 4. 시험 삼아 돌려보려면
+
+같은 화면에서 `publish`를 끄고 실행합니다. 설치 파일이 30일짜리 run
+artifact로만 남고 Release는 만들어지지 않습니다.
 
 ---
 

@@ -15,6 +15,10 @@ on:
         description: 'Publish a draft GitHub Release as well as the run artifacts'
         type: boolean
         default: false
+      tag:
+        description: 'Tag for that draft release, e.g. v1.0.0. Leave empty for a dated draft.'
+        type: string
+        default: ''
   push:
     tags: ['v*']
 
@@ -197,7 +201,11 @@ jobs:
       - name: Publish a draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_type == 'tag' && github.ref_name || format('draft-{0}', github.run_number) }}
+          # A tag push names itself. A dispatch may name the tag it wants —
+          # the draft release carries it and creates it on publish, which is
+          # how a release is cut without push access to refs/tags.
+          TAG: ${{ github.ref_type == 'tag' && github.ref_name || (inputs.tag != '' && inputs.tag || format('draft-{0}', github.run_number)) }}
+          TARGET: ${{ github.sha }}
         run: |
           set -euo pipefail
           notes=$(cat <<'EOF'
@@ -219,6 +227,7 @@ jobs:
           )
           gh release create "$TAG" \
             --draft \
+            --target "$TARGET" \
             --title "Louver Live $TAG" \
             --notes "$notes" \
             artifacts/* \
