@@ -803,6 +803,36 @@ product:
   state, so the tests now pass with the variables unset and with hostile
   values set, both confirmed.
 
+Two last ones, both about which FFmpeg the tests run against:
+
+- **An accepted socket inherits the listener's non-blocking mode on Windows**
+  and not on Linux or macOS. The fake Google servers set the listener
+  non-blocking so their accept loop can poll a stop flag, so on Windows
+  `read_line` returned WouldBlock, the request was dropped without a reply,
+  and the client waited out its whole timeout. Set back to blocking on accept.
+- **`apt` was the wrong fallback.** Swapping the arm64-broken setup-ffmpeg
+  action for each platform's package manager put Ubuntu 22.04's FFmpeg 4.4 on
+  the runner, which has no `-fps_mode` and cannot optimize a video at all — so
+  a failed download stopped being a download error and became a capability
+  failure three steps later. Linux now installs no system FFmpeg: the static
+  build or nothing.
+
+  BtbN's GitHub-hosted builds were tried as a second download source, since
+  johnvansickle.com rate-limits. They are rejected:
+  `looped_stream_copy_does_not_accumulate_av_drift` fails against their
+  `latest` every run, one stall in thirty loop boundaries, because `latest` is
+  a master snapshot rather than a release. For a playlist that loops all night
+  that is the whole product. The test did exactly what it is for, and the
+  nightly is not in the fallback chain.
+
+  The linkage gate was corrected while proving that: it scored a binary by
+  counting `ldd` lines with a threshold of eight, which called a genuinely
+  self-contained build unfit at nine glibc entries and would have passed one
+  carrying eight codec libraries. It now counts libraries that are *not* part
+  of the platform runtime, and names them — the system FFmpeg is refused with
+  `207 non-system libraries … libavcodec.so.60, libx264…` rather than a
+  number.
+
 The matrix is now Windows x64, macOS Apple Silicon, macOS Intel and Linux x64.
 Linux builds on `ubuntu-22.04` deliberately: glibc is forward-compatible only,
 so a `.deb` built on an older distribution installs on newer ones and not the

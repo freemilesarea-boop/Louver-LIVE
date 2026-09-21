@@ -43,10 +43,29 @@ function linkage(path) {
   if (/not a dynamic executable|statically linked/i.test(out)) {
     return { static: true, shared_libraries: 0 }
   }
-  const libs = out.split('\n').filter((l) => /=>|\.dylib|\.so/.test(l)).length
-  // A handful of system libraries is normal even for a "static" build; a long
-  // list means the binary depends on the build machine's environment.
-  return { static: libs <= 8, shared_libraries: libs }
+  const lines = out.split('\n').filter((l) => /=>|\.dylib|\.so/.test(l))
+  // Judged by *what* is linked, not how many. Every binary links the platform
+  // runtime — libc, libm, libpthread and friends — and counting those was
+  // scoring a genuinely self-contained build as unfit at nine of them while a
+  // build with eight codec libraries would have passed. What actually decides
+  // whether it runs on someone else's computer is whether it needs a library
+  // that computer has no reason to have: libavcodec, libx264, libvpx, libssl.
+  const SYSTEM = [
+    /\blibc\b/, /\blibm\b/, /\blibdl\b/, /\blibrt\b/, /\blibpthread\b/,
+    /\blibmvec\b/, /\blibgcc_s\b/, /\bld-linux/, /\blinux-vdso/, /\blibresolv\b/,
+    // macOS: the system frameworks and libSystem are present everywhere.
+    /\/usr\/lib\/libSystem/, /\/System\/Library\/Frameworks\//, /\blibiconv\b/,
+    /\blibc\+\+\b/, /\blibobjc\b/, /\blibz\b/, /\blibbz2\b/,
+  ]
+  const foreign = lines
+    .map((l) => l.trim())
+    .filter((l) => !SYSTEM.some((re) => re.test(l)))
+  return {
+    static: foreign.length === 0,
+    shared_libraries: lines.length,
+    foreign_libraries: foreign.length,
+    foreign: foreign.slice(0, 12),
+  }
 }
 
 /**
@@ -140,7 +159,9 @@ for (const b of binaries) {
   console.log(`  version        ${d.version}`)
   console.log(`  provider       ${d.provider.split('\n')[0]}`)
   console.log(`  licence        ${d.licence.id}  (${d.licence.why})`)
-  console.log(`  linkage        ${d.linkage.static ? 'static' : 'DYNAMIC'} (${d.linkage.shared_libraries} shared libs)`)
+  console.log(
+    `  linkage        ${d.linkage.static ? 'self-contained' : 'DEPENDENT'} (${d.linkage.shared_libraries} shared libs, ${d.linkage.foreign_libraries ?? '?'} non-system)`,
+  )
   console.log(`  H.264 encoders ${d.h264_encoders.join(', ') || 'NONE'}`)
   console.log(`  AAC            ${d.has_aac ? 'yes' : 'NO'}`)
   console.log(`  RTMPS          ${d.supports_rtmps ? 'yes' : 'NO'}`)
@@ -150,7 +171,10 @@ for (const b of binaries) {
   if (!d.licence.redistributable) problems.push(`${d.binary}: ${d.licence.why}`)
   if (d.provider === 'UNRECORDED') problems.push(`${d.binary}: provider not recorded — §15 requires it`)
   if (/DEVELOPMENT ONLY/.test(d.provider)) problems.push(`${d.binary}: built from the development fallback, which is not licence-cleared`)
-  if (d.linkage.static === false) problems.push(`${d.binary}: dynamically linked against ${d.linkage.shared_libraries} libraries — it will not run on a user's machine`)
+  if (d.linkage.static === false)
+    problems.push(
+      `${d.binary}: linked against ${d.linkage.foreign_libraries} non-system librar${d.linkage.foreign_libraries === 1 ? 'y' : 'ies'} — it will not run on a user's machine: ${(d.linkage.foreign || []).join(', ')}`,
+    )
   if (!d.h264_encoders.length) problems.push(`${d.binary}: no H.264 encoder, so videos cannot be optimized`)
   if (!d.has_aac) problems.push(`${d.binary}: no AAC encoder`)
   if (!d.supports_rtmps) problems.push(`${d.binary}: no RTMPS support, so it cannot publish to YouTube`)

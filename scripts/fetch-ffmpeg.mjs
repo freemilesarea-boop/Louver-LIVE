@@ -50,6 +50,14 @@ const SOURCES = {
     exe: '',
     license: 'GPL v3 (osxexperts.net)',
   },
+  // A *release* build, deliberately. BtbN's GitHub-hosted builds were tried
+  // as a second source, because johnvansickle rate-limits — but their `latest`
+  // is a master snapshot, and `looped_stream_copy_does_not_accumulate_av_drift`
+  // fails against it every run: one stall in thirty loop boundaries. For a
+  // playlist that loops all night that is the whole product, so the nightly is
+  // not an acceptable fallback and there is no second source. If this download
+  // fails, the build fails and says so — CI installs no system FFmpeg on Linux
+  // either, since ubuntu-22.04's is 4.4 and has no `-fps_mode` at all.
   'x86_64-unknown-linux-gnu': {
     url: 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz',
     archive: 'tar.xz',
@@ -185,10 +193,12 @@ function main() {
   const tmp = join(ROOT, 'node_modules/.cache/ffmpeg-fetch')
   mkdirSync(tmp, { recursive: true })
 
-  if (tryDownload(target, spec, tmp)) {
-    writeFileSync(join(OUT, `SOURCE-${target}.txt`), `${spec.url}\n${spec.license}\n`)
-    console.log('done (downloaded)')
-    return
+  for (const url of [spec.url, spec.fallbackUrl].filter(Boolean)) {
+    if (tryDownload(target, { ...spec, url }, tmp)) {
+      writeFileSync(join(OUT, `SOURCE-${target}.txt`), `${url}\n${spec.license}\n`)
+      console.log('done (downloaded)')
+      return
+    }
   }
 
   if (requireDownload) {

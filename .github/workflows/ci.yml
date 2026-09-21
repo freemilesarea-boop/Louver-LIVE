@@ -49,18 +49,21 @@ jobs:
       # macOS build and fails in under a second on macos-latest, which is
       # arm64 now, leaving the runner with no ffmpeg at all and the sidecar
       # step with nothing to fall back to.
+      # A fallback for fetch-ffmpeg.mjs, and deliberately not apt: ubuntu-22.04
+      # ships FFmpeg 4.4, which has no `-fps_mode` and so cannot optimize a
+      # video at all. Falling back to it turns a failed download into a
+      # capability failure three steps later. brew and choco are current.
+      # Linux gets no fallback on purpose — the static build below, or fail.
       - name: Install FFmpeg
+        if: runner.os != 'Linux'
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get install -y --no-install-recommends ffmpeg
-          elif [ "$RUNNER_OS" = "macOS" ]; then
+          if [ "$RUNNER_OS" = "macOS" ]; then
             brew install ffmpeg
           else
             choco install ffmpeg -y --no-progress
           fi
           ffmpeg -version | head -1
-          ffprobe -version | head -1
 
       - run: npm ci
       - run: node scripts/fetch-ffmpeg.mjs
