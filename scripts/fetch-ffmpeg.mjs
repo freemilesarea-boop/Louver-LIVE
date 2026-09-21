@@ -19,7 +19,9 @@
  *   node scripts/fetch-ffmpeg.mjs --require-download   # fail instead of falling back
  */
 import { execFileSync, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, copyFileSync, chmodSync, statSync, writeFileSync, readFileSync } from 'node:fs'
+import {
+  existsSync, mkdirSync, copyFileSync, chmodSync, statSync, writeFileSync, readFileSync, readdirSync,
+} from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -89,7 +91,13 @@ function tryDownload(target, spec, tmp) {
   mkdirSync(join(tmp, 'x'), { recursive: true })
   try {
     if (spec.archive === 'zip') {
-      execFileSync('unzip', ['-q', '-o', join(tmp, 'ffmpeg-archive'), '-d', join(tmp, 'x')])
+      try {
+        execFileSync('unzip', ['-q', '-o', join(tmp, 'ffmpeg-archive'), '-d', join(tmp, 'x')])
+      } catch {
+        // Windows has no unzip, but every Windows 10+ install has bsdtar,
+        // which reads zip files.
+        execFileSync('tar', ['-xf', join(tmp, 'ffmpeg-archive'), '-C', join(tmp, 'x')])
+      }
     } else {
       execFileSync('tar', ['-xf', join(tmp, 'ffmpeg-archive'), '-C', join(tmp, 'x')])
     }
@@ -99,16 +107,39 @@ function tryDownload(target, spec, tmp) {
   }
   const found = {}
   for (const name of ['ffmpeg', 'ffprobe']) {
-    const hit = execFileSync('find', [join(tmp, 'x'), '-type', 'f', '-name', name + spec.exe], { encoding: 'utf8' })
-      .split('\n')
-      .filter(Boolean)[0]
-    if (!hit) return false
+    const hit = findFile(join(tmp, 'x'), name + spec.exe)
+    if (!hit) {
+      console.log(`  ${name}${spec.exe} was not in the archive`)
+      return false
+    }
     found[name] = hit
   }
   for (const name of ['ffmpeg', 'ffprobe']) {
     install(found[name], target, name, spec.exe)
   }
   return true
+}
+
+/**
+ * The first file called `name` anywhere under `dir`.
+ *
+ * Walked in Node rather than shelled out to `find`, because on Windows `find`
+ * is `C:\\Windows\\System32\\find.exe` — a text search, not a file search. It
+ * answers `FIND: Parameter format not correct` and exits 2, which is why the
+ * download path had never once worked on Windows: every release build would
+ * have failed at the sidecar step before it compiled a line.
+ */
+function findFile(dir, name) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      const hit = findFile(full, name)
+      if (hit) return hit
+    } else if (entry.isFile() && entry.name === name) {
+      return full
+    }
+  }
+  return null
 }
 
 function install(from, target, name, exe) {

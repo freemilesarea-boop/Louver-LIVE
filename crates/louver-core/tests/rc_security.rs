@@ -77,7 +77,7 @@ fn assert_clean(what: &str, haystack: &str) {
             !contains_as_token(haystack, f),
             "STREAM KEY LEAK in {what}: found {:?}\n--- content ---\n{}",
             f,
-            &haystack.chars().take(4000).collect::<String>()
+            haystack.chars().take(4000).collect::<String>()
         );
     }
 }

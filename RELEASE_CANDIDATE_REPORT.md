@@ -738,6 +738,25 @@ neither of which any amount of reading would have shown:
   and `Live_1.0.0_amd64.deb`, neither of which exists, and under `set -e` the
   job dies. `find -print0` into a `read -d ''` loop now.
 
+Pushing it then found three more on the runners themselves, and one of them
+is why no Windows installer has ever been buildable:
+
+- **`fetch-ffmpeg.mjs` shelled out to `find`.** On Windows that is
+  `C:\Windows\System32\find.exe`, a text search, which answers
+  `FIND: Parameter format not correct` and exits 2. The download path has
+  never once worked there, so the Windows release job would have died at the
+  sidecar step before compiling a line. It walks the directory in Node now,
+  and the zip extraction falls back to bsdtar, which Windows has and `unzip`
+  is not.
+- **A newer clippy than this machine's** refuses `&haystack.chars()…` inside
+  an `assert!` as a redundant reference. Local clippy is 0.1.94; the runner's
+  cites 1.98. Fixed rather than allowed.
+- **`FedericoCarboni/setup-ffmpeg@v3` has no arm64 macOS build** and fails in
+  under a second on `macos-latest`, which is arm64 now. It was never required
+  — `fetch-ffmpeg.mjs` downloads the same static build and
+  `FfmpegTools::discover` reads `binaries/` before `PATH` — so it is
+  `continue-on-error` now.
+
 The matrix is now Windows x64, macOS Apple Silicon, macOS Intel and Linux x64.
 Linux builds on `ubuntu-22.04` deliberately: glibc is forward-compatible only,
 so a `.deb` built on an older distribution installs on newer ones and not the
