@@ -49,24 +49,37 @@ jobs:
       # macOS build and fails in under a second on macos-latest, which is
       # arm64 now, leaving the runner with no ffmpeg at all and the sidecar
       # step with nothing to fall back to.
-      # A fallback for fetch-ffmpeg.mjs, and deliberately not apt: ubuntu-22.04
-      # ships FFmpeg 4.4, which has no `-fps_mode` and so cannot optimize a
-      # video at all. Falling back to it turns a failed download into a
-      # capability failure three steps later. brew and choco are current.
-      # Linux gets no fallback on purpose — the static build below, or fail.
-      - name: Install FFmpeg
-        if: runner.os != 'Linux'
+      - run: npm ci
+
+      # No package-manager FFmpeg on any platform. The tests should run
+      # against the binary that actually ships, and every substitute tried
+      # here was worse than none: ubuntu-22.04's apt build is 4.4 and has no
+      # `-fps_mode`, and Chocolatey installs a shim that resolves a relative
+      # path and cannot find its own executable
+      # ("Cannot find file at '..\lib\ffmpeg\tools\ffmpeg\bin\ffmpeg.exe'").
+      # `--require-download` so a download failure is a loud failure rather
+      # than a silent fall back to whatever the runner happens to have.
+      - run: node scripts/fetch-ffmpeg.mjs --require-download --force
+
+      # The sidecars are named for their target triple, which no PATH lookup
+      # will find. The tests that probe capabilities resolve `ffmpeg` from
+      # PATH, so the downloaded build is put there under its plain name and
+      # they test the shipped binary rather than skipping.
+      - name: Put the downloaded FFmpeg on PATH
         shell: bash
         run: |
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            brew install ffmpeg
-          else
-            choco install ffmpeg -y --no-progress
-          fi
-          ffmpeg -version | head -1
-
-      - run: npm ci
-      - run: node scripts/fetch-ffmpeg.mjs
+          set -euo pipefail
+          dir="$RUNNER_TEMP/ffmpeg-bin"
+          mkdir -p "$dir"
+          ext=""
+          if [ "$RUNNER_OS" = "Windows" ]; then ext=".exe"; fi
+          for n in ffmpeg ffprobe; do
+            src=$(ls apps/desktop/src-tauri/binaries/$n-* | head -1)
+            cp "$src" "$dir/$n$ext"
+            chmod +x "$dir/$n$ext" || true
+          done
+          echo "$dir" >> "$GITHUB_PATH"
+          "$dir/ffmpeg$ext" -version | head -1
 
       - name: Verify
         run: node scripts/verify.mjs
