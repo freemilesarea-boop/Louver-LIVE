@@ -51,6 +51,14 @@ impl Fake {
             while !stopping.load(std::sync::atomic::Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        // Windows hands back an accepted socket that inherits
+                        // the listener's non-blocking mode; Linux and macOS
+                        // give a blocking one. Left as it comes, `read_line`
+                        // below returns WouldBlock, the request is dropped
+                        // without a reply, and the client waits out its whole
+                        // timeout — a Windows-only flake that looks like a
+                        // hung server.
+                        let _ = stream.set_nonblocking(false);
                         let mut reader = BufReader::new(stream.try_clone().unwrap());
                         let mut line = String::new();
                         if reader.read_line(&mut line).is_err() {
