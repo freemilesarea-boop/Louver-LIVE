@@ -49,17 +49,27 @@ jobs:
       # macOS build and fails in under a second on macos-latest, which is
       # arm64 now, leaving the runner with no ffmpeg at all and the sidecar
       # step with nothing to fall back to.
+      # A modern FFmpeg for `fetch-ffmpeg.mjs` to fall back to, on the two
+      # platforms whose download hosts are least reliable from a runner.
+      # Not every package manager will do: ubuntu-22.04's apt build is 4.4 and
+      # has no `-fps_mode`, and Chocolatey installs a shim that resolves a
+      # relative path and cannot find its own executable
+      # ("Cannot find file at '..\lib\ffmpeg\tools\ffmpeg\bin\ffmpeg.exe").
+      # Linux needs none — johnvansickle.com answers from a runner.
+      - name: Install a fallback FFmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+      - name: Install a fallback FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        uses: FedericoCarboni/setup-ffmpeg@v3
+
       - run: npm ci
 
-      # No package-manager FFmpeg on any platform. The tests should run
-      # against the binary that actually ships, and every substitute tried
-      # here was worse than none: ubuntu-22.04's apt build is 4.4 and has no
-      # `-fps_mode`, and Chocolatey installs a shim that resolves a relative
-      # path and cannot find its own executable
-      # ("Cannot find file at '..\lib\ffmpeg\tools\ffmpeg\bin\ffmpeg.exe'").
-      # `--require-download` so a download failure is a loud failure rather
-      # than a silent fall back to whatever the runner happens to have.
-      - run: node scripts/fetch-ffmpeg.mjs --require-download --force
+      # Preferred, not required. A release must ship the downloaded build and
+      # says so with `--require-download`; CI is checking the code, and
+      # failing the whole matrix because evermeet.cx was briefly unreachable
+      # tells nobody anything about the change being tested.
+      - run: node scripts/fetch-ffmpeg.mjs --force
 
       # The sidecars are named for their target triple, which no PATH lookup
       # will find. The tests that probe capabilities resolve `ffmpeg` from
