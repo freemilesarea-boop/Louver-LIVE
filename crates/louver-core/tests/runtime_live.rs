@@ -213,13 +213,24 @@ fn the_runtime_drives_real_ffmpeg_and_produces_a_playable_broadcast() {
     // startup alone eats enough of a fixed nine seconds to leave the output
     // short of one cycle. Waiting on media time asks the question the test
     // means — has it looped — instead of a proxy for it that Windows failed.
+    //
+    // Waited on both of the things asserted after the stop — the media time
+    // and the bytes on disk — because neither implies the other. FFmpeg can
+    // report media ahead of what it has flushed, so stopping the moment the
+    // clock passes eight seconds can still leave a file too small to probe.
     const PAST_ONE_CYCLE_MS: u64 = 8_000;
-    let deadline = Instant::now() + Duration::from_secs(90);
-    while rt.status().supervisor.progress.out_time_ms < PAST_ONE_CYCLE_MS {
+    const ENOUGH_BYTES: u64 = 50_000;
+    let out = dir.path().join("dry-run").join("dry-run.flv");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let media_ms = rt.status().supervisor.progress.out_time_ms;
+        let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        if media_ms >= PAST_ONE_CYCLE_MS && bytes > ENOUGH_BYTES {
+            break;
+        }
         assert!(
             Instant::now() < deadline,
-            "only {}ms of media in 90s — FFmpeg is not keeping up",
-            rt.status().supervisor.progress.out_time_ms
+            "after 120s FFmpeg had muxed {media_ms}ms of media into {bytes} bytes — not keeping up"
         );
         std::thread::sleep(Duration::from_millis(250));
         rt.tick();
@@ -254,9 +265,8 @@ fn the_runtime_drives_real_ffmpeg_and_produces_a_playable_broadcast() {
     assert!(SessionStore::new(dir.path().join("session.json")).load().is_none());
 
     // And the output is a real, playable stream with the expected properties.
-    let out = dir.path().join("dry-run").join("dry-run.flv");
     assert!(out.is_file(), "no output file was produced");
-    assert!(std::fs::metadata(&out).unwrap().len() > 50_000, "output is suspiciously small");
+    assert!(std::fs::metadata(&out).unwrap().len() > ENOUGH_BYTES, "output is suspiciously small");
     assert_eq!(stream_field(&tools, &out, "v:0", "codec_name"), "h264");
     assert_eq!(stream_field(&tools, &out, "a:0", "codec_name"), "aac");
     assert_eq!(stream_field(&tools, &out, "v:0", "width"), PROFILE.width().to_string());
