@@ -724,6 +724,20 @@ here — it exits 1 on the fallback sidecar with "it will not run on a user's
 machine". Both gates now agree, and the release step passes `--force` so a
 cached workspace cannot supply a stale one either.
 
+Building the Linux bundle here before trusting the workflow found two more,
+neither of which any amount of reading would have shown:
+
+- **The AppImage bundler needs `xdg-utils`**, which the apt list did not
+  install. It fails with `xdg-open binary not found`, *after* the `.deb` has
+  been written — so the job fails with one of its two installers already on
+  disk, which reads like a flake and is not one. `xdg-utils`, `fuse` and
+  `libfuse2` are now installed.
+- **Every bundler names its output after the product**, so the file is
+  `Louver Live_1.0.0_amd64.deb`. The collect step iterated `$(find ...)`
+  unquoted, which splits that on the space: it produced `.../bundle/deb/Louver`
+  and `Live_1.0.0_amd64.deb`, neither of which exists, and under `set -e` the
+  job dies. `find -print0` into a `read -d ''` loop now.
+
 The matrix is now Windows x64, macOS Apple Silicon, macOS Intel and Linux x64.
 Linux builds on `ubuntu-22.04` deliberately: glibc is forward-compatible only,
 so a `.deb` built on an older distribution installs on newer ones and not the
