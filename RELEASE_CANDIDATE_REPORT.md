@@ -1236,3 +1236,52 @@ LGHT0311 을 **하나만** 냈습니다 — 라이선스 대화상자 하나입�
 가리키는 파일의 모든 문자가 코드 페이지 1252 에 있는지 확인하고, 없으면
 문자·코드포인트·줄번호·문맥을 찍습니다. 화살표를 되돌리면 이 테스트가
 즉시 실패하는 것을 확인했습니다.
+
+## v1.0.3 은 이미 쓰였습니다 — 다음 릴리스는 v1.0.4 (2026-09-22)
+
+`v1.0.3` 태그는 이미 원격에 있고 `d3c2275` 를 가리킵니다. 그 커밋은 위의
+WiX 코드 페이지 수정이며, **최적화 작업(`360dfba`)과 Linux 제외
+(`e31876b`) 보다 앞섭니다.** 그 태그로 돈 Release run 은 초록으로 끝났고
+Draft Release 도 이미 만들어져 있는데, 거기에는 `.deb` 과 `.AppImage` 가
+붙어 있습니다.
+
+그래서 그 태그는 건드리지 않습니다. 강제로 덮어쓰면 이미 존재하는 Draft
+Release 가 가리키는 커밋이 바뀌고, 기존 태그 force overwrite 는 금지
+사항입니다. 버전을 `1.0.4` 로 올렸습니다 — `package.json`,
+`package-lock.json`, `tauri.conf.json`, `Cargo.toml`, `Cargo.lock`.
+`every_file_that_carries_the_version_agrees_with_the_crate` 가 이걸 잠급니다.
+
+### Release matrix 에서 Linux 를 뺐습니다
+
+| job | runner | target |
+| --- | --- | --- |
+| macOS Apple Silicon | `macos-14` | `aarch64-apple-darwin` |
+| macOS Intel | `macos-15-intel` | `x86_64-apple-darwin` |
+| Windows x64 | `windows-latest` | `x86_64-pc-windows-msvc` |
+
+`ubuntu` 빌드 job 도, `.deb`/`.AppImage` 산출물도 없습니다. `publish` job
+만 `ubuntu-latest` 에서 도는데 그건 세 job 이 만든 파일을 내려받아 `gh` 를
+부르는 일뿐이고 컴파일도 번들링도 하지 않습니다. 수집 단계는 `*.dmg`,
+`*.exe`, `*.msi` 만 집습니다.
+
+Linux 를 CI 에서까지 뺀 것은 아닙니다. 앱은 여전히 Linux 에서 빌드되고
+테스트가 돕니다 — 이 저장소의 테스트가 실제로 도는 곳이 거기입니다.
+CI 는 사이드카 4개 타깃을 확인하고, Release 는 그중 3개를 빌드합니다.
+
+`docs_sync.rs` 의 두 가드가 이걸 잠급니다:
+`the_release_builds_windows_and_macos_and_nothing_else` 는 matrix 에
+ubuntu/linux 가 없는지 보고(설명 주석은 먼저 걷어냅니다),
+`the_release_never_gets_green_by_checking_less` 는 `continue-on-error`,
+사이드카 검증 삭제, OAuth credential check 건너뛰기가 들어오면 실패합니다.
+
+### 이 컨테이너에서 확인할 수 없는 것
+
+태그 push 권한이 없습니다. `git push origin <tag>` 는 원격에서 연결이
+끊기고, `git ls-remote --tags origin` 으로 확인해 보면 태그가 도착하지
+않았습니다. `workflow_dispatch` 도 403 (`Resource not accessible by
+integration`) 입니다. 그러므로 **v1.0.4 Release run 은 아직 존재하지
+않으며, 세 플랫폼 결과·설치 파일·설치 확인은 전부 NOT TESTED 입니다.**
+돌았다고 적지 않습니다.
+
+`npm run verify` 는 1.0.4 에서 11/11 PASS 입니다. 그것이 이 환경에서
+실제로 확인된 전부입니다.
