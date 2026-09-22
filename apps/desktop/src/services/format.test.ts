@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   EVERYDAY, WEEKDAYS, crossesMidnight, describeDays, formatBytes, formatDuration, formatEta,
   formatDurationKo, formatMbps, hasDay, isBroadcastReady, mediaStatusLabel,
-  streamStateLabel, toggleDay, windowDurationSecs,
+  streamStateLabel, toggleDay, windowDurationSecs, encoderLabel,
 } from './format'
 
 describe('duration formatting', () => {
@@ -85,17 +85,37 @@ describe('status labels', () => {
     expect(streamStateLabel('LIVE')).toBe('방송 중')
   })
 
-  it('only treats compatible and normalized media as broadcastable', () => {
+  it('treats only a prepared file as broadcastable', () => {
     expect(isBroadcastReady('normalized')).toBe(true)
-    expect(isBroadcastReady('compatible')).toBe(true)
-    // §14: a file that needs no further work says so in the same words,
-    // whether it was optimized or was already compliant.
     expect(mediaStatusLabel('normalized')).toBe('송출 준비 완료')
-    expect(mediaStatusLabel('compatible')).toBe('송출 준비 완료')
-    for (const s of ['imported', 'optimization_required', 'missing', 'failed'] as const) {
+
+    // `compatible` means the source matches the profile, which buys a packet
+    // copy rather than an encode — not a way past preparation. Streaming one
+    // straight from the user's path faults at every concat join; the Rust
+    // test `a_source_file_used_untouched_breaks_the_loop` is the proof.
+    expect(isBroadcastReady('compatible')).toBe(false)
+
+    for (const s of ['imported', 'compatible', 'optimization_required', 'missing', 'failed'] as const) {
       expect(isBroadcastReady(s)).toBe(false)
       expect(mediaStatusLabel(s)).toBeTruthy()
     }
+  })
+
+  // §1: the word never reaches a user-facing string.
+  it('never calls preparation "최적화"', () => {
+    const statuses = ['imported', 'compatible', 'optimization_required', 'normalized', 'missing', 'failed'] as const
+    for (const s of statuses) {
+      expect(mediaStatusLabel(s)).not.toContain('최적화')
+    }
+  })
+
+  // §7: the engine is reported in words, and never asked for.
+  it('names the conversion engine without making the user read an encoder name', () => {
+    expect(encoderLabel('h264_nvenc')).toBe('NVIDIA GPU')
+    expect(encoderLabel('h264_qsv')).toBe('Intel Quick Sync')
+    expect(encoderLabel('h264_amf')).toBe('AMD GPU')
+    expect(encoderLabel('libx264')).toBe('CPU')
+    expect(encoderLabel('something_new')).toBe('CPU')
   })
 })
 

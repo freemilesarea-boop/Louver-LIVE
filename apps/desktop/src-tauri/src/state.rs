@@ -94,7 +94,7 @@ impl AppState {
             .as_ref()
             .and_then(|c| c.h264_encoder.clone())
             .unwrap_or_else(|| "libx264".to_string());
-        logger.info(LogTarget::App, &format!("최적화 인코더: {encoder}"));
+        logger.info(LogTarget::App, &format!("MEDIA_ENGINE encoder={encoder}"));
 
         let fallback = FfmpegTools::new("ffmpeg", "ffprobe");
         let builder = FfmpegCommandBuilder::new(tools.clone().unwrap_or(fallback.clone()), profile)

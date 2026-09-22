@@ -10,7 +10,7 @@ use louver_core::media::is_supported_extension;
 use louver_core::media::normalize::{
     engine_label_ko, mode_label_ko, normalize_one, plan_for, CancelToken, NormalizeProgress,
 };
-use louver_core::media::probe::{check_compatibility, probe, Compatibility};
+use louver_core::media::probe::probe;
 use louver_core::system::available_disk_bytes;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -62,14 +62,11 @@ fn import_one(
     let info = probe(builder, path)?;
     let hash = media_hash(path)?;
 
-    // A cached normalized copy from an earlier run is reused verbatim (§8).
+    // A cached normalized copy from an earlier run is reused verbatim (§8):
+    // the file was prepared once and nothing about it has changed, so it is
+    // ready without reading a packet of the source.
     let cached = state.cache.lookup(&hash, profile);
-    let compat = check_compatibility(&info, profile);
-    let status = match (&cached, &compat) {
-        (Some(_), _) => MediaStatus::Normalized,
-        (None, Compatibility::Compatible) => MediaStatus::Compatible,
-        (None, _) => MediaStatus::OptimizationRequired,
-    };
+    let status = if cached.is_some() { MediaStatus::Normalized } else { MediaStatus::OptimizationRequired };
 
     let media = Media {
         id: 0,
@@ -108,12 +105,22 @@ pub fn delete_media(state: State<'_, AppState>, id: i64) -> CmdResult<()> {
     state.db.delete_media(id)
 }
 
-/// Why a given file needs optimizing, for the UI's explanation (§7).
+/// Why a given file has to be prepared. Advanced detail, not the main UI (§1).
 #[tauri::command]
 pub fn compatibility_reasons(state: State<'_, AppState>, id: i64) -> CmdResult<Vec<String>> {
     let m = state.db.get_media(id)?.ok_or_else(|| LouverError::new(ErrorCode::MediaFileMissing))?;
-    let info = probe(&state.builder(), Path::new(&m.source_path))?;
-    Ok(check_compatibility(&info, state.profile()).reasons().to_vec())
+    let builder = state.builder();
+    let path = Path::new(&m.source_path);
+    let info = probe(&builder, path)?;
+    let p = plan_for(&builder, path, &info, state.profile());
+    let mut r = p.video_reasons.clone();
+    r.extend(p.audio_reasons.clone());
+    // A remux has no per-stream reason: nothing about the picture or the sound
+    // is wrong, only the container they are wrapped in.
+    if r.is_empty() {
+        r.push("파일 형식만 방송용으로 정리하면 됩니다".into());
+    }
+    Ok(r)
 }
 
 /// Disk-usage plan shown before optimization starts (§10).
@@ -322,6 +329,55 @@ pub fn optimize_media(
 
     *state.normalize_cancel.lock().unwrap() = None;
     Ok(done)
+}
+
+/// Add files and make them broadcastable, in one call (§1, §5).
+///
+/// The user picks videos and waits; there is no second button to find. What
+/// happens in between depends on the files: one that already matches the
+/// profile is ready the moment it is probed and nothing is written, and one
+/// that does not is prepared — as a remux, or as an encode of only the stream
+/// that needs it. Both outcomes look the same from the outside, which is the
+/// point: "optimization" is not a thing this program asks a person to think
+/// about.
+///
+/// Import and preparation stay separate commands underneath. A batch that
+/// fails to prepare has still been imported, so the library shows the files
+/// with what went wrong rather than losing them.
+#[tauri::command]
+pub fn add_media(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> CmdResult<AddResult> {
+    let result = import_media(state.clone(), paths)?;
+    let pending: Vec<i64> =
+        result.imported.iter().filter(|m| !m.status.is_broadcast_ready()).map(|m| m.id).collect();
+
+    let ready_at_once = result.imported.len() - pending.len();
+    state.logger.info(
+        LogTarget::App,
+        &format!(
+            "MEDIA_ADD imported={} ready={} to_prepare={} failed={}",
+            result.imported.len(),
+            ready_at_once,
+            pending.len(),
+            result.failed.len(),
+        ),
+    );
+
+    let prepared = if pending.is_empty() { 0 } else { optimize_media(app, state, pending)? };
+    Ok(AddResult { imported: result.imported, failed: result.failed, ready_at_once, prepared })
+}
+
+#[derive(Serialize)]
+pub struct AddResult {
+    pub imported: Vec<Media>,
+    pub failed: Vec<ImportFailure>,
+    /// Files that needed nothing done to them at all (§4).
+    pub ready_at_once: usize,
+    /// Files that were prepared, whether by a remux or an encode.
+    pub prepared: usize,
 }
 
 /// The 중단 button (§9).

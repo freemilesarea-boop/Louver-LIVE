@@ -308,6 +308,14 @@ export interface ImportResult {
   failed: { path: string; code: string; message: string }[]
 }
 
+/** What `add_media` did: files added, and what it took to make them usable. */
+export interface AddResult extends ImportResult {
+  /** Needed nothing done to them at all. */
+  ready_at_once: number
+  /** Were prepared, whether by a container rewrite or an encode. */
+  prepared: number
+}
+
 // --- YouTube (V2) ---------------------------------------------------------
 
 export type Privacy = 'public' | 'unlisted' | 'private'

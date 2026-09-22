@@ -24,6 +24,13 @@ export interface MockOptions {
   seedSettings?: Record<string, string>
   /** Simulate a machine where no browser can be opened. */
   failOpener?: boolean
+  /**
+   * Preparation leaves the files unready, as a cancelled or failed run does.
+   *
+   * The only way the library holds a file that is not broadcastable: adding a
+   * video prepares it, so this is the state the retry card exists for.
+   */
+  preparationFails?: boolean
   /** Report new schedules as being inside their window right now. */
   scheduleActiveNow?: boolean
   /**
@@ -351,7 +358,7 @@ export function createMockBackend(opts: MockOptions = {}) {
       { id: 'files', label: '파일 확인', outcome: 'pass', detail: '모든 파일이 존재합니다', code: null },
       unready.length === 0
         ? { id: 'normalized', label: '방송 규격', outcome: 'pass', detail: '모든 영상이 방송 규격입니다', code: null }
-        : { id: 'normalized', label: '방송 규격', outcome: 'fail', detail: `${unready.length}개 영상의 최적화가 필요합니다`, code: 'LL-STREAM-003' },
+        : { id: 'normalized', label: '방송 규격', outcome: 'fail', detail: `${unready.length}개 영상의 방송 준비가 필요합니다`, code: 'LL-STREAM-003' },
       dryRun || streamKey
         ? { id: 'stream_key', label: '스트림 키', outcome: 'pass', detail: dryRun ? '테스트 모드에서는 필요하지 않습니다' : '저장된 스트림 키를 사용합니다', code: null }
         : { id: 'stream_key', label: '스트림 키', outcome: 'fail', detail: '스트림 키가 없습니다', code: 'LL-STREAM-007' },
@@ -419,7 +426,6 @@ export function createMockBackend(opts: MockOptions = {}) {
         }
         const existing = media.find((m) => m.source_path === p)
         if (existing) { result.imported.push(existing); continue }
-        // Sources are deliberately non-conforming so the optimize flow is exercised.
         const m: Media = {
           id: ids.media++,
           source_path: p,
@@ -459,6 +465,7 @@ export function createMockBackend(opts: MockOptions = {}) {
     },
     optimize_media: (a) => {
       const ids2 = a.mediaIds as number[]
+      if (opts.preparationFails) return 0
       let done = 0
       ids2.forEach((id, idx) => {
         const m = media.find((x) => x.id === id)
@@ -472,12 +479,25 @@ export function createMockBackend(opts: MockOptions = {}) {
           media_id: id, file_name: m.display_name, percent: 100,
           files_done: idx + 1, files_total: ids2.length,
           remaining_files: ids2.length - idx - 1, estimated_cache_bytes: 0,
-          mode_label: '화면과 소리 변환 중', speed_x: 3.2, eta_secs: 42, engine_label: 'CPU',
+          mode_label: '방송에 맞게 준비 중', speed_x: 3.2, eta_secs: 42, engine_label: 'CPU',
         })
       })
       return done
     },
     cancel_optimization: () => undefined,
+    // §1, §5: one call does the whole thing, so the page has no second button.
+    add_media: (a) => {
+      const result = handlers.import_media!(a) as ImportResult
+      const pending = result.imported.filter((m) => m.status === 'optimization_required')
+      const prepared = pending.length
+        ? (handlers.optimize_media!({ mediaIds: pending.map((m) => m.id) }) as number)
+        : 0
+      return {
+        ...result,
+        ready_at_once: result.imported.length - pending.length,
+        prepared,
+      }
+    },
 
     // --- playlists ---
     list_playlists: () => playlists,
@@ -494,7 +514,7 @@ export function createMockBackend(opts: MockOptions = {}) {
         total_duration_label: h > 0
           ? `${h}시간 ${String(mm).padStart(2, '0')}분 ${String(ss).padStart(2, '0')}초`
           : `${mm}분 ${String(ss).padStart(2, '0')}초`,
-        unready_count: list.filter((i) => i.enabled && i.media.status !== 'normalized' && i.media.status !== 'compatible').length,
+        unready_count: list.filter((i) => i.enabled && i.media.status !== 'normalized').length,
       }
     },
     create_playlist: (a) => {

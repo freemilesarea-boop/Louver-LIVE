@@ -6,7 +6,7 @@
 use crate::config::OutputProfile;
 use crate::error::{ErrorCode, LouverError, Result};
 use crate::media::cache::{CacheMetadata, MediaCache};
-use crate::media::probe::{plan_transcode, probe_max_keyframe_gap, MediaInfo, TranscodePlan};
+use crate::media::probe::{plan_transcode, probe_max_keyframe_gap, MediaInfo, Readiness, TranscodePlan};
 use crate::streaming::ffmpeg::{mask_secrets, FfmpegCommandBuilder};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
@@ -32,11 +32,45 @@ pub fn plan_for(
     info: &MediaInfo,
     profile: OutputProfile,
 ) -> TranscodePlan {
-    let provisional = plan_transcode(info, profile, None);
-    if provisional.video.is_copy() {
-        plan_transcode(info, profile, probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS))
+    plan_transcode(info, profile, measured_gop(builder, source, info, profile))
+}
+
+/// What adding this file costs: nothing if it is already cached, else a plan.
+///
+/// The question the library asks the moment a file is added (§2), and the same
+/// question the preparation step asks, so the two cannot drift. A cache hit is
+/// answered without reading a packet; everything else is planned from the
+/// probe and the measured keyframe spacing.
+pub fn readiness_for(
+    builder: &FfmpegCommandBuilder,
+    cache: &MediaCache,
+    source: &Path,
+    media_hash: &str,
+    info: &MediaInfo,
+    profile: OutputProfile,
+) -> Readiness {
+    if cache.lookup(media_hash, profile).is_some() {
+        return Readiness::Cached;
+    }
+    Readiness::Prepare(plan_for(builder, source, info, profile))
+}
+
+/// The measured gap between keyframes — but only when it could change anything.
+///
+/// Reading packet flags costs an ffprobe pass over the first stretch of the
+/// file. A video that is already going to be re-encoded for some other reason
+/// gets a regular keyframe spacing out of that encode regardless, so the pass
+/// is skipped and the answer is `None`.
+fn measured_gop(
+    builder: &FfmpegCommandBuilder,
+    source: &Path,
+    info: &MediaInfo,
+    profile: OutputProfile,
+) -> Option<f64> {
+    if plan_transcode(info, profile, None).video.is_copy() {
+        probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS)
     } else {
-        provisional
+        None
     }
 }
 
@@ -58,7 +92,7 @@ pub struct NormalizeProgress {
     pub speed_x: f64,
     /// Estimated seconds left for the whole batch. Negative means unknown.
     pub eta_secs: f64,
-    /// The encoder doing the work, for the "최적화 엔진" line (§4).
+    /// The encoder doing the work, for the advanced settings line (§7).
     pub engine_label: String,
 }
 
@@ -107,13 +141,18 @@ pub struct NormalizeOutcome {
     pub avg_encode_fps: f64,
 }
 
-/// What the user is told is happening to a file (§2, §10).
+/// What the user is told is happening to a file (§1, §10).
+///
+/// None of these say "최적화", "인코딩", "H.264" or "remux". The person adding
+/// a video did not ask for a transcode; they asked to broadcast a file, and
+/// what the program does to make that work is the program's business. The
+/// words for the engineer are in the log line, keyed `mode=`.
 pub fn mode_label_ko(plan: &TranscodePlan) -> &'static str {
     match (plan.video.is_copy(), plan.audio.is_copy()) {
-        (true, true) => "이미 방송에 최적화된 영상입니다 · 추가 변환 없음",
-        (true, false) => "소리만 변환 중",
-        (false, true) => "화면만 변환 중",
-        (false, false) => "화면과 소리 변환 중",
+        (true, true) => "바로 사용할 수 있는 영상입니다",
+        (true, false) => "소리를 방송에 맞게 준비 중",
+        (false, true) => "화면을 방송에 맞게 준비 중",
+        (false, false) => "방송에 맞게 준비 중",
     }
 }
 

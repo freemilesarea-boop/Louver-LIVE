@@ -5,13 +5,22 @@ use crate::streaming::playlist::PlaybackMode;
 use crate::streaming::state::StreamState;
 use serde::{Deserialize, Serialize};
 
-/// Whether a media file can be broadcast as-is or needs optimization (§7).
+/// Where a media file stands between being added and being broadcastable (§7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaStatus {
     /// Probed but not yet checked against a profile.
     Imported,
-    /// Matches the profile exactly; broadcast straight from the original.
+    /// Matches the profile, but has no cache entry yet.
+    ///
+    /// This once meant "broadcast straight from the original" and no longer
+    /// does. A source that matches the profile in codec, geometry, rate, pixel
+    /// format and timescale still has an audio track that does not end on the
+    /// same whole frame its video does, and concatenating one of those with a
+    /// prepared entry produces non-monotonic DTS at the join — proven by
+    /// `a_source_file_used_untouched_breaks_the_loop`. Matching the profile
+    /// buys the cheap path through the normalizer, a packet copy, not a way
+    /// around it.
     Compatible,
     /// Needs a normalized cache file before it can be broadcast.
     OptimizationRequired,
@@ -45,8 +54,14 @@ impl MediaStatus {
         })
     }
     /// True when the file can go straight into a broadcast manifest.
+    ///
+    /// Only a prepared cache entry qualifies. `Compatible` deliberately does
+    /// not: see the note on that variant. A row left at `Compatible` by an
+    /// older version is therefore re-prepared rather than streamed, which
+    /// costs one packet copy and fixes a broadcast that would have stuttered
+    /// at every loop boundary.
     pub fn is_broadcast_ready(self) -> bool {
-        matches!(self, Self::Compatible | Self::Normalized)
+        matches!(self, Self::Normalized)
     }
 }
 
@@ -212,8 +227,8 @@ mod tests {
     }
 
     #[test]
-    fn only_compatible_and_normalized_are_broadcast_ready() {
-        assert!(MediaStatus::Compatible.is_broadcast_ready());
+    fn only_a_prepared_cache_entry_is_broadcast_ready() {
+        assert!(!MediaStatus::Compatible.is_broadcast_ready(), "a bare source is never manifest-ready");
         assert!(MediaStatus::Normalized.is_broadcast_ready());
         for s in [
             MediaStatus::Imported,

@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { GripVertical, Plus, Trash2, Wand2, X } from 'lucide-react'
 import { useAppStore } from '@/stores/useAppStore'
 import { api, pickVideoFiles } from '@/services/ipc'
-import { formatBytes, formatDurationKo, formatEta, formatResolution, isBroadcastReady, mediaStatusLabel } from '@/services/format'
+import { formatDurationKo, formatEta, formatResolution, isBroadcastReady, mediaStatusLabel } from '@/services/format'
 import { Badge, Button, Card, EmptyState, Modal, ProgressBar, Select } from '@/components/ui'
-import type { DiskEstimate, PlaylistItemView } from '@/types'
+import type { PlaylistItemView } from '@/types'
 
 /** Playlist page with drag-and-drop ordering (§11, §25). */
 export function PlaylistPage() {
@@ -16,12 +16,30 @@ export function PlaylistPage() {
 
   const [dragId, setDragId] = useState<number | null>(null)
   const [overId, setOverId] = useState<number | null>(null)
-  const [estimate, setEstimate] = useState<DiskEstimate | null>(null)
   const [reasons, setReasons] = useState<{ name: string; list: string[] } | null>(null)
   const [newName, setNewName] = useState('')
   const [creating, setCreating] = useState(false)
+  const [preparing, setPreparing] = useState(false)
+  const [showProgress, setShowProgress] = useState(false)
 
   useEffect(() => { void refreshPlaylists() }, [refreshPlaylists])
+
+  /**
+   * §11: a progress bar only when there is something to be patient about.
+   *
+   * Most additions are a file that needed nothing, or a container rewrite that
+   * finishes in the time it takes to copy — a bar that appears and vanishes
+   * inside a second reads as a glitch, not as progress. Three seconds in, the
+   * work is long enough to be worth watching, and the bar stays until it ends.
+   */
+  useEffect(() => {
+    if (!preparing) {
+      setShowProgress(false)
+      return
+    }
+    const t = setTimeout(() => setShowProgress(true), 3000)
+    return () => clearTimeout(t)
+  }, [preparing])
 
   const items = useMemo(() => activePlaylist?.items ?? [], [activePlaylist])
   const unready = useMemo(
@@ -29,11 +47,20 @@ export function PlaylistPage() {
     [items],
   )
 
+  /**
+   * Pick files, and have them ready to broadcast when this returns (§1, §5).
+   *
+   * One action: choose, wait, done. Whether a file needed nothing, a container
+   * rewrite or an encode is the program's problem, not something a person is
+   * asked to decide — so there is no second button and no "optimization"
+   * anywhere on this page.
+   */
   async function addVideos() {
     try {
       const paths = await pickVideoFiles()
       if (!paths.length) return
-      const result = await api.importMedia(paths)
+      setPreparing(true)
+      const result = await api.addMedia(paths)
       if (activePlaylistId != null && result.imported.length) {
         await api.addToPlaylist(activePlaylistId, result.imported.map((m) => m.id))
       }
@@ -41,34 +68,33 @@ export function PlaylistPage() {
         toast({ kind: 'error', message: `${f.path}: ${f.message}`, code: f.code })
       }
       if (result.imported.length) {
-        toast({ kind: 'success', message: `${result.imported.length}개 영상을 추가했습니다.` })
+        // The whole batch needed nothing: say so, rather than reporting work
+        // that did not happen.
+        const message = result.prepared === 0
+          ? `${result.imported.length}개 영상을 추가했습니다. 바로 사용할 수 있습니다.`
+          : `${result.imported.length}개 영상을 추가했습니다. 준비 완료.`
+        toast({ kind: 'success', message })
       }
       await Promise.all([refreshMedia(), refreshActivePlaylist()])
     } catch (e) {
       reportError(e)
+      await Promise.all([refreshMedia(), refreshActivePlaylist()])
+    } finally {
+      setPreparing(false)
     }
   }
 
-  /** §10: show the disk plan before any encoding starts. */
-  async function askToOptimize() {
-    try {
-      const ids = unready.map((i) => i.media_id)
-      if (!ids.length) return toast({ kind: 'info', message: '최적화할 영상이 없습니다.' })
-      setEstimate(await api.estimateOptimization(ids))
-    } catch (e) {
-      reportError(e)
-    }
-  }
-
-  async function runOptimize() {
+  /** Prepare files that an earlier run left unfinished — a retry, not a step. */
+  async function prepareRemaining() {
     const ids = unready.map((i) => i.media_id)
-    setEstimate(null)
+    if (!ids.length) return
     try {
-      const done = await api.optimizeMedia(ids)
-      toast({ kind: 'success', message: `${done}개 영상을 방송용으로 최적화했습니다.` })
+      setPreparing(true)
+      await api.optimizeMedia(ids)
     } catch (e) {
       reportError(e)
     } finally {
+      setPreparing(false)
       await Promise.all([refreshMedia(), refreshActivePlaylist()])
     }
   }
@@ -190,34 +216,47 @@ export function PlaylistPage() {
             )}
           </Card>
 
-          {unready.length > 0 && (
+          {/*
+            §11: nothing here while a short preparation runs. A file that needs
+            no work, and most that need only a container rewrite, are done
+            before this would have finished appearing.
+          */}
+          {showProgress && normalizing && (
+            <Card>
+              <div className="space-y-2" data-testid="preparing">
+                <p className="text-sm text-ink-100">방송 준비 중</p>
+                <ProgressBar
+                  percent={normalizing.percent}
+                  label={`영상 ${normalizing.files_done + 1}/${normalizing.files_total} · ${normalizing.file_name}`}
+                />
+                <p className="text-xs text-ink-500">
+                  {normalizing.mode_label}
+                  {normalizing.eta_secs >= 0 && ` · 약 ${formatEta(normalizing.eta_secs)} 남음`}
+                </p>
+                <Button size="sm" onClick={() => void api.cancelOptimization()}>중단</Button>
+              </div>
+            </Card>
+          )}
+
+          {/*
+            Only reachable when an earlier attempt was cancelled or failed.
+            Adding a video prepares it, so in the ordinary case this never
+            appears — and when it does, it offers to finish the job rather than
+            asking the user what optimization is.
+          */}
+          {unready.length > 0 && !preparing && (
             <Card>
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm text-warn">{unready.length}개 영상이 방송 규격과 다릅니다.</p>
+                  <p className="text-sm text-warn">{unready.length}개 영상이 아직 준비되지 않았습니다.</p>
                   <p className="mt-1 text-xs text-ink-500">
-                    방송을 시작하려면 먼저 최적화해야 합니다. 원본 파일은 변경되지 않습니다.
+                    준비가 끝나야 방송을 시작할 수 있습니다. 원본 파일은 변경되지 않습니다.
                   </p>
                 </div>
-                <Button variant="primary" onClick={() => void askToOptimize()} disabled={!!normalizing}>
-                  <span className="inline-flex items-center gap-2"><Wand2 size={15} /> 방송용으로 최적화</span>
+                <Button variant="primary" onClick={() => void prepareRemaining()}>
+                  <span className="inline-flex items-center gap-2"><Wand2 size={15} /> 방송 준비</span>
                 </Button>
               </div>
-              {normalizing && (
-                <div className="mt-4 space-y-2">
-                  <ProgressBar
-                    percent={normalizing.percent}
-                    label={`영상 ${normalizing.files_done + 1}/${normalizing.files_total} · ${normalizing.file_name}`}
-                  />
-                  <p className="text-xs text-ink-500">
-                    {normalizing.mode_label}
-                    {normalizing.speed_x > 0 && ` · 처리 속도 ${normalizing.speed_x.toFixed(1)}x`}
-                    {normalizing.eta_secs >= 0 && ` · 남은 시간 약 ${formatEta(normalizing.eta_secs)}`}
-                    {normalizing.engine_label && ` · 최적화 엔진 ${normalizing.engine_label}`}
-                  </p>
-                  <Button size="sm" onClick={() => void api.cancelOptimization()}>중단</Button>
-                </div>
-              )}
             </Card>
           )}
         </>
@@ -267,7 +306,7 @@ export function PlaylistPage() {
 
       <Modal
         open={reasons != null}
-        title={`${reasons?.name ?? ''} · 최적화가 필요한 이유`}
+        title={`${reasons?.name ?? ''} · 준비가 필요한 이유`}
         onClose={() => setReasons(null)}
         footer={<Button onClick={() => setReasons(null)}>닫기</Button>}
       >
@@ -276,33 +315,6 @@ export function PlaylistPage() {
         </ul>
       </Modal>
 
-      {/* §10: never start an encode that could fill the disk */}
-      <Modal
-        open={estimate != null}
-        title="저장 공간 확인"
-        onClose={() => setEstimate(null)}
-        footer={
-          <>
-            <Button onClick={() => setEstimate(null)}>취소</Button>
-            <Button variant="primary" disabled={!estimate?.has_enough_space} onClick={() => void runOptimize()}>
-              최적화 시작
-            </Button>
-          </>
-        }
-      >
-        {estimate && (
-          <dl className="space-y-2">
-            <div className="flex justify-between"><dt>대상 영상</dt><dd className="font-mono">{estimate.files_to_process}개</dd></div>
-            <div className="flex justify-between"><dt>예상 추가 공간</dt><dd className="font-mono">약 {formatBytes(estimate.estimated_bytes)}</dd></div>
-            <div className="flex justify-between"><dt>현재 여유 공간</dt><dd className="font-mono">{formatBytes(estimate.available_bytes)}</dd></div>
-            {!estimate.has_enough_space && (
-              <p className="mt-3 rounded border border-live-dim bg-live-dim/10 p-3 text-live">
-                저장 공간이 부족합니다. 공간을 확보한 뒤 다시 시도해주세요.
-              </p>
-            )}
-          </dl>
-        )}
-      </Modal>
     </div>
   )
 }

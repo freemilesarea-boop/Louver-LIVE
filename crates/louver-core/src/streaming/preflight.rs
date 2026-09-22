@@ -149,7 +149,7 @@ pub fn run(input: &PreflightInput<'_>, net: &dyn NetworkChecker) -> PreflightRep
         CheckResult::fail(
             "normalized",
             "방송 규격",
-            format!("{}개 영상의 최적화가 필요합니다: {}", unready.len(), unready.join(", ")),
+            format!("{}개 영상의 방송 준비가 필요합니다: {}", unready.len(), unready.join(", ")),
             ErrorCode::StreamNotNormalized,
         )
     });
@@ -403,7 +403,8 @@ mod tests {
         // FFmpeg 4.x: streams fine, cannot normalize. The files here are
         // already normalized, so the broadcast must still be allowed.
         let problems =
-            vec!["이 FFmpeg는 너무 오래되어 영상 최적화를 할 수 없습니다 (FFmpeg 5.1 이상 필요)".to_string()];
+            vec!["이 FFmpeg는 너무 오래되어 영상을 방송용으로 준비할 수 없습니다 (FFmpeg 5.1 이상 필요)"
+                .to_string()];
         let mut i = good_input(&m);
         i.ffmpeg_problems = &problems;
         let r = run(&i, &Net(true));
@@ -471,14 +472,20 @@ mod tests {
         assert!(run(&i, &Net(true)).can_broadcast, "dev/testing must not need a licence");
     }
 
+    /// Matching the profile is not the same as being prepared.
+    ///
+    /// Preflight used to let a `Compatible` row through with no cache entry.
+    /// `a_source_file_used_untouched_breaks_the_loop` shows what that costs at
+    /// the concat joins, so the check now asks for the prepared file and the
+    /// user is told to wait a moment rather than sent on air with a stutter.
     #[test]
-    fn a_compatible_file_needs_no_normalized_copy() {
+    fn a_file_that_matches_the_profile_but_was_never_prepared_is_held_back() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("a.mp4");
         std::fs::write(&f, b"x").unwrap();
         let mut m = media_at(&f, MediaStatus::Compatible);
-        m.normalized_path = None; // broadcast straight from the source
+        m.normalized_path = None;
         let r = run(&good_input(&[m]), &Net(true));
-        assert!(r.can_broadcast, "{:?}", r.first_failure());
+        assert!(!r.can_broadcast, "an unprepared source must not reach the wire");
     }
 }

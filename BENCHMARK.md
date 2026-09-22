@@ -156,6 +156,39 @@ available here, so **no hardware-encoder figure is reported.**
 
 ---
 
+## 3b. Adding a video — what each case costs (2026-09-22)
+
+What a person actually waits for when they press 영상 추가. Same 60-second
+source in each row, `optimize_speed.rs`, libx264 on the Linux container
+described under Environment — no NVENC, no Quick Sync, no AMF.
+
+| 소스 | mode | 걸린 시간 | 실시간 대비 |
+| --- | --- | --- | --- |
+| 이미 방송 규격 그대로 | `remux` | **0.50s** | 118.8× |
+| 소리만 규격 밖 | `audio-only` | 2.69s | 22.3× |
+| 화면·소리 모두 규격 밖 | `full-transcode` | 27.22s | 2.2× |
+
+Against the argv this replaced — both streams encoded unconditionally — on the
+same files:
+
+| 소스 | 이전 | 이후 | 배수 |
+| --- | --- | --- | --- |
+| 이미 방송 규격 그대로 | 23.86s | 0.25s | 96.3× |
+| 소리만 규격 밖 | 18.26s | 1.63s | 11.2× |
+| 화면·소리 모두 규격 밖 | 15.89s | 15.59s | 1.0× |
+
+At 118.8× a one-hour conformant file takes about 30 seconds and a five-minute
+one about 2.5 seconds. The remux is disk-bound, so a slower disk moves this
+number and a faster CPU does not.
+
+There is no faster case than `remux`, and deliberately so. Pointing the
+broadcast manifest at the user's own file skips even that copy, and
+`a_source_file_used_untouched_breaks_the_loop` shows what it costs: a source
+matching the profile on every axis the checker knows about still produces
+non-monotonic DTS at each concat join, because its audio track does not end on
+the same whole frame its video does. The remux applies the cut and zeroes the
+start timestamps. That is what is being bought for half a second.
+
 ## 4. Storage
 
 Derived from the measured output size above, not from the nominal bitrate:

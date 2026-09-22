@@ -274,13 +274,48 @@ impl TranscodePlan {
         self.video.is_copy() != self.audio.is_copy()
     }
 
-    /// A short word for the log and the progress UI.
+    /// A short word for the log. Never shown to a user (§1, §10).
     pub fn label(&self) -> &'static str {
         match (self.video, self.audio) {
             (StreamPlan::Copy, StreamPlan::Copy) => "remux",
-            (StreamPlan::Copy, StreamPlan::Encode) => "audio-only encode",
-            (StreamPlan::Encode, StreamPlan::Copy) => "video-only encode",
-            (StreamPlan::Encode, StreamPlan::Encode) => "full encode",
+            (StreamPlan::Copy, StreamPlan::Encode) => "audio-only",
+            (StreamPlan::Encode, StreamPlan::Copy) => "video-only",
+            (StreamPlan::Encode, StreamPlan::Encode) => "full-transcode",
+        }
+    }
+}
+
+/// What adding a file to the library actually costs.
+///
+/// One answer for the whole application, so the page that says "ready" and the
+/// code that prepares the file cannot disagree about a given source. They did:
+/// [`check_compatibility`] never looked at keyframe spacing while
+/// [`plan_transcode`] did, so a file with a two-minute gap between keyframes
+/// could be called ready at import and go into a concat manifest untouched.
+///
+/// Note what is *not* here: an outcome meaning "use the user's file as it is".
+/// There is no such outcome, and `a_source_file_used_untouched_breaks_the_loop`
+/// is why. Every entry in a broadcast manifest has been through the normalizer,
+/// even when both its streams were copied packet for packet, because the cut to
+/// a whole-frame boundary and the zeroed start timestamps are what let the
+/// concat demuxer join one file to the next. A file that matches the profile in
+/// every respect still does not match it in those two, and a library is not a
+/// place to find that out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Readiness {
+    /// Already prepared and cached; nothing to do.
+    Cached,
+    /// Needs a cache entry. The plan says how much of that is an encode —
+    /// `remux` when the streams are fine and only the container is not.
+    Prepare(TranscodePlan),
+}
+
+impl Readiness {
+    /// The word the log uses, keyed `mode=` (§10).
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Cached => "cached",
+            Self::Prepare(p) => p.label(),
         }
     }
 }
@@ -457,7 +492,7 @@ mod tests {
         assert!(p.video.is_copy(), "the picture was already right");
         assert!(!p.audio.is_copy());
         assert!(p.is_partial());
-        assert_eq!(p.label(), "audio-only encode");
+        assert_eq!(p.label(), "audio-only");
 
         // Picture wrong, audio right.
         let mut i = ready();
@@ -466,7 +501,7 @@ mod tests {
         let p = plan_transcode(&i, OutputProfile::P1080p30, Some(2.0));
         assert!(!p.video.is_copy());
         assert!(p.audio.is_copy(), "the audio was already right");
-        assert_eq!(p.label(), "video-only encode");
+        assert_eq!(p.label(), "video-only");
     }
 
     #[test]
@@ -475,7 +510,7 @@ mod tests {
         i.video_codec = "vp9".into();
         i.audio_codec = Some("opus".into());
         let p = plan_transcode(&i, OutputProfile::P1080p30, None);
-        assert_eq!(p.label(), "full encode");
+        assert_eq!(p.label(), "full-transcode");
         assert!(!p.video_reasons.is_empty() && !p.audio_reasons.is_empty());
     }
 
@@ -506,6 +541,60 @@ mod tests {
     #[test]
     fn an_unmeasured_keyframe_gap_is_not_held_against_the_file() {
         assert!(plan_transcode(&ready(), OutputProfile::P1080p30, None).video.is_copy());
+    }
+
+    /// §3 A–D, as one table: what the user's file is, and what it costs.
+    ///
+    /// A file that matches the profile in every respect is case A, and case A
+    /// is a remux — not "nothing". The container work is never skipped; see
+    /// [`Readiness`] and `a_source_file_used_untouched_breaks_the_loop`.
+    #[test]
+    fn every_kind_of_mismatch_costs_only_what_it_has_to() {
+        let profile = OutputProfile::P1080p30;
+        let gop = Some(2.0);
+
+        // A. both streams already right: copied, and only the container is
+        // rewritten. No decode, no scale, no fps filter, no encoder.
+        let p = plan_transcode(&ready(), profile, gop);
+        assert_eq!(p.label(), "remux");
+        assert!(p.video.is_copy() && p.audio.is_copy());
+
+        // A'. a wrong container is still only a remux, never an encode.
+        let mut i = ready();
+        i.time_base = "1/90000".into();
+        assert_eq!(plan_transcode(&i, profile, gop).label(), "remux");
+
+        // B. video right, audio wrong.
+        let mut i = ready();
+        i.audio_sample_rate = Some(44_100);
+        assert_eq!(plan_transcode(&i, profile, gop).label(), "audio-only");
+
+        // C. video wrong, audio right.
+        let mut i = ready();
+        i.width = 1280;
+        i.height = 720;
+        assert_eq!(plan_transcode(&i, profile, gop).label(), "video-only");
+
+        // D. both wrong.
+        let mut i = ready();
+        i.video_codec = "vp9".into();
+        i.audio_codec = Some("opus".into());
+        assert_eq!(plan_transcode(&i, profile, gop).label(), "full-transcode");
+    }
+
+    /// The hole the keyframe check closes. `check_compatibility` never looked
+    /// at keyframe spacing, so a file with a two-minute gap read as ready.
+    #[test]
+    fn a_ready_looking_file_with_far_apart_keyframes_is_still_re_encoded() {
+        let i = ready();
+        let far = OutputProfile::P1080p30.max_copy_gop_secs() + 0.1;
+        assert!(
+            check_compatibility(&i, OutputProfile::P1080p30).is_compatible(),
+            "the compatibility check alone sees nothing wrong with this file",
+        );
+        let p = plan_transcode(&i, OutputProfile::P1080p30, Some(far));
+        assert!(!p.video.is_copy(), "a 10-second keyframe gap must not be copied into a live stream");
+        assert_eq!(p.label(), "video-only");
     }
 
     #[test]

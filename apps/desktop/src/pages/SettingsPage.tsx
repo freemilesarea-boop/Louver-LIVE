@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { Eye, FolderOpen, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react'
 import { useAppStore } from '@/stores/useAppStore'
 import { api, openUrl, pickLicenseFile, revealPath } from '@/services/ipc'
+import { encoderLabel } from '@/services/format'
 import { Badge, Button, Card, Field, Input, Modal, Select, Toggle } from '@/components/ui'
 import type { QuotaReport, StreamDiagnostics, YoutubeStatus } from '@/types'
 
@@ -212,14 +213,20 @@ export function SettingsPage() {
         <dl className="space-y-2 text-sm">
           <Row label="FFmpeg" value={s.ffmpeg_version ?? '찾을 수 없음 (LL-CONFIG-002)'} />
           <Row label="FFmpeg 경로" value={s.ffmpeg_path ?? '—'} mono />
+          {/*
+            §7: the engine is chosen by probing, never by the user. This says
+            which one was chosen, in words rather than in encoder names, and
+            keeps the name itself for the people who came looking for it.
+          */}
           <Row
-            label="최적화 인코더"
+            label="사용 중인 변환 엔진"
             value={
               <span className="inline-flex items-center gap-2">
-                <span className="font-mono">{s.hardware_encoder}</span>
+                <span>{encoderLabel(s.hardware_encoder)}</span>
                 <Badge tone={s.hardware_encoder === 'libx264' ? 'default' : 'ok'}>
                   {s.hardware_encoder === 'libx264' ? '소프트웨어' : '하드웨어 가속'}
                 </Badge>
+                <span className="font-mono text-xs text-ink-500">{s.hardware_encoder}</span>
               </span>
             }
           />
@@ -316,10 +323,10 @@ export function SettingsPage() {
       >
         {inUse > 0 ? (
           <p className="text-warn">
-            현재 플레이리스트에서 사용 중인 최적화 파일 {inUse}개가 함께 삭제됩니다. 다시 방송하려면 최적화를 한 번 더 실행해야 합니다.
+            현재 플레이리스트에서 사용 중인 준비 파일 {inUse}개가 함께 삭제됩니다. 다시 방송하려면 영상을 한 번 더 준비해야 합니다.
           </p>
         ) : (
-          <p>최적화된 영상 캐시를 모두 삭제합니다. 원본 파일은 삭제되지 않습니다.</p>
+          <p>준비된 영상 캐시를 모두 삭제합니다. 원본 파일은 삭제되지 않습니다.</p>
         )}
       </Modal>
     </div>

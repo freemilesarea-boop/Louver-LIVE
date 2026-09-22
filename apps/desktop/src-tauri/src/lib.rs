@@ -139,6 +139,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // media
             commands::media::import_media,
+            commands::media::add_media,
             commands::media::list_media,
             commands::media::delete_media,
             commands::media::compatibility_reasons,

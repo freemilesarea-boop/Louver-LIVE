@@ -280,12 +280,19 @@ mod tests {
         assert_eq!(e.code, ErrorCode::MediaFileMissing);
     }
 
+    /// A file that matches the profile but has no cache entry is refused.
+    ///
+    /// It used to be broadcast straight from the user's own path, which reads
+    /// as an obvious saving and is not one: see
+    /// `a_source_file_used_untouched_breaks_the_loop`, where a source that
+    /// matches the profile on every axis still produces non-monotonic DTS at
+    /// each concat join. The manifest takes prepared entries only.
     #[test]
-    fn a_compatible_file_is_broadcast_from_its_original_path() {
+    fn a_file_that_matches_the_profile_is_still_not_broadcast_from_its_own_path() {
         let mut f = fixture(&[10.0]);
         f.media[0].status = MediaStatus::Compatible;
         f.media[0].normalized_path = None;
-        let plan = build_plan(
+        let e = build_plan(
             1,
             &items(1),
             &lookup(&f.media),
@@ -295,8 +302,8 @@ mod tests {
             1,
             &f.manifest,
         )
-        .unwrap();
-        assert_eq!(plan.items[0].path.to_string_lossy(), f.media[0].source_path);
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::StreamNotNormalized);
     }
 
     // --- "now playing / up next" over an infinite loop (§24) ---------------

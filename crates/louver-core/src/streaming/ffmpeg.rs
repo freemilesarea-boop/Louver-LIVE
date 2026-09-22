@@ -281,13 +281,16 @@ impl FfmpegCapabilities {
             v.push("이 FFmpeg는 RTMPS를 지원하지 않아 YouTube로 송출할 수 없습니다".into());
         }
         if !self.supports_fps_mode {
-            v.push("이 FFmpeg는 너무 오래되어 영상 최적화를 할 수 없습니다 (FFmpeg 5.1 이상 필요)".into());
+            v.push(
+                "이 FFmpeg는 너무 오래되어 영상을 방송용으로 준비할 수 없습니다 (FFmpeg 5.1 이상 필요)"
+                    .into(),
+            );
         }
         if self.h264_encoder.is_none() {
-            v.push("사용 가능한 H.264 인코더가 없어 영상 최적화를 할 수 없습니다".into());
+            v.push("사용 가능한 영상 변환 엔진이 없어 영상을 방송용으로 준비할 수 없습니다".into());
         }
         if !self.has_aac {
-            v.push("AAC 인코더가 없어 영상 최적화를 할 수 없습니다".into());
+            v.push("소리를 방송용으로 준비할 수 없습니다 (AAC 지원 없음)".into());
         }
         v
     }

@@ -136,12 +136,12 @@ impl ErrorCode {
             MediaUnsupported => "지원하지 않는 영상 형식입니다. MP4, MOV, MKV 파일을 사용해주세요.",
             MediaFileMissing => "영상 파일을 찾을 수 없습니다. 파일이 이동되었거나 삭제되었습니다.",
             MediaNoVideoStream => "이 파일에는 영상 트랙이 없습니다.",
-            MediaNormalizeFailed => "방송용 최적화에 실패했습니다. 원본 파일을 확인해주세요.",
-            MediaNormalizeCancelled => "최적화가 취소되었습니다.",
+            MediaNormalizeFailed => "방송 준비에 실패했습니다. 원본 파일을 확인해주세요.",
+            MediaNormalizeCancelled => "방송 준비가 취소되었습니다.",
             StreamFfmpegSpawn => "방송 엔진을 시작하지 못했습니다. 프로그램을 다시 설치해주세요.",
             StreamFfmpegExit => "방송이 예기치 않게 중단되었습니다. 자동으로 다시 연결합니다.",
             StreamNotNormalized => {
-                "아직 방송용으로 최적화되지 않은 영상이 있습니다. 먼저 최적화를 완료해주세요."
+                "아직 방송 준비가 끝나지 않은 영상이 있습니다. 준비가 끝난 뒤 시작해주세요."
             }
             StreamEmptyPlaylist => "플레이리스트가 비어 있습니다. 영상을 먼저 추가해주세요.",
             StreamAlreadyRunning => "이미 방송이 진행 중입니다.",
@@ -156,7 +156,7 @@ impl ErrorCode {
                 "유튜브 서버에 연결하지 못했습니다. 스트림 키와 인터넷 연결을 확인해주세요."
             }
             StorageInsufficientSpace => "저장 공간이 부족합니다. 공간을 확보한 뒤 다시 시도해주세요.",
-            StorageCacheCorrupt => "최적화 캐시가 손상되었습니다. 해당 영상을 다시 최적화합니다.",
+            StorageCacheCorrupt => "준비된 영상 파일이 손상되었습니다. 해당 영상을 다시 준비합니다.",
             StorageIo => "파일을 읽거나 쓰지 못했습니다. 디스크 상태를 확인해주세요.",
             DbOpen => "데이터베이스를 열지 못했습니다.",
             DbMigration => "데이터베이스 업그레이드에 실패했습니다.",

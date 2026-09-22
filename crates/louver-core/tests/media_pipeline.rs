@@ -15,10 +15,13 @@ mod common;
 use common::*;
 use louver_core::config::{OutputProfile, StreamMode};
 use louver_core::media::cache::MediaCache;
-use louver_core::media::normalize::{normalize_one, CancelToken};
-use louver_core::media::probe::{check_compatibility, plan_transcode, probe, probe_max_keyframe_gap};
+use louver_core::media::normalize::{normalize_one, readiness_for, CancelToken};
+use louver_core::media::probe::{
+    check_compatibility, plan_transcode, probe, probe_max_keyframe_gap, Readiness,
+};
+use louver_core::streaming::ffmpeg::FfmpegTools;
 use louver_core::streaming::manifest::write_manifest;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const PROFILE: OutputProfile = OutputProfile::P720p30;
 
@@ -827,4 +830,153 @@ fn a_copied_file_and_an_encoded_one_concatenate_and_stream_copy_together() {
         "mixed playlist ran {}s, expected {want}s",
         format_duration(&tools, &out)
     );
+}
+
+/// Build a file that already matches the broadcast profile exactly.
+///
+/// This is the file §4 is about: something downloaded from YouTube in H.264 /
+/// AAC that happens to match what we broadcast, down to the timescale.
+fn conformant_fixture(tools: &FfmpegTools, at: &Path, seconds: &str, pattern: &str) -> PathBuf {
+    let args: Vec<String> = [
+        "-y",
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("{pattern}=size=1280x720:rate=30:duration={seconds}"),
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("sine=frequency=440:sample_rate=48000:duration={seconds}"),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-profile:v",
+        "high",
+        "-level",
+        "3.1",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "60",
+        "-keyint_min",
+        "60",
+        "-sc_threshold",
+        "0",
+        "-b:v",
+        "3000k",
+        "-r",
+        "30",
+        "-fps_mode",
+        "cfr",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-ar",
+        "48000",
+        "-ac",
+        "2",
+        "-video_track_timescale",
+        "30000",
+        "-movflags",
+        "+faststart",
+        at.to_str().unwrap(),
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    let (code, err) = run_ffmpeg(tools, &args);
+    assert_eq!(code, 0, "conformant fixture build failed: {err}");
+    at.to_path_buf()
+}
+
+/// §4, §6 and §9 together: the cheap path, and why it is not cheaper still.
+///
+/// A source that already matches the broadcast profile in every respect takes
+/// the copy path — no decode, no scale, no fps filter, no H.264 encode, no AAC
+/// encode. What it does *not* get is a way around the normalizer, and this
+/// test is the reason. Concatenated straight from the user's file, a perfectly
+/// conformant source produces non-monotonic DTS at every join; the same file
+/// after a packet-copy remux does not. The difference is the whole-frame cut
+/// and the zeroed start timestamps the normalizer applies, which no source
+/// file has of its own accord.
+///
+/// If someone later decides the remux is a waste and points the manifest at
+/// the original, this fails.
+#[test]
+fn a_source_file_used_untouched_breaks_the_loop() {
+    let tools = require_ffmpeg!();
+    let b = builder(tools.clone(), PROFILE);
+    let work = tempfile::tempdir().unwrap();
+    let cache = MediaCache::new(work.path().join("cache"));
+
+    let raw = conformant_fixture(&tools, &work.path().join("asis.mp4"), "3", "testsrc2");
+    let raw_info = probe(&b, &raw).unwrap();
+
+    // It matches the profile on every axis the checker knows about.
+    assert!(
+        check_compatibility(&raw_info, PROFILE).is_compatible(),
+        "fixture is not conformant, so this test would prove nothing: {:?}",
+        check_compatibility(&raw_info, PROFILE).reasons(),
+    );
+
+    // So preparing it costs a remux and not an encode (§3 A, §4).
+    let verdict = readiness_for(&b, &cache, &raw, "asis", &raw_info, PROFILE);
+    assert_eq!(verdict.label(), "remux", "a conformant source must not be re-encoded");
+
+    let prepared_raw =
+        normalize_one(&b, &cache, &raw, "asis", &raw_info, PROFILE, &CancelToken::new(), |_| {}).unwrap();
+    assert_eq!(prepared_raw.video_encoder, "copy", "the conformant source went through an encoder");
+
+    // Asking again costs nothing at all (§8).
+    assert_eq!(readiness_for(&b, &cache, &raw, "asis", &raw_info, PROFILE), Readiness::Cached);
+
+    // A partner that genuinely needed work.
+    let odd = make_fixture(
+        &tools,
+        &fixture_dir(),
+        &FixtureSpec {
+            name: "asis_partner",
+            duration: 3.0,
+            size: "640x480",
+            fps: 24,
+            sample_rate: 44100,
+            channels: 1,
+            tone_hz: 330,
+            pattern: "smptebars",
+        },
+    );
+    let odd_info = probe(&b, &odd).unwrap();
+    let partner =
+        normalize_one(&b, &cache, &odd, "asis_partner", &odd_info, PROFILE, &CancelToken::new(), |_| {})
+            .unwrap();
+
+    // Run the real live command twice over: once with the user's own file in
+    // the manifest, once with the remux of that same file.
+    let faults_for = |label: &str, first: &Path| -> Vec<String> {
+        let files = vec![
+            first.to_path_buf(),
+            partner.output_path.clone(),
+            first.to_path_buf(),
+            partner.output_path.clone(),
+        ];
+        let manifest = work.path().join(format!("{label}.txt"));
+        write_manifest(&manifest, &files).unwrap();
+        let out = work.path().join(format!("{label}.flv"));
+        let (code, stderr) =
+            run_ffmpeg(&tools, &b.build_dry_run_args(&manifest, &out, StreamMode::StreamCopy, None, false));
+        assert_eq!(code, 0, "{stderr}");
+        timestamp_faults(&stderr)
+    };
+
+    let untouched = faults_for("untouched", &raw);
+    assert!(
+        !untouched.is_empty(),
+        "the shortcut looks safe on this FFmpeg build — re-read the note on \
+         MediaStatus::Compatible before trusting it",
+    );
+
+    let remuxed = faults_for("remuxed", &prepared_raw.output_path);
+    assert!(remuxed.is_empty(), "a remuxed conformant source must join cleanly:\n{}", remuxed.join("\n"),);
 }

@@ -11,7 +11,7 @@
  * packaged binary.
  */
 import type {
-  DashboardMetrics, DiskEstimate, ImportResult, LicenseState, LouverError,
+  AddResult, DashboardMetrics, DiskEstimate, ImportResult, LicenseState, LouverError,
   Media, Playlist, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
   SettingsView, StreamDiagnostics, StreamEvent, SchedulerStatusView,
   BroadcastMetadata, BroadcastPreset, ChatMessage, ChatSettings, ChatStatus,
@@ -77,6 +77,8 @@ export function emitLocal<T>(event: string, payload: T) {
 export const api = {
   // media
   importMedia: (paths: string[]) => call<ImportResult>('import_media', { paths }),
+  /** Add and prepare in one call, so no second button exists (§1, §5). */
+  addMedia: (paths: string[]) => call<AddResult>('add_media', { paths }),
   listMedia: () => call<Media[]>('list_media'),
   deleteMedia: (id: number) => call<void>('delete_media', { id }),
   compatibilityReasons: (id: number) => call<string[]>('compatibility_reasons', { id }),

@@ -95,7 +95,7 @@ describe('first run', () => {
 })
 
 describe('the main journey', () => {
-  it('adds videos, optimizes them, and reports the playlist total', async () => {
+  it('adds videos that are ready to broadcast without a second step', async () => {
     const user = userEvent.setup()
     mount()
     await screen.findByRole('button', { name: '대시보드' })
@@ -107,30 +107,34 @@ describe('the main journey', () => {
     const names = within(list).getAllByText(/night0\d\.mp4/).map((n) => n.textContent)
     expect(names).toEqual(['night01.mp4', 'night02.mp4', 'night03.mp4'])
 
-    // They are not broadcastable yet, and the UI says so (§7).
-    expect(screen.getByText(/3개 영상이 방송 규격과 다릅니다/)).toBeInTheDocument()
-
-    // The disk plan is shown before any encoding starts (§10).
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    expect(await screen.findByText('저장 공간 확인')).toBeInTheDocument()
-    expect(screen.getByText(/예상 추가 공간/)).toBeInTheDocument()
-    await user.click(screen.getByRole('button', { name: '최적화 시작' }))
-
-    await waitFor(() => {
-      expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument()
-    })
+    // §1, §5: adding them was the whole of it. There is no second button to
+    // press, nothing called "최적화" on the page, and nothing left unready.
     expect(await screen.findAllByText('송출 준비 완료')).toHaveLength(3)
+    expect(screen.queryByText(/최적화/)).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /최적화/ })).not.toBeInTheDocument()
+    expect(screen.queryByText(/아직 준비되지 않았습니다/)).not.toBeInTheDocument()
     // Three ~1h clips, so the total is reported in hours (§25).
     expect(screen.getByTestId('playlist-total')).toHaveTextContent(/^\d+시간 \d\d분 \d\d초$/)
   })
 
-  it('explains why a file needs optimizing instead of just failing', async () => {
+  /**
+   * The one state that leaves a file unready, now that adding prepares it.
+   *
+   * A person whose preparation was cancelled or failed is offered the job
+   * again — in those words. Nothing here says "최적화": the reasons are advanced
+   * detail behind a click, not the page's vocabulary (§1, §10).
+   */
+  it('offers to finish the job when an earlier preparation did not', async () => {
     const user = userEvent.setup()
-    mount()
+    mount({ preparationFails: true })
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
 
-    await user.click(screen.getAllByRole('button', { name: '최적화 필요' })[0]!)
+    expect(await screen.findByText(/3개 영상이 아직 준비되지 않았습니다/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '방송 준비' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /최적화/ })).not.toBeInTheDocument()
+
+    await user.click(screen.getAllByRole('button', { name: '방송 준비 필요' })[0]!)
     expect(await screen.findByText(/해상도가 1920x1080이 아닙니다/)).toBeInTheDocument()
   })
 
@@ -156,16 +160,16 @@ describe('the main journey', () => {
     })
   })
 
-  it('blocks a broadcast whose playlist is not optimized, naming the reason', async () => {
+  it('blocks a broadcast whose playlist is not ready, naming the reason', async () => {
     const user = userEvent.setup()
-    mount()
+    mount({ preparationFails: true })
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
     await gotoPage(user, '대시보드')
 
     await user.click(await screen.findByRole('button', { name: /방송 시작/ }))
     expect(await screen.findByText('방송 시작 전 점검')).toBeInTheDocument()
-    expect(screen.getByText(/최적화가 필요합니다/)).toBeInTheDocument()
+    expect(screen.getByText(/방송 준비가 필요합니다/)).toBeInTheDocument()
     expect(screen.getByText('LL-STREAM-003')).toBeInTheDocument()
   })
 
@@ -174,9 +178,6 @@ describe('the main journey', () => {
     mount({ hasStreamKey: false })
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
-    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
 
     await gotoPage(user, '대시보드')
     await user.click(await screen.findByRole('button', { name: /로컬 테스트/ }))
@@ -194,9 +195,6 @@ describe('the main journey', () => {
     mount()
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
-    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
     await gotoPage(user, '대시보드')
 
     await user.click(await screen.findByRole('button', { name: /방송 시작/ }))
@@ -346,13 +344,10 @@ describe('settings', () => {
     mount()
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
-    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
 
     await gotoPage(user, '설정')
     await user.click(await screen.findByRole('button', { name: '캐시 전체 삭제' }))
-    expect(await screen.findByText(/사용 중인 최적화 파일 3개가 함께 삭제됩니다/)).toBeInTheDocument()
+    expect(await screen.findByText(/사용 중인 준비 파일 3개가 함께 삭제됩니다/)).toBeInTheDocument()
   })
 })
 
@@ -387,9 +382,6 @@ describe('logs', () => {
     mount()
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
-    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
     await gotoPage(user, '대시보드')
     await user.click(await screen.findByRole('button', { name: /로컬 테스트/ }))
     await waitFor(() => expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE'))
@@ -407,9 +399,6 @@ describe('developer diagnostics', () => {
     mount({ seedSettings: { first_run_complete: 'true', developer_mode: 'true' } })
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
-    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
     await gotoPage(user, '대시보드')
     await user.click(await screen.findByRole('button', { name: /로컬 테스트/ }))
     await waitFor(() => expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE'))
@@ -443,9 +432,6 @@ describe('developer diagnostics', () => {
     })
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
-    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
     await gotoPage(user, '대시보드')
     await user.click(await screen.findByRole('button', { name: /로컬 테스트/ }))
     await waitFor(() => expect(screen.getAllByTestId('status-pill')[0]).toHaveAttribute('data-state', 'LIVE'))
@@ -658,9 +644,6 @@ describe('broadcasting without a Google account', () => {
     expect((backend('youtube_status', {}) as { connected: boolean }).connected).toBe(false)
 
     await buildPlaylist(user)
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
-    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
 
     await gotoPage(user, '대시보드')
     await startLive(user)
@@ -680,9 +663,6 @@ describe('broadcasting without a Google account', () => {
     mount({ youtubeApiFails: true })
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
-    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
 
     await gotoPage(user, '대시보드')
     await startLive(user)
@@ -717,9 +697,6 @@ describe('the YouTube side of a broadcast is reported on its own', () => {
 
   async function readyPlaylist(user: ReturnType<typeof userEvent.setup>) {
     await buildPlaylist(user)
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
-    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
   }
 
   it('does not claim settings will be applied when no account is connected', async () => {
@@ -1124,9 +1101,6 @@ describe('an open scheduled window', () => {
     })
     await screen.findByRole('button', { name: '대시보드' })
     await buildPlaylist(user)
-    await user.click(screen.getByRole('button', { name: /방송용으로 최적화/ }))
-    await user.click(await screen.findByRole('button', { name: '최적화 시작' }))
-    await waitFor(() => expect(screen.queryByText(/방송 규격과 다릅니다/)).not.toBeInTheDocument())
 
     await gotoPage(user, '대시보드')
     await startLive(user)

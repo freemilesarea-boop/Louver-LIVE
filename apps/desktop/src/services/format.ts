@@ -94,9 +94,9 @@ export function streamStateLabel(s: StreamState): string {
 
 export function mediaStatusLabel(s: MediaStatus): string {
   const map: Record<MediaStatus, string> = {
-    imported: '분석됨',
-    compatible: '송출 준비 완료',
-    optimization_required: '최적화 필요',
+    imported: '확인 중',
+    compatible: '방송 준비 필요',
+    optimization_required: '방송 준비 필요',
     normalized: '송출 준비 완료',
     missing: '파일 없음',
     failed: '실패',
@@ -104,8 +104,15 @@ export function mediaStatusLabel(s: MediaStatus): string {
   return map[s]
 }
 
+/**
+ * Only a prepared file is broadcastable.
+ *
+ * `compatible` means the source matches the profile, which is not the same
+ * thing: see the note on `MediaStatus::Compatible` in the Rust models. It
+ * buys a packet copy instead of an encode, not a way past preparation.
+ */
 export function isBroadcastReady(s: MediaStatus): boolean {
-  return s === 'compatible' || s === 'normalized'
+  return s === 'normalized'
 }
 
 /**
@@ -125,4 +132,21 @@ export function formatEta(seconds: number): string {
   if (m < 60) return `${m}분`
   const h = Math.floor(m / 60)
   return `${h}시간 ${m % 60}분`
+}
+
+/**
+ * The conversion engine in the words §7 asks for.
+ *
+ * The user never picks one — the backend probes for a working encoder and
+ * takes the first that answers, NVENC then Quick Sync then AMF then the CPU.
+ * This only reports which that turned out to be.
+ */
+export function encoderLabel(encoder: string): string {
+  const map: Record<string, string> = {
+    h264_nvenc: 'NVIDIA GPU',
+    h264_qsv: 'Intel Quick Sync',
+    h264_amf: 'AMD GPU',
+    h264_videotoolbox: 'Apple 하드웨어 가속',
+  }
+  return map[encoder] ?? 'CPU'
 }
