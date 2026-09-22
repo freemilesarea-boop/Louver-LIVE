@@ -35,11 +35,14 @@ grep -n '"version"' package.json
 ### 2. 태그를 밀면 빌드가 시작됩니다
 
 ```bash
-git tag v1.0.3
-git push origin v1.0.3
+git tag v1.0.4
+git push origin v1.0.4
 ```
 
-네 개 러너가 동시에 돌고, 각자 이 순서를 지킵니다.
+**이 릴리스는 Windows 와 macOS 만 만듭니다.** Linux 는 CI 에서 계속
+빌드·테스트되지만 판매용 설치 파일은 만들지 않습니다.
+
+세 개 러너가 동시에 돌고, 각자 이 순서를 지킵니다.
 
 1. FFmpeg 사이드카를 **내려받습니다** (`--require-download --force`).
    내려받지 못하면 그 자리에서 실패합니다 — 러너 자신의 FFmpeg를 대신
@@ -58,7 +61,8 @@ git push origin v1.0.3
 1~3번은 `.github/actions/sidecars` 하나에 들어 있고 **평소 CI도 네 플랫폼
 모두에서 같은 것을 돌립니다**. v1.0.0 태그가 macOS와 Windows에서 깨진 이유가
 정확히 이 단계들이 릴리스에서만 돌았기 때문입니다 — 태그를 밀기 전에
-CI의 `sidecars (…)` 네 개가 초록인지 먼저 보세요.
+CI의 `sidecars (…)` 네 개가 초록인지 먼저 보세요 (CI 는 Linux 도 확인하므로
+릴리스 대상 세 개보다 하나 많습니다).
 
 네 개가 모두 끝나면 **초안(draft) GitHub Release**가 만들어지고 설치 파일이
 모두 붙습니다. 초안인 이유는 아래 "아직 확인되지 않은 것"을 사람이 직접
@@ -70,11 +74,11 @@ CI의 `sidecars (…)` 네 개가 초록인지 먼저 보세요.
 Actions 탭 → **Release artifacts** → **Run workflow** 에서
 
 - `publish` 를 **켜고**
-- `tag` 에 `v1.0.3` 처럼 원하는 태그를 적으면
+- `tag` 에 `v1.0.4` 처럼 원하는 태그를 적으면
 
 같은 네 개 빌드가 돌고 그 태그로 초안 Release가 만들어집니다. **초안
 Release는 공개(Publish)하는 순간 그 태그를 직접 만듭니다** — `git push
-origin v1.0.3` 이 필요 없습니다.
+origin v1.0.4` 이 필요 없습니다.
 
 ### 4. 시험 삼아 돌려보려면
 
