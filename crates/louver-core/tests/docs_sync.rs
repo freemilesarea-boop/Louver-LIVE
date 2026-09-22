@@ -221,3 +221,75 @@ fn the_credential_check_reports_presence_and_never_a_value() {
         "the workflow echoes the client secret"
     );
 }
+
+/// This release ships Windows and macOS only.
+///
+/// Not a style rule: a Linux entry in the matrix produces a `.deb` and an
+/// `.AppImage` that get attached to the draft release and handed to
+/// customers, and the decision to stop shipping those was a deliberate one.
+/// If it is reversed, it should be reversed on purpose and this test is where
+/// that is written down.
+#[test]
+fn the_release_builds_windows_and_macos_and_nothing_else() {
+    let wf = read(".github/workflows/release.yml");
+
+    // The matrix block, up to the steps that follow it — and only the values
+    // in it. The comments there explain which runners were tried and rejected
+    // and name them, which is exactly what this test must not read.
+    let block = wf
+        .split_once("matrix:")
+        .and_then(|(_, rest)| rest.split_once("\n    steps:"))
+        .map(|(m, _)| m.to_string())
+        .expect("release.yml has no matrix");
+    let matrix: String = block
+        .lines()
+        .map(|l| l.split_once('#').map_or(l, |(code, _)| code))
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    for banned in ["ubuntu", "linux-gnu"] {
+        assert!(
+            !matrix.contains(banned),
+            "release matrix still targets {banned}; this release is Windows and macOS only:\n{matrix}"
+        );
+    }
+    for wanted in ["x86_64-pc-windows-msvc", "aarch64-apple-darwin", "x86_64-apple-darwin"] {
+        assert!(matrix.contains(wanted), "release matrix lost {wanted}:\n{matrix}");
+    }
+
+    // macos-13 was never given a runner; macos-15-intel was.
+    assert!(!matrix.contains("macos-13"), "macos-13 never gets a runner; use macos-15-intel");
+    assert!(matrix.contains("macos-15-intel"), "the Intel build needs macos-15-intel");
+
+    // And nothing collects a Linux installer even if one appeared.
+    let collect = wf.split_once("Collect the installers").expect("no collect step").1;
+    let collect = collect.split_once("upload-artifact").map(|(c, _)| c).unwrap_or(collect);
+    for banned in [".deb", ".AppImage", ".rpm"] {
+        assert!(!collect.contains(banned), "the collect step still gathers {banned}");
+    }
+}
+
+/// The checks that make an installer worth selling stay in the release.
+///
+/// Every one of these has been the difference between a release that works
+/// and one that looks like it does. A green run that skipped them is worth
+/// nothing, so removing one has to fail here first.
+#[test]
+fn the_release_never_gets_green_by_checking_less() {
+    let wf = read(".github/workflows/release.yml");
+    let action = read(".github/actions/sidecars/action.yml");
+
+    assert!(
+        !wf.contains("continue-on-error") && !action.contains("continue-on-error"),
+        "a release step is allowed to fail without failing the release"
+    );
+    assert!(action.contains("--require-download"), "the release may ship the development FFmpeg again");
+    assert!(action.contains("ffmpeg-manifest.mjs --check"), "the sidecar manifest check is gone");
+    assert!(action.contains("check-sidecars.mjs"), "the sidecar architecture check is gone");
+    assert!(
+        wf.contains("--credential-check"),
+        "the release no longer asks the binary about its OAuth client"
+    );
+    assert!(wf.contains("npm run verify"), "the release no longer runs the test suite");
+}

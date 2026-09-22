@@ -1,9 +1,13 @@
 name: Release artifacts
 
-# Builds the installers for every platform the product ships on. This
-# repository's own CI runs on Linux, and a macOS .app or a Windows .exe can
-# only be produced on macOS and Windows respectively — so those artifacts come
-# from this workflow rather than from a developer's machine.
+# Builds the installers the product is sold as: Windows x64, macOS Apple
+# Silicon and macOS Intel. A .app or a .exe can only be produced on its own
+# operating system, so they come from here rather than a developer's machine.
+#
+# Linux is deliberately absent. The app still builds and its tests still run
+# on Linux — that is what CI is for — but no .deb or .AppImage is produced
+# here and none is attached to a release. Adding one back means adding a
+# matrix entry and the webkit/patchelf/fuse dependencies it needs.
 #
 # Run it from the Actions tab (workflow_dispatch) for a test build, or push a
 # v* tag to publish a GitHub Release with the installers attached.
@@ -47,9 +51,6 @@ jobs:
           - label: Windows x64
             os: windows-latest
             target: x86_64-pc-windows-msvc
-          - label: Linux x64
-            os: ubuntu-22.04       # oldest supported glibc, so the .deb installs widely
-            target: x86_64-unknown-linux-gnu
 
     steps:
       - uses: actions/checkout@v4
@@ -67,17 +68,6 @@ jobs:
         with:
           workspaces: . -> target
           key: ${{ matrix.target }}
-
-      # Tauri's Linux build needs the webkit stack, and the AppImage bundler
-      # needs patchelf and fuse. The other runners need none of it.
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libsoup-3.0-dev patchelf desktop-file-utils \
-            xdg-utils fuse libfuse2
 
       - run: npm ci
 
@@ -237,14 +227,13 @@ jobs:
           ls -R "$bundle" || true
           found=0
           # -print0 and a read loop, because every bundler names its output
-          # after the product — "Louver Live_1.0.0_amd64.deb" — and a bare
+          # after the product — "Louver Live_1.0.3_x64_en-US.msi" — and a bare
           # $(find) would split that on the space and copy neither half.
           while IFS= read -r -d '' f; do
             cp "$f" dist-release/
             found=$((found + 1))
           done < <(find "$bundle" -maxdepth 2 -type f \
-                     \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \
-                        -o -name '*.deb' -o -name '*.AppImage' -o -name '*.rpm' \) -print0)
+                     \( -name '*.dmg' -o -name '*.exe' -o -name '*.msi' \) -print0)
           if [ "$found" -eq 0 ]; then
             echo "::error::no installer was produced for ${{ matrix.target }}"
             exit 1
@@ -263,6 +252,9 @@ jobs:
   publish:
     name: Publish the release
     needs: build
+    # Ubuntu only because this job downloads the artifacts the three build
+    # jobs made and calls `gh`. It compiles nothing and produces no Linux
+    # installer; the cheapest runner is the right one for that.
     if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
     runs-on: ubuntu-latest
     steps:
@@ -298,8 +290,12 @@ jobs:
           | Windows 10/11 (64비트) | `.exe` (권장) 또는 `.msi` |
           | Mac (M1 이상, Apple Silicon) | `aarch64.dmg` |
           | Mac (2020년 이전, Intel) | `x64.dmg` |
-          | Linux (Ubuntu/Debian 계열) | `.deb` |
-          | Linux (그 외) | `.AppImage` |
+
+          이번 릴리스는 Windows 와 macOS 만 제공합니다.
+
+          설치 파일에는 코드 서명이 없습니다. Windows 는 처음 실행할 때
+          SmartScreen 경고가 나옵니다 — `추가 정보` → `실행`을 누르면 됩니다.
+          macOS 는 처음 열 때 우클릭 → `열기`를 사용하세요.
 
           Mac에서 어느 쪽인지 모르시면 왼쪽 위 사과 → **이 Mac에 관하여**를 열어
           "칩"이라고 적혀 있으면 Apple Silicon, "프로세서"라고 적혀 있으면 Intel입니다.
