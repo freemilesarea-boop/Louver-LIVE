@@ -1136,3 +1136,58 @@ Homebrew 로 링크된 빌드는 여전히 거부합니다.
 움직이면 그 태그를 이미 받아간 사람의 체크아웃과 어긋납니다. 다음 후보는
 `v1.0.1` 이고, 버전은 `package.json` · `tauri.conf.json` · `Cargo.toml` ·
 `package-lock.json` 네 곳 모두 1.0.1 로 맞췄습니다.
+
+
+---
+
+## v1.0.1 Release run (`35688422852`, commit `3d21887`)
+
+사이드카 단계는 **네 플랫폼 모두 통과**했습니다 — v1.0.0 을 막았던 두 원인은
+해결됐습니다. 새 실패는 그 다음 단계인 `Build the installer` 이고, 세 가지가
+서로 다른 이유입니다.
+
+| 플랫폼 | 결과 | 최초 실패 step | 실제 stderr |
+| --- | --- | --- | --- |
+| Linux x64 | **PASS** | — | `.deb` · `.AppImage` · BUILD-INFO 세 파일 업로드 (199,785,664 B) |
+| macOS Apple Silicon | FAIL | `Build the installer` (exit 1) | `security: SecKeychainItemImport: One or more parameters passed to a function were not valid.` → `failed codesign application` |
+| macOS Intel | FAIL | 같은 step (exit 1) | 위와 완전히 동일 |
+| Windows x64 | FAIL | 같은 step (exit 1) | `failed to bundle project: failed to run …\WixTools314\light.exe` |
+
+세 job 모두 **Rust 컴파일은 성공**했습니다 (macOS ARM 3m12s, Windows 5m15s).
+Windows 는 NSIS `.exe` 까지 정상 생성한 뒤 MSI 단계에서 멈췄습니다.
+
+### macOS — 빈 서명 변수
+
+원인은 인증서가 아니라 **없는 인증서를 있다고 본 것**입니다. 워크플로가
+`APPLE_CERTIFICATE` 등을 빌드 step 의 `env:` 에 나열했고, 등록되지 않은
+Secret 은 **빈 문자열로 설정된 변수**가 됩니다. Tauri 는 이걸 `var_os` 로
+읽는데, `var_os` 는 "없음" 과 "비어 있음" 을 구분하지 못해 `Some("")` 을
+돌려줍니다. 그래서 서명해야 한다고 판단하고 빈 인증서로 `security import` 를
+실행했습니다.
+
+이제 값이 실제로 들어 있는 변수만 `$GITHUB_ENV` 로 내보냅니다. 이름만 찍고
+값은 찍지 않습니다 (`APPLE_CERTIFICATE: provided`). 이 수정은 스스로를
+진단합니다 — 만약 Secret 이 비어 있는 게 아니라 잘못된 값이었다면 로그에
+`provided` 가 남고 여전히 실패하므로 두 경우가 바로 구분됩니다.
+
+### Windows — light.exe 가 왜 실패했는지 로그에 없음
+
+**원인 미확정입니다.** Tauri 가 `failed to run light.exe` 만 남기고 도구
+자신의 출력을 삼켰습니다. 28초 돌다가 non-zero 로 끝났다는 것 외에 로그에
+아무 근거가 없습니다. 추측으로 고치지 않고, `tauri build` 에 `--verbose` 를
+붙여 다음 run 이 light.exe 의 실제 메시지를 남기게 했습니다. 그게 이번
+변경의 전부입니다.
+
+### OAuth
+
+Linux job 의 `Check the OAuth client was compiled in` 이 **통과**했습니다.
+이 step 은 빈 환경에서 릴리스 바이너리에게 직접 묻고, Secret 이 등록돼 있는데
+바이너리가 없다고 답하면 exit 1 합니다. 즉 **빌드 타임 주입이 실제로
+동작합니다** — 적어도 Linux 릴리스 바이너리에서는 확인됐습니다. macOS/Windows
+는 그 step 까지 가지 못했으므로 **NOT TESTED**.
+
+### 약화시킨 것 없음
+
+`--require-download`, manifest 검사, 아키텍처 검사, credential-check, 테스트
+모두 그대로이고 `continue-on-error` 는 없습니다. 이번에 추가한 것은 로그
+출력(`--verbose`)과, 빈 변수를 내보내지 않는 step 하나뿐입니다.

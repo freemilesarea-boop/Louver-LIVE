@@ -1,7 +1,7 @@
 {
   "name": "louver-live",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "description": "YouTube 음악 라이브 자동 송출 프로그램",
   "scripts": {

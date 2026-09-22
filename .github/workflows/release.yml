@@ -97,12 +97,21 @@ jobs:
       - name: Verify the application
         run: npm run verify
 
-      - name: Build the installer
-        uses: tauri-apps/tauri-action@v0
+      # A signing variable that exists but is empty is not the same as one
+      # that is absent, and Tauri reads it with `var_os`, which cannot tell
+      # them apart. Listing the secrets under the build step's `env:` set
+      # every one of them — empty for a repository that has no certificate —
+      # so Tauri decided the build was signed, ran `security import` on an
+      # empty certificate and stopped:
+      #   security: SecKeychainItemImport: One or more parameters passed to a
+      #   function were not valid.
+      #   failed to bundle project: failed codesign application
+      # Both macOS jobs died there on v1.0.1, after compiling cleanly. So the
+      # variables are exported here, and only the ones that actually hold
+      # something. Names only in the log, never values.
+      - name: Export the signing material, if this repository has any
+        shell: bash
         env:
-          # Present only when the release is signed; tauri-action skips
-          # signing when they are absent, which is what an unsigned test
-          # build wants.
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
@@ -115,6 +124,31 @@ jobs:
           # SIGNING.md for how it is generated and where it lives.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -uo pipefail
+          any=no
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY \
+                      APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID \
+                      WINDOWS_CERTIFICATE WINDOWS_CERTIFICATE_PASSWORD \
+                      TAURI_SIGNING_PRIVATE_KEY TAURI_SIGNING_PRIVATE_KEY_PASSWORD; do
+            value="${!name:-}"
+            [ -n "$value" ] || continue
+            # The heredoc form, because a private key is several lines.
+            {
+              printf '%s<<LOUVER_SIGNING_EOF\n' "$name"
+              printf '%s\n' "$value"
+              printf 'LOUVER_SIGNING_EOF\n'
+            } >> "$GITHUB_ENV"
+            echo "$name: provided"
+            any=yes
+          done
+          if [ "$any" = no ]; then
+            echo "::warning::no signing material in this repository — the installers will be unsigned"
+          fi
+
+      - name: Build the installer
+        uses: tauri-apps/tauri-action@v0
+        env:
           # The OAuth client baked into the release, so the user never meets
           # the Google Cloud console. Both are needed: Google refuses this
           # desktop client's token exchange without the secret. A build
@@ -123,7 +157,12 @@ jobs:
           LOUVER_GOOGLE_CLIENT_ID: ${{ secrets.LOUVER_GOOGLE_CLIENT_ID }}
           LOUVER_GOOGLE_CLIENT_SECRET: ${{ secrets.LOUVER_GOOGLE_CLIENT_SECRET }}
         with:
-          args: --target ${{ matrix.target }}
+          # `--verbose` so the bundlers' own tools are quoted when they fail.
+          # WiX `light.exe` exited non-zero on v1.0.1 after the NSIS installer
+          # had been produced, and Tauri reported only "failed to run
+          # light.exe" — the tool's own message was nowhere in the log, so
+          # there was nothing to fix from.
+          args: --target ${{ matrix.target }} --verbose
 
       # Proof that the secrets reached rustc, asked of the binary rather than
       # assumed from the fact that the secrets exist. `option_env!` is
