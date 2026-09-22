@@ -43,32 +43,16 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libsoup-3.0-dev patchelf
 
-      # The fallback fetch-ffmpeg.mjs uses when it cannot download a static
-      # build. Installed from each platform's own package manager rather than
-      # a third-party action: the action that used to do this has no arm64
-      # macOS build and fails in under a second on macos-latest, which is
-      # arm64 now, leaving the runner with no ffmpeg at all and the sidecar
-      # step with nothing to fall back to.
-      # A modern FFmpeg for `fetch-ffmpeg.mjs` to fall back to, on the two
-      # platforms whose download hosts are least reliable from a runner.
-      # Not every package manager will do: ubuntu-22.04's apt build is 4.4 and
-      # has no `-fps_mode`, and Chocolatey installs a shim that resolves a
-      # relative path and cannot find its own executable
-      # ("Cannot find file at '..\lib\ffmpeg\tools\ffmpeg\bin\ffmpeg.exe").
-      # Linux needs none — johnvansickle.com answers from a runner.
-      - name: Install a fallback FFmpeg (macOS)
-        if: runner.os == 'macOS'
-        run: brew install ffmpeg
-      - name: Install a fallback FFmpeg (Windows)
-        if: runner.os == 'Windows'
-        uses: FedericoCarboni/setup-ffmpeg@v3
-
       - run: npm ci
 
-      # Preferred, not required. A release must ship the downloaded build and
-      # says so with `--require-download`; CI is checking the code, and
-      # failing the whole matrix because evermeet.cx was briefly unreachable
-      # tells nobody anything about the change being tested.
+      # The same download the release makes, so the media tests run against
+      # the binary that ships rather than whatever the runner happened to
+      # have. Two fallback installers used to stand behind this — `brew
+      # install ffmpeg` and `FedericoCarboni/setup-ffmpeg` — and they are
+      # gone: the second broke upstream ("Cannot get latest release") and
+      # failed CI on Windows by itself, and the `sidecars` job below requires
+      # the download on all four platforms regardless, so neither was
+      # protecting the run from a download host being down any more.
       - run: node scripts/fetch-ffmpeg.mjs --force
 
       # The sidecars are named for their target triple, which no PATH lookup
@@ -113,7 +97,7 @@ jobs:
   # runner's own FFmpeg. Same composite action the release uses, so they
   # cannot drift apart again. No compile, so it costs a minute or two.
   sidecars:
-    name: sidecars (${{ matrix.target }})
+    name: sidecars (${{ matrix.target }} on ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -121,7 +105,16 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
+          # Two Intel labels on purpose, for one push. `macos-13` has not been
+          # given a runner twice now — queued over an hour on the v1.0.0 tag
+          # and again here, never starting a step — which is availability,
+          # not anything in this repository. `macos-15-intel` is the label
+          # that replaced it. Whichever one actually runs is the one the
+          # release should ask for; this is how to find out without spending
+          # a tag on the question. The loser comes out again.
           - os: macos-13
+            target: x86_64-apple-darwin
+          - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
