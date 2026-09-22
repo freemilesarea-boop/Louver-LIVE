@@ -220,6 +220,14 @@ export interface NormalizeProgress {
   files_done: number
   files_total: number
   remaining_files: number
+  /** What is being done to this file, already in Korean. */
+  mode_label: string
+  /** Seconds of video produced per second of wall clock. */
+  speed_x: number
+  /** Seconds left for the whole batch; negative until it can be estimated. */
+  eta_secs: number
+  /** "NVIDIA GPU", "Intel Quick Sync", "CPU", "변환 없음". */
+  engine_label: string
   estimated_cache_bytes: number
 }
 

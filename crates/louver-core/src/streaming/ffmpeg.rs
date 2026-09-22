@@ -7,6 +7,7 @@
 
 use crate::config::{OutputProfile, StreamMode};
 use crate::error::{ErrorCode, LouverError, Result};
+use crate::media::probe::TranscodePlan;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -454,6 +455,27 @@ impl FfmpegCommandBuilder {
         ]
     }
 
+    /// Ask ffprobe where the keyframes are, over the first `window_secs`.
+    ///
+    /// Only the packet flags are requested, so ffprobe reads the index rather
+    /// than decoding; on a normal MP4 this is tens of milliseconds against the
+    /// minutes an unnecessary encode would cost.
+    pub fn build_keyframe_probe_args(&self, input: &Path, window_secs: u32) -> Vec<String> {
+        vec![
+            "-v".into(),
+            "error".into(),
+            "-select_streams".into(),
+            "v:0".into(),
+            "-show_entries".into(),
+            "packet=pts_time,flags".into(),
+            "-of".into(),
+            "csv=print_section=0".into(),
+            "-read_intervals".into(),
+            format!("%+{window_secs}"),
+            input.to_string_lossy().into_owned(),
+        ]
+    }
+
     /// Normalization to the broadcast profile (§9).
     ///
     /// `target_duration_secs` snaps the output to a whole number of video frames
@@ -471,6 +493,7 @@ impl FfmpegCommandBuilder {
         output: &Path,
         target_duration_secs: f64,
         has_audio: bool,
+        plan: &TranscodePlan,
     ) -> Vec<String> {
         let p = self.profile;
         let (w, h) = (p.width(), p.height());
@@ -485,6 +508,12 @@ impl FfmpegCommandBuilder {
             p.audio_sample_rate()
         );
 
+        // A source with no audio always gets a synthesised silent track: the
+        // concat demuxer requires every input to have the same stream layout
+        // (§14), so "copy the audio" is not available when there is none.
+        let encode_video = !plan.video.is_copy();
+        let encode_audio = !has_audio || !plan.audio.is_copy();
+
         let mut a: Vec<String> = vec![
             "-hide_banner".into(),
             "-nostdin".into(),
@@ -497,51 +526,71 @@ impl FfmpegCommandBuilder {
             input.to_string_lossy().into_owned(),
         ];
 
-        if has_audio {
-            a.extend([
-                "-filter_complex".into(),
-                format!("[0:v]{vf}[v];[0:a]{af}[a]"),
-                "-map".into(),
-                "[v]".into(),
-                "-map".into(),
-                "[a]".into(),
-            ]);
-        } else {
-            // A silent source, bounded by the -t below.
+        // The silent source is a second input, so it has to be declared before
+        // any mapping refers to it.
+        if !has_audio {
             a.extend([
                 "-f".into(),
                 "lavfi".into(),
                 "-i".into(),
                 format!("anullsrc=channel_layout=stereo:sample_rate={}", p.audio_sample_rate()),
-                "-filter_complex".into(),
-                format!("[0:v]{vf}[v]"),
-                "-map".into(),
-                "[v]".into(),
-                "-map".into(),
-                "1:a".into(),
             ]);
         }
+
+        // Only the streams being encoded go through a filtergraph. Filtering a
+        // stream that is about to be copied is not merely wasteful — it decodes
+        // it, which is most of the cost the copy exists to avoid.
+        let mut graphs: Vec<String> = Vec::new();
+        if encode_video {
+            graphs.push(format!("[0:v]{vf}[v]"));
+        }
+        if has_audio && encode_audio {
+            graphs.push(format!("[0:a]{af}[a]"));
+        }
+        if !graphs.is_empty() {
+            a.extend(["-filter_complex".into(), graphs.join(";")]);
+        }
+
+        a.push("-map".into());
+        a.push(if encode_video { "[v]".into() } else { "0:v:0".to_string() });
+        a.push("-map".into());
+        a.push(match (has_audio, encode_audio) {
+            (false, _) => "1:a".to_string(),      // the silent source
+            (true, true) => "[a]".to_string(),    // filtered, then encoded
+            (true, false) => "0:a:0".to_string(), // copied verbatim
+        });
 
         // Hard duration cut on a whole-frame boundary.
         a.extend(["-t".into(), format!("{target_duration_secs:.6}")]);
 
-        a.extend(self.video_encode_args());
+        if encode_video {
+            a.extend(self.video_encode_args());
+            a.extend(["-r".into(), p.fps().to_string(), "-fps_mode".into(), "cfr".into()]);
+        } else {
+            a.extend(["-c:v".into(), "copy".into()]);
+        }
+
+        // Set on the muxer, so it applies to copied packets just as it does to
+        // encoded ones. A uniform timescale across every cache entry is what
+        // lets the concat demuxer join them without repairing timestamps.
+        a.extend(["-video_track_timescale".into(), p.video_timescale().to_string()]);
+
+        if encode_audio {
+            a.extend([
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                format!("{}k", p.audio_kbps()),
+                "-ar".into(),
+                p.audio_sample_rate().to_string(),
+                "-ac".into(),
+                p.audio_channels().to_string(),
+            ]);
+        } else {
+            a.extend(["-c:a".into(), "copy".into()]);
+        }
 
         a.extend([
-            "-r".into(),
-            p.fps().to_string(),
-            "-fps_mode".into(),
-            "cfr".into(),
-            "-video_track_timescale".into(),
-            p.video_timescale().to_string(),
-            "-c:a".into(),
-            "aac".into(),
-            "-b:a".into(),
-            format!("{}k", p.audio_kbps()),
-            "-ar".into(),
-            p.audio_sample_rate().to_string(),
-            "-ac".into(),
-            p.audio_channels().to_string(),
             "-movflags".into(),
             "+faststart".into(),
             "-map_metadata".into(),
@@ -566,6 +615,11 @@ impl FfmpegCommandBuilder {
                 "-profile:v".into(),
                 "high".into(),
             ]),
+            // The hardware presets are left where they are. Nothing here has
+            // an NVIDIA, Intel or AMD encoder to measure with, and changing a
+            // number that cannot be measured is how the slow path got its
+            // reputation in the first place. `optimize_speed.rs` prints the
+            // table on a machine that has one.
             "h264_qsv" => a.extend(["-preset".into(), "medium".into(), "-profile:v".into(), "high".into()]),
             "h264_amf" => a.extend([
                 "-quality".into(),
@@ -578,13 +632,27 @@ impl FfmpegCommandBuilder {
             "h264_videotoolbox" => {
                 a.extend(["-profile:v".into(), "high".into(), "-allow_sw".into(), "1".into()])
             }
+            // libx264 stays on `veryfast`, and that is a measured choice, not
+            // an inherited default. Same argv, same 30-second 1080p clips,
+            // varying only the preset:
+            //
+            //   preset      slow gradient        dense synthetic
+            //   ultrafast   4.44s  0.999641      4.66s  0.990459
+            //   superfast   6.40s  0.999794      6.54s  0.994192
+            //   veryfast   10.34s  0.999844      8.57s  0.995390
+            //   faster     16.31s  0.999880     11.74s  0.995504
+            //   medium     18.49s  0.999889     14.98s  0.995644
+            //
+            // Going slower buys SSIM in the fifth decimal for 40–80% more
+            // time. Going faster gives up something a viewer can actually see
+            // on busy content. This is the knee.
             _ => a.extend([
                 "-preset".into(),
                 "veryfast".into(),
                 "-profile:v".into(),
                 "high".into(),
                 "-level".into(),
-                "4.2".into(),
+                p.h264_level_str(),
                 "-x264-params".into(),
                 "force-cfr=1".into(),
             ]),
@@ -725,6 +793,119 @@ impl FfmpegCommandBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::media::probe::StreamPlan;
+
+    fn plan(v: StreamPlan, a: StreamPlan) -> TranscodePlan {
+        TranscodePlan { video: v, audio: a, video_reasons: vec![], audio_reasons: vec![] }
+    }
+
+    fn pairs(args: &[String]) -> Vec<(String, String)> {
+        args.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect()
+    }
+
+    #[test]
+    fn a_remux_decodes_nothing() {
+        let a = builder().build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/out.mp4"),
+            12.0,
+            true,
+            &plan(StreamPlan::Copy, StreamPlan::Copy),
+        );
+        assert!(pairs(&a).contains(&("-c:v".into(), "copy".into())), "{a:?}");
+        assert!(pairs(&a).contains(&("-c:a".into(), "copy".into())), "{a:?}");
+        // A filtergraph would decode the very streams the copy exists to skip.
+        assert!(!a.iter().any(|x| x == "-filter_complex"), "a remux must not filter: {a:?}");
+        assert!(!a.iter().any(|x| x == "libx264" || x.starts_with("h264_")), "{a:?}");
+        // And it is still our container, or concat could not join it.
+        assert!(pairs(&a).contains(&("-video_track_timescale".into(), "30000".into())));
+        assert!(pairs(&a).contains(&("-movflags".into(), "+faststart".into())));
+        assert!(pairs(&a).contains(&("-t".into(), "12.000000".into())));
+    }
+
+    #[test]
+    fn an_audio_only_encode_filters_only_the_audio() {
+        let a = builder().build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/out.mp4"),
+            9.0,
+            true,
+            &plan(StreamPlan::Copy, StreamPlan::Encode),
+        );
+        let g = a[a.iter().position(|x| x == "-filter_complex").expect("audio is filtered") + 1].clone();
+        assert!(g.contains("[0:a]"), "{g}");
+        assert!(!g.contains("[0:v]"), "the picture is copied, so it must not be filtered: {g}");
+        assert!(pairs(&a).contains(&("-c:v".into(), "copy".into())));
+        assert!(pairs(&a).contains(&("-c:a".into(), "aac".into())));
+        assert!(pairs(&a).contains(&("-map".into(), "0:v:0".into())), "{a:?}");
+        assert!(pairs(&a).contains(&("-map".into(), "[a]".into())), "{a:?}");
+    }
+
+    #[test]
+    fn a_video_only_encode_filters_only_the_video() {
+        let a = builder().build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/out.mp4"),
+            9.0,
+            true,
+            &plan(StreamPlan::Encode, StreamPlan::Copy),
+        );
+        let g = a[a.iter().position(|x| x == "-filter_complex").expect("video is filtered") + 1].clone();
+        assert!(g.contains("[0:v]"), "{g}");
+        assert!(!g.contains("[0:a]"), "the audio is copied, so it must not be filtered: {g}");
+        assert!(pairs(&a).contains(&("-c:a".into(), "copy".into())));
+        assert!(pairs(&a).contains(&("-map".into(), "[v]".into())));
+        assert!(pairs(&a).contains(&("-map".into(), "0:a:0".into())));
+        // Frame-rate control belongs to the encoder and is meaningless on a copy.
+        assert!(pairs(&a).contains(&("-fps_mode".into(), "cfr".into())));
+    }
+
+    #[test]
+    fn a_copied_video_is_never_told_what_frame_rate_to_encode_at() {
+        let a = builder().build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/out.mp4"),
+            9.0,
+            true,
+            &plan(StreamPlan::Copy, StreamPlan::Encode),
+        );
+        assert!(!a.iter().any(|x| x == "-fps_mode"), "{a:?}");
+        assert!(!pairs(&a).contains(&("-r".into(), "30".into())), "{a:?}");
+    }
+
+    #[test]
+    fn a_silent_source_still_gets_its_own_audio_track_even_when_copying_video() {
+        let a = builder().build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/out.mp4"),
+            9.0,
+            false,
+            &plan(StreamPlan::Copy, StreamPlan::Copy),
+        );
+        assert!(a.iter().any(|x| x.starts_with("anullsrc")), "{a:?}");
+        assert!(pairs(&a).contains(&("-map".into(), "1:a".into())), "{a:?}");
+        assert!(pairs(&a).contains(&("-c:a".into(), "aac".into())), "silence has to be encoded: {a:?}");
+        assert!(pairs(&a).contains(&("-c:v".into(), "copy".into())));
+    }
+
+    #[test]
+    fn the_full_encode_argv_is_unchanged() {
+        // The path a genuinely non-conforming file still takes.
+        let a = builder().build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/out.mp4"),
+            9.0,
+            true,
+            &TranscodePlan::full_encode(),
+        );
+        let g = a[a.iter().position(|x| x == "-filter_complex").unwrap() + 1].clone();
+        assert!(g.contains("[0:v]") && g.contains("[0:a]"), "{g}");
+        assert!(g.contains("scale=1920:1080") && g.contains("fps=30") && g.contains("format=yuv420p"));
+        assert!(pairs(&a).contains(&("-c:a".into(), "aac".into())));
+        assert!(!a.iter().any(|x| x == "copy"), "nothing is copied in a full encode: {a:?}");
+    }
+
     use std::path::PathBuf;
 
     fn builder() -> FfmpegCommandBuilder {
@@ -739,7 +920,13 @@ mod tests {
     #[test]
     fn windows_path_with_spaces_is_passed_as_one_argv_entry() {
         let p = PathBuf::from(r"C:\Users\Test User\Music\jazz 01.mp4");
-        let args = builder().build_normalize_args(&p, Path::new(r"C:\out\n.mp4"), 10.0, true);
+        let args = builder().build_normalize_args(
+            &p,
+            Path::new(r"C:\out\n.mp4"),
+            10.0,
+            true,
+            &TranscodePlan::full_encode(),
+        );
         assert!(args.contains(&r"C:\Users\Test User\Music\jazz 01.mp4".to_string()));
         // Never pre-quoted: quoting is the exec layer's job.
         assert!(!args.iter().any(|a| a.starts_with('"')));
@@ -750,7 +937,13 @@ mod tests {
         let win = PathBuf::from(r"C:\Users\Test User\Music\재즈 영상 01.mp4");
         let mac = PathBuf::from("/Users/test/Music/오늘 밤 재즈.mp4");
         for p in [win, mac] {
-            let args = builder().build_normalize_args(&p, Path::new("/tmp/o.mp4"), 5.0, true);
+            let args = builder().build_normalize_args(
+                &p,
+                Path::new("/tmp/o.mp4"),
+                5.0,
+                true,
+                &TranscodePlan::full_encode(),
+            );
             assert!(args.contains(&p.to_string_lossy().into_owned()), "korean path mangled: {args:?}");
         }
     }
@@ -858,7 +1051,13 @@ mod tests {
 
     #[test]
     fn normalize_targets_profile_geometry_and_two_second_gop() {
-        let a = builder().build_normalize_args(Path::new("/in.mp4"), Path::new("/out.mp4"), 12.5, true);
+        let a = builder().build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/out.mp4"),
+            12.5,
+            true,
+            &TranscodePlan::full_encode(),
+        );
         let joined = a.join(" ");
         assert!(joined.contains("scale=1920:1080"));
         assert!(joined.contains("pad=1920:1080"));
@@ -873,7 +1072,15 @@ mod tests {
     #[test]
     fn normalize_720p_uses_smaller_geometry_and_bitrate() {
         let b = FfmpegCommandBuilder::new(FfmpegTools::new("ffmpeg", "ffprobe"), OutputProfile::P720p30);
-        let joined = b.build_normalize_args(Path::new("/in.mp4"), Path::new("/o.mp4"), 3.0, true).join(" ");
+        let joined = b
+            .build_normalize_args(
+                Path::new("/in.mp4"),
+                Path::new("/o.mp4"),
+                3.0,
+                true,
+                &TranscodePlan::full_encode(),
+            )
+            .join(" ");
         assert!(joined.contains("scale=1280:720"));
         assert!(joined.contains("-b:v 4000k"));
     }
@@ -882,7 +1089,13 @@ mod tests {
     fn a_source_without_audio_still_gets_a_silent_aac_track() {
         // The concat demuxer requires an identical stream layout everywhere, so
         // a silent track is synthesised rather than the audio being omitted.
-        let a = builder().build_normalize_args(Path::new("/in.mp4"), Path::new("/o.mp4"), 3.0, false);
+        let a = builder().build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/o.mp4"),
+            3.0,
+            false,
+            &TranscodePlan::full_encode(),
+        );
         assert!(a.join(" ").contains("anullsrc"), "{a:?}");
         assert!(a.windows(2).any(|w| w == ["-map", "1:a"]));
         assert!(a.windows(2).any(|w| w == ["-c:a", "aac"]));
@@ -892,7 +1105,13 @@ mod tests {
 
     #[test]
     fn a_source_with_audio_uses_its_own_track() {
-        let a = builder().build_normalize_args(Path::new("/in.mp4"), Path::new("/o.mp4"), 3.0, true);
+        let a = builder().build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/o.mp4"),
+            3.0,
+            true,
+            &TranscodePlan::full_encode(),
+        );
         assert!(!a.join(" ").contains("anullsrc"));
         assert!(a.windows(2).any(|w| w == ["-map", "[a]"]));
         assert!(a.join(" ").contains("[0:a]aformat"));
@@ -901,7 +1120,13 @@ mod tests {
     #[test]
     fn hardware_encoder_swaps_codec_but_keeps_gop() {
         let b = builder().with_encoder("h264_nvenc");
-        let a = b.build_normalize_args(Path::new("/in.mp4"), Path::new("/o.mp4"), 3.0, true);
+        let a = b.build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/o.mp4"),
+            3.0,
+            true,
+            &TranscodePlan::full_encode(),
+        );
         assert!(a.windows(2).any(|w| w == ["-c:v", "h264_nvenc"]));
         assert!(!a.iter().any(|x| x == "libx264"));
         assert!(a.windows(2).any(|w| w == ["-g", "60"]));

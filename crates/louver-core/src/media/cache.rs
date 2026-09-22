@@ -178,11 +178,21 @@ pub struct DiskEstimate {
 /// Keep 2 GB free beyond the estimate so the OS never hits a full disk.
 pub const DISK_SAFETY_MARGIN: u64 = 2 * 1024 * 1024 * 1024;
 
-pub fn estimate_disk(durations: &[f64], profile: OutputProfile, available_bytes: u64) -> DiskEstimate {
-    let total: f64 = durations.iter().sum();
-    let estimated = (total * profile.bytes_per_second() as f64) as u64;
+pub fn estimate_disk(files: &[(f64, u64)], profile: OutputProfile, available_bytes: u64) -> DiskEstimate {
+    let total: f64 = files.iter().map(|(d, _)| *d).sum();
+    // Per file, the larger of what an encode would produce and what the source
+    // already occupies. A file that only needs a remux comes out about the size
+    // it went in, so estimating it at the profile's bitrate would under-count a
+    // high-bitrate source and let a batch start that cannot finish.
+    let estimated: u64 = files
+        .iter()
+        .map(|(secs, source_bytes)| {
+            let encoded = (secs * profile.bytes_per_second() as f64) as u64;
+            encoded.max(*source_bytes)
+        })
+        .sum();
     DiskEstimate {
-        files_to_process: durations.len(),
+        files_to_process: files.len(),
         total_duration_secs: total,
         estimated_bytes: estimated,
         available_bytes,
@@ -195,6 +205,24 @@ pub fn estimate_disk(durations: &[f64], profile: OutputProfile, available_bytes:
 mod tests {
     use super::*;
     use std::io::Write;
+    #[test]
+    fn a_file_that_will_only_be_remuxed_is_costed_at_its_own_size() {
+        // A 10-minute 30 Mbps source comes out of a remux about as big as it
+        // went in. Costing it at the profile's 6 Mbps would let a batch start
+        // that runs the disk out halfway through.
+        let big: u64 = 2_250_000_000;
+        let e = estimate_disk(&[(600.0, big)], OutputProfile::P1080p30, 0);
+        assert!(e.estimated_bytes >= big, "estimated {} for a {big}-byte source", e.estimated_bytes);
+    }
+
+    #[test]
+    fn a_small_source_is_still_costed_at_what_an_encode_would_produce() {
+        // The other direction: a tiny, badly-encoded source that has to be
+        // re-encoded grows, and the estimate has to expect that.
+        let e = estimate_disk(&[(600.0, 1_000)], OutputProfile::P1080p30, 0);
+        let encoded = 600 * OutputProfile::P1080p30.bytes_per_second();
+        assert_eq!(e.estimated_bytes, encoded);
+    }
 
     fn file_with(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let p = dir.join(name);
@@ -353,37 +381,46 @@ mod tests {
 
     #[test]
     fn estimate_blocks_the_job_when_space_is_short() {
-        // Ten one-hour videos at 1080p30 ≈ 45.9 GB
-        let durs = vec![3600.0; 10];
-        let e = estimate_disk(&durs, OutputProfile::P1080p30, 10 * 1_000_000_000);
+        // Ten one-hour videos at 1080p30, now 6 Mbps video + 192 kbps audio ≈ 27.9 GB
+        let durs = [3600.0; 10];
+        let files: Vec<(f64, u64)> = durs.iter().map(|d| (*d, 0u64)).collect();
+        let e = estimate_disk(&files, OutputProfile::P1080p30, 10 * 1_000_000_000);
         assert_eq!(e.files_to_process, 10);
-        assert!(e.estimated_bytes > 40_000_000_000);
-        assert!(!e.has_enough_space, "10 GB free must not be enough for ~46 GB");
+        assert!(e.estimated_bytes > 25_000_000_000, "estimated {}", e.estimated_bytes);
+        assert!(!e.has_enough_space, "10 GB free must not be enough for ~28 GB");
     }
 
     #[test]
     fn estimate_allows_the_job_with_room_to_spare() {
-        let e = estimate_disk(&[3600.0], OutputProfile::P1080p30, 200 * 1_000_000_000);
+        let e = estimate_disk(&[(3600.0, 0)], OutputProfile::P1080p30, 200 * 1_000_000_000);
         assert!(e.has_enough_space);
-        assert!(e.estimated_bytes > 4_000_000_000 && e.estimated_bytes < 5_500_000_000);
+        // One hour at 6 Mbps + 192 kbps ≈ 2.79 GB.
+        assert!(
+            e.estimated_bytes > 2_500_000_000 && e.estimated_bytes < 3_200_000_000,
+            "estimated {}",
+            e.estimated_bytes
+        );
     }
 
     #[test]
     fn estimate_enforces_the_safety_margin() {
         // Exactly the estimated size, with nothing left over, must be refused.
-        let e0 = estimate_disk(&[600.0], OutputProfile::P1080p30, 0);
-        let exact = estimate_disk(&[600.0], OutputProfile::P1080p30, e0.estimated_bytes);
+        let e0 = estimate_disk(&[(600.0, 0)], OutputProfile::P1080p30, 0);
+        let exact = estimate_disk(&[(600.0, 0)], OutputProfile::P1080p30, e0.estimated_bytes);
         assert!(!exact.has_enough_space);
         let with_margin =
-            estimate_disk(&[600.0], OutputProfile::P1080p30, e0.estimated_bytes + DISK_SAFETY_MARGIN);
+            estimate_disk(&[(600.0, 0)], OutputProfile::P1080p30, e0.estimated_bytes + DISK_SAFETY_MARGIN);
         assert!(with_margin.has_enough_space);
     }
 
     #[test]
     fn the_720p_profile_needs_less_space() {
-        let a = estimate_disk(&[3600.0], OutputProfile::P1080p30, 0).estimated_bytes;
-        let b = estimate_disk(&[3600.0], OutputProfile::P720p30, 0).estimated_bytes;
-        assert!(b < a / 2);
+        let a = estimate_disk(&[(3600.0, 0)], OutputProfile::P1080p30, 0).estimated_bytes;
+        let b = estimate_disk(&[(3600.0, 0)], OutputProfile::P720p30, 0).estimated_bytes;
+        // 4 Mbps against 6: smaller, though no longer less than half now that
+        // 1080p no longer asks for 10.
+        assert!(b < a, "720p {b} should be smaller than 1080p {a}");
+        assert!((b as f64) / (a as f64) < 0.75, "720p {b} vs 1080p {a}");
     }
 
     #[test]

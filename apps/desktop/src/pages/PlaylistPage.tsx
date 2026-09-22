@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { GripVertical, Plus, Trash2, Wand2, X } from 'lucide-react'
 import { useAppStore } from '@/stores/useAppStore'
 import { api, pickVideoFiles } from '@/services/ipc'
-import { formatBytes, formatDurationKo, formatResolution, isBroadcastReady, mediaStatusLabel } from '@/services/format'
+import { formatBytes, formatDurationKo, formatEta, formatResolution, isBroadcastReady, mediaStatusLabel } from '@/services/format'
 import { Badge, Button, Card, EmptyState, Modal, ProgressBar, Select } from '@/components/ui'
 import type { DiskEstimate, PlaylistItemView } from '@/types'
 
@@ -207,8 +207,14 @@ export function PlaylistPage() {
                 <div className="mt-4 space-y-2">
                   <ProgressBar
                     percent={normalizing.percent}
-                    label={`${normalizing.file_name} · 남은 파일 ${normalizing.remaining_files}개`}
+                    label={`영상 ${normalizing.files_done + 1}/${normalizing.files_total} · ${normalizing.file_name}`}
                   />
+                  <p className="text-xs text-ink-500">
+                    {normalizing.mode_label}
+                    {normalizing.speed_x > 0 && ` · 처리 속도 ${normalizing.speed_x.toFixed(1)}x`}
+                    {normalizing.eta_secs >= 0 && ` · 남은 시간 약 ${formatEta(normalizing.eta_secs)}`}
+                    {normalizing.engine_label && ` · 최적화 엔진 ${normalizing.engine_label}`}
+                  </p>
                   <Button size="sm" onClick={() => void api.cancelOptimization()}>중단</Button>
                 </div>
               )}

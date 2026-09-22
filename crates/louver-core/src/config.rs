@@ -60,12 +60,77 @@ impl OutputProfile {
         self.fps() * 2
     }
 
-    /// Target video bitrate in kbit/s.
+    /// Target video bitrate in kbit/s, for streams that must be re-encoded.
+    ///
+    /// 1080p30 was 10 Mbps and is now 6. Measured on 30-second 1080p30 clips
+    /// through this exact argv, varying only `-b:v`:
+    ///
+    /// | content | 4 Mbps | 6 Mbps | 8 Mbps | 10 Mbps |
+    /// | --- | --- | --- | --- | --- |
+    /// | slow gradient, SSIM | 0.99977 | 0.99985 | 0.99988 | 0.99988 |
+    /// | slow gradient, size | 15.0 MB | 22.3 MB | 28.6 MB | 28.7 MB |
+    /// | dense synthetic, SSIM | 0.99146 | 0.99539 | 0.99733 | 0.99842 |
+    ///
+    /// On the content this product exists for — a music video held on screen —
+    /// the encoder cannot even spend 10 Mbps: 8 and 10 produce the same file to
+    /// within 0.1 MB and the same SSIM to five decimal places. 6 Mbps is 22%
+    /// smaller than that ceiling for an SSIM difference of 0.00003, which no
+    /// viewer can see, and it sits inside YouTube's recommended range for a
+    /// 1080p30 live ingest where 10 Mbps sits above it.
+    ///
+    /// Encode *time* barely moved across the whole sweep (8.5–11 s), so this is
+    /// a cache-size and upload-headroom change, not a speed one — the speed
+    /// came from not encoding conformant files at all.
+    ///
+    /// A source that already conforms keeps its own bitrate untouched: it is
+    /// copied, not re-encoded, so this number never degrades it.
     pub fn video_kbps(self) -> u32 {
         match self {
-            Self::P1080p30 => 10_000,
+            Self::P1080p30 => 6_000,
+            // Unchanged: the sweep above was run at 1080p, and a number that
+            // was not measured is not a number to change.
             Self::P720p30 => 4_000,
         }
+    }
+
+    /// H.264 profiles a copied video may use.
+    ///
+    /// Everything here decodes on the hardware YouTube viewers actually have.
+    /// The 10-bit and 4:2:2/4:4:4 variants are absent on purpose — they carry a
+    /// pixel format the profile does not allow anyway, so they are caught twice.
+    pub fn allows_h264_profile(self, profile: &str) -> bool {
+        const OK: [&str; 4] = ["baseline", "constrained baseline", "main", "high"];
+        // An empty string means ffprobe did not say. A file that reached here
+        // has already matched codec, geometry and pixel format, so an unnamed
+        // profile is not grounds on its own to spend minutes re-encoding.
+        profile.is_empty() || OK.contains(&profile.to_ascii_lowercase().as_str())
+    }
+
+    /// The H.264 level the encoder declares, as `-level` wants it.
+    pub fn h264_level_str(self) -> String {
+        let l = self.max_h264_level();
+        format!("{}.{}", l / 10, l % 10)
+    }
+
+    /// Highest H.264 level a copied video may declare, ×10.
+    ///
+    /// The encoder targets exactly this, so a file this product made always
+    /// satisfies its own check — 4.2 was hardcoded once, and at 720p that
+    /// produced cache entries the compatibility check then rejected.
+    pub fn max_h264_level(self) -> u32 {
+        match self {
+            Self::P1080p30 => 42,
+            Self::P720p30 => 32,
+        }
+    }
+
+    /// Longest keyframe gap a copied video may have, in seconds.
+    ///
+    /// A copy keeps whatever spacing it arrived with. Twice the interval we
+    /// encode to is the point past which YouTube's ingest starts to suffer and
+    /// a viewer joining mid-loop waits noticeably for a picture.
+    pub fn max_copy_gop_secs(self) -> f64 {
+        f64::from(self.gop()) / f64::from(self.fps()) * 2.0
     }
 
     pub fn audio_kbps(self) -> u32 {
@@ -148,8 +213,11 @@ mod tests {
 
     #[test]
     fn disk_estimate_is_sane() {
-        // 1080p30 at 10192 kbps ≈ 1.27 MB/s ≈ 4.59 GB/hour
+        // 1080p30 at 6192 kbps ≈ 0.77 MB/s ≈ 2.79 GB/hour. Was 4.59 GB when
+        // the video target was 10 Mbps; see `video_kbps` for why it is 6.
         let per_hour = OutputProfile::P1080p30.bytes_per_second() * 3600;
-        assert!((4..6).contains(&(per_hour / 1_000_000_000)), "{per_hour}");
+        assert!((2..4).contains(&(per_hour / 1_000_000_000)), "{per_hour}");
+        // 720p is smaller still, and both stay well under a terabyte a day.
+        assert!(OutputProfile::P720p30.bytes_per_second() < OutputProfile::P1080p30.bytes_per_second());
     }
 }

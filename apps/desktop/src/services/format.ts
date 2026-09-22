@@ -107,3 +107,22 @@ export function mediaStatusLabel(s: MediaStatus): string {
 export function isBroadcastReady(s: MediaStatus): boolean {
   return s === 'compatible' || s === 'normalized'
 }
+
+/**
+ * How long is left, said the way a person would say it.
+ *
+ * Deliberately coarse: an estimate that reads "약 4분" and turns out to be
+ * three is forgivable, while "4분 12초" ticking down unevenly is not. Under a
+ * minute it counts seconds, because that is when the number is about to
+ * matter.
+ */
+export function formatEta(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return '계산 중'
+  const s = Math.ceil(seconds)
+  if (s < 10) return '10초 미만'
+  if (s < 60) return `${Math.ceil(s / 5) * 5}초`
+  const m = Math.ceil(s / 60)
+  if (m < 60) return `${m}분`
+  const h = Math.floor(m / 60)
+  return `${h}시간 ${m % 60}분`
+}

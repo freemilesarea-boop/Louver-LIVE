@@ -472,6 +472,7 @@ export function createMockBackend(opts: MockOptions = {}) {
           media_id: id, file_name: m.display_name, percent: 100,
           files_done: idx + 1, files_total: ids2.length,
           remaining_files: ids2.length - idx - 1, estimated_cache_bytes: 0,
+          mode_label: '화면과 소리 변환 중', speed_x: 3.2, eta_secs: 42, engine_label: 'CPU',
         })
       })
       return done

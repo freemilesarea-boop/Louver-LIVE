@@ -15,6 +15,10 @@ pub struct MediaInfo {
     pub height: u32,
     pub fps: f64,
     pub video_codec: String,
+    /// H.264 profile as ffprobe names it: "High", "Main", "Constrained Baseline".
+    pub video_profile: String,
+    /// H.264 level ×10, so 4.2 arrives as 42.
+    pub video_level: Option<u32>,
     pub pixel_format: String,
     pub video_bitrate: Option<u64>,
     pub audio_codec: Option<String>,
@@ -129,6 +133,9 @@ pub fn parse_probe_json(json: &str) -> Result<MediaInfo> {
         height: video["height"].as_u64().unwrap_or(0) as u32,
         fps,
         video_codec: video["codec_name"].as_str().unwrap_or_default().to_string(),
+        video_profile: video["profile"].as_str().unwrap_or_default().to_string(),
+        // ffprobe reports the level as an integer, already ×10.
+        video_level: video["level"].as_u64().filter(|l| *l > 0).map(|l| l as u32),
         video_bitrate: video["bit_rate"].as_str().and_then(|s| s.parse().ok()),
         is_hdr: detect_hdr(
             video["color_transfer"].as_str().unwrap_or_default(),
@@ -145,6 +152,43 @@ pub fn parse_probe_json(json: &str) -> Result<MediaInfo> {
         audio_bitrate: audio.and_then(|a| a["bit_rate"].as_str()).and_then(|s| s.parse().ok()),
         file_size: 0,
     })
+}
+
+/// The longest gap between keyframes in ffprobe's packet listing.
+///
+/// Lines look like `1.234000,K__` — the timestamp, then the flags, where `K`
+/// marks a keyframe. Returns `None` when fewer than two keyframes were seen,
+/// which says nothing either way and must not be held against the file.
+pub fn max_keyframe_gap(csv: &str) -> Option<f64> {
+    let mut keys: Vec<f64> = Vec::new();
+    for line in csv.lines() {
+        let mut parts = line.trim().split(',');
+        let (Some(ts), Some(flags)) = (parts.next(), parts.next()) else { continue };
+        if !flags.contains('K') {
+            continue;
+        }
+        if let Ok(t) = ts.trim().parse::<f64>() {
+            keys.push(t);
+        }
+    }
+    if keys.len() < 2 {
+        return None;
+    }
+    keys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    keys.windows(2).map(|w| w[1] - w[0]).fold(None, |m: Option<f64>, g| Some(m.map_or(g, |m| m.max(g))))
+}
+
+/// Measure the source's keyframe spacing over its opening seconds.
+///
+/// Errors are not failures: an unreadable index means "not measured", and the
+/// planner treats that as no objection rather than inventing one.
+pub fn probe_max_keyframe_gap(builder: &FfmpegCommandBuilder, path: &Path, window_secs: u32) -> Option<f64> {
+    let args = builder.build_keyframe_probe_args(path, window_secs);
+    let out = builder.probe_command(&args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    max_keyframe_gap(&String::from_utf8_lossy(&out.stdout))
 }
 
 /// Result of checking a source against the broadcast profile (§7).
@@ -168,15 +212,86 @@ impl Compatibility {
     }
 }
 
-/// Decide whether a file can be concatenated and stream-copied as-is (§7, §14).
-///
-/// The bar is deliberately high: the concat demuxer needs every input to agree
-/// on codec, geometry, frame rate, pixel format, time base and audio layout. A
-/// file that is merely "close" produces the timestamp faults §14 tests for, so
-/// anything short of an exact match is sent to the normalizer.
-pub fn check_compatibility(info: &MediaInfo, profile: OutputProfile) -> Compatibility {
-    let mut r = Vec::new();
+/// What a stream needs before it can join the broadcast playlist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StreamPlan {
+    /// The bitstream is already right; copy the packets.
+    Copy,
+    /// It has to be decoded and encoded again.
+    Encode,
+}
 
+impl StreamPlan {
+    pub fn is_copy(self) -> bool {
+        matches!(self, Self::Copy)
+    }
+}
+
+/// How one file will be turned into a cache entry.
+///
+/// Every file is still rewritten into our container — the timescale, the
+/// whole-frame duration and faststart are what let the concat demuxer join
+/// the results without timestamp repair — but rewriting a container is I/O,
+/// not encoding, and costs a fraction of a second where an encode costs
+/// minutes. The plan says which of the two streams actually needs the encoder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscodePlan {
+    pub video: StreamPlan,
+    pub audio: StreamPlan,
+    /// Why each stream is being encoded, for the log and the UI.
+    pub video_reasons: Vec<String>,
+    pub audio_reasons: Vec<String>,
+}
+
+impl TranscodePlan {
+    /// Both streams encoded — what every file used to get, unconditionally.
+    pub fn full_encode() -> Self {
+        Self {
+            video: StreamPlan::Encode,
+            audio: StreamPlan::Encode,
+            video_reasons: Vec::new(),
+            audio_reasons: Vec::new(),
+        }
+    }
+
+    /// Neither stream encoded.
+    pub fn remux() -> Self {
+        Self {
+            video: StreamPlan::Copy,
+            audio: StreamPlan::Copy,
+            video_reasons: Vec::new(),
+            audio_reasons: Vec::new(),
+        }
+    }
+
+    /// Neither stream is encoded: a pure remux.
+    pub fn is_remux(&self) -> bool {
+        self.video.is_copy() && self.audio.is_copy()
+    }
+
+    /// One stream is copied and the other encoded.
+    pub fn is_partial(&self) -> bool {
+        self.video.is_copy() != self.audio.is_copy()
+    }
+
+    /// A short word for the log and the progress UI.
+    pub fn label(&self) -> &'static str {
+        match (self.video, self.audio) {
+            (StreamPlan::Copy, StreamPlan::Copy) => "remux",
+            (StreamPlan::Copy, StreamPlan::Encode) => "audio-only encode",
+            (StreamPlan::Encode, StreamPlan::Copy) => "video-only encode",
+            (StreamPlan::Encode, StreamPlan::Encode) => "full encode",
+        }
+    }
+}
+
+/// Why the video pixels have to be decoded and encoded again.
+///
+/// Only things a bitstream copy cannot change belong here. The container's
+/// timescale is deliberately absent: the normalizer sets it on the muxer, which
+/// works just as well when the packets are copied.
+pub fn video_encode_reasons(info: &MediaInfo, profile: OutputProfile) -> Vec<String> {
+    let mut r = Vec::new();
     if info.video_codec != "h264" {
         r.push(format!("영상 코덱이 H.264가 아닙니다 ({})", info.video_codec));
     }
@@ -201,17 +316,94 @@ pub fn check_compatibility(info: &MediaInfo, profile: OutputProfile) -> Compatib
     if info.rotation != 0 {
         r.push(format!("회전 메타데이터가 있습니다 ({}도)", info.rotation));
     }
-    // A mismatched timescale is exactly what breaks concat stream copy.
-    let want_tb = format!("1/{}", profile.video_timescale());
-    if info.time_base != want_tb {
-        r.push(format!("타임베이스가 {want_tb}가 아닙니다 ({})", info.time_base));
+    if !profile.allows_h264_profile(&info.video_profile) {
+        r.push(format!("H.264 프로파일이 지원 범위 밖입니다 ({})", info.video_profile));
     }
+    if let Some(level) = info.video_level {
+        if level > profile.max_h264_level() {
+            r.push(format!(
+                "H.264 레벨이 {}를 넘습니다 ({})",
+                fmt_level(profile.max_h264_level()),
+                fmt_level(level)
+            ));
+        }
+    }
+    r
+}
+
+/// H.264 levels are reported as 31 for 3.1, 42 for 4.2.
+fn fmt_level(level: u32) -> String {
+    format!("{}.{}", level / 10, level % 10)
+}
+
+/// Why the audio has to be decoded and encoded again.
+pub fn audio_encode_reasons(info: &MediaInfo, profile: OutputProfile) -> Vec<String> {
+    let mut r = Vec::new();
     match (&info.audio_codec, info.audio_sample_rate, info.audio_channels) {
         (Some(c), Some(sr), Some(ch))
             if c == "aac" && sr == profile.audio_sample_rate() && ch == profile.audio_channels() => {}
         (None, _, _) => r.push("오디오 트랙이 없습니다".into()),
         _ => r.push("오디오가 48kHz 스테레오 AAC가 아닙니다".into()),
     }
+    // A stream far above the profile is re-encoded so the cache stays a
+    // predictable size; a stream below it is left alone, because encoding it
+    // again would only lose more.
+    if r.is_empty() {
+        if let Some(bps) = info.audio_bitrate {
+            let ceiling = u64::from(profile.audio_kbps()) * 1000 * 2;
+            if bps > ceiling {
+                r.push(format!("오디오 비트레이트가 너무 높습니다 ({} kbps)", bps / 1000));
+            }
+        }
+    }
+    r
+}
+
+/// Decide what has to be re-encoded, and what can simply be copied (§7, §8).
+///
+/// `max_gop_secs` is the longest gap between keyframes measured in the source,
+/// when it has been measured. A copied video keeps whatever keyframe spacing it
+/// arrived with, and a very long gap makes for a poor live stream, so past a
+/// limit the video is re-encoded to restore a regular one. `None` means it was
+/// not measured and is not held against the file.
+pub fn plan_transcode(info: &MediaInfo, profile: OutputProfile, max_gop_secs: Option<f64>) -> TranscodePlan {
+    let mut video_reasons = video_encode_reasons(info, profile);
+    if video_reasons.is_empty() {
+        if let Some(gop) = max_gop_secs {
+            let limit = profile.max_copy_gop_secs();
+            if gop > limit {
+                video_reasons.push(format!("키프레임 간격이 너무 깁니다 ({gop:.1}초 > {limit:.1}초)"));
+            }
+        }
+    }
+    let audio_reasons = audio_encode_reasons(info, profile);
+    TranscodePlan {
+        video: if video_reasons.is_empty() { StreamPlan::Copy } else { StreamPlan::Encode },
+        audio: if audio_reasons.is_empty() { StreamPlan::Copy } else { StreamPlan::Encode },
+        video_reasons,
+        audio_reasons,
+    }
+}
+
+/// Decide whether a file can be concatenated and stream-copied as-is (§7, §14).
+///
+/// The bar is deliberately high: the concat demuxer needs every input to agree
+/// on codec, geometry, frame rate, pixel format, time base and audio layout. A
+/// file that is merely "close" produces the timestamp faults §14 tests for, so
+/// anything short of an exact match is sent to the normalizer.
+///
+/// This answers a different question from [`plan_transcode`]: here the file
+/// would be used *exactly* as it is, so the container's own timescale counts
+/// against it. A file that fails only on timescale still needs a cache entry,
+/// and that entry costs a remux rather than an encode.
+pub fn check_compatibility(info: &MediaInfo, profile: OutputProfile) -> Compatibility {
+    let mut r = video_encode_reasons(info, profile);
+    // A mismatched timescale is exactly what breaks concat stream copy.
+    let want_tb = format!("1/{}", profile.video_timescale());
+    if info.time_base != want_tb {
+        r.push(format!("타임베이스가 {want_tb}가 아닙니다 ({})", info.time_base));
+    }
+    r.extend(audio_encode_reasons(info, profile));
 
     if r.is_empty() {
         Compatibility::Compatible
@@ -224,6 +416,139 @@ pub fn check_compatibility(info: &MediaInfo, profile: OutputProfile) -> Compatib
 mod tests {
     use super::*;
 
+    /// A file already produced by our own normalizer, for the planner tests.
+    fn ready() -> MediaInfo {
+        MediaInfo {
+            container: "mov,mp4,m4a".into(),
+            duration_secs: 60.0,
+            width: 1920,
+            height: 1080,
+            fps: 30.0,
+            video_codec: "h264".into(),
+            video_profile: "High".into(),
+            video_level: Some(40),
+            pixel_format: "yuv420p".into(),
+            video_bitrate: Some(6_000_000),
+            audio_codec: Some("aac".into()),
+            audio_sample_rate: Some(48_000),
+            audio_channels: Some(2),
+            audio_bitrate: Some(192_000),
+            time_base: "1/30000".into(),
+            rotation: 0,
+            is_hdr: false,
+            file_size: 1,
+            has_audio: true,
+        }
+    }
+
+    #[test]
+    fn a_broadcast_ready_file_is_not_re_encoded_at_all() {
+        let p = plan_transcode(&ready(), OutputProfile::P1080p30, Some(2.0));
+        assert!(p.is_remux(), "a conformant file must cost a remux, not an encode: {p:?}");
+        assert_eq!(p.label(), "remux");
+    }
+
+    #[test]
+    fn only_the_stream_that_is_wrong_gets_encoded() {
+        // Audio wrong, picture right.
+        let mut i = ready();
+        i.audio_sample_rate = Some(44_100);
+        let p = plan_transcode(&i, OutputProfile::P1080p30, Some(2.0));
+        assert!(p.video.is_copy(), "the picture was already right");
+        assert!(!p.audio.is_copy());
+        assert!(p.is_partial());
+        assert_eq!(p.label(), "audio-only encode");
+
+        // Picture wrong, audio right.
+        let mut i = ready();
+        i.width = 1280;
+        i.height = 720;
+        let p = plan_transcode(&i, OutputProfile::P1080p30, Some(2.0));
+        assert!(!p.video.is_copy());
+        assert!(p.audio.is_copy(), "the audio was already right");
+        assert_eq!(p.label(), "video-only encode");
+    }
+
+    #[test]
+    fn a_file_that_is_wrong_everywhere_still_gets_a_full_encode() {
+        let mut i = ready();
+        i.video_codec = "vp9".into();
+        i.audio_codec = Some("opus".into());
+        let p = plan_transcode(&i, OutputProfile::P1080p30, None);
+        assert_eq!(p.label(), "full encode");
+        assert!(!p.video_reasons.is_empty() && !p.audio_reasons.is_empty());
+    }
+
+    #[test]
+    fn a_wrong_timescale_costs_a_remux_and_not_an_encode() {
+        // The muxer sets the timescale, and it does that for copied packets
+        // too — so this must never be grounds for re-encoding the pixels.
+        let mut i = ready();
+        i.time_base = "1/90000".into();
+        assert!(
+            plan_transcode(&i, OutputProfile::P1080p30, Some(2.0)).is_remux(),
+            "a timescale difference is a container change, not a picture change"
+        );
+        // It still means the original file cannot be used as-is.
+        assert!(!check_compatibility(&i, OutputProfile::P1080p30).is_compatible());
+    }
+
+    #[test]
+    fn a_long_gap_between_keyframes_forces_the_video_to_be_re_encoded() {
+        let i = ready();
+        let limit = OutputProfile::P1080p30.max_copy_gop_secs();
+        assert!(plan_transcode(&i, OutputProfile::P1080p30, Some(limit - 0.1)).video.is_copy());
+        let far = plan_transcode(&i, OutputProfile::P1080p30, Some(limit + 0.1));
+        assert!(!far.video.is_copy(), "a 10-second keyframe gap must not be copied into a live stream");
+        assert!(far.video_reasons.iter().any(|r| r.contains("키프레임")));
+    }
+
+    #[test]
+    fn an_unmeasured_keyframe_gap_is_not_held_against_the_file() {
+        assert!(plan_transcode(&ready(), OutputProfile::P1080p30, None).video.is_copy());
+    }
+
+    #[test]
+    fn a_silent_source_always_gets_an_encoded_audio_track() {
+        let mut i = ready();
+        i.has_audio = false;
+        i.audio_codec = None;
+        i.audio_sample_rate = None;
+        i.audio_channels = None;
+        let p = plan_transcode(&i, OutputProfile::P1080p30, Some(2.0));
+        assert!(!p.audio.is_copy(), "there is no audio to copy; one has to be made");
+    }
+
+    #[test]
+    fn an_exotic_h264_profile_is_re_encoded() {
+        let mut i = ready();
+        i.video_profile = "High 4:4:4 Predictive".into();
+        assert!(!plan_transcode(&i, OutputProfile::P1080p30, Some(2.0)).video.is_copy());
+    }
+
+    #[test]
+    fn a_level_above_the_profile_is_re_encoded_but_one_below_is_not() {
+        let mut i = ready();
+        i.video_level = Some(51);
+        assert!(!plan_transcode(&i, OutputProfile::P1080p30, Some(2.0)).video.is_copy());
+        i.video_level = Some(31);
+        assert!(plan_transcode(&i, OutputProfile::P1080p30, Some(2.0)).video.is_copy());
+    }
+
+    #[test]
+    fn keyframe_gaps_are_read_out_of_ffprobe_packet_output() {
+        // Real shape: pts_time,flags — K marks a keyframe.
+        let csv = "0.000000,K__\n0.033333,__\n2.000000,K__\n2.033333,__\n7.000000,K__\n";
+        assert_eq!(max_keyframe_gap(csv), Some(5.0));
+    }
+
+    #[test]
+    fn one_keyframe_alone_says_nothing_about_spacing() {
+        assert_eq!(max_keyframe_gap("0.000000,K__\n0.033333,__\n"), None);
+        assert_eq!(max_keyframe_gap(""), None);
+        assert_eq!(max_keyframe_gap("garbage\nlines\n"), None);
+    }
+
     /// A file already produced by our own normalizer.
     fn perfect() -> MediaInfo {
         MediaInfo {
@@ -233,6 +558,8 @@ mod tests {
             height: 1080,
             fps: 30.0,
             video_codec: "h264".into(),
+            video_profile: "High".into(),
+            video_level: Some(40),
             pixel_format: "yuv420p".into(),
             video_bitrate: Some(10_000_000),
             audio_codec: Some("aac".into()),

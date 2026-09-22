@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
-  EVERYDAY, WEEKDAYS, crossesMidnight, describeDays, formatBytes, formatDuration,
+  EVERYDAY, WEEKDAYS, crossesMidnight, describeDays, formatBytes, formatDuration, formatEta,
   formatDurationKo, formatMbps, hasDay, isBroadcastReady, mediaStatusLabel,
   streamStateLabel, toggleDay, windowDurationSecs,
 } from './format'
@@ -96,5 +96,29 @@ describe('status labels', () => {
       expect(isBroadcastReady(s)).toBe(false)
       expect(mediaStatusLabel(s)).toBeTruthy()
     }
+  })
+})
+
+describe('formatEta', () => {
+  it('says nothing it cannot know', () => {
+    expect(formatEta(-1)).toBe('계산 중')
+    expect(formatEta(Number.NaN)).toBe('계산 중')
+    expect(formatEta(Number.POSITIVE_INFINITY)).toBe('계산 중')
+  })
+
+  it('counts seconds only when seconds are what matters', () => {
+    expect(formatEta(3)).toBe('10초 미만')
+    expect(formatEta(22)).toBe('25초')
+    expect(formatEta(59)).toBe('60초')
+  })
+
+  it('rounds up to whole minutes, so it never promises too little', () => {
+    expect(formatEta(61)).toBe('2분')
+    expect(formatEta(240)).toBe('4분')
+  })
+
+  it('reads as hours once it is one', () => {
+    expect(formatEta(3600)).toBe('1시간 0분')
+    expect(formatEta(5400)).toBe('1시간 30분')
   })
 })

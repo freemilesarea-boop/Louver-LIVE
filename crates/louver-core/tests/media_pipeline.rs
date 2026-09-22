@@ -16,7 +16,7 @@ use common::*;
 use louver_core::config::{OutputProfile, StreamMode};
 use louver_core::media::cache::MediaCache;
 use louver_core::media::normalize::{normalize_one, CancelToken};
-use louver_core::media::probe::{check_compatibility, probe};
+use louver_core::media::probe::{check_compatibility, plan_transcode, probe, probe_max_keyframe_gap};
 use louver_core::streaming::manifest::write_manifest;
 use std::path::PathBuf;
 
@@ -690,4 +690,141 @@ fn touching_a_source_without_changing_it_keeps_the_cache_valid() {
         "reading a file must not change its cache identity"
     );
     assert!(cache.lookup(&hash, PROFILE).is_some());
+}
+
+/// A remuxed file and an encoded one in the same playlist, stream-copied (§12).
+///
+/// This is what the copy fast path risks: the live command is `concat` plus
+/// `-c copy`, which needs every entry to agree on codec, geometry and
+/// timescale. A file that skipped the encoder has to come out of the
+/// normalizer just as joinable as one that did not, or the whole optimization
+/// is a way of breaking broadcasts quietly.
+#[test]
+fn a_copied_file_and_an_encoded_one_concatenate_and_stream_copy_together() {
+    let tools = require_ffmpeg!();
+    let b = builder(tools.clone(), PROFILE);
+    let work = tempfile::tempdir().unwrap();
+    let cache = MediaCache::new(work.path().join("cache"));
+
+    // Already exactly what we broadcast: this one must take the copy path.
+    let ready = work.path().join("ready.mp4");
+    let (code, err) = run_ffmpeg(
+        &tools,
+        &[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=30:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=3",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-profile:v",
+            "high",
+            "-level",
+            "3.1",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "60",
+            "-keyint_min",
+            "60",
+            "-sc_threshold",
+            "0",
+            "-b:v",
+            "3000k",
+            "-r",
+            "30",
+            "-fps_mode",
+            "cfr",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-video_track_timescale",
+            "30000",
+            "-movflags",
+            "+faststart",
+            ready.to_str().unwrap(),
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect::<Vec<_>>(),
+    );
+    assert_eq!(code, 0, "fixture build failed: {err}");
+
+    // Nothing like it: wrong size, wrong rate, wrong audio.
+    let odd = make_fixture(
+        &tools,
+        &fixture_dir(),
+        &FixtureSpec {
+            name: "mixed_odd",
+            duration: 3.0,
+            size: "640x480",
+            fps: 24,
+            sample_rate: 44100,
+            channels: 1,
+            tone_hz: 330,
+            pattern: "smptebars",
+        },
+    );
+
+    let ready_info = probe(&b, &ready).unwrap();
+    let odd_info = probe(&b, &odd).unwrap();
+
+    let ready_plan = plan_transcode(&ready_info, PROFILE, probe_max_keyframe_gap(&b, &ready, 60));
+    assert!(ready_plan.is_remux(), "the conformant fixture should not be encoded: {ready_plan:?}");
+    let odd_plan = plan_transcode(&odd_info, PROFILE, None);
+    assert!(!odd_plan.video.is_copy(), "the odd fixture must still be encoded: {odd_plan:?}");
+
+    let a =
+        normalize_one(&b, &cache, &ready, "mixed_ready", &ready_info, PROFILE, &CancelToken::new(), |_| {})
+            .unwrap();
+    let c = normalize_one(&b, &cache, &odd, "mixed_odd", &odd_info, PROFILE, &CancelToken::new(), |_| {})
+        .unwrap();
+    assert_eq!(a.video_encoder, "copy", "the ready file went through the encoder anyway");
+    assert_ne!(c.video_encoder, "copy");
+
+    // The two cache entries must agree on everything concat cares about.
+    for field in ["codec_name", "width", "height", "pix_fmt", "time_base", "r_frame_rate"] {
+        assert_eq!(
+            stream_field(&tools, &a.output_path, "v:0", field),
+            stream_field(&tools, &c.output_path, "v:0", field),
+            "copied and encoded entries disagree on {field}"
+        );
+    }
+    for field in ["codec_name", "sample_rate", "channels"] {
+        assert_eq!(
+            stream_field(&tools, &a.output_path, "a:0", field),
+            stream_field(&tools, &c.output_path, "a:0", field),
+            "copied and encoded entries disagree on audio {field}"
+        );
+    }
+
+    // And they have to survive the real live command, interleaved and looped.
+    let files =
+        vec![a.output_path.clone(), c.output_path.clone(), a.output_path.clone(), c.output_path.clone()];
+    let manifest = work.path().join("mixed.txt");
+    write_manifest(&manifest, &files).unwrap();
+    let out = work.path().join("mixed.flv");
+    let (code, stderr) =
+        run_ffmpeg(&tools, &b.build_dry_run_args(&manifest, &out, StreamMode::StreamCopy, None, false));
+    assert_eq!(code, 0, "{stderr}");
+    assert!(timestamp_faults(&stderr).is_empty(), "mixed playlist faults:\n{stderr}");
+
+    let want = a.duration_secs * 2.0 + c.duration_secs * 2.0;
+    assert!(
+        (format_duration(&tools, &out) - want).abs() < 0.3,
+        "mixed playlist ran {}s, expected {want}s",
+        format_duration(&tools, &out)
+    );
 }

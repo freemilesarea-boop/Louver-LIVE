@@ -4,9 +4,12 @@ use super::CmdResult;
 use crate::state::AppState;
 use louver_core::database::models::{Media, MediaStatus};
 use louver_core::error::{ErrorCode, LouverError};
+use louver_core::logging::LogTarget;
 use louver_core::media::cache::{estimate_disk, media_hash, DiskEstimate};
 use louver_core::media::is_supported_extension;
-use louver_core::media::normalize::{normalize_one, CancelToken, NormalizeProgress};
+use louver_core::media::normalize::{
+    engine_label_ko, mode_label_ko, normalize_one, plan_for, CancelToken, NormalizeProgress,
+};
 use louver_core::media::probe::{check_compatibility, probe, Compatibility};
 use louver_core::system::available_disk_bytes;
 use serde::Serialize;
@@ -117,12 +120,14 @@ pub fn compatibility_reasons(state: State<'_, AppState>, id: i64) -> CmdResult<V
 #[tauri::command]
 pub fn estimate_optimization(state: State<'_, AppState>, media_ids: Vec<i64>) -> CmdResult<DiskEstimate> {
     let profile = state.profile();
-    let mut durations = Vec::new();
+    // Duration and current size per file: a file that only needs a remux comes
+    // out about as big as it went in, so its own size is the better estimate.
+    let mut durations: Vec<(f64, u64)> = Vec::new();
     for id in media_ids {
         if let Some(m) = state.db.get_media(id)? {
             // Files already cached cost nothing more.
             if state.cache.lookup(&m.media_hash, profile).is_none() && !m.status.is_broadcast_ready() {
-                durations.push(m.duration_secs);
+                durations.push((m.duration_secs, m.file_size));
             }
         }
     }
@@ -155,16 +160,36 @@ pub fn optimize_media(
     let cancel = CancelToken::new();
     *state.normalize_cancel.lock().unwrap() = Some(cancel.clone());
 
-    let total = media_ids.len();
-    let mut done = 0usize;
-    for (idx, id) in media_ids.iter().enumerate() {
+    // Probe everything first, so the batch knows what it is in for: which
+    // files are instant, how many seconds of video there are in total, and
+    // therefore how long the whole thing will take (§10).
+    struct Job {
+        id: i64,
+        name: String,
+        source: String,
+        hash: String,
+        info: louver_core::media::probe::MediaInfo,
+        plan: louver_core::media::probe::TranscodePlan,
+    }
+
+    let mut jobs: Vec<Job> = Vec::new();
+    for id in &media_ids {
         if cancel.is_cancelled() {
             break;
         }
         let Some(m) = state.db.get_media(*id)? else { continue };
-
-        let info = match probe(&builder, Path::new(&m.source_path)) {
-            Ok(i) => i,
+        match probe(&builder, Path::new(&m.source_path)) {
+            Ok(info) => {
+                let plan = plan_for(&builder, Path::new(&m.source_path), &info, profile);
+                jobs.push(Job {
+                    id: *id,
+                    name: m.display_name,
+                    source: m.source_path,
+                    hash: m.media_hash,
+                    info,
+                    plan,
+                });
+            }
             Err(e) => {
                 state.db.update_media_status(
                     *id,
@@ -174,15 +199,62 @@ pub fn optimize_media(
                     None,
                     Some(&e.message),
                 )?;
-                continue;
             }
-        };
+        }
+    }
+
+    // The ones that need no encoder go first. They finish in the time it takes
+    // to copy the file, so a library that is mostly already broadcast-ready
+    // turns ready almost at once instead of waiting behind one slow encode.
+    jobs.sort_by_key(|j| !j.plan.is_remux());
+
+    let remux_count = jobs.iter().filter(|j| j.plan.is_remux()).count();
+    state.logger.info(
+        LogTarget::App,
+        &format!(
+            "MEDIA_OPTIMIZE_START files={} remux={} partial={} full={} engine={}",
+            jobs.len(),
+            remux_count,
+            jobs.iter().filter(|j| j.plan.is_partial()).count(),
+            jobs.iter().filter(|j| !j.plan.video.is_copy() && !j.plan.audio.is_copy()).count(),
+            builder.encoder(),
+        ),
+    );
+
+    let total = jobs.len();
+    let total_media_secs: f64 = jobs.iter().map(|j| j.info.duration_secs.max(0.0)).sum();
+    let batch_started = std::time::Instant::now();
+    let mut media_secs_done = 0.0f64;
+    let mut done = 0usize;
+
+    for (idx, job) in jobs.iter().enumerate() {
+        if cancel.is_cancelled() {
+            break;
+        }
+        let this_duration = job.info.duration_secs.max(0.0);
+        let mode = mode_label_ko(&job.plan).to_string();
+        let engine = if job.plan.video.is_copy() {
+            engine_label_ko("copy")
+        } else {
+            engine_label_ko(builder.encoder())
+        }
+        .to_string();
 
         let emit = {
             let app = app.clone();
-            let name = m.display_name.clone();
-            let id = *id;
+            let name = job.name.clone();
+            let id = job.id;
+            let mode = mode.clone();
+            let engine = engine.clone();
             move |percent: f64| {
+                // Rate over the whole batch so far, in seconds of video per
+                // second of wall clock. Using the batch rather than this file
+                // keeps the estimate steady when a remux and an encode follow
+                // each other, which differ by two orders of magnitude.
+                let elapsed = batch_started.elapsed().as_secs_f64();
+                let processed = media_secs_done + this_duration * (percent / 100.0);
+                let rate = if elapsed > 0.5 && processed > 0.0 { processed / elapsed } else { 0.0 };
+                let remaining_media = (total_media_secs - processed).max(0.0);
                 let _ = app.emit(
                     "louver://normalize",
                     NormalizeProgress {
@@ -193,6 +265,10 @@ pub fn optimize_media(
                         files_total: total,
                         remaining_files: total.saturating_sub(idx + 1),
                         estimated_cache_bytes: 0,
+                        mode_label: mode.clone(),
+                        speed_x: rate,
+                        eta_secs: if rate > 0.0 { remaining_media / rate } else { -1.0 },
+                        engine_label: engine.clone(),
                     },
                 );
             }
@@ -201,16 +277,17 @@ pub fn optimize_media(
         match normalize_one(
             &builder,
             &state.cache,
-            Path::new(&m.source_path),
-            &m.media_hash,
-            &info,
+            Path::new(&job.source),
+            &job.hash,
+            &job.info,
             profile,
             &cancel,
             emit,
         ) {
             Ok(out) => {
+                state.logger.info(LogTarget::App, &out.summary(&job.info, profile));
                 state.db.update_media_status(
-                    *id,
+                    job.id,
                     MediaStatus::Normalized,
                     Some(&out.output_path.to_string_lossy()),
                     Some(profile.id()),
@@ -221,10 +298,27 @@ pub fn optimize_media(
             }
             Err(e) if e.code == ErrorCode::MediaNormalizeCancelled => break,
             Err(e) => {
-                state.db.update_media_status(*id, MediaStatus::Failed, None, None, None, Some(&e.message))?;
+                state.logger.warn(
+                    LogTarget::App,
+                    &format!("MEDIA_OPTIMIZE_FAIL mode={} {}", job.plan.label(), e.message),
+                );
+                state.db.update_media_status(
+                    job.id,
+                    MediaStatus::Failed,
+                    None,
+                    None,
+                    None,
+                    Some(&e.message),
+                )?;
             }
         }
+        media_secs_done += this_duration;
     }
+
+    state.logger.info(
+        LogTarget::App,
+        &format!("MEDIA_OPTIMIZE_END done={done}/{total} took={:.1}s", batch_started.elapsed().as_secs_f64()),
+    );
 
     *state.normalize_cancel.lock().unwrap() = None;
     Ok(done)

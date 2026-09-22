@@ -6,7 +6,7 @@
 use crate::config::OutputProfile;
 use crate::error::{ErrorCode, LouverError, Result};
 use crate::media::cache::{CacheMetadata, MediaCache};
-use crate::media::probe::MediaInfo;
+use crate::media::probe::{plan_transcode, probe_max_keyframe_gap, MediaInfo, TranscodePlan};
 use crate::streaming::ffmpeg::{mask_secrets, FfmpegCommandBuilder};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader};
@@ -14,6 +14,31 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// How much of a file to read when measuring its keyframe spacing.
+///
+/// Long enough to see several keyframes at any sane interval, short enough
+/// that it is a seek and an index read rather than a scan of the whole file.
+const KEYFRAME_WINDOW_SECS: u32 = 60;
+
+/// Decide what this file needs, measuring keyframe spacing only when it could
+/// change the answer (§2, §7, §8).
+///
+/// Public so the batch layer can ask the same question before it starts, to
+/// show the user what is about to happen and to do the instant files first.
+pub fn plan_for(
+    builder: &FfmpegCommandBuilder,
+    source: &Path,
+    info: &MediaInfo,
+    profile: OutputProfile,
+) -> TranscodePlan {
+    let provisional = plan_transcode(info, profile, None);
+    if provisional.video.is_copy() {
+        plan_transcode(info, profile, probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS))
+    } else {
+        provisional
+    }
+}
 
 /// Progress for one file, and for the batch as a whole (§9).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +52,14 @@ pub struct NormalizeProgress {
     pub remaining_files: usize,
     /// Rough estimate of the bytes the whole batch will add to the cache.
     pub estimated_cache_bytes: u64,
+    /// What is being done to this file, in the user's language (§10).
+    pub mode_label: String,
+    /// Seconds of video produced per second of wall clock, so far.
+    pub speed_x: f64,
+    /// Estimated seconds left for the whole batch. Negative means unknown.
+    pub eta_secs: f64,
+    /// The encoder doing the work, for the "최적화 엔진" line (§4).
+    pub engine_label: String,
 }
 
 /// Cancellation token for the "중단" button (§9).
@@ -53,7 +86,7 @@ pub fn percent_from_out_time(out_time_us: u64, total_secs: f64) -> f64 {
     ((out_time_us as f64 / 1_000_000.0) / total_secs * 100.0).clamp(0.0, 100.0)
 }
 
-/// Outcome of normalizing one file.
+/// Outcome of normalizing one file, with what it cost (§1).
 #[derive(Debug, Clone)]
 pub struct NormalizeOutcome {
     pub output_path: PathBuf,
@@ -62,6 +95,67 @@ pub struct NormalizeOutcome {
     pub bytes: u64,
     /// True when an existing cache entry was reused (§8).
     pub from_cache: bool,
+    /// Which streams were copied and which were encoded.
+    pub plan: TranscodePlan,
+    /// Wall-clock time spent, including the probe.
+    pub elapsed_secs: f64,
+    /// What actually encoded the video: an encoder name, or "copy".
+    pub video_encoder: String,
+    /// Output seconds produced per second of wall clock. 1.0 is real time.
+    pub speed_x: f64,
+    /// Video frames written per second of wall clock.
+    pub avg_encode_fps: f64,
+}
+
+/// What the user is told is happening to a file (§2, §10).
+pub fn mode_label_ko(plan: &TranscodePlan) -> &'static str {
+    match (plan.video.is_copy(), plan.audio.is_copy()) {
+        (true, true) => "이미 방송에 최적화된 영상입니다 · 추가 변환 없음",
+        (true, false) => "소리만 변환 중",
+        (false, true) => "화면만 변환 중",
+        (false, false) => "화면과 소리 변환 중",
+    }
+}
+
+/// The encoder in the words the Settings page uses (§4).
+pub fn engine_label_ko(encoder: &str) -> &'static str {
+    match encoder {
+        "h264_nvenc" => "NVIDIA GPU",
+        "h264_qsv" => "Intel Quick Sync",
+        "h264_amf" => "AMD GPU",
+        "h264_videotoolbox" => "Apple 하드웨어 가속",
+        "copy" => "변환 없음",
+        _ => "CPU",
+    }
+}
+
+impl NormalizeOutcome {
+    /// One line for the log: what was done, how fast, how big (§1).
+    ///
+    /// Carries no path and no user content — only the shape of the work — so
+    /// it is safe to write to a log a user may send us.
+    pub fn summary(&self, info: &MediaInfo, profile: OutputProfile) -> String {
+        format!(
+            "MEDIA_OPTIMIZE_DONE mode={} video={} audio={} in={}x{}@{:.2}fps/{} out={}x{}@{}fps \
+             dur={:.1}s took={:.2}s speed={:.1}x fps={:.0} size={} encoder={}",
+            self.plan.label(),
+            if self.plan.video.is_copy() { "copy" } else { "encode" },
+            if self.plan.audio.is_copy() { "copy" } else { "encode" },
+            info.width,
+            info.height,
+            info.fps,
+            if info.video_codec.is_empty() { "?" } else { &info.video_codec },
+            profile.width(),
+            profile.height(),
+            profile.fps(),
+            self.duration_secs,
+            self.elapsed_secs,
+            self.speed_x,
+            self.avg_encode_fps,
+            crate::system::format_bytes(self.bytes),
+            self.video_encoder,
+        )
+    }
 }
 
 /// Normalize one file into the cache, reusing an existing entry when valid.
@@ -78,6 +172,7 @@ pub fn normalize_one(
     cancel: &CancelToken,
     mut on_progress: impl FnMut(f64),
 ) -> Result<NormalizeOutcome> {
+    let started = std::time::Instant::now();
     if let Some(meta) = cache.lookup(media_hash, profile) {
         on_progress(100.0);
         return Ok(NormalizeOutcome {
@@ -87,6 +182,16 @@ pub fn normalize_one(
                 .map(|m| m.len())
                 .unwrap_or(0),
             from_cache: true,
+            plan: TranscodePlan {
+                video: crate::media::probe::StreamPlan::Copy,
+                audio: crate::media::probe::StreamPlan::Copy,
+                video_reasons: Vec::new(),
+                audio_reasons: Vec::new(),
+            },
+            elapsed_secs: started.elapsed().as_secs_f64(),
+            video_encoder: meta.encoder,
+            speed_x: f64::INFINITY,
+            avg_encode_fps: 0.0,
         });
     }
     if !source.is_file() {
@@ -101,7 +206,12 @@ pub fn normalize_one(
     let _ = std::fs::remove_file(&tmp_path);
 
     let target = info.snapped_duration(profile);
-    let args = builder.build_normalize_args(source, &tmp_path, target, info.has_audio);
+
+    // What actually has to be re-encoded (§2, §7, §8). The keyframe spacing is
+    // only measured when the video would otherwise be copied, so a file headed
+    // for a full encode does not pay for the extra probe.
+    let plan = plan_for(builder, source, info, profile);
+    let args = builder.build_normalize_args(source, &tmp_path, target, info.has_audio, &plan);
 
     let mut child = builder
         .command(&args)
@@ -156,6 +266,8 @@ pub fn normalize_one(
         return Err(LouverError::with_detail(ErrorCode::MediaNormalizeFailed, detail));
     }
 
+    let video_encoder = if plan.video.is_copy() { "copy".to_string() } else { builder.encoder().to_string() };
+
     std::fs::rename(&tmp_path, &final_path)?;
     let bytes = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
     if bytes == 0 {
@@ -173,14 +285,25 @@ pub fn normalize_one(
             profile: profile.id().to_string(),
             duration_secs: target,
             created_at: chrono::Utc::now().to_rfc3339(),
-            encoder: builder.encoder().to_string(),
+            encoder: video_encoder.clone(),
             app_version: env!("CARGO_PKG_VERSION").to_string(),
         },
         profile,
     )?;
 
     on_progress(100.0);
-    Ok(NormalizeOutcome { output_path: final_path, duration_secs: target, bytes, from_cache: false })
+    let elapsed = started.elapsed().as_secs_f64();
+    Ok(NormalizeOutcome {
+        output_path: final_path,
+        duration_secs: target,
+        bytes,
+        from_cache: false,
+        plan,
+        elapsed_secs: elapsed,
+        video_encoder,
+        speed_x: if elapsed > 0.0 { target / elapsed } else { f64::INFINITY },
+        avg_encode_fps: if elapsed > 0.0 { target * f64::from(profile.fps()) / elapsed } else { 0.0 },
+    })
 }
 
 #[cfg(test)]
