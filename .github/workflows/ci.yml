@@ -105,6 +105,39 @@ jobs:
             soak-results/
           retention-days: 7
 
+  # The release path for the FFmpeg sidecars, run on every push instead of
+  # first on a tag. Both v1.0.0 release failures lived in these three steps —
+  # a macOS archive that has never contained ffprobe, and a Windows
+  # provenance file looked for under a name nothing writes — and neither
+  # could show up in the job above, which is allowed to fall back to the
+  # runner's own FFmpeg. Same composite action the release uses, so they
+  # cannot drift apart again. No compile, so it costs a minute or two.
+  sidecars:
+    name: sidecars (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Place and check the FFmpeg sidecars
+        uses: ./.github/actions/sidecars
+        with:
+          target: ${{ matrix.target }}
+
   bundle:
     name: bundle (${{ matrix.os }})
     needs: verify

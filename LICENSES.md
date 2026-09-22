@@ -75,6 +75,12 @@ Sources `scripts/fetch-ffmpeg.mjs` downloads:
 | macOS Apple Silicon | [osxexperts.net](https://www.osxexperts.net/) | GPL v3 |
 | Linux x64 / arm64 | [johnvansickle.com](https://johnvansickle.com/ffmpeg/) static | GPL v3 |
 
+Both macOS providers publish **one download per tool**, so `ffprobe` is fetched
+from its own archive there; gyan.dev and johnvansickle ship both in one. The
+URLs a build actually used are written to `binaries/SOURCE-<triple>.txt` and
+`ffmpeg-manifest.mjs --check` refuses to release a binary whose source is not
+recorded.
+
 **Obligations when shipping a GPL build:**
 
 1. Ship this notice with the application.

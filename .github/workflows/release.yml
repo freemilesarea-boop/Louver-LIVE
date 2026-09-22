@@ -71,58 +71,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
-            librsvg2-dev libsoup-3.0-dev patchelf file desktop-file-utils \
+            librsvg2-dev libsoup-3.0-dev patchelf desktop-file-utils \
             xdg-utils fuse libfuse2
 
       - run: npm ci
 
-      # No development fallback in a release. If the download hosts cannot be
-      # reached the build fails here rather than shipping the runner's own
-      # FFmpeg, which is dynamically linked and would not run on a user's
-      # machine. --force so a cached workspace cannot supply a stale one.
-      - name: Fetch the FFmpeg sidecars
-        run: node scripts/fetch-ffmpeg.mjs --require-download --force --target ${{ matrix.target }}
-
-      # The licence, linkage, encoders, protocols and minimum version are read
-      # out of the binaries themselves. A build that fails this does not ship.
-      - name: Verify the FFmpeg sidecars
-        run: node scripts/ffmpeg-manifest.mjs --check
-
-      # The manifest checks what the binaries can do and whether they are
-      # self-contained. It cannot check that they are for the machine this
-      # installer is aimed at — a download served the wrong asset produces an
-      # installer that looks perfect and cannot spawn FFmpeg on the customer's
-      # computer. `file` reads the header and says.
-      - name: Check the sidecars are built for this target
-        shell: bash
-        run: |
-          set -euo pipefail
-          case "${{ matrix.target }}" in
-            x86_64-pc-windows-msvc)    want="PE32\+ executable.*x86-64" ;;
-            aarch64-apple-darwin)      want="Mach-O.*arm64" ;;
-            x86_64-apple-darwin)       want="Mach-O.*x86_64" ;;
-            x86_64-unknown-linux-gnu)  want="ELF 64-bit.*x86-64" ;;
-            *) echo "::error::no architecture expectation for ${{ matrix.target }}"; exit 1 ;;
-          esac
-          for name in ffmpeg ffprobe; do
-            bin=$(ls apps/desktop/src-tauri/binaries/$name-${{ matrix.target }}* )
-            got=$(file -b "$bin")
-            echo "$name: $got"
-            grep -Eq "$want" <<<"$got" || {
-              echo "::error::$name is not $want — it is: $got"
-              exit 1
-            }
-          done
-          # And it is the downloaded build, not the runner's own. The
-          # provenance file says which, and fetch-ffmpeg writes the marker.
-          for f in apps/desktop/src-tauri/binaries/SOURCE-*.txt; do
-            cat "$f"
-            grep -q "DEVELOPMENT ONLY" "$f" && {
-              echo "::error::$f is the development fallback and must not ship"
-              exit 1
-            }
-          done
-          echo "sidecars are the downloaded build for ${{ matrix.target }}"
+      # The three checks that decide whether this build may ship the FFmpeg
+      # it just downloaded. Shared with CI, which runs them on every push for
+      # all four targets: when they ran only here, a tag was the first thing
+      # to discover that macOS ships ffprobe in its own archive and that the
+      # Windows provenance file was being looked for under the wrong name.
+      - name: Place and check the FFmpeg sidecars
+        uses: ./.github/actions/sidecars
+        with:
+          target: ${{ matrix.target }}
 
       # Everything the product claims about itself, on the platform it is
       # about to be shipped for. A release is the wrong place to discover that
@@ -176,11 +138,19 @@ jobs:
           bin="target/${{ matrix.target }}/release/louver-desktop"
           [ -f "$bin" ] || bin="$bin.exe"
           [ -f "$bin" ] || { echo "::error::no binary at $bin"; exit 1; }
-          # Asked of the binary, with an empty environment, so the answer is
-          # the one a customer gets from Finder or the Start menu and not an
-          # echo of this runner's variables. Prints whether, never what, and
-          # exits non-zero when no client was compiled in.
-          env -i "$PWD/$bin" --credential-check
+          # Asked of the binary, with the runner's variables taken away, so
+          # the answer is the one a customer gets from Finder or the Start
+          # menu and not an echo of this build. Prints whether, never what,
+          # and exits non-zero when no client was compiled in.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # A Windows program will not start without SystemRoot, so there
+            # the two variables that could answer for the binary are removed
+            # rather than the whole environment replaced.
+            env -u LOUVER_GOOGLE_CLIENT_ID -u LOUVER_GOOGLE_CLIENT_SECRET \
+              "$PWD/$bin" --credential-check
+          else
+            env -i "$PWD/$bin" --credential-check
+          fi
           got=$?
           if [ "$EXPECTED" = "true" ] && [ "$got" -ne 0 ]; then
             echo "::error::the secrets are set but no OAuth client reached the binary"

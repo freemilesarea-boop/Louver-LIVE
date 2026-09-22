@@ -35,8 +35,8 @@ grep -n '"version"' package.json
 ### 2. 태그를 밀면 빌드가 시작됩니다
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.0.1
+git push origin v1.0.1
 ```
 
 네 개 러너가 동시에 돌고, 각자 이 순서를 지킵니다.
@@ -46,9 +46,19 @@ git push origin v1.0.0
    넣지 않습니다. 그 FFmpeg는 동적 링크라 사용자 컴퓨터에서 실행되지
    않습니다.
 2. 사이드카를 검사합니다 (라이선스·링크 방식·인코더·프로토콜·최소 버전).
-3. `npm run verify` 를 **그 플랫폼에서** 돌립니다.
-4. 설치 파일을 만듭니다.
-5. 설치 파일을 모읍니다. 하나도 안 만들어졌으면 실패합니다.
+3. 사이드카가 **이 플랫폼용 바이너리가 맞는지** 헤더를 직접 읽어 확인하고,
+   출처 기록이 개발용 대체본이 아닌지 확인합니다
+   (`node scripts/check-sidecars.mjs --target <triple>`).
+4. `npm run verify` 를 **그 플랫폼에서** 돌립니다.
+5. 설치 파일을 만듭니다.
+6. 빌드된 바이너리에 OAuth 클라이언트가 실제로 들어갔는지 물어봅니다
+   (`--credential-check`, 값은 절대 출력하지 않고 있음/없음만).
+7. 설치 파일을 모읍니다. 하나도 안 만들어졌으면 실패합니다.
+
+1~3번은 `.github/actions/sidecars` 하나에 들어 있고 **평소 CI도 네 플랫폼
+모두에서 같은 것을 돌립니다**. v1.0.0 태그가 macOS와 Windows에서 깨진 이유가
+정확히 이 단계들이 릴리스에서만 돌았기 때문입니다 — 태그를 밀기 전에
+CI의 `sidecars (…)` 네 개가 초록인지 먼저 보세요.
 
 네 개가 모두 끝나면 **초안(draft) GitHub Release**가 만들어지고 설치 파일이
 모두 붙습니다. 초안인 이유는 아래 "아직 확인되지 않은 것"을 사람이 직접
@@ -60,11 +70,11 @@ git push origin v1.0.0
 Actions 탭 → **Release artifacts** → **Run workflow** 에서
 
 - `publish` 를 **켜고**
-- `tag` 에 `v1.0.0` 처럼 원하는 태그를 적으면
+- `tag` 에 `v1.0.1` 처럼 원하는 태그를 적으면
 
 같은 네 개 빌드가 돌고 그 태그로 초안 Release가 만들어집니다. **초안
 Release는 공개(Publish)하는 순간 그 태그를 직접 만듭니다** — `git push
-origin v1.0.0` 이 필요 없습니다.
+origin v1.0.1` 이 필요 없습니다.
 
 ### 4. 시험 삼아 돌려보려면
 

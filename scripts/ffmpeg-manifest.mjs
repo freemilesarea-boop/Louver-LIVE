@@ -14,6 +14,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, readFileSync, writeFileSync, statSync } from 'node:fs'
 import { dirname, join, resolve, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { provenanceName, tripleOf } from './sidecar-sources.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const BIN_DIR = join(ROOT, 'apps/desktop/src-tauri/binaries')
@@ -101,7 +102,11 @@ function describe(path) {
   const wanted = ['libx264', 'libopenh264', 'h264_nvenc', 'h264_qsv', 'h264_amf', 'h264_videotoolbox', 'h264_mf', 'aac']
   const present = wanted.filter((e) => new RegExp(`\\b${e}\\b`).test(encoders))
 
-  const sourceFile = join(BIN_DIR, `SOURCE-${basename(path).replace(/^ffmpeg-/, '')}.txt`)
+  // `SOURCE-<triple>.txt`, with no `.exe`: dropping only the `ffmpeg-`
+  // prefix looked for `SOURCE-…-msvc.exe.txt` on Windows, found nothing, and
+  // reported the provider UNRECORDED — a release blocker that only a release
+  // runs into, since ordinary CI never checks the manifest.
+  const sourceFile = join(BIN_DIR, provenanceName(tripleOf(basename(path))))
   const provider = existsSync(sourceFile) ? readFileSync(sourceFile, 'utf8').trim() : 'UNRECORDED'
 
   const versionText = firstLine.replace('ffmpeg version ', '').split(' Copyright')[0]
@@ -159,8 +164,12 @@ for (const b of binaries) {
   console.log(`  version        ${d.version}`)
   console.log(`  provider       ${d.provider.split('\n')[0]}`)
   console.log(`  licence        ${d.licence.id}  (${d.licence.why})`)
+  // Three states, not two: `null` is "this platform has no ldd/otool", and
+  // printing that as DEPENDENT reads like a finding when nothing was looked at.
   console.log(
-    `  linkage        ${d.linkage.static ? 'self-contained' : 'DEPENDENT'} (${d.linkage.shared_libraries} shared libs, ${d.linkage.foreign_libraries ?? '?'} non-system)`,
+    d.linkage.static === null
+      ? `  linkage        undetermined (${d.linkage.note})`
+      : `  linkage        ${d.linkage.static ? 'self-contained' : 'DEPENDENT'} (${d.linkage.shared_libraries} shared libs, ${d.linkage.foreign_libraries ?? '?'} non-system)`,
   )
   console.log(`  H.264 encoders ${d.h264_encoders.join(', ') || 'NONE'}`)
   console.log(`  AAC            ${d.has_aac ? 'yes' : 'NO'}`)

@@ -1,0 +1,38 @@
+name: Release FFmpeg sidecars
+description: >
+  Download the licence-cleared FFmpeg build a release ships, and refuse
+  anything else. Shared by the release workflow and by CI, because when only
+  the release ran these steps the release was where their bugs were found.
+
+inputs:
+  target:
+    description: The Tauri target triple the sidecars are for.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # No development fallback in a release. If the download hosts cannot be
+    # reached the build fails here rather than shipping the runner's own
+    # FFmpeg, which is dynamically linked and would not run on a user's
+    # machine. --force so a cached workspace cannot supply a stale one.
+    - name: Fetch the FFmpeg sidecars
+      shell: bash
+      run: node scripts/fetch-ffmpeg.mjs --require-download --force --target ${{ inputs.target }}
+
+    # The licence, provenance, linkage, encoders, protocols and minimum
+    # version are read out of the binaries themselves. A build that fails
+    # this does not ship.
+    - name: Verify the FFmpeg sidecars
+      shell: bash
+      run: node scripts/ffmpeg-manifest.mjs --check
+
+    # The manifest checks what the binaries can do. This checks what they
+    # are: built for the machine this installer is aimed at, and the
+    # licence-cleared download rather than the runner's own FFmpeg. Node
+    # reads the ELF/Mach-O/PE header itself — the `file` program has to be
+    # installed on the Linux runner and is not in every Git for Windows, and
+    # the Windows release had never got this far to find out.
+    - name: Check the sidecars are the build this target ships
+      shell: bash
+      run: node scripts/check-sidecars.mjs --target ${{ inputs.target }}

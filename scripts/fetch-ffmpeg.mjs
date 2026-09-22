@@ -17,60 +17,23 @@
  *   node scripts/fetch-ffmpeg.mjs                  # host platform
  *   node scripts/fetch-ffmpeg.mjs --target <triple>
  *   node scripts/fetch-ffmpeg.mjs --require-download   # fail instead of falling back
+ *   node scripts/fetch-ffmpeg.mjs --url <u> --probe-url <u> --out <dir>
+ *
+ * The last three override where the archives come from and where the sidecars
+ * are put. They exist so the download path can be exercised against a local
+ * server — it is the part that has broken a release twice and the part no
+ * offline test could reach — and for anyone mirroring the builds internally.
  */
 import { execFileSync, spawnSync } from 'node:child_process'
 import {
-  existsSync, mkdirSync, copyFileSync, chmodSync, statSync, writeFileSync, readFileSync, readdirSync,
+  existsSync, mkdirSync, copyFileSync, chmodSync, statSync, writeFileSync, readFileSync, readdirSync, rmSync,
 } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { SOURCES, TOOLS, urlsFor, sidecarName, provenanceName } from './sidecar-sources.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-const OUT = join(ROOT, 'apps/desktop/src-tauri/binaries')
-
-/** Tauri target triples, and where an official static build comes from. */
-const SOURCES = {
-  'x86_64-pc-windows-msvc': {
-    url: 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip',
-    archive: 'zip',
-    exe: '.exe',
-    license: 'GPL v3 (gyan.dev release-essentials)',
-  },
-  'x86_64-apple-darwin': {
-    url: 'https://evermeet.cx/ffmpeg/getrelease/zip',
-    probeUrl: 'https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip',
-    archive: 'zip',
-    exe: '',
-    license: 'GPL v3 (evermeet.cx)',
-  },
-  'aarch64-apple-darwin': {
-    url: 'https://www.osxexperts.net/ffmpeg711arm.zip',
-    probeUrl: 'https://www.osxexperts.net/ffprobe711arm.zip',
-    archive: 'zip',
-    exe: '',
-    license: 'GPL v3 (osxexperts.net)',
-  },
-  // A *release* build, deliberately. BtbN's GitHub-hosted builds were tried
-  // as a second source, because johnvansickle rate-limits — but their `latest`
-  // is a master snapshot, and `looped_stream_copy_does_not_accumulate_av_drift`
-  // fails against it every run: one stall in thirty loop boundaries. For a
-  // playlist that loops all night that is the whole product, so the nightly is
-  // not an acceptable fallback and there is no second source. If this download
-  // fails, the build fails and says so — CI installs no system FFmpeg on Linux
-  // either, since ubuntu-22.04's is 4.4 and has no `-fps_mode` at all.
-  'x86_64-unknown-linux-gnu': {
-    url: 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz',
-    archive: 'tar.xz',
-    exe: '',
-    license: 'GPL v3 (johnvansickle.com static)',
-  },
-  'aarch64-unknown-linux-gnu': {
-    url: 'https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz',
-    archive: 'tar.xz',
-    exe: '',
-    license: 'GPL v3 (johnvansickle.com static)',
-  },
-}
+const DEFAULT_OUT = join(ROOT, 'apps/desktop/src-tauri/binaries')
 
 function hostTriple() {
   const { platform, arch } = process
@@ -86,46 +49,70 @@ function which(name) {
   return r.stdout.split(/\r?\n/)[0].trim() || null
 }
 
-function tryDownload(target, spec, tmp) {
-  console.log(`  downloading ${spec.url}`)
+/** Download one archive and unpack it into its own directory. Null if either fails. */
+function unpack(url, spec, tmp, slot) {
+  console.log(`  downloading ${url}`)
+  const archive = join(tmp, `archive-${slot}`)
   try {
-    execFileSync('curl', ['-fsSL', '--max-time', '300', '-o', join(tmp, 'ffmpeg-archive'), spec.url], {
+    execFileSync('curl', ['-fsSL', '--max-time', '300', '-o', archive, url], {
       stdio: ['ignore', 'ignore', 'pipe'],
     })
   } catch (e) {
     console.log(`  download unavailable: ${String(e.stderr || e.message).trim().slice(0, 160)}`)
-    return false
+    return null
   }
-  mkdirSync(join(tmp, 'x'), { recursive: true })
+  const dir = join(tmp, `x-${slot}`)
+  rmSync(dir, { recursive: true, force: true })
+  mkdirSync(dir, { recursive: true })
   try {
     if (spec.archive === 'zip') {
       try {
-        execFileSync('unzip', ['-q', '-o', join(tmp, 'ffmpeg-archive'), '-d', join(tmp, 'x')])
+        execFileSync('unzip', ['-q', '-o', archive, '-d', dir])
       } catch {
         // Windows has no unzip, but every Windows 10+ install has bsdtar,
         // which reads zip files.
-        execFileSync('tar', ['-xf', join(tmp, 'ffmpeg-archive'), '-C', join(tmp, 'x')])
+        execFileSync('tar', ['-xf', archive, '-C', dir])
       }
     } else {
-      execFileSync('tar', ['-xf', join(tmp, 'ffmpeg-archive'), '-C', join(tmp, 'x')])
+      execFileSync('tar', ['-xf', archive, '-C', dir])
     }
   } catch {
     console.log('  could not unpack the archive')
-    return false
+    return null
   }
+  return dir
+}
+
+/**
+ * Put both sidecars in place from the official build. Returns the URLs they
+ * came from, or null if any part could not be had.
+ *
+ * ffmpeg and ffprobe do not always travel together. gyan.dev and
+ * johnvansickle ship one archive holding both; evermeet.cx and osxexperts.net
+ * publish a separate download per tool, which is what `probeUrl` is for.
+ * Reading only `url` on those two meant the archive was fetched, searched for
+ * an ffprobe that was never in it, and the whole release failed at
+ * "ffprobe was not in the archive" — with the download itself working
+ * perfectly. CI never caught it because without --require-download the same
+ * miss silently falls through to the runner's own FFmpeg.
+ */
+function tryDownload(target, spec, tmp, out) {
+  const wanted = { ffmpeg: spec.url, ffprobe: spec.probeUrl ?? spec.url }
+  const unpacked = new Map()
   const found = {}
-  for (const name of ['ffmpeg', 'ffprobe']) {
-    const hit = findFile(join(tmp, 'x'), name + spec.exe)
+  for (const [name, url] of Object.entries(wanted)) {
+    if (!unpacked.has(url)) unpacked.set(url, unpack(url, spec, tmp, unpacked.size))
+    const dir = unpacked.get(url)
+    if (!dir) return null
+    const hit = findFile(dir, name + spec.exe)
     if (!hit) {
-      console.log(`  ${name}${spec.exe} was not in the archive`)
-      return false
+      console.log(`  ${name}${spec.exe} was not in ${url}`)
+      return null
     }
     found[name] = hit
   }
-  for (const name of ['ffmpeg', 'ffprobe']) {
-    install(found[name], target, name, spec.exe)
-  }
-  return true
+  for (const name of TOOLS) install(found[name], target, name, out)
+  return [...new Set(Object.values(wanted))]
 }
 
 /**
@@ -150,9 +137,9 @@ function findFile(dir, name) {
   return null
 }
 
-function install(from, target, name, exe) {
-  mkdirSync(OUT, { recursive: true })
-  const dest = join(OUT, `${name}-${target}${exe}`)
+function install(from, target, name, out) {
+  mkdirSync(out, { recursive: true })
+  const dest = join(out, sidecarName(name, target))
   copyFileSync(from, dest)
   if (process.platform !== 'win32') chmodSync(dest, 0o755)
   console.log(`  ${name} -> ${dest} (${(statSync(dest).size / 1e6).toFixed(1)} MB)`)
@@ -160,22 +147,25 @@ function install(from, target, name, exe) {
 
 function main() {
   const args = process.argv.slice(2)
-  const target = args.includes('--target') ? args[args.indexOf('--target') + 1] : hostTriple()
+  const flag = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : null)
+  const target = flag('--target') ?? hostTriple()
   const requireDownload = args.includes('--require-download')
-  const spec = SOURCES[target]
-  if (!spec) {
+  const base = SOURCES[target]
+  if (!base) {
     console.error(`unknown target triple: ${target}`)
     process.exit(1)
   }
+  const OUT = resolve(flag('--out') ?? DEFAULT_OUT)
+  const urls = urlsFor(target, flag('--url'))
+  const spec = { ...base, url: urls.ffmpeg, probeUrl: flag('--probe-url') ?? urls.ffprobe }
 
-  const exe = spec.exe
-  const already = ['ffmpeg', 'ffprobe'].every((n) => existsSync(join(OUT, `${n}-${target}${exe}`)))
+  const already = TOOLS.every((n) => existsSync(join(OUT, sidecarName(n, target))))
   // What the sidecars presently there actually are. A release must ship the
   // downloaded, licence-cleared static build; the development fallback is the
   // machine's own FFmpeg, dynamically linked against libraries a user's
   // computer does not have, so shipping one produces an app that cannot
   // broadcast at all.
-  const sourceFile = join(OUT, `SOURCE-${target}.txt`)
+  const sourceFile = join(OUT, provenanceName(target))
   const provenance = existsSync(sourceFile) ? readFileSync(sourceFile, 'utf8') : ''
   const isFallback = !provenance || provenance.includes('DEVELOPMENT ONLY')
 
@@ -194,8 +184,9 @@ function main() {
   mkdirSync(tmp, { recursive: true })
 
   for (const url of [spec.url, spec.fallbackUrl].filter(Boolean)) {
-    if (tryDownload(target, { ...spec, url }, tmp)) {
-      writeFileSync(join(OUT, `SOURCE-${target}.txt`), `${url}\n${spec.license}\n`)
+    const from = tryDownload(target, { ...spec, url }, tmp, OUT)
+    if (from) {
+      writeFileSync(join(OUT, provenanceName(target)), `${from.join('\n')}\n${base.license}\n`)
       console.log('done (downloaded)')
       return
     }
@@ -227,9 +218,9 @@ function main() {
     process.exit(1)
   }
   console.log('  download unavailable; using the system FFmpeg (development only)')
-  for (const name of ['ffmpeg', 'ffprobe']) install(sys[name], target, name, exe)
+  for (const name of TOOLS) install(sys[name], target, name, OUT)
   writeFileSync(
-    join(OUT, `SOURCE-${target}.txt`),
+    join(OUT, provenanceName(target)),
     `system PATH fallback: ${sys.ffmpeg}\nDEVELOPMENT ONLY - not licence-cleared for redistribution\n`,
   )
   console.log('done (system fallback)')

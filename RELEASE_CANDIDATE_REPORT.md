@@ -89,14 +89,15 @@ not YouTube, and this report never claims otherwise.
 
 ## 3. Build and static verification
 
-`npm run verify`, 10 of 10 steps:
+`npm run verify`, 11 of 11 steps:
 
 ```
-PASS  ffmpeg sidecar               PASS  rust fmt check
-PASS  secret scan                  PASS  rust clippy
-PASS  frontend typecheck           PASS  rust tests
-PASS  frontend lint                PASS  frontend build
-PASS  frontend tests               PASS  UI e2e tests
+PASS  ffmpeg sidecar               PASS  release tooling tests
+PASS  secret scan                  PASS  frontend build
+PASS  frontend typecheck           PASS  rust fmt check
+PASS  frontend lint                PASS  rust clippy
+PASS  frontend tests               PASS  rust tests
+PASS  UI e2e tests
 ```
 
 | Suite | Tests | Uses |
@@ -1032,3 +1033,80 @@ creation, Twitch, TikTok, scenes, camera, overlay, multi-stream and cloud.
 The rule the decision did not change: nothing in the YouTube module is reachable
 from the broadcast tick. `youtube_follow_broadcast` hands every network call to
 another thread, so the loop that keeps FFmpeg alive never waits on Google.
+
+
+---
+
+## v1.0.0 태그가 실패한 이유, 그리고 v1.0.1
+
+`v1.0.0` 태그를 밀었을 때 네 개 중 하나만 통과했습니다. 아래는 추측이 아니라
+GitHub Actions run `35681647451` 의 실제 로그입니다.
+
+| 플랫폼 | 결과 | 최초 실패 step | 실제 stderr |
+| --- | --- | --- | --- |
+| Linux x64 | **PASS** | — | 설치 파일까지 정상 |
+| macOS Apple Silicon | FAIL | `Fetch the FFmpeg sidecars` (exit 1) | `ffprobe was not in the archive` — `ffmpeg711arm.zip` 은 받아졌습니다 |
+| Windows x64 | FAIL | `Verify the FFmpeg sidecars` (exit 1) | `UNFIT ffmpeg-x86_64-pc-windows-msvc.exe: provider not recorded` |
+| macOS Intel | 대기 중 | — | macos-13 러너 배정이 계속 지연 |
+
+원인은 두 개이고, 둘 다 **릴리스에서만 도는 step** 안에 있었습니다.
+
+1. **macOS** — osxexperts.net 과 evermeet.cx 는 도구마다 zip 을 따로 냅니다.
+   `SOURCES` 표에는 `probeUrl` 이 있었는데 `tryDownload()` 가 그 값을 한 번도
+   읽지 않아서, ffmpeg 압축 파일 안에서 들어 있을 리 없는 ffprobe 를 찾다가
+   실패했습니다. 평소 CI 는 `--require-download` 없이 돌기 때문에 같은 실패가
+   조용히 러너의 brew FFmpeg 로 넘어가 초록으로 보였습니다.
+2. **Windows** — `fetch-ffmpeg.mjs` 는 출처를
+   `SOURCE-x86_64-pc-windows-msvc.txt` 로 적고, `ffmpeg-manifest.mjs` 는
+   `SOURCE-x86_64-pc-windows-msvc.exe.txt` 를 찾았습니다. `.exe` 가 붙는 건
+   Windows 뿐이라 Linux·macOS 에서는 드러나지 않고, manifest 검사 자체가
+   릴리스에만 있어서 평소 CI 는 한 번도 실행한 적이 없습니다.
+
+Node 20 deprecation 경고는 두 로그에 모두 있지만 **경고일 뿐이고 원인이
+아닙니다** — 두 job 모두 그 경고가 찍히기 전에 위 step 에서 exit 1 로
+끝났고, 초록으로 끝난 Linux job 에도 같은 경고가 있습니다.
+
+### 고친 방식
+
+숨기지 않았습니다. `--require-download`, manifest 검사, OAuth
+credential-check, 테스트 중 어느 것도 제거하거나 `continue-on-error` 로
+덮지 않았습니다.
+
+- 이름과 출처 표를 `scripts/sidecar-sources.mjs` 하나로 합쳐, 두 스크립트가
+  다시 어긋날 수 없게 했습니다.
+- `.github/actions/sidecars` 로 세 개 step 을 묶고 **평소 CI 가 네 플랫폼
+  모두에서 같은 것을 돌립니다**. 릴리스에서만 돌던 것이 문제였으니, 릴리스에서만
+  돌지 않게 한 것이 고침의 핵심입니다.
+- 아키텍처 확인을 `file` 프로그램 대신 ELF/Mach-O/PE 헤더를 직접 읽는
+  `scripts/check-sidecars.mjs` 로 바꿨습니다. `file` 은 Linux 러너에 따로
+  설치해야 하고 모든 Git for Windows 에 들어 있지도 않은데, Windows 릴리스는
+  거기까지 가본 적이 없어 확인된 적이 없었습니다.
+- Windows 의 `--credential-check` 는 `env -i` 대신 `LOUVER_GOOGLE_*` 두 개만
+  지웁니다. Windows 프로그램은 `SystemRoot` 없이는 아예 시작하지 못하므로
+  `env -i` 는 자격 증명과 무관한 이유로 실패할 수 있습니다.
+
+### 새로 잠근 것 (27개 테스트)
+
+| 무엇 | 어디 |
+| --- | --- |
+| macOS 는 ffprobe 를 별도 아카이브에서 받는다 | `scripts/sidecar-sources.test.mjs` |
+| 출처 파일 이름은 fetch 가 쓴 것과 manifest 가 찾는 것이 같다 | 같은 파일 |
+| 실제 다운로드 — 로컬 HTTP 서버에서 두 아카이브를 받아 사이드카 두 개를 놓는다 | `scripts/fetch-ffmpeg.test.mjs` |
+| ffprobe 가 없는 아카이브를 가리키면 **릴리스가 멈춘다** | 같은 파일 |
+| PE/Mach-O/ELF 헤더에서 아키텍처를 읽고, 맞는 플랫폼이 아니면 거부한다 | `scripts/binary-arch.test.mjs` |
+
+v1.0.0 당시 동작으로 되돌리면 이 중 네 개가 즉시 실패하는 것을 확인했습니다.
+
+### 이번에도 확인하지 못한 것
+
+| 항목 | 상태 |
+| --- | --- |
+| 네 플랫폼 릴리스 job 전부 초록 | **NOT TESTED** — 태그를 밀 권한이 없어 (`403 Resource not accessible by integration`) 아직 돌려보지 못했습니다. CI 의 `sidecars (…)` 네 개로 실패했던 step 들만 먼저 검증합니다 |
+| macOS Intel 릴리스 job | **NOT TESTED** — v1.0.0 에서 러너 배정을 못 받아 큐에 남아 있었습니다 |
+| `.dmg` 설치 후 Finder 에서 YouTube 계정 연결 | **NOT TESTED** — macOS 기기 없음 |
+| 실제 Google 예약 방송 | **NOT TESTED** — 계정·키 없음 |
+
+`v1.0.0` 태그는 **덮어쓰지 않았습니다**. 이미 커밋을 가리키고 있고, 태그를
+움직이면 그 태그를 이미 받아간 사람의 체크아웃과 어긋납니다. 다음 후보는
+`v1.0.1` 이고, 버전은 `package.json` · `tauri.conf.json` · `Cargo.toml` ·
+`package-lock.json` 네 곳 모두 1.0.1 로 맞췄습니다.

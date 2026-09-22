@@ -21,6 +21,9 @@ const STEPS = [
   { name: 'frontend lint', cmd: 'npm', args: ['run', '--silent', 'lint'] },
   { name: 'frontend tests', cmd: 'npx', args: ['vitest', 'run'] },
   { name: 'UI e2e tests', cmd: 'npx', args: ['vitest', 'run', '--config', 'vitest.e2e.config.ts'] },
+  // The scripts that place, check and ship the FFmpeg sidecars. They are only
+  // exercised for real by a release, which is where their mistakes were found.
+  { name: 'release tooling tests', cmd: 'npx', args: ['vitest', 'run', '--config', 'vitest.tooling.config.ts'] },
   // Before the Rust steps, not after them. `tauri::generate_context!()` reads
   // `frontendDist` at compile time and panics if `dist/` is not there, so on a
   // fresh checkout — which is what CI always is — clippy failed with

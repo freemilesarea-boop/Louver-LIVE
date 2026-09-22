@@ -1,7 +1,7 @@
 {
   "name": "louver-live",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.1",
   "type": "module",
   "description": "YouTube 음악 라이브 자동 송출 프로그램",
   "scripts": {
@@ -28,7 +28,8 @@
     "ffmpeg:manifest": "node scripts/ffmpeg-manifest.mjs",
     "soak:overnight": "node scripts/overnight-soak.mjs",
     "soak:report": "node scripts/soak-report.mjs",
-    "app": "node scripts/app.mjs"
+    "app": "node scripts/app.mjs",
+    "test:tooling": "vitest run --config vitest.tooling.config.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.1.1",
