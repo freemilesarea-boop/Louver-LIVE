@@ -15,6 +15,7 @@ import { existsSync, readdirSync, readFileSync, writeFileSync, statSync } from '
 import { dirname, join, resolve, basename } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { provenanceName, tripleOf } from './sidecar-sources.mjs'
+import { classify } from './linkage.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const BIN_DIR = join(ROOT, 'apps/desktop/src-tauri/binaries')
@@ -37,36 +38,11 @@ function licenceOf(config) {
 
 function linkage(path) {
   const os = process.platform
-  let out = ''
-  if (os === 'darwin') out = run('otool', ['-L', path])
-  else if (os === 'linux') out = run('ldd', [path])
-  else return { static: null, shared_libraries: null, note: 'not determined on this platform' }
-  if (/not a dynamic executable|statically linked/i.test(out)) {
-    return { static: true, shared_libraries: 0 }
-  }
-  const lines = out.split('\n').filter((l) => /=>|\.dylib|\.so/.test(l))
-  // Judged by *what* is linked, not how many. Every binary links the platform
-  // runtime — libc, libm, libpthread and friends — and counting those was
-  // scoring a genuinely self-contained build as unfit at nine of them while a
-  // build with eight codec libraries would have passed. What actually decides
-  // whether it runs on someone else's computer is whether it needs a library
-  // that computer has no reason to have: libavcodec, libx264, libvpx, libssl.
-  const SYSTEM = [
-    /\blibc\b/, /\blibm\b/, /\blibdl\b/, /\blibrt\b/, /\blibpthread\b/,
-    /\blibmvec\b/, /\blibgcc_s\b/, /\bld-linux/, /\blinux-vdso/, /\blibresolv\b/,
-    // macOS: the system frameworks and libSystem are present everywhere.
-    /\/usr\/lib\/libSystem/, /\/System\/Library\/Frameworks\//, /\blibiconv\b/,
-    /\blibc\+\+\b/, /\blibobjc\b/, /\blibz\b/, /\blibbz2\b/,
-  ]
-  const foreign = lines
-    .map((l) => l.trim())
-    .filter((l) => !SYSTEM.some((re) => re.test(l)))
-  return {
-    static: foreign.length === 0,
-    shared_libraries: lines.length,
-    foreign_libraries: foreign.length,
-    foreign: foreign.slice(0, 12),
-  }
+  if (os === 'darwin') return classify(run('otool', ['-L', path]))
+  if (os === 'linux') return classify(run('ldd', [path]))
+  // Windows has neither, and no PE import reader here has been tried against
+  // a real shipped binary, so this says nothing rather than guessing.
+  return classify('', { determined: false })
 }
 
 /**
