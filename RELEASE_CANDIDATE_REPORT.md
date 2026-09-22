@@ -1047,7 +1047,7 @@ GitHub Actions run `35681647451` 의 실제 로그입니다.
 | Linux x64 | **PASS** | — | 설치 파일까지 정상 |
 | macOS Apple Silicon | FAIL | `Fetch the FFmpeg sidecars` (exit 1) | `ffprobe was not in the archive` — `ffmpeg711arm.zip` 은 받아졌습니다 |
 | Windows x64 | FAIL | `Verify the FFmpeg sidecars` (exit 1) | `UNFIT ffmpeg-x86_64-pc-windows-msvc.exe: provider not recorded` |
-| macOS Intel | 대기 중 | — | macos-13 러너 배정이 계속 지연 |
+| macOS Intel | 시작조차 못 함 | — | `macos-13` 러너가 배정되지 않음 (1시간 넘게 queued) |
 
 원인은 두 개이고, 둘 다 **릴리스에서만 도는 step** 안에 있었습니다.
 
@@ -1097,12 +1097,38 @@ credential-check, 테스트 중 어느 것도 제거하거나 `continue-on-error
 
 v1.0.0 당시 동작으로 되돌리면 이 중 네 개가 즉시 실패하는 것을 확인했습니다.
 
+### macOS Intel: 코드가 아니라 러너 문제였습니다
+
+`macos-13` 은 **실패한 게 아니라 시작을 못 했습니다.** v1.0.0 태그에서 1시간
+넘게 queued 로 남아 step 을 하나도 실행하지 않았고, 이 브랜치에서도 같았습니다.
+추측하지 않고 확인했습니다 — CI 의 sidecars matrix 에 `macos-13` 과
+`macos-15-intel` 을 한 번에 넣어 같은 push 로 돌렸더니, `macos-15-intel` 은
+전체 job 을 끝냈고 `macos-13` 은 그때까지도 queued 였습니다. 그래서 릴리스의
+Intel 러너를 `macos-15-intel` 로 바꿨습니다.
+
+### 실제 러너에서 확인된 것 (CI run `35685056760`)
+
+| sidecars 대상 | 러너 | 결과 |
+| --- | --- | --- |
+| `aarch64-apple-darwin` | macos-14 | **success** — v1.0.0 에서 실패했던 대상 |
+| `x86_64-apple-darwin` | macos-15-intel | **success** |
+| `x86_64-pc-windows-msvc` | windows-latest | **success** — v1.0.0 에서 실패했던 대상 |
+| `x86_64-unknown-linux-gnu` | ubuntu-22.04 | **success** |
+| `x86_64-apple-darwin` | macos-13 | 같은 시각까지 **queued** |
+
+Apple Silicon 은 ffprobe 문제를 고치자 두 번째 문제가 드러났습니다: manifest 가
+`/usr/lib/libexpat.1.dylib` 을 "non-system library" 로 보고 빌드를 막았습니다.
+그 라이브러리는 모든 macOS 에 들어 있습니다 — 검사가 본 것은 옳고 판단이
+틀렸습니다. 이제 이름이 아니라 위치로 판단합니다: `/usr/lib` 와
+`/System/Library` 는 OS, `/opt/homebrew` · `/usr/local` · `@rpath` 는 아닙니다.
+Homebrew 로 링크된 빌드는 여전히 거부합니다.
+
 ### 이번에도 확인하지 못한 것
 
 | 항목 | 상태 |
 | --- | --- |
 | 네 플랫폼 릴리스 job 전부 초록 | **NOT TESTED** — 태그를 밀 권한이 없어 (`403 Resource not accessible by integration`) 아직 돌려보지 못했습니다. CI 의 `sidecars (…)` 네 개로 실패했던 step 들만 먼저 검증합니다 |
-| macOS Intel 릴리스 job | **NOT TESTED** — v1.0.0 에서 러너 배정을 못 받아 큐에 남아 있었습니다 |
+| macOS Intel 릴리스 job | **NOT TESTED** — 단, 사이드카 단계는 `macos-15-intel` 에서 통과했습니다 (아래) |
 | `.dmg` 설치 후 Finder 에서 YouTube 계정 연결 | **NOT TESTED** — macOS 기기 없음 |
 | 실제 Google 예약 방송 | **NOT TESTED** — 계정·키 없음 |
 

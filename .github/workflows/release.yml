@@ -37,7 +37,12 @@ jobs:
             os: macos-14           # arm64 runner
             target: aarch64-apple-darwin
           - label: macOS Intel
-            os: macos-13
+            # Not `macos-13`. That label was never given a runner: the v1.0.0
+            # tag's Intel job sat queued for over an hour without starting a
+            # step, and a CI run that asked for both labels at once had this
+            # one finish while `macos-13` was still waiting. Nothing in the
+            # job was wrong — there was no machine to run it on.
+            os: macos-15-intel
             target: x86_64-apple-darwin
           - label: Windows x64
             os: windows-latest

@@ -97,7 +97,7 @@ jobs:
   # runner's own FFmpeg. Same composite action the release uses, so they
   # cannot drift apart again. No compile, so it costs a minute or two.
   sidecars:
-    name: sidecars (${{ matrix.target }} on ${{ matrix.os }})
+    name: sidecars (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -105,15 +105,8 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-          # Two Intel labels on purpose, for one push. `macos-13` has not been
-          # given a runner twice now — queued over an hour on the v1.0.0 tag
-          # and again here, never starting a step — which is availability,
-          # not anything in this repository. `macos-15-intel` is the label
-          # that replaced it. Whichever one actually runs is the one the
-          # release should ask for; this is how to find out without spending
-          # a tag on the question. The loser comes out again.
-          - os: macos-13
-            target: x86_64-apple-darwin
+          # `macos-15-intel`, not `macos-13`: asked for both at once on one
+          # push, this one ran the whole job while `macos-13` never started.
           - os: macos-15-intel
             target: x86_64-apple-darwin
           - os: windows-latest
