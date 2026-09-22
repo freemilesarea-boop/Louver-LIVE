@@ -1,8 +1,7 @@
-//! Settings, stream key and licence commands (§15, §45, §46).
+//! Settings and stream key commands (§15, §45).
 
 use super::CmdResult;
 use crate::state::AppState;
-use louver_core::license::LicenseState;
 use louver_core::security::{key_hint, validate_stream_key};
 use louver_core::system::format_bytes;
 use louver_core::{settings_keys, OutputProfile};
@@ -19,7 +18,6 @@ pub struct SettingsView {
     pub minimize_to_tray: bool,
     pub auto_reconnect: bool,
     pub developer_mode: bool,
-    pub enforce_device_binding: bool,
     pub first_run_complete: bool,
     /// Playlist the user last worked with, restored on the next launch.
     pub active_playlist: Option<i64>,
@@ -37,7 +35,6 @@ pub struct SettingsView {
     pub hardware_encoder: String,
     pub logs_dir: String,
     pub app_version: String,
-    pub license: LicenseState,
     pub profiles: Vec<ProfileOption>,
 }
 
@@ -62,7 +59,6 @@ pub fn get_settings(state: State<'_, AppState>) -> CmdResult<SettingsView> {
         minimize_to_tray: flag(settings_keys::MINIMIZE_TO_TRAY, "true"),
         auto_reconnect: flag(settings_keys::AUTO_RECONNECT, "true"),
         developer_mode: state.developer_mode(),
-        enforce_device_binding: flag(settings_keys::ENFORCE_DEVICE_BINDING, "false"),
         first_run_complete: flag(settings_keys::FIRST_RUN_COMPLETE, "false"),
         active_playlist: db
             .get_setting(settings_keys::ACTIVE_PLAYLIST)
@@ -82,7 +78,6 @@ pub fn get_settings(state: State<'_, AppState>) -> CmdResult<SettingsView> {
         hardware_encoder: state.encoder.clone(),
         logs_dir: state.paths.logs_dir().to_string_lossy().into_owned(),
         app_version: louver_core::VERSION.to_string(),
-        license: state.license_state(),
         profiles: OutputProfile::all()
             .iter()
             .map(|p| ProfileOption { id: p.id().into(), label: p.label().into(), video_kbps: p.video_kbps() })
@@ -113,18 +108,4 @@ pub fn reveal_stream_key(state: State<'_, AppState>) -> CmdResult<String> {
 #[tauri::command]
 pub fn clear_stream_key(state: State<'_, AppState>) -> CmdResult<()> {
     state.keys.clear()
-}
-
-#[tauri::command]
-pub fn get_license(state: State<'_, AppState>) -> CmdResult<LicenseState> {
-    Ok(state.license_state())
-}
-
-/// Install a licence file the user picked (§46).
-#[tauri::command]
-pub fn install_license(state: State<'_, AppState>, path: String) -> CmdResult<LicenseState> {
-    std::fs::copy(&path, state.paths.license_file()).map_err(|e| {
-        louver_core::LouverError::with_detail(louver_core::ErrorCode::LicenseMalformed, e.to_string())
-    })?;
-    Ok(state.license_state())
 }

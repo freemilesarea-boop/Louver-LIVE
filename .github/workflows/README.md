@@ -23,14 +23,15 @@ None of them is optional in the sense that the result is the same —
 | --- | --- |
 | `LOUVER_GOOGLE_CLIENT_ID` | The OAuth client baked into the release, so a user never opens the Google Cloud console |
 | `LOUVER_GOOGLE_CLIENT_SECRET` | The same client's secret. Google refuses this desktop client's token exchange without it, so both are needed or neither works |
-| `LOUVER_LICENSE_PUBLIC_KEY` | Embedded at build time so issued licences verify (§46) |
 | `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID` | Signing and notarizing the macOS builds |
 | `WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD` | Signing the Windows installer |
 | `TAURI_SIGNING_PRIVATE_KEY` | Signs update bundles (§48) |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Passphrase for the above |
 
-The licence **private** key is never in CI, never in this repository, and never
-in `.env`. It lives offline and is used only by `tools/license-generator`.
+There is no licence key here any more. Louver Live had an in-app licence gate
+— a signed `license.json` had to be installed before a broadcast would start —
+and it is gone. Who may use the program is decided before the installer is
+handed over, so the app's job once it is running is to broadcast.
 
 The Google client secret is a secret here and nowhere else: it is compiled into
 the binary, which Google's own documentation allows for an installed app, and

@@ -26,7 +26,7 @@ on macOS hardware, so everything below stays **NOT TESTED**.
 npm ci
 node scripts/fetch-ffmpeg.mjs --require-download --force
 node scripts/ffmpeg-manifest.mjs --check     # must pass before bundling
-LOUVER_LICENSE_PUBLIC_KEY=<production public key> npx tauri build
+npx tauri build
 ```
 
 - [ ] `.dmg` and `.app` produced

@@ -231,13 +231,6 @@ export interface NormalizeProgress {
   estimated_cache_bytes: number
 }
 
-export interface LicenseState {
-  status: 'valid' | 'development' | 'missing' | 'invalid' | 'expired' | 'device_mismatch'
-  payload?: { license_id: string; product: string; edition: string; expires_at?: string | null } | null
-  message: string
-  device_binding_enforced: boolean
-}
-
 export interface ProfileOption {
   id: string
   label: string
@@ -253,7 +246,6 @@ export interface SettingsView {
   minimize_to_tray: boolean
   auto_reconnect: boolean
   developer_mode: boolean
-  enforce_device_binding: boolean
   first_run_complete: boolean
   active_playlist?: number | null
   cache_location: string
@@ -269,7 +261,6 @@ export interface SettingsView {
   hardware_encoder: string
   logs_dir: string
   app_version: string
-  license: LicenseState
   profiles: ProfileOption[]
 }
 
@@ -290,8 +281,6 @@ export interface DashboardMetrics {
   ffmpeg_ready: boolean
   ffprobe_ready: boolean
   stream_mode_label: string
-  license_label: string
-  license_is_development: boolean
 }
 
 export interface StreamEvent {

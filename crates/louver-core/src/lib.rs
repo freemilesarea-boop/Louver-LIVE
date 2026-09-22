@@ -20,7 +20,6 @@ pub mod clock;
 pub mod config;
 pub mod database;
 pub mod error;
-pub mod license;
 pub mod logging;
 pub mod media;
 pub mod runtime;
@@ -66,9 +65,6 @@ impl AppPaths {
     pub fn session_file(&self) -> std::path::PathBuf {
         self.data_dir.join("session.json")
     }
-    pub fn license_file(&self) -> std::path::PathBuf {
-        self.data_dir.join("license.json")
-    }
     pub fn manifest_file(&self) -> std::path::PathBuf {
         self.data_dir.join("current-playlist.txt")
     }
@@ -80,7 +76,25 @@ impl AppPaths {
         for d in [self.data_dir.clone(), self.cache_dir(), self.logs_dir(), self.dry_run_dir()] {
             std::fs::create_dir_all(d)?;
         }
+        self.discard_obsolete_license();
         Ok(())
+    }
+
+    /// Remove the licence file older versions kept here. Never fails.
+    ///
+    /// Louver Live had an in-app licence gate: a signed `license.json` had to
+    /// be present or a broadcast was refused. Who may use the program is now
+    /// decided before the installer changes hands, so the file means nothing
+    /// and nothing reads it. It is deleted because leaving a file that looks
+    /// like a credential in a user's data directory invites the question of
+    /// what it is for.
+    ///
+    /// Deliberately infallible. A read-only directory, a file held open by a
+    /// backup tool, a permission a user changed years ago — none of that is a
+    /// reason to refuse to start, because the file is already irrelevant. It
+    /// is tried once per launch and forgotten.
+    fn discard_obsolete_license(&self) {
+        let _ = std::fs::remove_file(self.data_dir.join("license.json"));
     }
 }
 
@@ -100,7 +114,6 @@ pub mod settings_keys {
     pub const HARDWARE_ENCODER: &str = "hardware_encoder";
     pub const ACTIVE_PLAYLIST: &str = "active_playlist";
     pub const FIRST_RUN_COMPLETE: &str = "first_run_complete";
-    pub const ENFORCE_DEVICE_BINDING: &str = "enforce_device_binding";
     pub const WARNED_ABOUT_UPTIME: &str = "warned_about_uptime";
     /// Whether this computer is watching the clock for scheduled broadcasts.
     ///
@@ -119,13 +132,37 @@ mod tests {
     #[test]
     fn app_paths_are_all_under_the_data_dir() {
         let p = AppPaths::new("/data/LouverLive");
-        for path in
-            [p.database(), p.cache_dir(), p.logs_dir(), p.session_file(), p.license_file(), p.manifest_file()]
-        {
+        for path in [p.database(), p.cache_dir(), p.logs_dir(), p.session_file(), p.manifest_file()] {
             assert!(path.starts_with("/data/LouverLive"), "{path:?} escaped the data dir");
         }
         assert!(p.database().ends_with("louver.db"));
         assert!(p.logs_dir().ends_with("logs"));
+    }
+
+    /// §9: a licence file left by an older install changes nothing.
+    #[test]
+    fn a_leftover_licence_file_is_removed_and_never_read() {
+        let d = tempfile::tempdir().unwrap();
+        let p = AppPaths::new(d.path().join("LouverLive"));
+        std::fs::create_dir_all(&p.data_dir).unwrap();
+        let stale = p.data_dir.join("license.json");
+        std::fs::write(&stale, b"{\"payload\":{},\"signature\":\"not-a-signature\"}").unwrap();
+
+        p.ensure().expect("a leftover licence must not stop the app starting");
+        assert!(!stale.exists(), "the obsolete licence file is still there");
+    }
+
+    /// And a licence file that cannot be deleted changes nothing either.
+    #[test]
+    fn a_licence_file_that_will_not_delete_does_not_stop_startup() {
+        let d = tempfile::tempdir().unwrap();
+        let p = AppPaths::new(d.path().join("LouverLive"));
+        std::fs::create_dir_all(&p.data_dir).unwrap();
+        // A directory by that name cannot be removed with remove_file, which
+        // stands in for every reason a delete fails on a real machine.
+        std::fs::create_dir(p.data_dir.join("license.json")).unwrap();
+
+        p.ensure().expect("a licence file that resists deletion must not stop startup");
     }
 
     #[test]

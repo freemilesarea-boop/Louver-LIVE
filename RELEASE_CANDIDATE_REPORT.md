@@ -976,13 +976,13 @@ Ordered by what retires the most risk.
    it should: this machine has only the dynamically linked development
    fallback. Note GPL v3 is generally read as incompatible with the Mac App
    Store.
-4. **Generate the production keys** — the Ed25519 licence keypair and the Tauri
-   updater keypair — and add them to CI as secrets. `SIGNING.md` has the
-   procedure. The private licence key is generated on your own machine and
-   stays offline; this repository neither creates nor stores one, and
-   `npm run secret-scan` fails the build if one appears. Until then
-   `license-generator verify-build` correctly reports that the build carries
-   the placeholder public key.
+4. **Generate the Tauri updater keypair** and add it to CI as a secret.
+   `SIGNING.md` has the procedure. The private half is generated on your own
+   machine and stays offline; this repository neither creates nor stores one,
+   and `npm run secret-scan` fails the build if one appears.
+
+   The licence keypair that used to be item 4 is no longer needed at all —
+   see the section on removing the in-app licence gate below.
 
 Not blockers, but do them before shipping: code-sign and notarize both
 platforms, and run a 24-hour soak on target-class hardware.
@@ -1460,3 +1460,60 @@ remux 보다 싼 경로는 없고, 있어서도 안 됩니다. `is_broadcast_rea
 
 `npm run verify` 11/11. concat + stream copy + loop + A/V sync + timestamp
 continuity 전부 통과, 여기에 위의 새 테스트가 더해졌습니다.
+
+## 앱 내부 라이선스 시스템 제거 (2026-09-22, v1.0.7)
+
+위 섹션 12와 A6, 그리고 17-4 는 당시의 기록이며 그대로 둡니다. 이 섹션이
+그것들을 대체합니다.
+
+### 왜
+
+판매 대상이 수강생 전용이고 구매 권한은 외부 시스템에서 통제합니다. 앱이
+스스로 구매 권한을 검증할 이유가 없습니다.
+
+그리고 실제로 **동작한 적이 없습니다.** `release.yml` 은
+`LOUVER_LICENSE_PUBLIC_KEY` 를 빌드에 넘긴 적이 없습니다 — `ci.yml` 에만
+있었고 릴리스 워크플로에는 없었습니다. `option_env!` 는 컴파일 시점에
+해석되므로, 지금까지 만들어진 모든 설치 파일은 플레이스홀더 공개키(32바이트
+전부 0)로 컴파일됐습니다. 그 키는 파싱에는 성공하고 **모든 서명을
+거부**합니다. 즉 라이선스 파일 없이는 `LL-LICENSE-001`, 파일을 넣으면
+`LL-LICENSE-002` — 어느 쪽이든 방송이 불가능했습니다.
+
+### 제거한 것
+
+| 대상 | 처리 |
+| --- | --- |
+| `preflight.rs` 의 라이선스 차단 | 삭제. `PreflightInput::license_allows_broadcast` 필드도 제거 |
+| `crates/louver-core/src/license/` | 모듈 전체 삭제 |
+| `tools/license-generator` | 크레이트 삭제, 워크스페이스 멤버에서 제외 |
+| `crates/louver-core/tests/rc_license.rs` | 삭제 |
+| `LL-LICENSE-001` ~ `005` | `ErrorCode` 와 README 표에서 제거 |
+| `LOUVER_LICENSE_PUBLIC_KEY` | `ci.yml` 에서 제거 (`release.yml` 에는 원래 없었음) |
+| `ed25519-dalek` | 워크스페이스 의존성에서 제거 |
+| 대시보드 `DEVELOPMENT LICENSE` 배지 | 삭제 |
+| 설정의 `라이선스` 카드·파일 등록 버튼 | 삭제 |
+| `get_license` / `install_license` 커맨드 | 삭제 |
+| `장치 바인딩 강제` 토글 · `enforce_device_binding` | 삭제 (라이선스 전용 설정이었음) |
+| `cfg!(debug_assertions)` 개발용 라이선스 특례 | 삭제. debug 와 release 가 동일하게 동작 |
+| `secret-scan.mjs` 의 `baked-license-key` 규칙 | 삭제. `license-signing-key.txt` 금지 규칙은 유지 |
+
+`base64`·`sha2`·`hex` 는 남겼습니다 — OAuth PKCE 와 미디어 캐시 해시가
+씁니다. 라이선스 전용이던 것은 `ed25519-dalek` 하나뿐이었습니다.
+
+### 기존 사용자 데이터
+
+`AppPaths::ensure()` 가 실행될 때마다 `<data_dir>/license.json` 을 한 번
+지우려 시도하고, **실패해도 무시합니다**. 읽기 전용 디렉터리든 백업 도구가
+잡고 있든 권한이 이상하든, 이미 의미 없는 파일 때문에 앱이 시작을 거부할
+이유가 없습니다. 두 테스트가 이걸 잠급니다:
+`a_leftover_licence_file_is_removed_and_never_read` 와
+`a_licence_file_that_will_not_delete_does_not_stop_startup`.
+
+### 유지한 것
+
+Google OAuth, Client ID/Secret 빌드 타임 주입, YouTube API, 스트림 키 보안,
+macOS Keychain, Windows Credential Manager, 코드 서명, FFmpeg 사이드카 검증 —
+전부 그대로입니다. 라이선스 제거와 무관한 영역입니다.
+
+`SIGNING.md` 는 이제 코드 서명만 다룹니다. 서명 인증서가 없으면 SmartScreen /
+Gatekeeper 경고가 나오지만 앱은 정상 동작합니다.

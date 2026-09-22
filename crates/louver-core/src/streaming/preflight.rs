@@ -87,7 +87,6 @@ pub struct PreflightInput<'a> {
     /// files.
     pub ffmpeg_can_broadcast: bool,
     pub ffmpeg_problems: &'a [String],
-    pub license_allows_broadcast: bool,
     /// Dry runs skip the network and key checks.
     pub dry_run: bool,
 }
@@ -237,15 +236,10 @@ pub fn run(input: &PreflightInput<'_>, net: &dyn NetworkChecker) -> PreflightRep
         }
     });
 
-    // Licence gate (§47) — not one of the seven, but it blocks RTMPS.
-    if !input.dry_run && !input.license_allows_broadcast {
-        checks.push(CheckResult::fail(
-            "license",
-            "라이선스",
-            ErrorCode::LicenseMissing.user_message(),
-            ErrorCode::LicenseMissing,
-        ));
-    }
+    // There is no licence gate here, and adding one back would be a mistake.
+    // Who may run Louver Live is decided before the installer is handed over;
+    // the program's job once it is running is to broadcast. A check here can
+    // only ever take a working broadcast off the air.
 
     let can_broadcast = !checks.iter().any(|c| c.outcome == CheckOutcome::Fail);
     PreflightReport { checks, can_broadcast }
@@ -298,7 +292,6 @@ mod tests {
             ffmpeg_version: Some("ffmpeg version 6.1.1"),
             ffmpeg_can_broadcast: true,
             ffmpeg_problems: &[],
-            license_allows_broadcast: true,
             dry_run: false,
         }
     }
@@ -453,23 +446,25 @@ mod tests {
         assert_eq!(r.checks.iter().find(|c| c.id == "ingest").unwrap().outcome, CheckOutcome::Fail);
     }
 
+    /// §1: nothing about licensing may stop a broadcast, in either direction.
+    ///
+    /// The check that used to live here failed with LL-LICENSE-001 on a
+    /// machine with no `license.json`, which is every machine now. Selling is
+    /// controlled before the installer changes hands, so preflight answers one
+    /// question only: can this playlist go on air right now.
     #[test]
-    fn no_licence_blocks_rtmps_but_allows_a_dry_run() {
+    fn nothing_about_licensing_can_block_a_broadcast() {
         let d = tempfile::tempdir().unwrap();
         let f = d.path().join("a.mp4");
         std::fs::write(&f, b"x").unwrap();
         let m = vec![media_at(&f, MediaStatus::Normalized)];
-        let mut i = good_input(&m);
-        i.license_allows_broadcast = false;
-        let r = run(&i, &Net(true));
-        assert!(!r.can_broadcast, "§47: broadcasting requires a licence");
-        assert_eq!(
-            r.checks.iter().find(|c| c.id == "license").unwrap().code.as_deref(),
-            Some("LL-LICENSE-001")
+        let r = run(&good_input(&m), &Net(true));
+        assert!(r.can_broadcast, "{:?}", r.first_failure());
+        assert!(!r.checks.iter().any(|c| c.id == "license"), "preflight still reports a licence check",);
+        assert!(
+            !r.checks.iter().any(|c| c.code.as_deref().is_some_and(|x| x.starts_with("LL-LICENSE"))),
+            "an LL-LICENSE-* code survived in preflight",
         );
-
-        i.dry_run = true;
-        assert!(run(&i, &Net(true)).can_broadcast, "dev/testing must not need a licence");
     }
 
     /// Matching the profile is not the same as being prepared.

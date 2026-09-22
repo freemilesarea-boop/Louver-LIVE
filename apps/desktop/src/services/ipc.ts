@@ -11,7 +11,7 @@
  * packaged binary.
  */
 import type {
-  AddResult, DashboardMetrics, LicenseState, LouverError,
+  AddResult, DashboardMetrics, LouverError,
   Media, Playlist, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
   SettingsView, StreamDiagnostics, StreamEvent, SchedulerStatusView,
   BroadcastMetadata, BroadcastPreset, ChatMessage, ChatSettings, ChatStatus,
@@ -139,8 +139,6 @@ export const api = {
   setStreamKey: (key: string) => call<void>('set_stream_key', { key }),
   revealStreamKey: () => call<string>('reveal_stream_key'),
   clearStreamKey: () => call<void>('clear_stream_key'),
-  getLicense: () => call<LicenseState>('get_license'),
-  installLicense: (path: string) => call<LicenseState>('install_license', { path }),
 
   // system
   getMetrics: () => call<DashboardMetrics>('get_metrics'),
@@ -199,15 +197,6 @@ export async function pickVideoFiles(): Promise<string[]> {
     return Array.isArray(r) ? r : [r]
   }
   return call<string[]>('__pick_files')
-}
-
-export async function pickLicenseFile(): Promise<string | null> {
-  if (isTauri()) {
-    const { open } = await import('@tauri-apps/plugin-dialog')
-    const r = await open({ multiple: false, filters: [{ name: '라이선스', extensions: ['json'] }] })
-    return typeof r === 'string' ? r : null
-  }
-  return call<string | null>('__pick_license')
 }
 
 /**

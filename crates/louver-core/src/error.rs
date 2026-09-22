@@ -42,12 +42,6 @@ pub enum ErrorCode {
     // LL-SEC-0xx
     SecretStoreUnavailable,
     SecretNotFound,
-    // LL-LICENSE-0xx
-    LicenseMissing,
-    LicenseInvalidSignature,
-    LicenseMalformed,
-    LicenseExpired,
-    LicenseDeviceMismatch,
     // LL-SCHED-0xx
     // LL-YOUTUBE-0xx / LL-CHAT-0xx
     YoutubeNotConnected,
@@ -103,11 +97,6 @@ impl ErrorCode {
             DbQuery => "LL-DB-003",
             SecretStoreUnavailable => "LL-SEC-001",
             SecretNotFound => "LL-SEC-002",
-            LicenseMissing => "LL-LICENSE-001",
-            LicenseInvalidSignature => "LL-LICENSE-002",
-            LicenseMalformed => "LL-LICENSE-003",
-            LicenseExpired => "LL-LICENSE-004",
-            LicenseDeviceMismatch => "LL-LICENSE-005",
             YoutubeNotConnected => "LL-YOUTUBE-001",
             YoutubeAuthExpired => "LL-YOUTUBE-002",
             YoutubeAuthRefreshFailed => "LL-YOUTUBE-AUTH-REFRESH",
@@ -163,11 +152,6 @@ impl ErrorCode {
             DbQuery => "데이터를 저장하거나 불러오지 못했습니다.",
             SecretStoreUnavailable => "이 컴퓨터의 보안 저장소를 사용할 수 없습니다.",
             SecretNotFound => "저장된 스트림 키가 없습니다.",
-            LicenseMissing => "라이선스가 없습니다. 방송을 시작하려면 라이선스를 등록해주세요.",
-            LicenseInvalidSignature => "라이선스 파일이 올바르지 않습니다.",
-            LicenseMalformed => "라이선스 파일을 읽을 수 없습니다.",
-            LicenseExpired => "라이선스가 만료되었습니다.",
-            LicenseDeviceMismatch => "이 라이선스는 다른 컴퓨터에 등록되어 있습니다.",
             YoutubeNotConnected => "YouTube 계정이 연결되지 않았습니다. 설정에서 연결해주세요.",
             YoutubeAuthExpired => "YouTube 로그인이 만료되었습니다. 설정에서 다시 연결해주세요.",
             YoutubeAuthRefreshFailed => {
@@ -291,11 +275,6 @@ pub const ALL_ERROR_CODES: &[ErrorCode] = {
         DbQuery,
         SecretStoreUnavailable,
         SecretNotFound,
-        LicenseMissing,
-        LicenseInvalidSignature,
-        LicenseMalformed,
-        LicenseExpired,
-        LicenseDeviceMismatch,
         YoutubeNotConnected,
         YoutubeAuthExpired,
         YoutubeAuthRefreshFailed,

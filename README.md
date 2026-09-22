@@ -224,7 +224,6 @@ SQLite, JSON, 로그 파일 어디에도 평문으로 저장되지 않습니다.
 | `LL-STREAM-008` | YouTube가 스트림 키를 거부함 | 설정에서 입력 |
 | `LL-NETWORK-001` | 인터넷 연결 없음 | 네트워크 확인 |
 | `LL-CONFIG-002` | FFmpeg 사이드카 없음 | 재설치, 또는 `npm run sidecar` |
-| `LL-LICENSE-001` | 라이선스 없음 | 설정 → 라이선스에서 등록 |
 
 ### 방송 중 화면이 `재연결 중`으로 바뀝니다
 
@@ -351,11 +350,6 @@ The user is not enabled for live streaming.
 | `LL-DB-003` | 데이터 조회/저장 실패 |
 | `LL-SEC-001` | 보안 저장소를 사용할 수 없음 |
 | `LL-SEC-002` | 저장된 스트림 키 없음 |
-| `LL-LICENSE-001` | 라이선스 없음 |
-| `LL-LICENSE-002` | 라이선스 서명이 올바르지 않음 |
-| `LL-LICENSE-003` | 라이선스 파일 형식 오류 |
-| `LL-LICENSE-004` | 라이선스 만료 |
-| `LL-LICENSE-005` | 다른 컴퓨터에 등록된 라이선스 |
 | `LL-SCHED-001` | 예약 시간이 올바르지 않음 |
 | `LL-SCHED-002` | 요일이 선택되지 않음 |
 | `LL-SCHED-003` | 예약에 연결된 플레이리스트를 찾을 수 없음 |

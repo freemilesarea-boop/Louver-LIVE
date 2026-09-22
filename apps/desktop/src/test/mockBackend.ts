@@ -9,7 +9,7 @@
  */
 import { emitLocal } from '@/services/ipc'
 import type {
-  DashboardMetrics, DiskEstimate, ImportResult, LicenseState, Media, Playlist,
+  DashboardMetrics, DiskEstimate, ImportResult, Media, Playlist,
   PlaylistItemView, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
   SettingsView, StreamEvent, StreamState, MetadataApplyState, MetadataOutcome,
   ProvisionStep, StepRecord, LouverError,
@@ -19,7 +19,6 @@ export interface MockOptions {
   /** Files the picker returns. */
   filesToPick?: string[]
   hasStreamKey?: boolean
-  licenseValid?: boolean
   /** Persisted settings carried across a simulated restart. */
   seedSettings?: Record<string, string>
   /** Simulate a machine where no browser can be opened. */
@@ -366,16 +365,7 @@ export function createMockBackend(opts: MockOptions = {}) {
       { id: 'ffmpeg', label: '방송 엔진', outcome: 'pass', detail: 'ffmpeg version 6.1.1', code: null },
       { id: 'ingest', label: '업로드 네트워크', outcome: 'pass', detail: 'a.rtmps.youtube.com:443 연결 가능', code: null },
     ]
-    if (!dryRun && opts.licenseValid === false) {
-      checks.push({ id: 'license', label: '라이선스', outcome: 'fail', detail: '라이선스가 없습니다', code: 'LL-LICENSE-001' })
-    }
     return { checks, can_broadcast: !checks.some((c) => c.outcome === 'fail') }
-  }
-
-  function licenseState(): LicenseState {
-    return opts.licenseValid === false
-      ? { status: 'missing', payload: null, message: '라이선스가 없습니다.', device_binding_enforced: false }
-      : { status: 'development', payload: null, message: '개발용 라이선스 (디버그 빌드 전용)', device_binding_enforced: false }
   }
 
   function settingsView(): SettingsView {
@@ -389,7 +379,6 @@ export function createMockBackend(opts: MockOptions = {}) {
       minimize_to_tray: flag('minimize_to_tray', 'true'),
       auto_reconnect: flag('auto_reconnect', 'true'),
       developer_mode: flag('developer_mode'),
-      enforce_device_binding: flag('enforce_device_binding'),
       first_run_complete: flag('first_run_complete'),
       active_playlist: settings.has('active_playlist') ? Number(settings.get('active_playlist')) : null,
       cache_location: '/data/LouverLive/cache',
@@ -405,7 +394,6 @@ export function createMockBackend(opts: MockOptions = {}) {
       hardware_encoder: 'libx264',
       logs_dir: '/data/LouverLive/logs',
       app_version: '1.0.0',
-      license: licenseState(),
       profiles: [
         { id: '1080p30', label: '1080p30 (권장)', video_kbps: 10000 },
         { id: '720p30', label: '720p30 (저대역폭)', video_kbps: 4000 },
@@ -751,8 +739,6 @@ export function createMockBackend(opts: MockOptions = {}) {
       return streamKey
     },
     clear_stream_key: () => { streamKey = null },
-    get_license: () => licenseState(),
-    install_license: () => licenseState(),
 
     // --- youtube (V2) ---
     youtube_status: () => ({
@@ -911,8 +897,6 @@ export function createMockBackend(opts: MockOptions = {}) {
       stream_mode_label: (settings.get('stream_mode') ?? 'stream_copy') === 'stream_copy'
         ? 'STREAM COPY'
         : 'COMPATIBILITY ENCODE',
-      license_label: '개발용',
-      license_is_development: true,
     }),
     recent_events: () => events.slice(0, 100),
     read_log: () => ['2026-03-02 20:00:00.000 [INFO] 방송 시작: Night Jazz', '2026-03-02 20:00:01.120 [INFO] 방송이 시작되었습니다'],
@@ -933,7 +917,6 @@ export function createMockBackend(opts: MockOptions = {}) {
 
     // --- picker stand-ins ---
     __pick_files: () => opts.filesToPick ?? ['/videos/night01.mp4', '/videos/night02.mp4', '/videos/night03.mp4'],
-    __pick_license: () => '/tmp/license.json',
     __reveal: () => undefined,
     __open_url: () => {
       // A machine with no browser, or a denied capability, is a real case: the

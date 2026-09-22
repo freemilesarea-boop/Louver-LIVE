@@ -212,10 +212,11 @@ minimum hardware spec. The 24-hour claim in §65 is *projected* from a flat
    `--require-download`. See [LICENSES.md](LICENSES.md), which also flags that
    the intended builds are **GPL v3** and that this needs legal review before
    commercial distribution.
-4. **The licence public key is a placeholder.** `LICENSE_PUBLIC_KEY_B64`
-   defaults to zeros, so no real licence verifies until a build sets
-   `LOUVER_LICENSE_PUBLIC_KEY`. Debug builds grant a development licence;
-   release builds do not.
+4. **There is no in-app licence check, by design.** The Ed25519 gate this
+   report described was removed: it refused a broadcast unless a signed
+   `license.json` was installed, and no release build ever carried a real
+   public key, so it refused every broadcast. Who may use Louver Live is
+   decided before the installer changes hands.
 5. **The updater is designed, not deployed.** `tauri.conf.json` has
    `updater.active: false` and a placeholder pubkey. §48 asks for the structure
    only, which exists.

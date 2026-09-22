@@ -182,13 +182,4 @@ impl AppState {
     pub fn developer_mode(&self) -> bool {
         self.db.get_setting_or(settings_keys::DEVELOPER_MODE, "false") == "true" || cfg!(debug_assertions)
     }
-
-    pub fn license_state(&self) -> louver_core::license::LicenseState {
-        louver_core::license::load_state(
-            &self.paths.license_file(),
-            self.db.get_setting_or(settings_keys::ENFORCE_DEVICE_BINDING, "false") == "true",
-            // DEV_LICENSE is compiled out of release builds (§46).
-            cfg!(debug_assertions),
-        )
-    }
 }

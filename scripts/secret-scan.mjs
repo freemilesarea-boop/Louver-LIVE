@@ -149,16 +149,10 @@ for (const f of FORBIDDEN) {
   }
 }
 
-// The compiled-in licence key must still be the placeholder in source.
-const lic = readFileSync(join(ROOT, 'crates/louver-core/src/license/mod.rs'), 'utf8')
-if (!lic.includes('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=')) {
-  findings.push({
-    rule: 'baked-license-key',
-    why: 'a real licence public key appears to be hard-coded; it must come from LOUVER_LICENSE_PUBLIC_KEY at build time',
-    where: 'crates/louver-core/src/license/mod.rs',
-    sample: '',
-  })
-}
+// There is no compiled-in licence key to check any more: the in-app licence
+// gate is gone and nothing verifies a `license.json`. `license-signing-key.txt`
+// stays in FORBIDDEN above regardless — a private key does not become safe to
+// commit because the code that used it was deleted.
 
 console.log('\n' + '─'.repeat(60))
 if (!findings.length) {

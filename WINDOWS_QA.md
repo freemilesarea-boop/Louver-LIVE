@@ -21,7 +21,7 @@ does it.
 npm ci
 node scripts/fetch-ffmpeg.mjs --require-download --force
 node scripts/ffmpeg-manifest.mjs --check     # must pass before bundling
-$env:LOUVER_LICENSE_PUBLIC_KEY="<production public key>"; npx tauri build
+npx tauri build
 ```
 
 - [ ] `.msi` and NSIS `.exe` produced

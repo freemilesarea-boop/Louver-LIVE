@@ -186,6 +186,13 @@ fn harness(now: &str) -> Harness {
     Harness { _dir: dir, db, clock, launcher, events, rt, playlist_id, session_store }
 }
 
+impl Harness {
+    /// The data directory this run is using, so a test can put a file in it.
+    fn dir(&self) -> std::path::PathBuf {
+        self._dir.path().to_path_buf()
+    }
+}
+
 /// Save a schedule *and* switch this computer on to watch the clock.
 ///
 /// The two are separate on purpose — see `schedule_only` — and almost every
@@ -235,6 +242,62 @@ const MON: &str = "2026-03-02";
 const TUE: &str = "2026-03-03";
 
 // ---------------------------------------------------------------------------
+
+/// §8 A, B and C in one: this machine has no licence and never will.
+///
+/// Louver Live used to refuse a broadcast unless a signed `license.json` sat
+/// in the data directory. Who may run the program is decided before the
+/// installer is handed over now, so the file is gone and so is the check —
+/// but the way to be sure of that is not to read the diff. It is to put a
+/// broken licence file exactly where the old code looked, start the app the
+/// way the app starts, and broadcast both ways.
+#[test]
+fn a_machine_with_no_licence_broadcasts_manually_and_on_schedule() {
+    let mut h = harness(&format!("{MON} 19:58:00"));
+
+    // C: whatever an older version left behind, at the path it used.
+    let data_dir = h.dir();
+    let stale = data_dir.join("license.json");
+    std::fs::write(&stale, b"{\"payload\":{\"license_id\":\"old\"},\"signature\":\"junk\"}").unwrap();
+
+    // Startup, as the desktop app performs it.
+    louver_core::AppPaths::new(&data_dir).ensure().expect("a stale licence must not stop startup");
+    assert!(!stale.exists(), "§9: the obsolete licence file should be gone");
+
+    // A: a manual broadcast, with nothing installed to permit it.
+    h.rt.start(StartOptions {
+        playlist_id: h.playlist_id,
+        reason: StartReason::Manual,
+        dry_run: false,
+        scheduled_end: None,
+        occurrence: None,
+        order_seed: Some(1),
+        skip_pre_start: false,
+    })
+    .expect("a manual broadcast must not need a licence");
+    assert_eq!(h.launcher.launch_count(), 1);
+    mark_connected(&mut h.rt);
+    assert_eq!(h.rt.state(), StreamState::Live);
+    h.rt.stop(true).unwrap();
+
+    // B: and the scheduler, which no one is watching, starts one too.
+    schedule(&mut h, DaysOfWeek::everyday(), "20:00", "08:00");
+    h.clock.set_str(&format!("{MON} 20:00:00"));
+    h.rt.tick();
+    assert!(h.rt.is_active(), "the schedule must start a broadcast without a licence");
+    assert_eq!(h.rt.status().start_reason, Some(StartReason::Scheduled));
+    mark_connected(&mut h.rt);
+
+    // F: and stops itself at the end of the window, as before.
+    h.clock.set_str(&format!("{TUE} 08:00:00"));
+    h.rt.tick();
+    assert!(!h.rt.is_active(), "the schedule did not stop the broadcast");
+
+    // Nothing anywhere in the run mentioned a licence.
+    let logs = h.events.logs();
+    assert!(!logs.contains("라이선스"), "a licence message reached the log:\n{logs}");
+    assert!(!logs.contains("LL-LICENSE"), "an LL-LICENSE-* code reached the log:\n{logs}");
+}
 
 #[test]
 fn a_manual_broadcast_starts_and_stops() {

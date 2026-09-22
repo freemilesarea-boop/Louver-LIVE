@@ -93,7 +93,6 @@ crates/louver-core/           no Tauri, no UI, fully testable
   runtime.rs                  the tick loop that ties it all together
   session/                    crash-safe state file + recovery decisions
   security/                   SecretStore trait, masking, ingest URL assembly
-  license/                    Ed25519 verification
   logging/                    rotating logs that mask on the way in
   system/                     metrics, disk, sleep/autostart traits
 

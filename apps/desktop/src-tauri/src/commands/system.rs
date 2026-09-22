@@ -24,10 +24,6 @@ pub struct DashboardMetrics {
     pub ffmpeg_ready: bool,
     pub ffprobe_ready: bool,
     pub stream_mode_label: String,
-    /// "정식" / "개발용" / "없음" — so a development licence is never mistaken
-    /// for a real one.
-    pub license_label: String,
-    pub license_is_development: bool,
 }
 
 #[tauri::command]
@@ -36,7 +32,6 @@ pub fn get_metrics(state: State<'_, AppState>) -> CmdResult<DashboardMetrics> {
     let m = state.metrics.lock().unwrap().sample(pid);
     let cache = state.cache.total_size();
     let free = available_disk_bytes(state.cache.root());
-    let license = state.license_state();
     Ok(DashboardMetrics {
         app_memory_label: format_bytes(m.app_memory_bytes),
         metrics: m,
@@ -57,13 +52,6 @@ pub fn get_metrics(state: State<'_, AppState>) -> CmdResult<DashboardMetrics> {
         }
         .label()
         .to_string(),
-        license_label: match license.status {
-            louver_core::license::LicenseStatus::Valid => "정식",
-            louver_core::license::LicenseStatus::Development => "개발용",
-            _ => "없음",
-        }
-        .to_string(),
-        license_is_development: license.status == louver_core::license::LicenseStatus::Development,
     })
 }
 

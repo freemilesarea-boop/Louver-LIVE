@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Eye, FolderOpen, ShieldAlert, ShieldCheck, Trash2 } from 'lucide-react'
+import { Eye, FolderOpen, Trash2 } from 'lucide-react'
 import { useAppStore } from '@/stores/useAppStore'
-import { api, openUrl, pickLicenseFile, revealPath } from '@/services/ipc'
+import { api, openUrl, revealPath } from '@/services/ipc'
 import { encoderLabel } from '@/services/format'
 import { Badge, Button, Card, Field, Input, Modal, Select, Toggle } from '@/components/ui'
 import type { QuotaReport, StreamDiagnostics, YoutubeStatus } from '@/types'
 
-/** Settings (§45), including the stream key and licence panels. */
+/** Settings (§45), including the stream key panel. */
 export function SettingsPage() {
   const { settings, refreshSettings, reportError, toast } = useAppStore()
   const [keyInput, setKeyInput] = useState('')
@@ -176,39 +176,6 @@ export function SettingsPage() {
         </div>
       </Card>
 
-      <Card title="라이선스">
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              {s.license.status === 'valid' || s.license.status === 'development' ? (
-                <ShieldCheck size={16} className="text-ok" />
-              ) : (
-                <ShieldAlert size={16} className="text-live" />
-              )}
-              <span className="text-sm text-ink-100">{s.license.message}</span>
-            </div>
-            {s.license.status !== 'valid' && s.license.status !== 'development' && (
-              <p className="mt-1.5 text-xs text-ink-500">
-                라이선스가 없어도 앱은 사용할 수 있지만, YouTube 송출은 시작할 수 없습니다.
-              </p>
-            )}
-          </div>
-          <Button
-            onClick={async () => {
-              const p = await pickLicenseFile()
-              if (!p) return
-              try {
-                await api.installLicense(p)
-                toast({ kind: 'success', message: '라이선스를 등록했습니다.' })
-                await refreshSettings()
-              } catch (e) { reportError(e) }
-            }}
-          >
-            라이선스 파일 등록
-          </Button>
-        </div>
-      </Card>
-
       <Card title="고급">
         <dl className="space-y-2 text-sm">
           <Row label="FFmpeg" value={s.ffmpeg_version ?? '찾을 수 없음 (LL-CONFIG-002)'} />
@@ -259,11 +226,6 @@ export function SettingsPage() {
               >
                 FFmpeg 크래시 시뮬레이션
               </Button>
-              <Toggle
-                label="장치 바인딩 강제"
-                checked={s.enforce_device_binding}
-                onChange={setFlag('enforce_device_binding')}
-              />
             </div>
           </div>
         )}

@@ -206,9 +206,6 @@ export function Dashboard() {
         <Ready label="Streaming Mode" value={metrics?.stream_mode_label ?? '—'} tone="ok" />
         <Ready label="FFmpeg" value={metrics?.ffmpeg_ready ? 'READY' : 'MISSING'} tone={metrics?.ffmpeg_ready ? 'ok' : 'bad'} />
         <Ready label="ffprobe" value={metrics?.ffprobe_ready ? 'READY' : 'MISSING'} tone={metrics?.ffprobe_ready ? 'ok' : 'bad'} />
-        {metrics?.license_is_development && (
-          <Badge tone="warn">DEVELOPMENT LICENSE</Badge>
-        )}
       </div>
 
       {/* Primary control (§26): the largest thing on the screen. */}

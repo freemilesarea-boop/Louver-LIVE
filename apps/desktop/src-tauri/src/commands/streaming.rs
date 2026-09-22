@@ -44,7 +44,6 @@ pub fn run_preflight(
             // `ffmpeg_ok` above already fails on — so this must not fail twice.
             ffmpeg_can_broadcast: state.ffmpeg_caps.as_ref().map(|c| c.can_broadcast()).unwrap_or(true),
             ffmpeg_problems: &ffmpeg_problems,
-            license_allows_broadcast: state.license_state().status.allows_broadcast(),
             dry_run,
         },
         &state.net,

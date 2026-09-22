@@ -180,8 +180,6 @@ pub fn run() {
             commands::settings::set_stream_key,
             commands::settings::reveal_stream_key,
             commands::settings::clear_stream_key,
-            commands::settings::get_license,
-            commands::settings::install_license,
             // system
             commands::system::get_metrics,
             commands::system::recent_events,

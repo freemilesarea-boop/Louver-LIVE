@@ -35,8 +35,8 @@ grep -n '"version"' package.json
 ### 2. 태그를 밀면 빌드가 시작됩니다
 
 ```bash
-git tag v1.0.6
-git push origin v1.0.6
+git tag v1.0.7
+git push origin v1.0.7
 ```
 
 **이 릴리스는 Windows 와 macOS 만 만듭니다.** Linux 는 CI 에서 계속
@@ -74,11 +74,11 @@ CI의 `sidecars (…)` 네 개가 초록인지 먼저 보세요 (CI 는 Linux �
 Actions 탭 → **Release artifacts** → **Run workflow** 에서
 
 - `publish` 를 **켜고**
-- `tag` 에 `v1.0.6` 처럼 원하는 태그를 적으면
+- `tag` 에 `v1.0.7` 처럼 원하는 태그를 적으면
 
 같은 네 개 빌드가 돌고 그 태그로 초안 Release가 만들어집니다. **초안
 Release는 공개(Publish)하는 순간 그 태그를 직접 만듭니다** — `git push
-origin v1.0.6` 이 필요 없습니다.
+origin v1.0.7` 이 필요 없습니다.
 
 ### 4. 시험 삼아 돌려보려면
 
