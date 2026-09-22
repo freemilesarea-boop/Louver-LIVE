@@ -1285,3 +1285,73 @@ integration`) 입니다. 그러므로 **v1.0.4 Release run 은 아직 존재하�
 
 `npm run verify` 는 1.0.4 에서 11/11 PASS 입니다. 그것이 이 환경에서
 실제로 확인된 전부입니다.
+
+## v1.0.4 Release run (`35707223493`, commit `24dc2c7`) — Windows
+
+| 플랫폼 | 결과 |
+| --- | --- |
+| macOS Apple Silicon | **PASS** — 설치 파일까지 |
+| Windows x64 | FAIL — `Place and check the FFmpeg sidecars` |
+
+Windows 는 Rust 도, Tauri 도, NSIS 도, WiX 도 건드리지 못했습니다. 7번째
+step 에서 **1.2 초** 만에 끝났습니다:
+
+```
+fetching FFmpeg sidecars for x86_64-pc-windows-msvc
+  downloading https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+  download unavailable: curl: (22) The requested URL returned error: 503
+FAILED: no static build could be downloaded, and --require-download was set.
+```
+
+서명과는 무관합니다 — `Export the signing material` step 은 실행조차 되지
+않았습니다(skipped). v1.0.2 의 WiX LGHT0311 과도 무관합니다. 같은 URL 이
+90분 전 v1.0.3 release job 을 정상적으로 서비스했고, 요청은 한 글자도
+바뀌지 않았습니다. **공급자가 503 을 냈습니다.**
+
+### 진짜 문제는 503 이 아니라, 한 번만 물어봤다는 것
+
+503 은 "지금은 안 되니 잠시 뒤에 다시"라는 뜻입니다. 그런데 다운로드
+경로에는 재시도가 없었습니다 — `main()` 의 루프는 `spec.fallbackUrl` 을
+읽지만 어떤 소스도 그 필드를 정의하지 않으므로 실제로는 한 번 돌고 끝
+입니다. 릴리스 전체가 일시적인 HTTP 상태 하나에 1.2 초 만에 무너졌습니다.
+
+이제 재시도합니다. **기다리면 해결될 수 있는 이유일 때만**:
+
+- `TRANSIENT_HTTP` = 408, 425, 429, 500, 502, 503, 504
+- `TRANSIENT_CURL` = 연결이 끊기거나 타임아웃한 curl 종료 코드
+- 대기 `0, 5, 20, 60` 초 — 네 번 시도한 뒤 정직하게 실패
+
+404 는 이 목록에 **일부러** 없습니다. 틀린 URL 은 열 번째에도 틀립니다.
+아카이브에 ffprobe 가 없는 경우도 마찬가지로 즉시 실패합니다 — 같은
+아카이브를 다시 받아봐야 같은 내용입니다.
+
+curl 자체 `--retry` 는 쓰지 않습니다. 두 곳에서 재시도하면 대기 시간을
+예측할 수 없고 **로그에 보이지 않습니다** — curl 은 조용히 재시도하므로
+1분을 기다린 job 이 즉시 실패한 job 과 로그상 구별되지 않습니다. 이제 모든
+시도는 `BACKOFF_SECS` 의 한 줄이자 로그의 한 줄입니다.
+
+### 무엇을 바꾸지 않았는가
+
+`--require-download` 그대로. manifest 검증, 아키텍처 검증, OAuth
+credential check, 테스트 전부 그대로. `continue-on-error` 없음. macOS 두
+job 의 설정은 한 글자도 건드리지 않았습니다 — Apple Silicon 은 이미
+초록이었고, 재시도는 첫 시도가 실패할 때만 동작하므로 성공하는 경로의
+동작은 바뀌지 않습니다.
+
+**Windows 미러 소스는 추가하지 않았습니다.** 이 컨테이너에서는 후보
+호스트에 접근할 수 없고(프록시가 차단) Windows 머신도 없어서, 받은 바이너리가
+`looped_stream_copy_does_not_accumulate_av_drift` 를 통과하는지 확인할 방법이
+없습니다. 검증하지 않은 FFmpeg 빌드를 사용자에게 배포하는 것은 빌드가
+한 번 실패하는 것보다 나쁩니다. 미러가 필요하다고 판단되면 그때 실제로
+검증한 뒤에 넣는 것이 맞습니다.
+
+### 이게 재현되는지 확인한 방법
+
+`scripts/fetch-ffmpeg.test.mjs` 에 로컬 HTTP 서버로 세 가지를 잠갔습니다:
+
+- `/flaky.tar` — 503 두 번 뒤 정상 아카이브. 다운로드가 성공하고
+  provenance 에 `DEVELOPMENT ONLY` 가 아닌 실제 URL 이 남습니다.
+- `/always-503.tar` — 계속 503. 정확히 세 번(설정한 대기 수만큼) 요청하고
+  실패하며, 시스템 FFmpeg 으로 넘어가지 않습니다.
+- `/gone.tar` — 404. 대기 시간을 600초로 설정해도 **한 번만** 요청하고
+  즉시 실패합니다. 재시도가 새면 이 테스트가 타임아웃으로 잡습니다.

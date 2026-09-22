@@ -18,6 +18,7 @@ const TARGET = 'x86_64-unknown-linux-gnu'
 let work
 let server
 let origin
+let attempts = {}
 
 /** A tar holding just `name`, the way a provider's archive holds just ffmpeg. */
 function archiveWith(names) {
@@ -39,10 +40,13 @@ function archiveWith(names) {
  * and a synchronous child blocks the event loop that would answer the request
  * — the script waits for a download that cannot arrive until it exits.
  */
-function fetchInto(out, extra = []) {
+function fetchInto(out, extra = [], env = {}) {
   const args = ['scripts/fetch-ffmpeg.mjs', '--require-download', '--force', '--target', TARGET, '--out', out]
   return new Promise((done, fail) => {
-    const child = spawn(process.execPath, [...args, ...extra], { encoding: 'utf8' })
+    const child = spawn(process.execPath, [...args, ...extra], {
+      encoding: 'utf8',
+      env: { ...process.env, ...env },
+    })
     let stdout = ''
     let stderr = ''
     child.stdout.on('data', (d) => (stdout += d))
@@ -60,7 +64,29 @@ beforeAll(async () => {
     '/both.tar': archiveWith(['ffmpeg', 'ffprobe']),
   }
   server = createServer((req, res) => {
-    const file = files[req.url]
+    const url = req.url.split('?')[0]
+    // Two 503s, then the archive — a provider having a bad minute, which is
+    // what gyan.dev did to the v1.0.4 Windows release.
+    if (url === '/flaky.tar') {
+      attempts.flaky = (attempts.flaky ?? 0) + 1
+      if (attempts.flaky <= 2) {
+        res.writeHead(503).end()
+        return
+      }
+      res.writeHead(200, { 'content-type': 'application/x-tar' }).end(readFileSync(files['/both.tar']))
+      return
+    }
+    if (url === '/always-503.tar') {
+      attempts.down = (attempts.down ?? 0) + 1
+      res.writeHead(503).end()
+      return
+    }
+    if (url === '/gone.tar') {
+      attempts.gone = (attempts.gone ?? 0) + 1
+      res.writeHead(404).end()
+      return
+    }
+    const file = files[url]
     if (!file) {
       res.writeHead(404).end()
       return
@@ -130,4 +156,77 @@ describe('placing the sidecars from a real download', () => {
     expect(r.stderr).toContain('--require-download')
     expect(existsSync(join(out, `ffmpeg-${TARGET}`))).toBe(false)
   })
+})
+
+/**
+ * The v1.0.4 Windows release failed here and nowhere else.
+ *
+ *   downloading https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+ *   download unavailable: curl: (22) The requested URL returned error: 503
+ *   FAILED: no static build could be downloaded, and --require-download was set.
+ *
+ * 1.2 seconds, one attempt, no retry — for a status whose whole meaning is
+ * "try again". The same URL had served the v1.0.3 release ninety minutes
+ * earlier. What follows is the line between a provider to wait for and a URL
+ * that is simply wrong; getting it backwards either ships nothing or wastes
+ * minutes on a 404.
+ */
+describe('a provider having a bad minute', () => {
+  it('waits and asks again when the answer was 503, and ships what finally arrives', async () => {
+    const out = join(work, 'out-flaky')
+    mkdirSync(out, { recursive: true })
+    attempts.flaky = 0
+    const r = await fetchInto(
+      out,
+      ['--url', `${origin}/flaky.tar`, '--probe-url', `${origin}/flaky.tar`],
+      { LOUVER_FETCH_BACKOFF: '0,1,1' },
+    )
+    expect(r.stdout + r.stderr).toContain('done (downloaded)')
+    expect(r.status).toBe(0)
+    expect(r.stdout).toContain('503')
+    expect(r.stdout).toContain('retryable')
+    expect(r.stdout).toContain('retrying in 1s')
+    for (const tool of ['ffmpeg', 'ffprobe']) {
+      expect(existsSync(join(out, `${tool}-${TARGET}`)), tool).toBe(true)
+    }
+    // The provenance is the real archive, not a note that something went wrong.
+    const source = readFileSync(join(out, `SOURCE-${TARGET}.txt`), 'utf8')
+    expect(source).toContain('/flaky.tar')
+    expect(source).not.toContain('DEVELOPMENT ONLY')
+  }, 30000)
+
+  it('gives up honestly, and does not ship the system FFmpeg, when it stays down', async () => {
+    const out = join(work, 'out-down')
+    mkdirSync(out, { recursive: true })
+    attempts.down = 0
+    const r = await fetchInto(
+      out,
+      ['--url', `${origin}/always-503.tar`, '--probe-url', `${origin}/always-503.tar`],
+      { LOUVER_FETCH_BACKOFF: '0,1,1' },
+    )
+    expect(r.status).toBe(1)
+    expect(r.stderr).toContain('--require-download')
+    expect(existsSync(join(out, `ffmpeg-${TARGET}`))).toBe(false)
+    // Exactly as many attempts as there are waits, because the script is now
+    // the only thing retrying. One would be the bug; forever would be worse.
+    expect(attempts.down).toBe(3)
+    expect(r.stdout).toContain('retrying in 1s (attempt 2 of 3)')
+    expect(r.stdout).toContain('retrying in 1s (attempt 3 of 3)')
+  }, 30000)
+
+  it('does not wait on a 404, because the URL is wrong however long you wait', async () => {
+    const out = join(work, 'out-gone')
+    mkdirSync(out, { recursive: true })
+    attempts.gone = 0
+    const r = await fetchInto(
+      out,
+      ['--url', `${origin}/gone.tar`, '--probe-url', `${origin}/gone.tar`],
+      // Minutes, so a retry here would be unmistakable in the elapsed time.
+      { LOUVER_FETCH_BACKOFF: '0,600,600' },
+    )
+    expect(r.status).toBe(1)
+    expect(r.stdout).not.toContain('retryable')
+    expect(r.stdout).not.toContain('retrying in')
+    expect(attempts.gone).toBe(1)
+  }, 20000)
 })
