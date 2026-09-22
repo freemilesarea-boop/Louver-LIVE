@@ -11,7 +11,7 @@
  * packaged binary.
  */
 import type {
-  AddResult, DashboardMetrics, DiskEstimate, ImportResult, LicenseState, LouverError,
+  AddResult, DashboardMetrics, LicenseState, LouverError,
   Media, Playlist, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
   SettingsView, StreamDiagnostics, StreamEvent, SchedulerStatusView,
   BroadcastMetadata, BroadcastPreset, ChatMessage, ChatSettings, ChatStatus,
@@ -76,14 +76,19 @@ export function emitLocal<T>(event: string, payload: T) {
 
 export const api = {
   // media
-  importMedia: (paths: string[]) => call<ImportResult>('import_media', { paths }),
-  /** Add and prepare in one call, so no second button exists (§1, §5). */
+  /**
+   * Add and prepare in one call, so no second button exists (§1, §5).
+   *
+   * There is no `importMedia` beside this one. `import_media` and
+   * `estimate_optimization` are still Rust commands — `add_media` calls the
+   * first and `optimize_media` calls the second for its disk guard — but
+   * nothing in the UI reaches either directly any more, and a binding no
+   * screen uses is a binding no test covers.
+   */
   addMedia: (paths: string[]) => call<AddResult>('add_media', { paths }),
   listMedia: () => call<Media[]>('list_media'),
   deleteMedia: (id: number) => call<void>('delete_media', { id }),
   compatibilityReasons: (id: number) => call<string[]>('compatibility_reasons', { id }),
-  estimateOptimization: (mediaIds: number[]) =>
-    call<DiskEstimate>('estimate_optimization', { mediaIds }),
   optimizeMedia: (mediaIds: number[]) => call<number>('optimize_media', { mediaIds }),
   cancelOptimization: () => call<void>('cancel_optimization'),
 
