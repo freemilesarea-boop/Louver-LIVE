@@ -1191,3 +1191,48 @@ Linux job 의 `Check the OAuth client was compiled in` 이 **통과**했습니�
 `--require-download`, manifest 검사, 아키텍처 검사, credential-check, 테스트
 모두 그대로이고 `continue-on-error` 는 없습니다. 이번에 추가한 것은 로그
 출력(`--verbose`)과, 빈 변수를 내보내지 않는 step 하나뿐입니다.
+
+
+---
+
+## v1.0.2 Release run (`35691290628`, commit `c10d110`)
+
+| 플랫폼 | 결과 |
+| --- | --- |
+| macOS Apple Silicon | **PASS** |
+| macOS Intel | **PASS** |
+| Linux x64 | **PASS** |
+| Windows x64 | FAIL — `Build the installer` |
+
+빈 서명 변수 수정이 통했습니다. macOS 두 대가 처음으로 끝까지 갔고,
+`Check the OAuth client was compiled in` 도 세 플랫폼에서 통과했습니다.
+
+### Windows — WiX 코드 페이지
+
+`--verbose` 덕분에 v1.0.1 에서 삼켜졌던 도구 출력이 이번엔 남았습니다.
+최초의 의미 있는 error line 은 이것 하나입니다:
+
+```
+C:\agent\_work\36\s\wix\src\ext\UIExtension\wixlib\LicenseAgreementDlg.wxs(27) :
+error LGHT0311 : A string was provided with characters that are not available
+in the specified database code page '1252'.
+```
+
+서명도, 사이드카도, Rust 도, NSIS 도 아닙니다 — NSIS `.exe` 는 정상
+생성됐고 Rust 는 컴파일을 마쳤습니다. MSI 는 `-cultures:en-us` 로 링크되고
+그 코드 페이지는 1252 인데, 설치 관리자가 보여주는 **라이선스 본문**에
+1252 에 없는 문자가 들어 있었습니다.
+
+`bundle.licenseFile` 은 `LICENSES.md` 이고, 그 파일에서 1252 로 표현할 수
+없는 문자는 **한 줄에 있는 오른쪽 화살표 `→` 두 개가 전부**였습니다
+(`—`, `©`, `§` 는 1252 에 있습니다). `->` 로 바꿨습니다.
+
+한국어 설명(`shortDescription`/`longDescription`)은 그대로 둡니다. 그것들은
+Summary Information 스트림으로 가고 자체 코드 페이지를 쓰며, 이번 로그도
+LGHT0311 을 **하나만** 냈습니다 — 라이선스 대화상자 하나입니다. 추측으로
+제품 문구를 영어로 바꾸지 않았습니다.
+
+`scripts/windows-msi.test.mjs` 가 이걸 잠급니다: `bundle.licenseFile` 이
+가리키는 파일의 모든 문자가 코드 페이지 1252 에 있는지 확인하고, 없으면
+문자·코드포인트·줄번호·문맥을 찍습니다. 화살표를 되돌리면 이 테스트가
+즉시 실패하는 것을 확인했습니다.

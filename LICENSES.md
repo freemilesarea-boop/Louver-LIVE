@@ -103,7 +103,7 @@ recorded.
 
 This option is genuinely viable here because the live path needs no encoder at
 all. The code supports it: the encoder chain prefers hardware, then falls back
-through `libx264` → `libopenh264` → `h264_mf`, and each candidate is proved by
+through `libx264` -> `libopenh264` -> `h264_mf`, and each candidate is proved by
 encoding a frame before it is used. An LGPL build simply never reaches
 `libx264`.
 
