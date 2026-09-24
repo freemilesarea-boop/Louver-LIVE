@@ -19,18 +19,21 @@ export function PlaylistPage() {
   const [reasons, setReasons] = useState<{ name: string; list: string[] } | null>(null)
   const [newName, setNewName] = useState('')
   const [creating, setCreating] = useState(false)
-  const [preparing, setPreparing] = useState(false)
   const [showProgress, setShowProgress] = useState(false)
 
   useEffect(() => { void refreshPlaylists() }, [refreshPlaylists])
 
+  // Preparation runs on a background thread now, so the only thing that knows
+  // whether work is in flight is the progress event itself.
+  const preparing = normalizing != null
+
   /**
-   * §11: a progress bar only when there is something to be patient about.
+   * A progress bar only when there is something to be patient about.
    *
-   * Most additions are a file that needed nothing, or a container rewrite that
-   * finishes in the time it takes to copy — a bar that appears and vanishes
-   * inside a second reads as a glitch, not as progress. Three seconds in, the
-   * work is long enough to be worth watching, and the bar stays until it ends.
+   * Most files need a container rewrite that finishes in the time it takes to
+   * copy — a bar that appears and vanishes inside a second reads as a glitch,
+   * not as progress. Three seconds in, the work is long enough to be worth
+   * watching, and the bar stays until it ends.
    */
   useEffect(() => {
     if (!preparing) {
@@ -46,6 +49,9 @@ export function PlaylistPage() {
     () => items.filter((i) => i.enabled && !isBroadcastReady(i.media.status)),
     [items],
   )
+  // Rows the background worker has not reached yet. They are not a problem to
+  // report, so they must not turn on the "something went wrong" card.
+  const analysing = useMemo(() => items.filter((i) => i.media.status === 'imported'), [items])
 
   /**
    * Pick files, and have them ready to broadcast when this returns (§1, §5).
@@ -59,7 +65,6 @@ export function PlaylistPage() {
     try {
       const paths = await pickVideoFiles()
       if (!paths.length) return
-      setPreparing(true)
       const result = await api.addMedia(paths)
       if (activePlaylistId != null && result.imported.length) {
         await api.addToPlaylist(activePlaylistId, result.imported.map((m) => m.id))
@@ -68,19 +73,18 @@ export function PlaylistPage() {
         toast({ kind: 'error', message: `${f.path}: ${f.message}`, code: f.code })
       }
       if (result.imported.length) {
-        // The whole batch needed nothing: say so, rather than reporting work
-        // that did not happen.
-        const message = result.prepared === 0
-          ? `${result.imported.length}개 영상을 추가했습니다. 바로 사용할 수 있습니다.`
-          : `${result.imported.length}개 영상을 추가했습니다. 준비 완료.`
+        // Said the moment the rows exist, because that is when it is true.
+        // Whether each file then needs a container rewrite or an encode is
+        // reported by its own row as the background worker gets to it.
+        const message = result.analysing === 0
+          ? `${result.imported.length}개 영상을 추가했습니다.`
+          : `${result.imported.length}개 영상을 추가했습니다. 방송 준비는 백그라운드에서 진행됩니다.`
         toast({ kind: 'success', message })
       }
       await Promise.all([refreshMedia(), refreshActivePlaylist()])
     } catch (e) {
       reportError(e)
       await Promise.all([refreshMedia(), refreshActivePlaylist()])
-    } finally {
-      setPreparing(false)
     }
   }
 
@@ -89,13 +93,9 @@ export function PlaylistPage() {
     const ids = unready.map((i) => i.media_id)
     if (!ids.length) return
     try {
-      setPreparing(true)
-      await api.optimizeMedia(ids)
+      await api.prepareMedia(ids)
     } catch (e) {
       reportError(e)
-    } finally {
-      setPreparing(false)
-      await Promise.all([refreshMedia(), refreshActivePlaylist()])
     }
   }
 
@@ -244,11 +244,13 @@ export function PlaylistPage() {
             appears — and when it does, it offers to finish the job rather than
             asking the user what optimization is.
           */}
-          {unready.length > 0 && !preparing && (
+          {unready.length > analysing.length && !preparing && (
             <Card>
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                  <p className="text-sm text-warn">{unready.length}개 영상이 아직 준비되지 않았습니다.</p>
+                  <p className="text-sm text-warn">
+                    {unready.length - analysing.length}개 영상이 아직 준비되지 않았습니다.
+                  </p>
                   <p className="mt-1 text-xs text-ink-500">
                     준비가 끝나야 방송을 시작할 수 있습니다. 원본 파일은 변경되지 않습니다.
                   </p>

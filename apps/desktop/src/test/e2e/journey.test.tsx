@@ -138,6 +138,34 @@ describe('the main journey', () => {
     expect(await screen.findByText(/해상도가 1920x1080이 아닙니다/)).toBeInTheDocument()
   })
 
+  /**
+   * The bug this exists to prevent: adding a 90-minute video took over twenty
+   * minutes to show up, because `add_media` ran the preparation encode inside
+   * the call. Preparation is a background thread now, and the playlist is
+   * drawn from what registration returned.
+   *
+   * Here preparation is queued and never runs. Every file must still be on
+   * screen, named, and marked as being looked at.
+   */
+  it('shows the files immediately, without waiting for preparation', async () => {
+    const user = userEvent.setup()
+    mount({ preparationStalls: true })
+    await screen.findByRole('button', { name: '대시보드' })
+    await buildPlaylist(user)
+
+    const list = screen.getByRole('list', { name: '영상 목록' })
+    const names = within(list).getAllByText(/night0\d\.mp4/).map((n) => n.textContent)
+    expect(names).toEqual(['night01.mp4', 'night02.mp4', 'night03.mp4'])
+
+    // Drawn, and honest about not knowing anything else yet.
+    expect(await screen.findAllByText('확인 중…')).toHaveLength(3)
+
+    // Nothing is claimed to be broadcastable, and no failure is reported for
+    // work that simply has not happened.
+    expect(screen.queryByText('송출 준비 완료')).not.toBeInTheDocument()
+    expect(screen.queryByText(/아직 준비되지 않았습니다/)).not.toBeInTheDocument()
+  })
+
   it('reorders the playlist by drag and drop and persists the new order', async () => {
     const user = userEvent.setup()
     mount()

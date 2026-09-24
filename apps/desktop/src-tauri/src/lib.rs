@@ -143,8 +143,7 @@ pub fn run() {
             commands::media::list_media,
             commands::media::delete_media,
             commands::media::compatibility_reasons,
-            commands::media::estimate_optimization,
-            commands::media::optimize_media,
+            commands::media::prepare_media,
             commands::media::cancel_optimization,
             // playlist
             commands::playlist::list_playlists,

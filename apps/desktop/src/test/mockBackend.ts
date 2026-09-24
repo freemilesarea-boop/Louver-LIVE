@@ -9,7 +9,7 @@
  */
 import { emitLocal } from '@/services/ipc'
 import type {
-  DashboardMetrics, DiskEstimate, ImportResult, Media, Playlist,
+  DashboardMetrics, ImportResult, Media, Playlist,
   PlaylistItemView, PlaylistView, PreflightReport, RuntimeStatus, ScheduleView,
   SettingsView, StreamEvent, StreamState, MetadataApplyState, MetadataOutcome,
   ProvisionStep, StepRecord, LouverError,
@@ -23,6 +23,14 @@ export interface MockOptions {
   seedSettings?: Record<string, string>
   /** Simulate a machine where no browser can be opened. */
   failOpener?: boolean
+  /**
+   * Background analysis is queued but never runs.
+   *
+   * Stands for the real case that started all this: a 90-minute source whose
+   * preparation takes 26 minutes. Nothing about drawing the playlist may wait
+   * on it.
+   */
+  preparationStalls?: boolean
   /**
    * Preparation leaves the files unready, as a cancelled or failed run does.
    *
@@ -401,6 +409,18 @@ export function createMockBackend(opts: MockOptions = {}) {
     }
   }
 
+  /**
+   * Run work after the current call returns, the way a thread would.
+   *
+   * The real `add_media` spawns a thread and returns; the playlist is drawn
+   * from what it returned, not from what the thread goes on to do. A mock that
+   * did the work inline would hide exactly the bug this exists to prevent.
+   */
+  const backgroundTimers: Array<ReturnType<typeof setTimeout>> = []
+  function queueBackground(fn: () => void) {
+    backgroundTimers.push(setTimeout(fn, 0))
+  }
+
   const handlers: Record<string, (a: Record<string, unknown>) => unknown> = {
     // --- media ---
     import_media: (a) => {
@@ -418,7 +438,7 @@ export function createMockBackend(opts: MockOptions = {}) {
           id: ids.media++,
           source_path: p,
           display_name: p.split(/[\\/]/).pop() ?? p,
-          status: 'optimization_required',
+          status: 'imported',
           media_hash: `h${ids.media}`,
           normalized_path: null,
           normalized_profile: null,
@@ -437,22 +457,18 @@ export function createMockBackend(opts: MockOptions = {}) {
     list_media: () => media,
     delete_media: (a) => { const i = media.findIndex((m) => m.id === a.id); if (i >= 0) media.splice(i, 1) },
     compatibility_reasons: () => ['해상도가 1920x1080이 아닙니다 (1280x720)', '프레임레이트가 30fps가 아닙니다 (25.00fps)'],
-    estimate_optimization: (a): DiskEstimate => {
+    prepare_media: (a) => {
       const ids2 = a.mediaIds as number[]
-      const targets = media.filter((m) => ids2.includes(m.id) && m.status === 'optimization_required')
-      const total = targets.reduce((x, m) => x + m.duration_secs, 0)
-      const estimated = Math.round(total * 1274000)
-      return {
-        files_to_process: targets.length,
-        total_duration_secs: total,
-        estimated_bytes: estimated,
-        available_bytes: 184 * 1e9,
-        has_enough_space: 184 * 1e9 >= estimated + 2 * 1024 ** 3,
-        safety_margin_bytes: 2 * 1024 ** 3,
+      // Stage 1: the probe, which fills in what the row did not know yet.
+      for (const id of ids2) {
+        const m = media.find((x) => x.id === id)
+        if (!m) continue
+        m.duration_secs = 3600 + id * 7
+        m.width = 1280; m.height = 720; m.fps = 25
+        m.video_codec = 'h264'; m.audio_codec = 'aac'; m.pixel_format = 'yuv420p'
+        m.status = 'optimization_required'
+        emitLocal('louver://media', { media_id: id })
       }
-    },
-    optimize_media: (a) => {
-      const ids2 = a.mediaIds as number[]
       if (opts.preparationFails) return 0
       let done = 0
       ids2.forEach((id, idx) => {
@@ -463,6 +479,7 @@ export function createMockBackend(opts: MockOptions = {}) {
         m.normalized_profile = settings.get('output_profile') ?? '1080p30'
         m.normalized_duration_secs = Math.floor(m.duration_secs * 30) / 30
         done++
+        emitLocal('louver://media', { media_id: id })
         emitLocal('louver://normalize', {
           media_id: id, file_name: m.display_name, percent: 100,
           files_done: idx + 1, files_total: ids2.length,
@@ -473,18 +490,21 @@ export function createMockBackend(opts: MockOptions = {}) {
       return done
     },
     cancel_optimization: () => undefined,
-    // §1, §5: one call does the whole thing, so the page has no second button.
+    /**
+     * Register now, analyse later — the shape the real command has.
+     *
+     * The rows come back as `imported` and the background work happens on a
+     * timer, so a test that asserts the playlist is drawn before preparation
+     * finishes is asserting the thing the user complained about.
+     */
     add_media: (a) => {
       const result = handlers.import_media!(a) as ImportResult
-      const pending = result.imported.filter((m) => m.status === 'optimization_required')
-      const prepared = pending.length
-        ? (handlers.optimize_media!({ mediaIds: pending.map((m) => m.id) }) as number)
-        : 0
-      return {
-        ...result,
-        ready_at_once: result.imported.length - pending.length,
-        prepared,
+      const pending = result.imported.filter((m) => m.status === 'imported')
+      if (pending.length && !opts.preparationStalls) {
+        const ids = pending.map((m) => m.id)
+        queueBackground(() => { handlers.prepare_media!({ mediaIds: ids }) })
       }
+      return { ...result, analysing: pending.length }
     },
 
     // --- playlists ---
@@ -934,6 +954,10 @@ export function createMockBackend(opts: MockOptions = {}) {
 
   /** Settings survive a simulated restart, which the e2e suite checks. */
   backend.snapshotSettings = () => Object.fromEntries(settings)
-  backend.stop = () => { if (elapsedTimer) clearInterval(elapsedTimer) }
+  backend.stop = () => {
+    if (elapsedTimer) clearInterval(elapsedTimer)
+    for (const t of backgroundTimers) clearTimeout(t)
+    backgroundTimers.length = 0
+  }
   return backend
 }

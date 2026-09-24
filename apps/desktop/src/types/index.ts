@@ -204,15 +204,6 @@ export interface PreflightReport {
   can_broadcast: boolean
 }
 
-export interface DiskEstimate {
-  files_to_process: number
-  total_duration_secs: number
-  estimated_bytes: number
-  available_bytes: number
-  has_enough_space: boolean
-  safety_margin_bytes: number
-}
-
 export interface NormalizeProgress {
   media_id: number
   file_name: string
@@ -299,10 +290,8 @@ export interface ImportResult {
 
 /** What `add_media` did: files added, and what it took to make them usable. */
 export interface AddResult extends ImportResult {
-  /** Needed nothing done to them at all. */
-  ready_at_once: number
-  /** Were prepared, whether by a container rewrite or an encode. */
-  prepared: number
+  /** How many are being looked at in the background right now. */
+  analysing: number
 }
 
 // --- YouTube (V2) ---------------------------------------------------------

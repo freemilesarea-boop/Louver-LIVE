@@ -180,6 +180,44 @@ impl Database {
             .optional()?)
     }
 
+    /// The row for a source path, if the library already holds it.
+    ///
+    /// Adding the same file twice must not discard what is already known about
+    /// it — a second add of a prepared file would otherwise reset it to
+    /// "analysing" and prepare it all over again.
+    pub fn find_media_by_path(&self, source_path: &str) -> Result<Option<Media>> {
+        Ok(self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT * FROM media WHERE source_path=?1", [source_path], row_to_media)
+            .optional()?)
+    }
+
+    /// Write back what the probe found, leaving status and cache columns alone.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_media_metadata(&self, id: i64, m: &Media) -> Result<()> {
+        self.conn.lock().unwrap().execute(
+            "UPDATE media SET media_hash=?2, duration_secs=?3, width=?4, height=?5, fps=?6,
+                video_codec=?7, audio_codec=?8, pixel_format=?9, is_hdr=?10, file_size=?11
+             WHERE id=?1",
+            params![
+                id,
+                m.media_hash,
+                m.duration_secs,
+                m.width,
+                m.height,
+                m.fps,
+                m.video_codec,
+                m.audio_codec,
+                m.pixel_format,
+                m.is_hdr,
+                m.file_size,
+            ],
+        )?;
+        Ok(())
+    }
+
     pub fn list_media(&self) -> Result<Vec<Media>> {
         let c = self.conn.lock().unwrap();
         let mut st = c.prepare("SELECT * FROM media ORDER BY added_at DESC, id DESC")?;

@@ -94,7 +94,7 @@ export function streamStateLabel(s: StreamState): string {
 
 export function mediaStatusLabel(s: MediaStatus): string {
   const map: Record<MediaStatus, string> = {
-    imported: '확인 중',
+    imported: '확인 중…',
     compatible: '방송 준비 필요',
     optimization_required: '방송 준비 필요',
     normalized: '송출 준비 완료',

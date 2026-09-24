@@ -173,6 +173,15 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ normalizing: p.percent >= 100 && p.remaining_files === 0 ? null : p }),
       ),
     )
+    // One row finished analysis or preparation. The list redraws from the
+    // database rather than from the event, so a refresh that arrives late
+    // still shows the truth.
+    offs.push(
+      await listen<{ media_id: number }>('louver://media', () => {
+        void get().refreshMedia()
+        void get().refreshActivePlaylist()
+      }),
+    )
     offs.push(
       await listen<string>('louver://navigate', (page) => set({ page: page as Page })),
     )

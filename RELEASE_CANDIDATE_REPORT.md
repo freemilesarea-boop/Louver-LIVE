@@ -1517,3 +1517,100 @@ macOS Keychain, Windows Credential Manager, 코드 서명, FFmpeg 사이드카 �
 
 `SIGNING.md` 는 이제 코드 서명만 다룹니다. 서명 인증서가 없으면 SmartScreen /
 Gatekeeper 경고가 나오지만 앱은 정상 동작합니다.
+
+## 영상 추가가 20분 걸리던 이유 (2026-09-24, v1.0.8)
+
+90분짜리 영상 하나를 추가하면 20분 넘게 끝나지 않는다는 보고. 추측하지 않고
+`영상 추가` 경로 전체를 단계별로 계측했습니다 (90분 / 4.22 GB 실파일).
+
+| 단계 | 실제 실행 내용 | 측정 |
+| --- | --- | --- |
+| `is_supported_extension` | 확장자 비교 | ~0 |
+| `probe()` | `ffprobe -show_format -show_streams` (헤더만) | 0.11s |
+| `media_hash()` | path+size+mtime+앞뒤 256KB | 1.7ms |
+| `cache.lookup()` | 사이드카 JSON 1개 | ~0 |
+| `plan_for()` | `ffprobe -read_intervals %+60` | 0.29s |
+| **`normalize_one()`** | **FFmpeg가 영상 전체를 새로 씀** | **26분** |
+
+앞의 다섯 단계 합계는 **0.41초**입니다. 문제는 마지막 하나였습니다.
+
+### 지목된 후보 중 애초에 없던 것들
+
+코드 전체 검색 결과입니다. 추측이 아닙니다.
+
+- **thumbnail 생성 코드 없음** (`thumbnail|thumb|poster|preview` 0건)
+- **원본 파일 copy 없음**
+- **전체 파일 SHA256 아님** — 앞뒤 256KB씩만 읽습니다 (4.22 GB에 1.7ms).
+  제거할 이유가 없어 유지했습니다
+- **전체 decode/scan 없음** — ffprobe 두 번 다 헤더·인덱스만 읽습니다
+
+### 진짜 원인
+
+v1.0.6 에서 "버튼을 하나 더 누르게 하지 말라"를 구현하면서 `add_media` 가
+`optimize_media` 를 **동기로** 호출하게 만들었습니다. 준비 작업을 추가 동작
+**안에** 넣은 것입니다.
+
+규격 밖 90분 영상의 인코딩 속도를 실측하면 180초 분량에 52.2초, 즉
+**3.45배속**입니다. 5400 ÷ 3.45 = **1565초 = 26분**. 보고된 "20분 이상"과
+일치합니다. 설계 실수였습니다.
+
+### 수정
+
+**등록은 동기, 분석과 준비는 백그라운드 스레드.** 버튼은 여전히 하나입니다.
+
+```
+영상 추가 클릭
+ → register: fs::metadata + INSERT           ← 여기서 반환. 파일이 화면에 뜸
+ → (백그라운드 스레드)
+    stage 1  probe + hash + cache lookup     ~0.3s/파일
+    stage 2  plan (호환성 판정)
+    stage 3  normalize_one (remux 또는 인코딩, 취소 가능)
+```
+
+- `import_media` 는 이제 **파일을 열지 않습니다.** `fs::metadata` 하나로
+  존재와 크기만 확인하고 `status = Imported` 로 행을 만듭니다
+- `upsert_media` 가 `source_path` 로 키를 잡으므로 빈 해시로 먼저 넣어도
+  충돌하지 않습니다. 해시는 stage 1 에서 채웁니다
+- 같은 파일을 다시 추가하면 `find_media_by_path` 가 기존 행을 돌려주어
+  분석 결과를 버리지 않습니다
+- 워커는 **큐를 비웁니다.** 실행 중에 추가된 파일은 같은 배치에 합류하며,
+  두 번째 스레드를 띄우지 않습니다 — 인코더 두 개가 같은 코어를 두고
+  경쟁하면 둘 다 느려지고 배치는 더 빨리 끝나지 않습니다
+- 디스크 여유 검사를 워커 안으로 옮겼습니다. 클릭 시점에는 아직 probe 전이라
+  모든 duration 이 0 이어서 추정값도 0 이었습니다. 이제 실제 길이로 계산합니다
+
+### 로그
+
+```
+MEDIA_REGISTER files=1 failed=0 took=1ms
+MEDIA_ANALYSE id=7 dur=5400s 1280x720@24.00 probe=284ms hash=28ms cache=miss
+MEDIA_PREPARE_START files=1 remux=0 partial=0 full=1 engine=libx264
+MEDIA_OPTIMIZE_DONE mode=full-transcode ...
+MEDIA_PREPARE_END took=...s
+```
+
+### 측정 결과 (동일 90분 파일)
+
+| | 이전 | 이후 |
+| --- | --- | --- |
+| 파일 선택 → 플레이리스트 표시 | 20분 이상 | **0.0 ms** |
+| → metadata 확정 | — | 122ms (규격 파일) / 312ms (규격 밖) |
+| → 호환성 판정 확정 | — | 254ms / 312ms |
+| → 방송 가능 | 20분 이상 | 24.0s (remux) / 백그라운드 (인코딩) |
+
+`crates/louver-core/tests/import_cost.rs` 가 이 표를 재현합니다:
+
+```bash
+LOUVER_IMPORT_SAMPLE=/path/to/long.mp4 \
+  cargo test -p louver-core --test import_cost -- --ignored --nocapture
+```
+
+### 깨뜨리지 않은 것
+
+`runtime_scheduling` 47, `runtime_live` 2, `supervisor_recovery` 9,
+`youtube_live` 39, `rc_security` 8, `docs_sync` 12 — 전부 통과. 예약 방송,
+playlist persistence, sequential/random 재생, FFmpeg 송출 로직은 건드리지
+않았습니다.
+
+`thumbnail` 은 **만들지 않았습니다.** 요구사항이 "필요하면"이었고 코드에
+존재한 적이 없으며, 지금 추가하면 요청하지 않은 기능이 됩니다.

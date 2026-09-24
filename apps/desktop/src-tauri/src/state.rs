@@ -57,6 +57,15 @@ pub struct AppState {
     /// Message from session recovery, shown once by the UI.
     pub startup_notice: Mutex<Option<String>>,
     pub normalize_cancel: Mutex<Option<louver_core::media::normalize::CancelToken>>,
+    /// Media ids waiting to be analysed and prepared, and whether a worker is
+    /// already draining them.
+    ///
+    /// Adding files twice in a row must not start a second encoder: two
+    /// preparations at once make each slower and finish the pair no sooner.
+    /// The second call appends to the queue and returns; the running worker
+    /// picks the ids up.
+    pub media_queue: Arc<Mutex<std::collections::VecDeque<i64>>>,
+    pub media_worker_running: Arc<std::sync::atomic::AtomicBool>,
     /// YouTube account, metadata and the chat bot (V2). Deliberately not
     /// reachable from the broadcast tick.
     pub youtube: Arc<crate::youtube_service::YoutubeService>,
@@ -157,6 +166,8 @@ impl AppState {
             db_recovery_notice,
             startup_notice: Mutex::new(None),
             normalize_cancel: Mutex::new(None),
+            media_queue: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            media_worker_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             youtube,
         })
     }

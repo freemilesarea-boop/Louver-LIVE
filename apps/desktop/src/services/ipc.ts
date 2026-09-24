@@ -79,17 +79,15 @@ export const api = {
   /**
    * Add and prepare in one call, so no second button exists (§1, §5).
    *
-   * There is no `importMedia` beside this one. `import_media` and
-   * `estimate_optimization` are still Rust commands — `add_media` calls the
-   * first and `optimize_media` calls the second for its disk guard — but
-   * nothing in the UI reaches either directly any more, and a binding no
-   * screen uses is a binding no test covers.
+   * `import_media` is still a Rust command and `add_media` calls it, but
+   * nothing in the UI reaches it directly, and a binding no screen uses is a
+   * binding no test covers.
    */
   addMedia: (paths: string[]) => call<AddResult>('add_media', { paths }),
   listMedia: () => call<Media[]>('list_media'),
   deleteMedia: (id: number) => call<void>('delete_media', { id }),
   compatibilityReasons: (id: number) => call<string[]>('compatibility_reasons', { id }),
-  optimizeMedia: (mediaIds: number[]) => call<number>('optimize_media', { mediaIds }),
+  prepareMedia: (mediaIds: number[]) => call<number>('prepare_media', { mediaIds }),
   cancelOptimization: () => call<void>('cancel_optimization'),
 
   // playlists
