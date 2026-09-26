@@ -700,12 +700,13 @@ impl CloudDb {
         state: RuntimeState,
         restart_count: i64,
         uptime_secs: i64,
+        bytes_sent: i64,
     ) -> Result<()> {
         self.raw().lock().unwrap().execute(
             "UPDATE broadcasts SET runtime_state=?2, restart_count=?3, uptime_secs=?4,
-                    last_heartbeat=datetime('now')
+                    bytes_sent=?5, last_heartbeat=datetime('now')
              WHERE id=?1",
-            params![id, state.id(), restart_count, uptime_secs],
+            params![id, state.id(), restart_count, uptime_secs, bytes_sent],
         )?;
         Ok(())
     }

@@ -91,15 +91,45 @@ struct Worker {
 struct DbEvents {
     db: CloudDb,
     broadcast_id: String,
+    sent: Mutex<Meter>,
+}
+
+/// Bytes pushed to the ingest, accumulated across restarts.
+///
+/// Each FFmpeg reports its own running total and a replacement process starts
+/// again at zero, so the outgoing one's final figure is banked before the new
+/// one begins counting. Without that, a night of reconnects would bill as less
+/// bandwidth than it used — §22 wants a number that can be costed, not a
+/// number that resets.
+#[derive(Debug, Default)]
+struct Meter {
+    banked: i64,
+    current: i64,
+}
+
+impl Meter {
+    fn observe(&mut self, reported: i64) -> i64 {
+        if reported < self.current {
+            self.banked += self.current;
+        }
+        self.current = reported;
+        self.banked + self.current
+    }
 }
 
 impl RuntimeEvents for DbEvents {
     fn on_status(&self, status: &RuntimeStatus) {
+        let sent = self
+            .sent
+            .lock()
+            .map(|mut m| m.observe(status.supervisor.progress.total_bytes as i64))
+            .unwrap_or(0);
         let _ = self.db.record_runtime(
             &self.broadcast_id,
             RuntimeState::from_engine(status.supervisor.state),
             status.supervisor.restart_count as i64,
             status.elapsed_secs,
+            sent,
         );
     }
 
@@ -270,7 +300,11 @@ impl BroadcastManager {
         let builder = FfmpegCommandBuilder::new(self.tools.clone(), OutputProfile::P1080p30)
             .with_encoder(self.encoder.clone());
         let events: Arc<dyn RuntimeEvents> =
-            Arc::new(DbEvents { db: self.db.clone(), broadcast_id: broadcast_id.to_string() });
+            Arc::new(DbEvents {
+                db: self.db.clone(),
+                broadcast_id: broadcast_id.to_string(),
+                sent: Mutex::new(Meter::default()),
+            });
         let launcher = self.launchers.for_broadcast(&self.db, broadcast_id);
 
         let mut rt = BroadcastRuntime::new(
@@ -285,6 +319,19 @@ impl BroadcastManager {
             dir.join("manifest.txt"),
             dir.join("dry-run"),
         );
+
+        // A hard kill of this process leaves its FFmpeg children publishing.
+        // Starting a second sender to the same ingest URL is worse than not
+        // recovering at all — YouTube sees two streams on one key — so the
+        // previous run's process is killed first, by pid, after the core has
+        // verified that the pid really is an FFmpeg.
+        if let Some(pid) = rt.clean_orphan_process() {
+            let _ = self.db.append_event(
+                broadcast_id,
+                EventLevel::Warn,
+                &format!("이전 실행이 남긴 FFmpeg({pid})를 정리했습니다"),
+            );
+        }
 
         rt.start(StartOptions {
             playlist_id,
@@ -426,4 +473,22 @@ pub struct Dashboard {
     pub active: i64,
     pub allowed: i64,
     pub broadcasts: Vec<Broadcast>,
+}
+
+#[cfg(test)]
+mod meter_tests {
+    use super::Meter;
+
+    #[test]
+    fn a_restart_banks_what_the_previous_process_sent() {
+        let mut m = Meter::default();
+        assert_eq!(m.observe(1_000), 1_000);
+        assert_eq!(m.observe(5_000), 5_000);
+        // FFmpeg died and its replacement starts counting from zero again.
+        assert_eq!(m.observe(10), 5_010);
+        assert_eq!(m.observe(2_000), 7_000);
+        // A second restart banks the second process too.
+        assert_eq!(m.observe(0), 7_000);
+        assert_eq!(m.observe(500), 7_500);
+    }
 }

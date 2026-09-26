@@ -1,0 +1,39 @@
+# Development and small-scale production are the same file here, because the
+# difference is the environment, not the topology.
+#
+#   cp .env.example .env        # then set LOUVER_MASTER_KEY
+#   docker compose up --build
+services:
+  louver:
+    build: .
+    # A broadcast must survive a restart of the host, and the server brings back
+    # whatever was still meant to be running.
+    restart: unless-stopped
+    ports:
+      - '${LOUVER_PORT:-8080}:8080'
+    env_file: .env
+    environment:
+      # Read at boot; the server refuses to start without it, rather than
+      # inventing a key that would orphan every saved stream key.
+      LOUVER_MASTER_KEY: ${LOUVER_MASTER_KEY:?set LOUVER_MASTER_KEY in .env}
+      LOUVER_DEFAULT_PLAN: ${LOUVER_DEFAULT_PLAN:-basic}
+      LOUVER_ENCODER: ${LOUVER_ENCODER:-libx264}
+    volumes:
+      # The database, the originals and the prepared copies.
+      - louver-data:/var/lib/louver
+    # FFmpeg is the whole workload: one stream-copy send is cheap, a transcode
+    # at upload is not. Give it room and cap it so one tenant's upload cannot
+    # starve everyone's broadcasts.
+    deploy:
+      resources:
+        limits:
+          cpus: '${LOUVER_CPUS:-4}'
+          memory: ${LOUVER_MEMORY:-4g}
+    healthcheck:
+      test: ['CMD', 'louver-server', '--health-check']
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+
+volumes:
+  louver-data:

@@ -1,0 +1,12 @@
+node_modules
+target
+apps/web/dist
+apps/desktop/dist
+apps/desktop/src-tauri/target
+apps/desktop/src-tauri/binaries/ffmpeg*
+apps/desktop/src-tauri/binaries/ffprobe*
+tests/fixtures
+soak-results
+rc-results
+.git
+.env
