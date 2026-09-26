@@ -240,3 +240,151 @@ built in from the start and no price is written into the code.
 One scope note recorded rather than silently decided: broadcast **scheduling**
 is P1 in §18. The cloud stores `desired_state` and reconciles it, which is the
 mechanism a scheduler would drive, but no cron is built in this pass.
+
+---
+
+# PHASE 4 — What was built
+
+## Crates and apps
+
+| where | what |
+| --- | --- |
+| `crates/louver-cloud` | tenancy, entitlements, credentials, storage, ingest, the broadcast manager |
+| `apps/server` | the HTTP API (axum), auth, SSE, `--health-check` |
+| `apps/web` | the cloud front end, sharing the desktop's primitives through `@` |
+| `Dockerfile`, `docker-compose.yml`, `.env.example` | one image, one container, Linux |
+
+`crates/louver-core` gained two things and lost nothing: `StreamKeyStore::with_account`,
+so one process can hold one key per destination, and nothing else. Every file
+under `apps/desktop` is untouched except `tailwind.config.js`'s content globs and
+the `typecheck`/`lint` scripts, which now cover `apps/web` too.
+
+The plan said the transport split would modify `apps/desktop/src/services/ipc.ts`.
+It did not need to: `apps/web/src/transport.ts` defines the interface and
+`desktopTransport.ts` satisfies it *from* `ipc.ts` without changing it, which
+leaves the desktop app's own call sites exactly as they were.
+
+## The API
+
+Nine nouns, not seventy-two commands. Every row below takes a session and, where
+it names a thing, that thing must belong to the caller.
+
+| method | path | what |
+| --- | --- | --- |
+| POST | `/api/auth/register`, `/api/auth/login` | sets an HttpOnly session cookie |
+| POST | `/api/auth/logout` | ends the session server-side |
+| GET | `/api/me`, `/api/me/subscription` | who, and on what plan |
+| GET POST | `/api/media`, `/api/media/upload` | list, upload (multipart, streamed) |
+| GET DELETE | `/api/media/{id}` | one video |
+| GET POST | `/api/stream-destinations` | list, save (key sealed, never returned) |
+| DELETE | `/api/stream-destinations/{id}` | forget a destination and its key |
+| GET POST | `/api/broadcasts` | the dashboard, and create |
+| GET DELETE | `/api/broadcasts/{id}` | one broadcast |
+| POST | `/api/broadcasts/{id}/start|stop|restart` | lifecycle |
+| GET | `/api/broadcasts/{id}/logs` | that broadcast's events |
+| GET | `/api/events` | SSE: the dashboard as it changes |
+| GET | `/api/health` | for the container |
+
+`Forbidden` answers **404**, deliberately: "this exists but is not yours" is
+itself a fact about another account.
+
+---
+
+# PHASE 5 — Verification
+
+`npm run verify` — all 11 steps pass (secret scan, typecheck, lint, frontend
+tests, UI e2e, release tooling, frontend build, fmt, clippy, workspace tests).
+
+## Measured on Linux, against a real RTMP endpoint
+
+The server was run as a real process against `scripts/rtmp-sink.mjs`, which
+speaks the actual RTMP protocol, with the distro's FFmpeg 6.1.1 — the same setup
+the Dockerfile produces.
+
+| step | measured |
+| --- | --- |
+| upload of a 39 MB clip → row returned | **0.22 s** |
+| that clip analysed and prepared (20 s, 1080p30, remux) | **1.24 s** total |
+| broadcast started → publisher connected at the ingest | **~1 s** |
+| bytes at the ingest after 12 s | 23.9 MB |
+| `kill -9` the server, restart → broadcast running again | yes, ~1 s after boot |
+| bytes at the ingest after recovery | 49.0 MB, continuing |
+| publishers after recovery | **exactly 1** (the orphan is killed by pid first) |
+| user stop, then `kill -9`, then restart | stays `STOPPED`, `active` 0 |
+| `bytes_sent` on the row | 26,258,834 — matches the sink's own count |
+
+## Two things the real run found, and the fix
+
+**An orphaned FFmpeg.** A hard-killed server leaves its child publishing.
+Recovery then started a second sender to the same key. The core already knew how
+to kill a previous run's process after verifying it is an FFmpeg; the manager now
+does that before starting. One publisher after recovery, measured.
+
+**`bytes_sent` was always 0.** Each FFmpeg reports its own total and a
+replacement starts at zero, so the outgoing figure is banked before the new one
+counts.
+
+And one the test suite found: two preparations of one upload destroyed each
+other's output. A media id is now claimed while it is being prepared.
+
+---
+
+# Final report
+
+## P0 (§18)
+
+| # | item | verdict | evidence |
+| --- | --- | --- | --- |
+| 1 | Broadcast Manager independent of the request | **PASS** | worker thread per broadcast; HTTP returns immediately |
+| 2 | Broadcast lifecycle + state machine | **PASS** | `RuntimeState` (8 states) ← engine; `broadcast_manager.rs` |
+| 3 | `desired_state` vs `runtime_state` | **PASS** | `recovery_finds_only_what_was_meant_to_be_running` |
+| 4 | Web authentication | **PASS** | PBKDF2 600k, HttpOnly cookie, 7 HTTP tests |
+| 5 | Upload + probe + prepare | **PASS** | 5 ingest tests on real media; 0.22 s to row |
+| 6 | Stream destination stored safely | **PASS** | sealed with ChaCha20-Poly1305; DB holds no plaintext |
+| 7 | Create / start / stop a broadcast | **PASS** | HTTP tests + the live run |
+| 8 | Plan limit on concurrent streams | **PASS** | `BEGIN IMMEDIATE`; refused with 402, no process spawned |
+| 9 | Watchdog with backoff | **PASS** | `StreamSupervisor`, reused unchanged |
+| 10 | A user stop is never resumed | **PASS** | two tests + the live restart |
+| 11 | Recovery after a server restart | **PASS** | live `kill -9` → running again, bytes resumed |
+| 12 | One broadcast's failure isolates | **PASS** | `three_broadcasts_run_at_once_and_one_crash_is_isolated` |
+| 13 | Ownership on every request | **PASS** | `knowing_another_users_ids_buys_nothing` (9 routes) |
+| 14 | Stream key never leaves the server | **PASS** | no `key` field exists; DB file scanned; logs masked |
+| 15 | Storage abstraction | **PASS** | `Storage` trait; `LocalStorage` now, S3 later |
+| 16 | Web dashboard | **PASS** | slots as `2 / 3`, live over SSE, 18 front-end tests |
+| 17 | Docker / Linux | **PARTIAL** | files written and compose interpolation checked; **the image was not built** — no Docker daemon in this environment |
+| 18 | Metering for costing | **PASS** | `bytes_sent`, `uptime_secs`, `restart_count` per broadcast |
+
+## §21 — the ten prohibitions
+
+| # | prohibition | verdict |
+| --- | --- | --- |
+| 1 | desktop app deleted or broken | **kept** — `apps/desktop` untouched; its tests and e2e suite pass |
+| 2 | verified FFmpeg logic rewritten | **kept** — `plan_for`, `normalize_one`, `StreamSupervisor` called, not copied |
+| 3 | FFmpeg in the browser | **kept** — the browser uploads and clicks; FFmpeg runs on the server |
+| 4 | lifecycle tied to the browser | **kept** — proved by killing the server, not the tab |
+| 5 | stream key in the front end | **kept** — no storage write; asserted against `localStorage`, `sessionStorage`, the DOM |
+| 6 | plan limits only in the front end | **kept** — enforced in a transaction; the browser only displays |
+| 7 | a VPS per user | **kept** — one process, many tenants |
+| 8 | Kubernetes from the start | **kept** — one container |
+| 9 | a large refactor without tests | **kept** — 62 new tests |
+| 10 | guessing instead of reading the code | **kept** — PHASE 1 read it; the live run measured it |
+
+## Not done, and said so
+
+| item | status |
+| --- | --- |
+| Docker image built and run | **NOT VERIFIED** — no Docker daemon here; `docker compose config` parses |
+| S3-compatible storage | **NOT IMPLEMENTED** — the trait is there; only `LocalStorage` exists |
+| Scheduled broadcasts in the cloud | **NOT IMPLEMENTED** — P1 in §18; `desired_state` is the seam a scheduler drives |
+| YouTube OAuth / metadata / chat on the server | **NOT IMPLEMENTED** — `skip_pre_start: true`; the desktop keeps these |
+| Storage quota enforcement per plan | **PARTIAL** — `max_upload_bytes` is enforced per file; `max_storage_bytes` is stored and read but not yet refused at upload |
+| Billing, invoicing, prices | **NOT IMPLEMENTED** by intent — §22 asks for metrics, not prices |
+
+## Resource report (for pricing, not priced here)
+
+| resource | per 24/7 1080p30 6 Mbps stream | three of them |
+| --- | --- | --- |
+| egress | ~1.9 TB / month | ~5.8 TB / month |
+| CPU while streaming | stream copy: a fraction of one core | still under one core |
+| CPU at upload | remux ~119× realtime; full encode ~3.45× realtime | one core per upload, once |
+| storage | ~4 GB per 90-minute prepared video, plus the original | grows with the library |
