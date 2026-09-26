@@ -4,6 +4,7 @@ members = [
     "crates/louver-core",
     "crates/louver-cloud",
     "apps/desktop/src-tauri",
+    "apps/server",
 ]
 
 [workspace.package]

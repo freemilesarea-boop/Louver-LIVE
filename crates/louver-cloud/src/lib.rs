@@ -12,6 +12,7 @@
 pub mod credentials;
 pub mod db;
 pub mod entitlement;
+pub mod ingest;
 pub mod manager;
 pub mod models;
 pub mod storage;

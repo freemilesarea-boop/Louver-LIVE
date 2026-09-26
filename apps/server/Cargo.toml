@@ -1,0 +1,32 @@
+[package]
+name = "louver-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lib]
+name = "louver_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "louver-server"
+path = "src/main.rs"
+
+[dependencies]
+louver-core = { path = "../../crates/louver-core" }
+louver-cloud = { path = "../../crates/louver-cloud" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+# hyper, tower and tokio were already in the lock file via rustls/ureq, so axum
+# is the only genuinely new crate the server adds.
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tower-http = { version = "0.6", features = ["fs", "trace"] }
+# Only for the SSE endpoint's ticking stream; it pulls in nothing new.
+tokio-stream = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true
+tower = { version = "0.5", features = ["util"] }
