@@ -46,6 +46,37 @@ const TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// thread stops rather than reconnecting into the night.
 const MAX_RESTARTS: i64 = 10;
 
+/// Makes the thing that launches a broadcast's process.
+///
+/// One per broadcast, because `FfmpegLauncher` carries the log sink that writes
+/// into *that* broadcast's event table. A seam rather than a hardcoded
+/// constructor so the isolation, crash and stop tests can drive the worker loop
+/// without spawning real encoders — the same reason `StreamLauncher` is a trait
+/// in the core.
+pub trait LauncherFactory: Send + Sync + std::fmt::Debug {
+    fn for_broadcast(&self, db: &CloudDb, broadcast_id: &str) -> Arc<dyn StreamLauncher>;
+}
+
+/// The real one: the bundled FFmpeg, logging into the broadcast's events.
+#[derive(Debug)]
+pub struct FfmpegLaunchers {
+    pub program: PathBuf,
+}
+
+impl LauncherFactory for FfmpegLaunchers {
+    fn for_broadcast(&self, db: &CloudDb, broadcast_id: &str) -> Arc<dyn StreamLauncher> {
+        let db = db.clone();
+        let id = broadcast_id.to_string();
+        Arc::new(FfmpegLauncher {
+            program: self.program.clone(),
+            // The core masks the stream key before a line reaches here.
+            log: Arc::new(move |line: &str| {
+                let _ = db.append_event(&id, EventLevel::Info, line);
+            }),
+        })
+    }
+}
+
 /// Everything a worker thread needs, owned rather than borrowed.
 struct Worker {
     handle: Option<std::thread::JoinHandle<()>>,
@@ -88,6 +119,7 @@ pub struct BroadcastManager {
     tools: FfmpegTools,
     encoder: String,
     keys: Arc<dyn louver_core::security::SecretStore>,
+    launchers: Arc<dyn LauncherFactory>,
     workers: Arc<Mutex<HashMap<String, Worker>>>,
 }
 
@@ -105,6 +137,7 @@ impl BroadcastManager {
         tools: FfmpegTools,
         encoder: String,
         keys: Arc<dyn louver_core::security::SecretStore>,
+        launchers: Arc<dyn LauncherFactory>,
     ) -> Self {
         Self {
             db,
@@ -113,8 +146,17 @@ impl BroadcastManager {
             tools,
             encoder,
             keys,
+            launchers,
             workers: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// The store broadcasts read their stream keys from.
+    ///
+    /// Exposed so the process that saves a destination's key writes it where
+    /// the manager will look, rather than each guessing an account name.
+    pub fn secret_store(&self) -> Arc<dyn louver_core::security::SecretStore> {
+        Arc::clone(&self.keys)
     }
 
     /// Broadcast ids with a live worker thread.
@@ -229,18 +271,7 @@ impl BroadcastManager {
             .with_encoder(self.encoder.clone());
         let events: Arc<dyn RuntimeEvents> =
             Arc::new(DbEvents { db: self.db.clone(), broadcast_id: broadcast_id.to_string() });
-        // FFmpeg's own stderr goes to this broadcast's event log, where the
-        // core has already masked the stream key out of it.
-        let launcher: Arc<dyn StreamLauncher> = {
-            let db = self.db.clone();
-            let id = broadcast_id.to_string();
-            Arc::new(FfmpegLauncher {
-                program: self.tools.ffmpeg.clone(),
-                log: Arc::new(move |line: &str| {
-                    let _ = db.append_event(&id, EventLevel::Info, line);
-                }),
-            })
-        };
+        let launcher = self.launchers.for_broadcast(&self.db, broadcast_id);
 
         let mut rt = BroadcastRuntime::new(
             core_db,
