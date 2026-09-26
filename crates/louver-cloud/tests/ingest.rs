@@ -9,8 +9,8 @@ use louver_core::streaming::ffmpeg::FfmpegTools;
 use std::sync::Arc;
 
 fn tools() -> Option<FfmpegTools> {
-    let sidecar = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../apps/desktop/src-tauri/binaries");
+    let sidecar =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/desktop/src-tauri/binaries");
     FfmpegTools::discover(Some(&sidecar)).ok()
 }
 
@@ -18,22 +18,74 @@ fn tools() -> Option<FfmpegTools> {
 fn make(tools: &FfmpegTools, at: &std::path::Path, conformant: bool) {
     let args: Vec<String> = if conformant {
         vec![
-            "-y", "-loglevel", "error",
-            "-f", "lavfi", "-i", "testsrc2=size=1920x1080:rate=30:duration=2",
-            "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=2",
-            "-c:v", "libx264", "-preset", "ultrafast", "-profile:v", "high", "-level", "4.2",
-            "-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "60", "-sc_threshold", "0",
-            "-b:v", "6000k", "-r", "30", "-fps_mode", "cfr",
-            "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
-            "-video_track_timescale", "30000", "-movflags", "+faststart",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1920x1080:rate=30:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-profile:v",
+            "high",
+            "-level",
+            "4.2",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "60",
+            "-keyint_min",
+            "60",
+            "-sc_threshold",
+            "0",
+            "-b:v",
+            "6000k",
+            "-r",
+            "30",
+            "-fps_mode",
+            "cfr",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-video_track_timescale",
+            "30000",
+            "-movflags",
+            "+faststart",
             at.to_str().unwrap(),
         ]
     } else {
         vec![
-            "-y", "-loglevel", "error",
-            "-f", "lavfi", "-i", "smptebars=size=640x480:rate=24:duration=2",
-            "-f", "lavfi", "-i", "sine=frequency=330:sample_rate=44100:duration=2",
-            "-ac", "1", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "smptebars=size=640x480:rate=24:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:sample_rate=44100:duration=2",
+            "-ac",
+            "1",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-c:a",
+            "aac",
             at.to_str().unwrap(),
         ]
     }
@@ -43,6 +95,22 @@ fn make(tools: &FfmpegTools, at: &std::path::Path, conformant: bool) {
 
     let out = std::process::Command::new(&tools.ffmpeg).args(&args).output().expect("ffmpeg");
     assert!(out.status.success(), "fixture: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Wait for the preparation `accept_upload` started on its own thread.
+///
+/// The test watches the row the way a browser does rather than starting a
+/// second preparation of the same upload, which is the production path and also
+/// the only one that cannot race itself.
+fn settled(e: &Env, id: &str) -> louver_cloud::CloudMedia {
+    for _ in 0..600 {
+        let m = e.db.media_owned(&e.user, id).unwrap();
+        if matches!(m.state, MediaState::Ready | MediaState::Failed) {
+            return m;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("preparation never finished");
 }
 
 struct Env {
@@ -78,10 +146,8 @@ fn a_conformant_upload_is_remuxed_and_becomes_broadcastable() {
     assert_eq!(m.state, MediaState::Uploaded, "the row exists before anything is read");
     assert!(!src.exists(), "the upload temp file was left behind");
 
-    e.ingest.prepare(&m.id).expect("prepare");
-
-    let done = e.db.media_owned(&e.user, &m.id).unwrap();
-    assert_eq!(done.state, MediaState::Ready);
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
     assert_eq!(done.width, 1920);
     assert_eq!(done.height, 1080);
     assert!((done.fps - 30.0).abs() < 0.01);
@@ -109,16 +175,14 @@ fn a_non_conformant_upload_is_transcoded_and_still_becomes_broadcastable() {
     make(&tools, &src, false);
 
     let m = e.ingest.accept_upload(&e.user, "odd.mp4", &src).unwrap();
-    e.ingest.prepare(&m.id).expect("prepare");
 
-    let done = e.db.media_owned(&e.user, &m.id).unwrap();
-    assert_eq!(done.state, MediaState::Ready);
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
     // What was probed is the source's own shape, not the profile's.
     assert_eq!((done.width, done.height), (640, 480));
     // What was produced conforms, which is what makes it broadcastable.
-    let prepared = LocalStorage::new(e.root.join("media"))
-        .localize(&done.prepared_path.clone().unwrap())
-        .unwrap();
+    let prepared =
+        LocalStorage::new(e.root.join("media")).localize(&done.prepared_path.clone().unwrap()).unwrap();
     let builder = louver_core::streaming::ffmpeg::FfmpegCommandBuilder::new(
         tools.clone(),
         louver_cloud::ingest::CLOUD_PROFILE,
@@ -143,12 +207,11 @@ fn a_file_that_is_not_video_fails_the_media_and_not_the_server() {
     std::fs::write(&src, b"this is not an mp4").unwrap();
 
     let m = e.ingest.accept_upload(&e.user, "notvideo.mp4", &src).unwrap();
-    assert!(e.ingest.prepare(&m.id).is_err(), "garbage must not report success");
 
-    // The failure belongs to the row, with something a person can read.
-    e.db.record_media_failed(&m.id, "probe failed").unwrap();
-    let done = e.db.media_owned(&e.user, &m.id).unwrap();
-    assert_eq!(done.state, MediaState::Failed);
+    // The failure belongs to the row, with something a person can read, and the
+    // server carries on.
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Failed, "garbage must not report success");
     assert!(done.last_error.is_some());
 
     // And a broadcast cannot be started from it.
@@ -179,4 +242,37 @@ fn an_upload_over_the_plan_limit_is_refused_before_it_is_stored() {
     assert!(matches!(r, Err(louver_cloud::CloudError::LimitReached { .. })), "{r:?}");
     assert!(src.exists(), "a refused upload should not have been consumed");
     assert!(e.db.media_for(&e.user).unwrap().is_empty(), "a refused upload left a row");
+}
+
+#[test]
+fn preparing_the_same_upload_twice_at_once_does_not_destroy_it() {
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let src = e.root.join("twice.mp4");
+    make(&tools, &src, true);
+    let m = e.ingest.accept_upload(&e.user, "twice.mp4", &src).unwrap();
+
+    // Four callers at once, on top of the thread the upload already started.
+    // Exactly one preparation must happen: the others found it in flight and
+    // left it alone rather than filing its output away underneath it.
+    let hands: Vec<_> = (0..4)
+        .map(|_| {
+            let ingest = e.ingest.clone();
+            let id = m.id.clone();
+            std::thread::spawn(move || ingest.prepare(&id))
+        })
+        .collect();
+    for h in hands {
+        assert!(h.join().unwrap().is_ok(), "a concurrent prepare reported a failure");
+    }
+
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
+    assert!(done.prepared_path.is_some());
+
+    // And a retry afterwards is still allowed — the claim was released.
+    e.ingest.prepare(&m.id).expect("a retry after the work finished");
 }

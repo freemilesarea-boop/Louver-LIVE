@@ -55,6 +55,11 @@ const ALLOWLIST = [
   /^crates\/louver-core\/tests\//,
   /^apps\/desktop\/src\/test\//,
   /^apps\/desktop\/src\/.*\.test\.tsx?$/,
+  // The cloud's own suites do the same: a key-shaped string is the only way to
+  // prove that a key-shaped string never reaches a response, a log or the DOM.
+  /^apps\/server\/tests\//,
+  /^crates\/louver-cloud\/tests\//,
+  /^apps\/web\/src\/.*\.test\.tsx?$/,
   /^README\.md$/,
   /^TESTING\.md$/,
   /^ARCHITECTURE\.md$/,

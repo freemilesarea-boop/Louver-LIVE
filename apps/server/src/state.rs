@@ -23,9 +23,8 @@ pub struct App {
 impl App {
     /// Build everything from the environment, and fail loudly on what is missing.
     pub fn boot() -> Result<Self> {
-        let data = PathBuf::from(
-            std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()),
-        );
+        let data =
+            PathBuf::from(std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()));
         std::fs::create_dir_all(&data)?;
 
         let db = CloudDb::open(&data.join("cloud.db"))?;
@@ -39,10 +38,9 @@ impl App {
         let upload_tmp = data.join("uploads");
         std::fs::create_dir_all(&upload_tmp)?;
 
-        let tools = FfmpegTools::discover(
-            std::env::var("LOUVER_FFMPEG_DIR").ok().map(PathBuf::from).as_deref(),
-        )
-        .map_err(|e| louver_cloud::CloudError::Invalid(format!("FFmpeg를 찾지 못했습니다: {e}")))?;
+        let tools =
+            FfmpegTools::discover(std::env::var("LOUVER_FFMPEG_DIR").ok().map(PathBuf::from).as_deref())
+                .map_err(|e| louver_cloud::CloudError::Invalid(format!("FFmpeg를 찾지 못했습니다: {e}")))?;
         let encoder = std::env::var("LOUVER_ENCODER").unwrap_or_else(|_| "libx264".into());
 
         let mgr = BroadcastManager::new(

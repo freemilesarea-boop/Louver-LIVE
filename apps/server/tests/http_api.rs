@@ -123,8 +123,7 @@ async fn send(
     };
     let res = louver_server::router(s.app.clone()).oneshot(req).await.unwrap();
     let status = res.status();
-    let set_cookie =
-        res.headers().get(header::SET_COOKIE).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let set_cookie = res.headers().get(header::SET_COOKIE).and_then(|v| v.to_str().ok()).map(str::to_string);
     let bytes = axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024).await.unwrap();
     Reply { status, body: String::from_utf8_lossy(&bytes).to_string(), set_cookie }
 }
@@ -151,12 +150,7 @@ async fn account(s: &Server, email: &str) -> String {
     let cookie = r.set_cookie.expect("register must set a session cookie");
     assert!(cookie.contains("HttpOnly"), "session cookie must be HttpOnly: {cookie}");
     assert!(!r.body.contains("louver_session"), "the token must not be in the body: {}", r.body);
-    cookie
-        .split(';')
-        .next()
-        .unwrap()
-        .trim_start_matches("louver_session=")
-        .to_string()
+    cookie.split(';').next().unwrap().trim_start_matches("louver_session=").to_string()
 }
 
 const A_REAL_LOOKING_KEY: &str = "abcd-1234-efgh-5678-ijkl";
@@ -231,10 +225,7 @@ async fn knowing_another_users_ids_buys_nothing() {
     let b = account(&s, "b@example.com").await;
     let b_id = get(&s, "/api/me", &b).await.id();
     let (b_broadcast, b_media) = ready_broadcast(&s, &b, &b_id, "B의 방송").await;
-    let b_dest = get(&s, "/api/stream-destinations", &b).await.json()[0]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let b_dest = get(&s, "/api/stream-destinations", &b).await.json()[0]["id"].as_str().unwrap().to_string();
 
     // A holds B's real ids. Every one of them is simply not found.
     for (method, path) in [
@@ -265,10 +256,7 @@ async fn knowing_another_users_ids_buys_nothing() {
     // A's own listings show only A's things, which is to say nothing yet.
     assert_eq!(get(&s, "/api/media", &a).await.json().as_array().unwrap().len(), 0);
     assert_eq!(get(&s, "/api/stream-destinations", &a).await.json().as_array().unwrap().len(), 0);
-    assert_eq!(
-        get(&s, "/api/broadcasts", &a).await.json()["broadcasts"].as_array().unwrap().len(),
-        0
-    );
+    assert_eq!(get(&s, "/api/broadcasts", &a).await.json()["broadcasts"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]

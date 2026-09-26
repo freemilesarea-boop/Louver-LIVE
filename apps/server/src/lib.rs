@@ -29,9 +29,7 @@ where
 {
     match tokio::task::spawn_blocking(f).await {
         Ok(r) => r.map_err(ApiError::from),
-        Err(_) => Err(ApiError(CloudError::Io(std::io::Error::other(
-            "요청 처리가 중단되었습니다",
-        )))),
+        Err(_) => Err(ApiError(CloudError::Io(std::io::Error::other("요청 처리가 중단되었습니다")))),
     }
 }
 
@@ -52,10 +50,7 @@ pub fn router(app: App) -> Router {
         .route("/api/me", get(auth::me))
         .route("/api/me/subscription", get(auth::subscription))
         .merge(media)
-        .route(
-            "/api/stream-destinations",
-            get(api::list_destinations).post(api::create_destination),
-        )
+        .route("/api/stream-destinations", get(api::list_destinations).post(api::create_destination))
         .route("/api/stream-destinations/{id}", delete(api::delete_destination))
         .route("/api/broadcasts", get(api::list_broadcasts).post(api::create_broadcast))
         .route("/api/broadcasts/{id}", get(api::get_broadcast).delete(api::delete_broadcast))
@@ -71,8 +66,6 @@ pub async fn health() -> &'static str {
     "ok"
 }
 
-
-
 /// Serves the built web UI when there is one, so a single container is enough.
 pub fn with_web_ui(router: Router) -> Router {
     let Ok(dir) = std::env::var("LOUVER_WEB_DIR") else {
@@ -80,7 +73,6 @@ pub fn with_web_ui(router: Router) -> Router {
     };
     let index = std::path::Path::new(&dir).join("index.html");
     router.fallback_service(
-        tower_http::services::ServeDir::new(&dir)
-            .fallback(tower_http::services::ServeFile::new(index)),
+        tower_http::services::ServeDir::new(&dir).fallback(tower_http::services::ServeFile::new(index)),
     )
 }

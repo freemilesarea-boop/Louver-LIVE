@@ -299,12 +299,11 @@ impl BroadcastManager {
 
         let builder = FfmpegCommandBuilder::new(self.tools.clone(), OutputProfile::P1080p30)
             .with_encoder(self.encoder.clone());
-        let events: Arc<dyn RuntimeEvents> =
-            Arc::new(DbEvents {
-                db: self.db.clone(),
-                broadcast_id: broadcast_id.to_string(),
-                sent: Mutex::new(Meter::default()),
-            });
+        let events: Arc<dyn RuntimeEvents> = Arc::new(DbEvents {
+            db: self.db.clone(),
+            broadcast_id: broadcast_id.to_string(),
+            sent: Mutex::new(Meter::default()),
+        });
         let launcher = self.launchers.for_broadcast(&self.db, broadcast_id);
 
         let mut rt = BroadcastRuntime::new(

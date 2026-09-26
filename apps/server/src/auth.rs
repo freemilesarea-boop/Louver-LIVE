@@ -30,19 +30,14 @@ pub struct Caller(pub String);
 impl FromRequestParts<App> for Caller {
     type Rejection = ApiError;
 
-    async fn from_request_parts(
-        parts: &mut Parts,
-        app: &App,
-    ) -> std::result::Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut Parts, app: &App) -> std::result::Result<Self, Self::Rejection> {
         let token = token_from(&parts.headers).ok_or(CloudError::BadCredentials)?;
         let hash = token_hash(&token);
         let db = app.db.clone();
         // A token that resolves to nothing is a session problem, not a missing
         // resource: the caller is told to sign in, never that some id exists.
-        let id = crate::blocking(move || {
-            db.user_for_token(&hash).map_err(|_| CloudError::BadCredentials)
-        })
-        .await?;
+        let id =
+            crate::blocking(move || db.user_for_token(&hash).map_err(|_| CloudError::BadCredentials)).await?;
         Ok(Self(id))
     }
 }
@@ -114,10 +109,7 @@ pub async fn register(State(app): State<App>, Json(body): Json<Credentials>) -> 
         let user = app.db.create_user(&email, &hash, &plan)?;
         let (token, hash) = new_token()?;
         app.db.create_auth_session(&user.id, &hash, SESSION_DAYS)?;
-        Ok((
-            Me { id: user.id, email: user.email, plan_id: user.plan_id },
-            token,
-        ))
+        Ok((Me { id: user.id, email: user.email, plan_id: user.plan_id }, token))
     })
     .await?;
     Ok((with_cookie(session_cookie(&token)), Json(me)))
@@ -135,20 +127,14 @@ pub async fn login(State(app): State<App>, Json(body): Json<Credentials>) -> Ans
         let user = app.db.user(&user_id)?;
         let (token, hash) = new_token()?;
         app.db.create_auth_session(&user.id, &hash, SESSION_DAYS)?;
-        Ok((
-            Me { id: user.id, email: user.email, plan_id: user.plan_id },
-            token,
-        ))
+        Ok((Me { id: user.id, email: user.email, plan_id: user.plan_id }, token))
     })
     .await?;
     Ok((with_cookie(session_cookie(&token)), Json(me)))
 }
 
 /// Ends this session server-side, not only in the browser.
-pub async fn logout(
-    State(app): State<App>,
-    headers: HeaderMap,
-) -> std::result::Result<HeaderMap, ApiError> {
+pub async fn logout(State(app): State<App>, headers: HeaderMap) -> std::result::Result<HeaderMap, ApiError> {
     if let Some(token) = token_from(&headers) {
         let hash = token_hash(&token);
         crate::blocking(move || app.db.delete_auth_session(&hash)).await?;
@@ -156,10 +142,7 @@ pub async fn logout(
     Ok(with_cookie(cleared_cookie()))
 }
 
-pub async fn me(
-    State(app): State<App>,
-    Caller(user_id): Caller,
-) -> std::result::Result<Json<Me>, ApiError> {
+pub async fn me(State(app): State<App>, Caller(user_id): Caller) -> std::result::Result<Json<Me>, ApiError> {
     let u = crate::blocking(move || app.db.user(&user_id)).await?;
     Ok(Json(Me { id: u.id, email: u.email, plan_id: u.plan_id }))
 }

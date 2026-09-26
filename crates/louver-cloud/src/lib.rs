@@ -52,7 +52,14 @@ pub enum CloudError {
 
 impl From<louver_core::error::LouverError> for CloudError {
     fn from(e: louver_core::error::LouverError) -> Self {
-        Self::Engine(e.message)
+        // The detail is where FFmpeg's own stderr lives. Dropping it leaves a
+        // server operator with "방송 준비에 실패했습니다" and nothing to act on,
+        // which is exactly the position §17 asks us not to put them in. It is
+        // already masked by the core on its way here.
+        match e.detail.as_deref().filter(|d| !d.trim().is_empty()) {
+            Some(detail) => Self::Engine(format!("{} ({detail})", e.message)),
+            None => Self::Engine(e.message),
+        }
     }
 }
 

@@ -19,7 +19,8 @@ use louver_core::media::cache::MediaCache;
 use louver_core::media::normalize::{normalize_one, CancelToken};
 use louver_core::media::probe::probe;
 use louver_core::streaming::ffmpeg::{FfmpegCommandBuilder, FfmpegTools};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 /// The profile everything is prepared into.
 pub const CLOUD_PROFILE: OutputProfile = OutputProfile::P1080p30;
@@ -31,6 +32,13 @@ pub struct Ingest {
     storage: Arc<dyn Storage>,
     tools: FfmpegTools,
     encoder: String,
+    /// Media ids being prepared right now.
+    ///
+    /// Two preparations of one upload at the same time do not merely waste a
+    /// core: the second files the first one's output away mid-run and both die
+    /// with "no such file". A retry after one finishes is fine; an overlap is
+    /// not, so the second caller is told the work is already under way.
+    in_flight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl std::fmt::Debug for Ingest {
@@ -41,7 +49,7 @@ impl std::fmt::Debug for Ingest {
 
 impl Ingest {
     pub fn new(db: CloudDb, storage: Arc<dyn Storage>, tools: FfmpegTools, encoder: String) -> Self {
-        Self { db, storage, tools, encoder }
+        Self { db, storage, tools, encoder, in_flight: Arc::new(Mutex::new(HashSet::new())) }
     }
 
     /// Store a file that has finished uploading, then analyse and prepare it.
@@ -74,22 +82,36 @@ impl Ingest {
 
     /// Analyse, then remux or encode into the broadcast profile.
     ///
-    /// Synchronous, and public, so a test can run it and watch the result
-    /// rather than racing a thread.
+    /// Synchronous and public, so a retry can be driven from anywhere. It
+    /// returns immediately when this media is already being prepared, which is
+    /// what makes a retry safe to call without knowing whether the upload's own
+    /// thread is still working.
     pub fn prepare(&self, media_id: &str) -> Result<()> {
-        let builder = FfmpegCommandBuilder::new(self.tools.clone(), CLOUD_PROFILE)
-            .with_encoder(self.encoder.clone());
+        // Claim this media, or leave it to whoever has it.
+        {
+            let mut busy = self.in_flight.lock().unwrap();
+            if !busy.insert(media_id.to_string()) {
+                return Ok(());
+            }
+        }
+        let done = Claim { set: Arc::clone(&self.in_flight), id: media_id.to_string() };
+        let outcome = self.prepare_now(media_id);
+        drop(done);
+        outcome
+    }
+
+    fn prepare_now(&self, media_id: &str) -> Result<()> {
+        let builder =
+            FfmpegCommandBuilder::new(self.tools.clone(), CLOUD_PROFILE).with_encoder(self.encoder.clone());
 
         let row = self
             .db
             .raw()
             .lock()
             .unwrap()
-            .query_row(
-                "SELECT user_id, storage_path FROM media WHERE id=?1",
-                [media_id],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
+            .query_row("SELECT user_id, storage_path FROM media WHERE id=?1", [media_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
             .map_err(|_| CloudError::NotFound("media"))?;
         let (user_id, key) = row;
 
@@ -126,12 +148,7 @@ impl Ingest {
 
         let original = self.storage.size_bytes(&key).unwrap_or(0) as i64;
         let prepared = self.storage.size_bytes(&prepared_key).unwrap_or(0) as i64;
-        self.db.record_media_prepared(
-            media_id,
-            &prepared_key,
-            out.duration_secs,
-            original + prepared,
-        )?;
+        self.db.record_media_prepared(media_id, &prepared_key, out.duration_secs, original + prepared)?;
         Ok(())
     }
 
@@ -142,10 +159,22 @@ impl Ingest {
             .raw()
             .lock()
             .unwrap()
-            .query_row("SELECT state FROM media WHERE id=?1", [media_id], |r| {
-                r.get::<_, String>(0)
-            })
+            .query_row("SELECT state FROM media WHERE id=?1", [media_id], |r| r.get::<_, String>(0))
             .map_err(|_| CloudError::NotFound("media"))?;
         Ok(m)
+    }
+}
+
+/// Releases an in-flight claim however `prepare_now` ends, panic included.
+struct Claim {
+    set: Arc<Mutex<HashSet<String>>>,
+    id: String,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Ok(mut busy) = self.set.lock() {
+            busy.remove(&self.id);
+        }
     }
 }

@@ -51,10 +51,8 @@ pub async fn upload_media(
     };
 
     let mut saved: Option<(String, std::path::PathBuf)> = None;
-    while let Some(mut field) = form
-        .next_field()
-        .await
-        .map_err(|e| CloudError::Invalid(format!("업로드를 읽을 수 없습니다: {e}")))?
+    while let Some(mut field) =
+        form.next_field().await.map_err(|e| CloudError::Invalid(format!("업로드를 읽을 수 없습니다: {e}")))?
     {
         if field.name() != Some("file") {
             continue;
@@ -141,10 +139,7 @@ pub struct NewDestination {
     pub stream_key: String,
 }
 
-pub async fn list_destinations(
-    State(app): State<App>,
-    Caller(uid): Caller,
-) -> Out<Vec<StreamDestination>> {
+pub async fn list_destinations(State(app): State<App>, Caller(uid): Caller) -> Out<Vec<StreamDestination>> {
     Ok(Json(crate::blocking(move || app.db.destinations_for(&uid)).await?))
 }
 
@@ -327,18 +322,17 @@ pub async fn events(
 ) -> Sse<impl tokio_stream::Stream<Item = std::result::Result<Event, Infallible>>> {
     use tokio_stream::StreamExt;
 
-    let ticks = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(
-        Duration::from_secs(2),
-    ));
+    let ticks = tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(Duration::from_secs(2)));
     let stream = ticks.then(move |_| {
         let app = app.clone();
         let uid = uid.clone();
         async move {
             let snapshot = crate::blocking(move || app.mgr.dashboard(&uid)).await;
             let event = match snapshot {
-                Ok(d) => Event::default().event("dashboard").json_data(d).unwrap_or_else(|_| {
-                    Event::default().event("error").data("직렬화 실패")
-                }),
+                Ok(d) => Event::default()
+                    .event("dashboard")
+                    .json_data(d)
+                    .unwrap_or_else(|_| Event::default().event("error").data("직렬화 실패")),
                 // A failure here is the caller's session ending, not something
                 // to spell out over a public channel.
                 Err(_) => Event::default().event("error").data("상태를 읽을 수 없습니다"),
