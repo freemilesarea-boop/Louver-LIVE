@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/louver-core",
+    "crates/louver-cloud",
     "apps/desktop/src-tauri",
 ]
 

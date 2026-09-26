@@ -2208,6 +2208,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "louver-cloud"
+version = "1.0.8"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "hex",
+ "louver-core",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "louver-core"
 version = "1.0.8"
 dependencies = [

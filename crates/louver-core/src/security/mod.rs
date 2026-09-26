@@ -102,24 +102,37 @@ pub fn validate_stream_key(key: &str) -> Result<()> {
 #[derive(Debug)]
 pub struct StreamKeyStore {
     inner: Arc<dyn SecretStore>,
+    /// Which account name this store reads and writes.
+    ///
+    /// The desktop has one stream key, so it uses [`STREAM_KEY_ACCOUNT`]. A
+    /// server has one per destination and cannot share a name, or two
+    /// broadcasts would read each other's key. `SecretStore` was always keyed
+    /// by account; this simply stops hardcoding which key.
+    account: String,
 }
 
 impl StreamKeyStore {
     pub fn new(inner: Arc<dyn SecretStore>) -> Self {
-        Self { inner }
+        Self::with_account(inner, STREAM_KEY_ACCOUNT.to_string())
     }
+
+    /// A store scoped to one account name.
+    pub fn with_account(inner: Arc<dyn SecretStore>, account: String) -> Self {
+        Self { inner, account }
+    }
+
     pub fn set(&self, key: &str) -> Result<()> {
         validate_stream_key(key)?;
-        self.inner.set(STREAM_KEY_ACCOUNT, key.trim())
+        self.inner.set(&self.account, key.trim())
     }
     pub fn get(&self) -> Result<Option<String>> {
-        self.inner.get(STREAM_KEY_ACCOUNT)
+        self.inner.get(&self.account)
     }
     pub fn require(&self) -> Result<String> {
         self.get()?.ok_or_else(|| LouverError::new(ErrorCode::StreamNoStreamKey))
     }
     pub fn clear(&self) -> Result<()> {
-        self.inner.delete(STREAM_KEY_ACCOUNT)
+        self.inner.delete(&self.account)
     }
     pub fn has_key(&self) -> bool {
         matches!(self.get(), Ok(Some(k)) if !k.is_empty())
@@ -249,5 +262,42 @@ mod tests {
     fn app_data_dir_is_platform_appropriate() {
         let d = default_app_data_dir();
         assert!(d.to_string_lossy().contains("LouverLive"));
+    }
+}
+
+#[cfg(test)]
+mod account_scope_tests {
+    use super::*;
+
+    /// Two destinations must not be able to read each other's key.
+    ///
+    /// The cloud runs several broadcasts against one secret store. If both
+    /// stores wrote to the same account name, starting the second broadcast
+    /// would overwrite the first's key and both would stream to one channel.
+    #[test]
+    fn two_scoped_stores_hold_separate_keys() {
+        let backing: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        let a = StreamKeyStore::with_account(Arc::clone(&backing), "destination:a".into());
+        let b = StreamKeyStore::with_account(Arc::clone(&backing), "destination:b".into());
+
+        a.set("aaaa-aaaa-aaaa-aaaa").unwrap();
+        b.set("bbbb-bbbb-bbbb-bbbb").unwrap();
+
+        assert_eq!(a.get().unwrap().as_deref(), Some("aaaa-aaaa-aaaa-aaaa"));
+        assert_eq!(b.get().unwrap().as_deref(), Some("bbbb-bbbb-bbbb-bbbb"));
+
+        // And clearing one leaves the other alone.
+        a.clear().unwrap();
+        assert!(a.get().unwrap().is_none());
+        assert_eq!(b.get().unwrap().as_deref(), Some("bbbb-bbbb-bbbb-bbbb"));
+    }
+
+    /// The default keeps the account name the desktop has always used, so an
+    /// installed copy still finds the key it saved before this change.
+    #[test]
+    fn the_default_store_still_uses_the_desktops_account_name() {
+        let backing: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+        StreamKeyStore::new(Arc::clone(&backing)).set("cccc-cccc-cccc-cccc").unwrap();
+        assert_eq!(backing.get(STREAM_KEY_ACCOUNT).unwrap().as_deref(), Some("cccc-cccc-cccc-cccc"));
     }
 }
