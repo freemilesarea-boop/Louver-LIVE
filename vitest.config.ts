@@ -9,7 +9,9 @@ export default defineConfig({
     environment: 'jsdom',
     globals: true,
     setupFiles: ['apps/desktop/src/test/setup.ts'],
-    include: ['apps/desktop/src/**/*.test.{ts,tsx}'],
+    // The web front end shares these primitives and this setup file, so its
+    // tests run in the same suite rather than a parallel one nobody remembers.
+    include: ['apps/desktop/src/**/*.test.{ts,tsx}', 'apps/web/src/**/*.test.{ts,tsx}'],
     // The journey suite has its own config and runs as a separate step, so it
     // is excluded here rather than being counted twice.
     exclude: ['apps/desktop/src/test/e2e/**'],
