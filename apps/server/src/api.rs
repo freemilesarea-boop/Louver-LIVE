@@ -343,3 +343,89 @@ pub async fn events(
 
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
+
+// --- metrics --------------------------------------------------------------
+
+/// What a broadcast has cost so far, and what the machine is doing.
+///
+/// §9 of the brief and §22 of the original: the numbers a 24-hour test needs,
+/// and the ones a price is eventually calculated from. Scoped to the caller —
+/// the broadcasts are theirs, and the machine figures are the same ones `top`
+/// would show anyone with a shell on the box.
+#[derive(Serialize)]
+pub struct Metrics {
+    pub deployment: String,
+    pub server: ServerMetrics,
+    pub broadcasts: Vec<BroadcastMetrics>,
+}
+
+#[derive(Serialize)]
+pub struct ServerMetrics {
+    pub cpu_percent: f32,
+    pub memory_total_bytes: u64,
+    pub memory_available_bytes: u64,
+    pub process_cpu_percent: f32,
+    pub process_memory_bytes: u64,
+    pub disk_available_bytes: u64,
+    /// Bytes this account's broadcasts have pushed since each one started.
+    /// The closest thing to "network out" that is actually attributable.
+    pub egress_bytes: i64,
+}
+
+#[derive(Serialize)]
+pub struct BroadcastMetrics {
+    pub id: String,
+    pub name: String,
+    pub runtime_state: louver_cloud::RuntimeState,
+    pub uptime_secs: i64,
+    pub bytes_sent: i64,
+    pub average_bitrate_bps: i64,
+    pub restart_count: i64,
+    pub last_error: Option<String>,
+    pub ffmpeg_pid: Option<i64>,
+    pub last_heartbeat: Option<String>,
+}
+
+pub async fn metrics(State(app): State<App>, Caller(uid): Caller) -> Out<Metrics> {
+    let m = crate::blocking(move || {
+        let broadcasts = app.db.broadcasts_for(&uid)?;
+        let egress = broadcasts.iter().map(|b| b.bytes_sent).sum();
+
+        // `sysinfo` needs two samples to have a CPU figure at all, and the
+        // second must not be taken in the same instant as the first.
+        let mut collector = louver_core::system::MetricsCollector::new();
+        let _ = collector.sample(None);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let s = collector.sample(None);
+
+        Ok(Metrics {
+            deployment: crate::health::deployment(),
+            server: ServerMetrics {
+                cpu_percent: s.system_cpu_percent,
+                memory_total_bytes: s.total_memory_bytes,
+                memory_available_bytes: s.available_memory_bytes,
+                process_cpu_percent: s.app_cpu_percent,
+                process_memory_bytes: s.app_memory_bytes,
+                disk_available_bytes: louver_core::system::available_disk_bytes(&app.storage.scratch_dir()),
+                egress_bytes: egress,
+            },
+            broadcasts: broadcasts
+                .into_iter()
+                .map(|b| BroadcastMetrics {
+                    average_bitrate_bps: b.average_bitrate_bps(),
+                    id: b.id,
+                    name: b.name,
+                    runtime_state: b.runtime_state,
+                    uptime_secs: b.uptime_secs,
+                    bytes_sent: b.bytes_sent,
+                    restart_count: b.restart_count,
+                    last_error: b.last_error,
+                    ffmpeg_pid: b.ffmpeg_pid,
+                    last_heartbeat: b.last_heartbeat,
+                })
+                .collect(),
+        })
+    })
+    .await?;
+    Ok(Json(m))
+}

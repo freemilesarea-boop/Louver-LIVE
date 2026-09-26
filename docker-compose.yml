@@ -11,7 +11,12 @@ services:
     restart: unless-stopped
     ports:
       - '${LOUVER_PORT:-8080}:8080'
-    env_file: .env
+    # Optional so that a missing .env fails with the message below — "set
+    # LOUVER_MASTER_KEY in .env" — instead of a stat error about a file the
+    # reader has not been told to create yet.
+    env_file:
+      - path: .env
+        required: false
     environment:
       # Read at boot; the server refuses to start without it, rather than
       # inventing a key that would orphan every saved stream key.

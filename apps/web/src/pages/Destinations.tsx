@@ -129,10 +129,15 @@ function AddDestination({
       }
     >
       <Field label="이름">
-        <Input value={label} onChange={(e) => setLabel(e.target.value)} placeholder="내 채널" />
+        <Input
+          value={label}
+          aria-label="대상 이름"
+          onChange={(e) => setLabel(e.target.value)}
+          placeholder="내 채널"
+        />
       </Field>
       <Field label="서버 주소">
-        <Input value={url} onChange={(e) => setUrl(e.target.value)} />
+        <Input value={url} aria-label="서버 주소" onChange={(e) => setUrl(e.target.value)} />
       </Field>
       <Field label="스트림 키" hint="저장한 뒤에는 다시 볼 수 없습니다. 서버에 암호화되어 보관됩니다.">
         <Input

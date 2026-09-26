@@ -82,10 +82,10 @@ fn server() -> Server {
         Arc::clone(&keys),
         Arc::new(Fake),
     );
-    let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools, "libx264".into());
+    let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools.clone(), "libx264".into());
     let upload_tmp = dir.path().join("uploads");
     std::fs::create_dir_all(&upload_tmp).unwrap();
-    Server { _dir: dir, app: App { db, mgr, ingest, storage, keys, upload_tmp } }
+    Server { _dir: dir, app: App { db, mgr, ingest, storage, keys, upload_tmp, tools } }
 }
 
 struct Reply {
@@ -435,4 +435,59 @@ async fn an_account_cannot_be_registered_twice_or_with_a_weak_password() {
     assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
     assert_eq!(unknown.status, unknown.status);
     assert_eq!(wrong.body, unknown.body);
+}
+
+#[tokio::test]
+async fn health_answers_without_a_session_and_names_what_is_broken() {
+    let s = server();
+    let r = send(&s, Method::GET, "/health", None, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.json()["status"], "ok");
+    // The four things the operator asked for, each its own answer.
+    for check in ["api", "database", "ffmpeg", "storage"] {
+        assert_eq!(r.json()["checks"][check], true, "{check} failed: {}", r.body);
+    }
+    // And where this is running, which is what decides whether closing a
+    // laptop ends a broadcast.
+    assert!(["local", "cloud"].contains(&r.json()["deployment"].as_str().unwrap()));
+
+    // A server whose FFmpeg is missing says so, and says it with a 503 so an
+    // orchestrator does not have to read the body.
+    let broken = Server {
+        _dir: tempfile::tempdir().unwrap(),
+        app: App { tools: FfmpegTools::new("/nonexistent/ffmpeg", "/nonexistent/ffprobe"), ..s.app.clone() },
+    };
+    let r = send(&broken, Method::GET, "/health", None, None).await;
+    assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(r.json()["status"], "degraded");
+    assert_eq!(r.json()["checks"]["ffmpeg"], false);
+    assert_eq!(r.json()["checks"]["database"], true, "one failure must not mask the rest");
+}
+
+#[tokio::test]
+async fn metrics_are_per_account_and_carry_what_a_long_test_needs() {
+    let s = server();
+    let a = account(&s, "metrics-a@example.com").await;
+    let b = account(&s, "metrics-b@example.com").await;
+    let a_id = get(&s, "/api/me", &a).await.id();
+    let (broadcast, _) = ready_broadcast(&s, &a, &a_id, "지표 확인").await;
+    post(&s, &format!("/api/broadcasts/{broadcast}/start"), &a, None).await;
+
+    let mine = get(&s, "/api/metrics", &a).await;
+    assert_eq!(mine.status, StatusCode::OK, "{}", mine.body);
+    let row = &mine.json()["broadcasts"][0];
+    assert_eq!(row["id"], broadcast.as_str());
+    for field in
+        ["uptime_secs", "bytes_sent", "average_bitrate_bps", "restart_count", "last_error", "ffmpeg_pid"]
+    {
+        assert!(row.get(field).is_some(), "{field} missing from {}", mine.body);
+    }
+    assert!(mine.json()["server"]["memory_total_bytes"].as_u64().unwrap_or(0) > 0);
+
+    // The other account sees its own nothing, not someone else's broadcast.
+    let theirs = get(&s, "/api/metrics", &b).await;
+    assert_eq!(theirs.json()["broadcasts"].as_array().unwrap().len(), 0);
+    assert!(!theirs.body.contains(&broadcast));
+
+    s.app.mgr.shutdown();
 }

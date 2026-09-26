@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "vite",
     "dev:web": "vite --config vite.web.config.ts",
+    "cloud:dev": "node scripts/cloud-dev.mjs",
+    "cloud:user": "node scripts/cloud-dev.mjs --create-user",
     "build:cloud": "tsc --noEmit -p apps/web/tsconfig.json && vite build --config vite.web.config.ts",
     "build:web": "tsc --noEmit -p apps/desktop/tsconfig.json && vite build",
     "build": "npm run sidecar && npm run build:web && tauri build",

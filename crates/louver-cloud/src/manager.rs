@@ -130,6 +130,7 @@ impl RuntimeEvents for DbEvents {
             status.supervisor.restart_count as i64,
             status.elapsed_secs,
             sent,
+            status.supervisor.pid.map(i64::from),
         );
     }
 

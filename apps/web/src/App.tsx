@@ -9,16 +9,18 @@ import { Button } from '@/components/ui'
 import { CloudDashboard } from './pages/CloudDashboard'
 import { Destinations } from './pages/Destinations'
 import { MediaLibrary } from './pages/MediaLibrary'
+import { DeploymentBanner, ServerStatus } from './pages/ServerStatus'
 import { SignIn } from './pages/SignIn'
 import { useTransport } from './TransportContext'
 import type { Me } from './cloud'
 
-type Tab = 'broadcasts' | 'media' | 'destinations'
+type Tab = 'broadcasts' | 'media' | 'destinations' | 'status'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'broadcasts', label: '방송' },
   { id: 'media', label: '영상' },
   { id: 'destinations', label: '송출 대상' },
+  { id: 'status', label: '서버 상태' },
 ]
 
 export function App() {
@@ -44,10 +46,18 @@ export function App() {
     return <div className="flex min-h-screen items-center justify-center text-sm text-ink-500">불러오는 중…</div>
   }
 
-  if (!me) return <SignIn onSignedIn={setMe} />
+  if (!me) {
+    return (
+      <>
+        <DeploymentBanner />
+        <SignIn onSignedIn={setMe} />
+      </>
+    )
+  }
 
   return (
     <div className="min-h-screen bg-ink-950 text-ink-100">
+      <DeploymentBanner />
       <header className="flex items-center justify-between border-b border-ink-700 px-6 py-3">
         <div className="flex items-center gap-6">
           <span className="text-sm font-semibold">Louver Live</span>
@@ -83,6 +93,7 @@ export function App() {
         {tab === 'broadcasts' && <CloudDashboard />}
         {tab === 'media' && <MediaLibrary />}
         {tab === 'destinations' && <Destinations />}
+        {tab === 'status' && <ServerStatus />}
       </main>
     </div>
   )

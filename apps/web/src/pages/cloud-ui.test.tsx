@@ -11,6 +11,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ReactElement } from 'react'
 import { TransportProvider } from '../TransportContext'
 import { CloudDashboard } from './CloudDashboard'
+import { DeploymentBanner, ServerStatus } from './ServerStatus'
 import { Destinations } from './Destinations'
 import { MediaLibrary } from './MediaLibrary'
 import type { Broadcast, CloudMedia, Dashboard, StreamDestination } from '../cloud'
@@ -88,6 +89,25 @@ function fake(over: Partial<Transport> = {}): Transport {
     deleteBroadcast: vi.fn().mockResolvedValue(undefined),
     logs: vi.fn().mockResolvedValue([]),
     watchDashboard: vi.fn().mockReturnValue(() => undefined),
+    health: vi.fn().mockResolvedValue({
+      status: 'ok',
+      version: '1.0.8',
+      deployment: 'cloud',
+      checks: { api: true, database: true, ffmpeg: true, storage: true },
+    }),
+    metrics: vi.fn().mockResolvedValue({
+      deployment: 'cloud',
+      server: {
+        cpu_percent: 12,
+        memory_total_bytes: 16_000_000_000,
+        memory_available_bytes: 12_000_000_000,
+        process_cpu_percent: 1,
+        process_memory_bytes: 50_000_000,
+        disk_available_bytes: 80_000_000_000,
+        egress_bytes: 1_500_000_000,
+      },
+      broadcasts: [],
+    }),
   }
   return { ...base, ...over } as Transport
 }
@@ -231,5 +251,94 @@ describe('the media library', () => {
     )
 
     expect(await screen.findByRole('alert')).toHaveTextContent('max_upload_bytes 한도를 초과했습니다')
+  })
+})
+
+describe('where this is running', () => {
+  it('says CLOUD when the server says cloud, and says what that means', async () => {
+    show(<DeploymentBanner />, fake())
+
+    const banner = await screen.findByTestId('deployment-banner')
+    expect(banner).toHaveAttribute('data-deployment', 'cloud')
+    expect(banner).toHaveTextContent('REMOTE CLOUD SERVER')
+    expect(banner).toHaveTextContent('브라우저나 이 컴퓨터를 꺼도 방송은 계속됩니다')
+  })
+
+  it('warns on a laptop, because closing it ends the broadcast', async () => {
+    const t = fake({
+      health: vi.fn().mockResolvedValue({
+        status: 'ok',
+        version: '1.0.8',
+        deployment: 'local',
+        checks: { api: true, database: true, ffmpeg: true, storage: true },
+      }),
+    })
+    show(<DeploymentBanner />, t)
+
+    const banner = await screen.findByTestId('deployment-banner')
+    expect(banner).toHaveAttribute('data-deployment', 'local')
+    expect(banner).toHaveTextContent('LOCAL DEVELOPMENT')
+    expect(banner).toHaveTextContent('컴퓨터를 끄거나 절전되면 방송도 끝납니다')
+  })
+
+  it('names the part that is failing rather than just going red', async () => {
+    const t = fake({
+      health: vi.fn().mockResolvedValue({
+        status: 'degraded',
+        version: '1.0.8',
+        deployment: 'cloud',
+        checks: { api: true, database: true, ffmpeg: false, storage: true },
+      }),
+    })
+    show(<DeploymentBanner />, t)
+
+    expect(await screen.findByTestId('health-degraded')).toHaveTextContent('ffmpeg')
+  })
+})
+
+describe('the metrics a long test needs', () => {
+  it('shows per-broadcast uptime, bytes, bitrate, restarts and the pid', async () => {
+    const t = fake({
+      metrics: vi.fn().mockResolvedValue({
+        deployment: 'cloud',
+        server: {
+          cpu_percent: 7,
+          memory_total_bytes: 16_000_000_000,
+          memory_available_bytes: 12_000_000_000,
+          process_cpu_percent: 1,
+          process_memory_bytes: 50_000_000,
+          disk_available_bytes: 80_000_000_000,
+          egress_bytes: 1_500_000_000,
+        },
+        broadcasts: [
+          {
+            id: 'b1',
+            name: '밤 라디오',
+            runtime_state: 'RUNNING',
+            uptime_secs: 3725,
+            bytes_sent: 2_793_000_000,
+            average_bitrate_bps: 5_998_000,
+            restart_count: 2,
+            last_error: null,
+            ffmpeg_pid: 4242,
+            last_heartbeat: null,
+          },
+        ],
+      }),
+    })
+
+    show(<ServerStatus />, t)
+
+    const row = await screen.findByTestId('metrics-row')
+    expect(row).toHaveTextContent('밤 라디오')
+    expect(row).toHaveTextContent('송출 중')
+    expect(row).toHaveTextContent('1시간 02분 05초')
+    expect(row).toHaveTextContent('6.00 Mbps')
+    expect(row).toHaveTextContent('4242')
+    // Every check the operator asked for, named rather than rolled into one dot.
+    const checks = await screen.findByTestId('health-checks')
+    for (const name of ['api', 'database', 'ffmpeg', 'storage']) {
+      expect(checks).toHaveTextContent(name)
+    }
   })
 })

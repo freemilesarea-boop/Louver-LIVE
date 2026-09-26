@@ -226,6 +226,23 @@ pub struct Broadcast {
     pub bytes_sent: i64,
     pub uptime_secs: i64,
     pub ffmpeg_exit_code: Option<i64>,
+    /// The process actually sending, while one is running. For an operator
+    /// looking at `top` beside the dashboard, and for nothing else: it is not
+    /// a handle anything in the API acts on.
+    pub ffmpeg_pid: Option<i64>,
+}
+
+impl Broadcast {
+    /// Average bitrate over the broadcast's life, in bits per second.
+    ///
+    /// Bytes over uptime rather than FFmpeg's instantaneous figure, because
+    /// what a month costs is the average, not the moment.
+    pub fn average_bitrate_bps(&self) -> i64 {
+        if self.uptime_secs <= 0 {
+            return 0;
+        }
+        self.bytes_sent.saturating_mul(8) / self.uptime_secs
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

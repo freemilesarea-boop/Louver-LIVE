@@ -5,6 +5,8 @@ target/
 .DS_Store
 .env
 .env.local
+# Local cloud development: database, media and the dev master key.
+.louver-dev/
 apps/desktop/src-tauri/binaries/ffmpeg*
 apps/desktop/src-tauri/binaries/ffprobe*
 !apps/desktop/src-tauri/binaries/.gitkeep

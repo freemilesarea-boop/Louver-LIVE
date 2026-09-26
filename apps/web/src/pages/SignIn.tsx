@@ -38,6 +38,7 @@ export function SignIn({ onSignedIn }: { onSignedIn: (me: Me) => void }) {
             <Field label="이메일">
               <Input
                 type="email"
+                aria-label="이메일"
                 autoComplete="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
@@ -47,6 +48,7 @@ export function SignIn({ onSignedIn }: { onSignedIn: (me: Me) => void }) {
             <Field label="비밀번호" hint={mode === 'register' ? '10자 이상' : undefined}>
               <Input
                 type="password"
+                aria-label="비밀번호"
                 autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}

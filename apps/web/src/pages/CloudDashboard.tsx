@@ -228,7 +228,12 @@ function NewBroadcastModal({
       }
     >
       <Field label="이름">
-        <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="새 방송" />
+        <Input
+          value={name}
+          aria-label="방송 이름"
+          onChange={(e) => setName(e.target.value)}
+          placeholder="새 방송"
+        />
       </Field>
       <Field label="영상">
         <Select value={mediaId} onChange={(e) => setMediaId(e.target.value)} aria-label="영상">

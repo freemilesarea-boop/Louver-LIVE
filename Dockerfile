@@ -12,7 +12,10 @@ COPY package.json package-lock.json ./
 # npm ci installs from the lock file as a whole, which is what keeps the build
 # reproducible.
 RUN npm ci --no-audit --no-fund
-COPY tsconfig*.json vite.web.config.ts tailwind.config.js postcss.config.js ./
+# No tsconfig at the repository root: `apps/web`'s extends `apps/desktop`'s,
+# and both are copied below. A `tsconfig*.json` glob here matches nothing and
+# fails the build.
+COPY vite.web.config.ts tailwind.config.js postcss.config.js ./
 COPY apps/desktop/tsconfig.json apps/desktop/tsconfig.json
 COPY apps/desktop/src apps/desktop/src
 COPY apps/web apps/web
@@ -46,7 +49,10 @@ COPY --from=web /app/apps/web/dist /srv/louver/web
 ENV LOUVER_DATA_DIR=/var/lib/louver \
     LOUVER_WEB_DIR=/srv/louver/web \
     LOUVER_FFMPEG_DIR=/usr/bin \
-    LOUVER_BIND=0.0.0.0:8080
+    LOUVER_BIND=0.0.0.0:8080 \
+    # A container is a server that stays on. The UI says so, and the warning
+    # about closing a laptop is not shown.
+    LOUVER_DEPLOYMENT=cloud
 # The database, the uploaded originals and the prepared copies. Lose this and
 # the broadcasts are gone; back it up, not the image.
 VOLUME ["/var/lib/louver"]

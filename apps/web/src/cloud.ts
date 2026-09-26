@@ -133,3 +133,56 @@ export const MEDIA_LABELS: Record<MediaState, string> = {
 export function holdsASlot(b: Broadcast): boolean {
   return ['PREPARING', 'STARTING', 'RUNNING', 'RECONNECTING'].includes(b.runtime_state)
 }
+
+/** What `/health` answers. No session needed: a monitor is usually asking. */
+export interface Health {
+  status: 'ok' | 'degraded'
+  version: string
+  /** `local` — this computer. `cloud` — a server that stays on. */
+  deployment: 'local' | 'cloud'
+  checks: {
+    api: boolean
+    database: boolean
+    ffmpeg: boolean
+    storage: boolean
+  }
+}
+
+export interface BroadcastMetrics {
+  id: string
+  name: string
+  runtime_state: RuntimeState
+  uptime_secs: number
+  bytes_sent: number
+  average_bitrate_bps: number
+  restart_count: number
+  last_error?: string | null
+  ffmpeg_pid?: number | null
+  last_heartbeat?: string | null
+}
+
+export interface Metrics {
+  deployment: 'local' | 'cloud'
+  server: {
+    cpu_percent: number
+    memory_total_bytes: number
+    memory_available_bytes: number
+    process_cpu_percent: number
+    process_memory_bytes: number
+    disk_available_bytes: number
+    egress_bytes: number
+  }
+  broadcasts: BroadcastMetrics[]
+}
+
+/** What the header says about where this is running, and why it matters. */
+export const DEPLOYMENT_LABELS: Record<Health['deployment'], { title: string; hint: string }> = {
+  local: {
+    title: 'LOCAL DEVELOPMENT',
+    hint: '이 컴퓨터에서 서버가 실행 중입니다. 컴퓨터를 끄거나 절전되면 방송도 끝납니다.',
+  },
+  cloud: {
+    title: 'REMOTE CLOUD SERVER',
+    hint: '서버에서 방송이 실행됩니다. 브라우저나 이 컴퓨터를 꺼도 방송은 계속됩니다.',
+  },
+}

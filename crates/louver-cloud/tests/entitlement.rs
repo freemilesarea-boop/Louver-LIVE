@@ -207,7 +207,7 @@ fn a_reconnecting_broadcast_still_occupies_its_slot() {
     let db = CloudDb::open_in_memory().unwrap();
     let (uid, b) = user_with_broadcasts(&db, "blip@x.com", "basic", 2);
     db.claim_stream_slot(&uid, &b[0]).unwrap();
-    db.record_runtime(&b[0], RuntimeState::Reconnecting, 1, 30, 4_096).unwrap();
+    db.record_runtime(&b[0], RuntimeState::Reconnecting, 1, 30, 4_096, Some(4242)).unwrap();
     assert_eq!(db.active_stream_count(&uid).unwrap(), 1);
     assert!(db.claim_stream_slot(&uid, &b[1]).is_err(), "a blip must not free a slot");
 }

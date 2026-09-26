@@ -7,8 +7,8 @@
  * in a browser against a server" lives in exactly two classes in this file.
  */
 import type {
-  Broadcast, BroadcastEvent, CloudMedia, Dashboard, Me, NewBroadcast, NewDestination,
-  StreamDestination, Subscription,
+  Broadcast, BroadcastEvent, CloudMedia, Dashboard, Health, Me, Metrics, NewBroadcast,
+  NewDestination, StreamDestination, Subscription,
 } from './cloud'
 import type { LouverError } from '@/types'
 
@@ -40,6 +40,11 @@ export interface Transport {
 
   /** Live dashboard updates. Returns an unsubscribe function. */
   watchDashboard(onSnapshot: (d: Dashboard) => void): () => void
+
+  /** Where this is running and whether every part of it works. No session. */
+  health(): Promise<Health>
+  /** Per-broadcast and machine numbers, for a long test and for costing. */
+  metrics(): Promise<Metrics>
 }
 
 /** Every rejection reaches the UI in the shape its error banner already knows. */
@@ -228,6 +233,14 @@ export class WebTransport implements Transport {
     return this.json<BroadcastEvent[]>(
       `/api/broadcasts/${encodeURIComponent(id)}/logs?limit=${limit}`,
     )
+  }
+
+  health() {
+    return this.json<Health>('/health')
+  }
+
+  metrics() {
+    return this.json<Metrics>('/api/metrics')
   }
 
   /**

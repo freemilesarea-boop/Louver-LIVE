@@ -12,8 +12,8 @@
 import { api, listen } from '@/services/ipc'
 import type { Media, RuntimeStatus, StreamState } from '@/types'
 import type {
-  Broadcast, BroadcastEvent, CloudMedia, Dashboard, DesiredState, Me, MediaState, NewBroadcast,
-  NewDestination, RuntimeState, StreamDestination, Subscription,
+  Broadcast, BroadcastEvent, CloudMedia, Dashboard, DesiredState, Health, Me, MediaState, Metrics,
+  NewBroadcast, NewDestination, RuntimeState, StreamDestination, Subscription,
 } from './cloud'
 import type { Transport } from './transport'
 
@@ -133,6 +133,48 @@ export class DesktopTransport implements Transport {
       level: e.level,
       message: e.message,
     }))
+  }
+
+  /** The desktop is the machine in front of you. That is the whole point. */
+  async health(): Promise<Health> {
+    return {
+      status: 'ok',
+      version: '',
+      deployment: 'local',
+      checks: { api: true, database: true, ffmpeg: true, storage: true },
+    }
+  }
+
+  async metrics(): Promise<Metrics> {
+    const status = await api.getStatus()
+    const m = await api.getMetrics()
+    const d = await this.dashboard()
+    return {
+      deployment: 'local',
+      server: {
+        cpu_percent: m.system_cpu_percent,
+        memory_total_bytes: m.total_memory_bytes,
+        memory_available_bytes: m.available_memory_bytes,
+        process_cpu_percent: m.app_cpu_percent,
+        process_memory_bytes: m.app_memory_bytes,
+        disk_available_bytes: m.free_disk_bytes,
+        // The desktop sends from this machine and meters nothing: there is no
+        // bill to attribute, which is the difference the label is warning about.
+        egress_bytes: 0,
+      },
+      broadcasts: d.broadcasts.map((b) => ({
+        id: b.id,
+        name: b.name,
+        runtime_state: b.runtime_state,
+        uptime_secs: b.uptime_secs,
+        bytes_sent: 0,
+        average_bitrate_bps: 0,
+        restart_count: b.restart_count,
+        last_error: b.last_error ?? null,
+        ffmpeg_pid: status.supervisor.pid ?? null,
+        last_heartbeat: null,
+      })),
+    }
   }
 
   /** The desktop already pushes a status event; a snapshot follows each one. */

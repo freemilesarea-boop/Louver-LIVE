@@ -18,6 +18,9 @@ pub struct App {
     pub storage: Arc<dyn Storage>,
     pub keys: Arc<dyn SecretStore>,
     pub upload_tmp: PathBuf,
+    /// Kept so `/health` can ask FFmpeg whether it runs, rather than checking
+    /// that a file exists where one was once found.
+    pub tools: FfmpegTools,
 }
 
 impl App {
@@ -52,8 +55,8 @@ impl App {
             Arc::clone(&keys),
             Arc::new(FfmpegLaunchers { program: tools.ffmpeg.clone() }),
         );
-        let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools, encoder);
+        let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools.clone(), encoder);
 
-        Ok(Self { db, mgr, ingest, storage, keys, upload_tmp })
+        Ok(Self { db, mgr, ingest, storage, keys, upload_tmp, tools })
     }
 }

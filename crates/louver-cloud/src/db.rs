@@ -102,7 +102,8 @@ CREATE TABLE IF NOT EXISTS broadcasts (
     last_heartbeat   TEXT,
     bytes_sent       INTEGER NOT NULL DEFAULT 0,
     uptime_secs      INTEGER NOT NULL DEFAULT 0,
-    ffmpeg_exit_code INTEGER
+    ffmpeg_exit_code INTEGER,
+    ffmpeg_pid       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_broadcast_user ON broadcasts(user_id);
 CREATE INDEX IF NOT EXISTS idx_broadcast_desired ON broadcasts(desired_state);
@@ -173,6 +174,18 @@ impl std::fmt::Debug for CloudDb {
     }
 }
 
+/// Add a column unless it is already there. The cloud's own small migration.
+fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let existing: Vec<String> =
+        st.query_map([], |r| r.get::<_, String>(1))?.collect::<std::result::Result<_, _>>()?;
+    if existing.iter().any(|c| c == column) {
+        return Ok(());
+    }
+    conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"))?;
+    Ok(())
+}
+
 impl CloudDb {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(d) = path.parent() {
@@ -194,10 +207,42 @@ impl CloudDb {
         // seconds of waiting beats returning "database is locked" to a user.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA)?;
+        // `CREATE TABLE IF NOT EXISTS` does nothing to a table that is already
+        // there, so a column added after the first release needs its own step.
+        // Adding one that exists is an error, not a no-op, hence the check.
+        ensure_column(&conn, "broadcasts", "ffmpeg_pid", "INTEGER")?;
 
         let db = Self { conn: Arc::new(Mutex::new(conn)) };
         db.seed_plans()?;
         Ok(db)
+    }
+
+    /// Cheapest possible "is the database answering?".
+    ///
+    /// A real query, not a connection check: WAL recovery, a full disk and a
+    /// corrupt page all present as a failing read, not as a missing handle.
+    pub fn ping(&self) -> Result<()> {
+        self.conn.lock().unwrap().query_row("SELECT count(*) FROM plans", [], |r| r.get::<_, i64>(0))?;
+        Ok(())
+    }
+
+    /// Look a user up by the address they sign in with. For the bootstrap CLI.
+    pub fn user_by_email(&self, email: &str) -> Result<User> {
+        let id: Option<String> = self
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT id FROM users WHERE email=?1", [email.trim().to_lowercase()], |r| r.get(0))
+            .optional()?;
+        self.user(&id.ok_or(CloudError::NotFound("user"))?)
+    }
+
+    /// Every plan id the service knows, for a CLI that must not guess.
+    pub fn plan_ids(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare("SELECT id FROM plans ORDER BY id")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// The connection, for the credential store to share.
@@ -701,12 +746,13 @@ impl CloudDb {
         restart_count: i64,
         uptime_secs: i64,
         bytes_sent: i64,
+        ffmpeg_pid: Option<i64>,
     ) -> Result<()> {
         self.raw().lock().unwrap().execute(
             "UPDATE broadcasts SET runtime_state=?2, restart_count=?3, uptime_secs=?4,
-                    bytes_sent=?5, last_heartbeat=datetime('now')
+                    bytes_sent=?5, ffmpeg_pid=?6, last_heartbeat=datetime('now')
              WHERE id=?1",
-            params![id, state.id(), restart_count, uptime_secs, bytes_sent],
+            params![id, state.id(), restart_count, uptime_secs, bytes_sent, ffmpeg_pid],
         )?;
         Ok(())
     }
@@ -789,7 +835,8 @@ impl CloudDb {
 
 const BROADCAST_COLUMNS: &str = "SELECT id, user_id, name, media_id, destination_id, loop_forever,
         desired_state, runtime_state, restart_count, last_error, created_at, started_at,
-        stopped_at, last_heartbeat, bytes_sent, uptime_secs, ffmpeg_exit_code FROM broadcasts";
+        stopped_at, last_heartbeat, bytes_sent, uptime_secs, ffmpeg_exit_code, ffmpeg_pid
+        FROM broadcasts";
 
 fn row_to_media(r: &rusqlite::Row<'_>) -> rusqlite::Result<CloudMedia> {
     let state: String = r.get(4)?;
@@ -847,6 +894,7 @@ fn row_to_broadcast(r: &rusqlite::Row<'_>) -> rusqlite::Result<Broadcast> {
         bytes_sent: r.get(14)?,
         uptime_secs: r.get(15)?,
         ffmpeg_exit_code: r.get(16)?,
+        ffmpeg_pid: r.get(17)?,
     })
 }
 

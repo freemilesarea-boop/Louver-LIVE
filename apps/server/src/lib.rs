@@ -8,6 +8,7 @@
 pub mod api;
 pub mod auth;
 pub mod error;
+pub mod health;
 pub mod state;
 
 use crate::state::App;
@@ -43,7 +44,11 @@ pub fn router(app: App) -> Router {
         .layer(DefaultBodyLimit::disable());
 
     Router::new()
-        .route("/api/health", get(health))
+        // Unauthenticated on purpose: the caller is usually a healthcheck.
+        // `/api/health` is the same answer, for a proxy that only forwards
+        // `/api`.
+        .route("/health", get(health::health))
+        .route("/api/health", get(health::health))
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
@@ -58,12 +63,9 @@ pub fn router(app: App) -> Router {
         .route("/api/broadcasts/{id}/stop", post(api::stop_broadcast))
         .route("/api/broadcasts/{id}/restart", post(api::restart_broadcast))
         .route("/api/broadcasts/{id}/logs", get(api::broadcast_logs))
+        .route("/api/metrics", get(api::metrics))
         .route("/api/events", get(api::events))
         .with_state(app)
-}
-
-pub async fn health() -> &'static str {
-    "ok"
 }
 
 /// Serves the built web UI when there is one, so a single container is enough.
