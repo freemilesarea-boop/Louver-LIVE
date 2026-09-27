@@ -375,8 +375,10 @@ other's output. A media id is now claimed while it is being prepared.
 | --- | --- |
 | Docker image built and run | **NOT VERIFIED** — no Docker daemon here; `docker compose config` parses |
 | S3-compatible storage | **NOT IMPLEMENTED** — the trait is there; only `LocalStorage` exists |
-| Scheduled broadcasts in the cloud | **NOT IMPLEMENTED** — P1 in §18; `desired_state` is the seam a scheduler drives |
-| YouTube OAuth / metadata / chat on the server | **NOT IMPLEMENTED** — `skip_pre_start: true`; the desktop keeps these |
+| Scheduled broadcasts in the cloud | **DONE** — `crate::schedule::decide` and `spawn_scheduler`; the clock is the server's |
+| YouTube OAuth and live broadcasts on the server | **DONE, NOT VERIFIED AGAINST REAL YOUTUBE** — `crates/louver-cloud/src/youtube.rs`, tested against a fake Google. See [YOUTUBE_OAUTH.md](YOUTUBE_OAUTH.md) |
+| YouTube live chat on the server | **NOT IMPLEMENTED** — the desktop keeps it; nothing in the cloud reads a chat |
+| Broadcast thumbnails (`thumbnails.set`) | **NOT IMPLEMENTED** — there is no thumbnail field to upload yet, so nothing is scaffolded that would pretend otherwise |
 | Storage quota enforcement per plan | **PARTIAL** — `max_upload_bytes` is enforced per file; `max_storage_bytes` is stored and read but not yet refused at upload |
 | Billing, invoicing, prices | **NOT IMPLEMENTED** by intent — §22 asks for metrics, not prices |
 
