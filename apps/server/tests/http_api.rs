@@ -85,13 +85,16 @@ fn server() -> Server {
     let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools.clone(), "libx264".into());
     let upload_tmp = dir.path().join("uploads");
     std::fs::create_dir_all(&upload_tmp).unwrap();
-    Server { _dir: dir, app: App { db, mgr, ingest, storage, keys, upload_tmp, tools } }
+    Server { _dir: dir, app: App { db, mgr, ingest, storage, keys, upload_tmp, tools, youtube: None } }
 }
 
 struct Reply {
     status: StatusCode,
     body: String,
     set_cookie: Option<String>,
+    /// Where a redirect points. The OAuth callback answers with one rather than
+    /// a body, because what arrives there is a person looking at a browser.
+    location: Option<String>,
 }
 
 impl Reply {
@@ -124,8 +127,9 @@ async fn send(
     let res = louver_server::router(s.app.clone()).oneshot(req).await.unwrap();
     let status = res.status();
     let set_cookie = res.headers().get(header::SET_COOKIE).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let location = res.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string);
     let bytes = axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024).await.unwrap();
-    Reply { status, body: String::from_utf8_lossy(&bytes).to_string(), set_cookie }
+    Reply { status, body: String::from_utf8_lossy(&bytes).to_string(), set_cookie, location }
 }
 
 async fn get(s: &Server, path: &str, token: &str) -> Reply {
@@ -491,4 +495,158 @@ async fn metrics_are_per_account_and_carry_what_a_long_test_needs() {
     assert!(!theirs.body.contains(&broadcast));
 
     s.app.mgr.shutdown();
+}
+
+// --- §2, §15: the YouTube routes -------------------------------------------
+//
+// The provider itself is exercised against a fake Google in
+// `crates/louver-cloud/tests/youtube_provider.rs`. What is under test here is
+// the layer above it: who each route believes, and what it answers on a server
+// that has no Google credentials — which is every server until an operator sets
+// two environment variables, and therefore the state these routes are most
+// likely to be met in.
+
+#[tokio::test]
+async fn the_youtube_routes_need_a_caller_like_every_other_route() {
+    let s = server();
+    for (method, path) in [
+        (Method::GET, "/api/youtube"),
+        (Method::GET, "/api/youtube/oauth/start"),
+        (Method::GET, "/api/youtube/accounts"),
+        (Method::DELETE, "/api/youtube/accounts/whatever"),
+    ] {
+        let r = send(&s, method.clone(), path, None, None).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{method} {path} answered {}: {}", r.status, r.body);
+    }
+}
+
+#[tokio::test]
+async fn an_unconfigured_server_says_so_rather_than_failing() {
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+
+    let what = get(&s, "/api/youtube", &a).await;
+    assert_eq!(what.status, StatusCode::OK, "{}", what.body);
+    assert_eq!(what.json()["configured"], false);
+    // The exact URI to register in the Google console, which is the single most
+    // common thing to get wrong.
+    assert!(what.json()["redirect_uri"].as_str().unwrap().ends_with("/api/youtube/oauth/callback"));
+
+    // Starting a flow there is a 400 with an instruction, not a 500.
+    let start = get(&s, "/api/youtube/oauth/start", &a).await;
+    assert_eq!(start.status, StatusCode::BAD_REQUEST, "{}", start.body);
+    assert!(start.body.contains("YOUTUBE_CLIENT_ID"), "{}", start.body);
+
+    // And no account can exist yet.
+    let list = get(&s, "/api/youtube/accounts", &a).await;
+    assert_eq!(list.status, StatusCode::OK);
+    assert_eq!(list.json().as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn the_callback_always_sends_the_browser_back_into_the_app() {
+    let s = server();
+    // Deliberately unauthenticated: the session cookie is SameSite=Strict, so a
+    // browser arriving from accounts.google.com does not send it. A callback
+    // that required one would fail for every real user.
+    for (query, expect) in [
+        ("?error=access_denied", "youtube=error"),
+        ("?code=abc", "youtube=error"),  // no state
+        ("?state=abc", "youtube=error"), // no code
+        ("?code=abc&state=never-issued", "youtube=error"),
+    ] {
+        let r = send(&s, Method::GET, &format!("/api/youtube/oauth/callback{query}"), None, None).await;
+        assert_eq!(r.status, StatusCode::SEE_OTHER, "{query} answered {}: {}", r.status, r.body);
+        let to = location(&r);
+        assert!(to.starts_with('/'), "the redirect has to stay on this host: {to}");
+        assert!(to.contains(expect), "{query} → {to}");
+        // A code is a credential; it must not be handed back to the browser.
+        assert!(!to.contains("code=abc"), "{to}");
+    }
+}
+
+#[tokio::test]
+async fn one_account_cannot_disconnect_anothers_channel() {
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+    let b = account(&s, "other@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+
+    // A connected channel, put in place directly: the consent flow is tested
+    // against a fake Google elsewhere, and what matters here is the owner check.
+    let mine = s.app.db.upsert_youtube_account(&me, "UC-1", "COLORISTE", None).unwrap().id;
+    s.app.keys.set(&louver_cloud::youtube::refresh_account(&mine), "refresh-1").unwrap();
+
+    // The other account cannot see it…
+    let theirs = get(&s, "/api/youtube/accounts", &b).await;
+    assert_eq!(theirs.json().as_array().unwrap().len(), 0);
+    assert!(!theirs.body.contains(&mine));
+
+    // …and knowing the id buys nothing.
+    let stolen = send(&s, Method::DELETE, &format!("/api/youtube/accounts/{mine}"), Some(&b), None).await;
+    assert_eq!(stolen.status, StatusCode::NOT_FOUND, "{}", stolen.body);
+    assert_eq!(
+        s.app.keys.get(&louver_cloud::youtube::refresh_account(&mine)).unwrap().as_deref(),
+        Some("refresh-1"),
+        "a refused request must not have deleted the owner's token"
+    );
+
+    // The owner can, and the token goes with the row.
+    let gone = send(&s, Method::DELETE, &format!("/api/youtube/accounts/{mine}"), Some(&a), None).await;
+    assert_eq!(gone.status, StatusCode::OK, "{}", gone.body);
+    assert_eq!(s.app.keys.get(&louver_cloud::youtube::refresh_account(&mine)).unwrap(), None);
+}
+
+#[tokio::test]
+async fn the_account_list_carries_no_token_and_no_key() {
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    let id = s.app.db.upsert_youtube_account(&me, "UC-1", "COLORISTE", Some("https://yt/t.jpg")).unwrap().id;
+    s.app.keys.set(&louver_cloud::youtube::refresh_account(&id), "refresh-1").unwrap();
+    s.app.keys.set(&louver_cloud::youtube::access_account(&id), "access-1").unwrap();
+
+    let list = get(&s, "/api/youtube/accounts", &a).await;
+    assert_eq!(list.status, StatusCode::OK, "{}", list.body);
+    let row = &list.json()[0];
+    assert_eq!(row["channel_title"], "COLORISTE");
+    assert_eq!(row["channel_id"], "UC-1");
+    // §3: there is no field that could carry one, and this is the test that
+    // fails if somebody adds one.
+    for secret in ["refresh-1", "access-1", "refresh_token", "access_token"] {
+        assert!(!list.body.contains(secret), "{secret} reached the browser: {}", list.body);
+    }
+}
+
+#[tokio::test]
+async fn asking_for_a_youtube_broadcast_on_an_unconfigured_server_leaves_nothing_behind() {
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    let (_, media) = ready_broadcast(&s, &a, &me, "one").await;
+    let account_id = s.app.db.upsert_youtube_account(&me, "UC-1", "COLORISTE", None).unwrap().id;
+
+    let before = s.app.db.destinations_for(&me).unwrap().len();
+    let made = post(
+        &s,
+        "/api/broadcasts",
+        &a,
+        Some(serde_json::json!({
+            "name": "유튜브 방송",
+            "youtube_account_id": account_id,
+            "media_ids": [media],
+        })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::BAD_REQUEST, "{}", made.body);
+
+    // Nothing half-made: no broadcast, and no destination pointing at an
+    // address YouTube never gave us.
+    let list = get(&s, "/api/broadcasts", &a).await;
+    assert_eq!(list.json()["broadcasts"].as_array().unwrap().len(), 1, "{}", list.body);
+    assert_eq!(s.app.db.destinations_for(&me).unwrap().len(), before);
+}
+
+fn location(r: &Reply) -> String {
+    r.location.clone().unwrap_or_default()
 }

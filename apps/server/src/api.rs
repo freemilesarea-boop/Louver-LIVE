@@ -197,7 +197,14 @@ const MASK: &str = "••••••••••••";
 #[derive(Deserialize)]
 pub struct NewBroadcast {
     pub name: String,
+    /// A pasted-key destination. Empty when `youtube_account_id` is given,
+    /// because YouTube has not made one yet.
+    #[serde(default)]
     pub destination_id: String,
+    /// A connected channel, for a broadcast 247streams will create on YouTube
+    /// itself. §5: the two providers are chosen here and nowhere else.
+    #[serde(default)]
+    pub youtube_account_id: Option<String>,
     /// The playlist, in order. This is what the web app sends.
     #[serde(default)]
     pub items: Vec<louver_cloud::db::NewItem>,
@@ -271,7 +278,34 @@ pub async fn create_broadcast(
             .ok_or_else(|| CloudError::Invalid("영상을 최소 한 개 선택해 주세요".into()))?
             .media_id
             .clone();
-        let made = app.db.create_broadcast(&uid, b.name.trim(), &first, &b.destination_id, b.loop_forever)?;
+
+        // §5: one of two providers. A connected account has no destination yet —
+        // YouTube cannot be asked for an ingestion address before there is a
+        // broadcast to bind it to — so an empty row of the right kind is
+        // reserved and filled in by `provision` below.
+        let account = b.youtube_account_id.clone().filter(|a| !a.trim().is_empty());
+        // Asked for before anything is written, so a server with no Google
+        // credentials refuses the request instead of leaving a broadcast behind
+        // that could never be provisioned.
+        let provider = match &account {
+            Some(_) => Some(app.youtube.clone().ok_or_else(|| {
+                CloudError::Invalid("이 서버에는 YouTube 연결이 설정되지 않았습니다.".into())
+            })?),
+            None => None,
+        };
+        let reserved = match &account {
+            Some(account_id) => Some(app.db.reserve_youtube_destination(&uid, account_id)?),
+            None => None,
+        };
+        let destination_id = match &reserved {
+            Some(d) => d.id.clone(),
+            None => b.destination_id.trim().to_string(),
+        };
+        if destination_id.is_empty() {
+            return Err(CloudError::Invalid("송출 대상을 선택해 주세요".into()));
+        }
+
+        let made = app.db.create_broadcast(&uid, b.name.trim(), &first, &destination_id, b.loop_forever)?;
         let items = app.db.replace_items(&uid, &made.id, &playlist)?;
         let patch = louver_cloud::BroadcastPatch {
             title: Some(b.title.clone().unwrap_or_else(|| b.name.trim().to_string())),
@@ -284,6 +318,24 @@ pub async fn create_broadcast(
             ..Default::default()
         };
         let broadcast = app.db.update_broadcast_owned(&uid, &made.id, &patch)?;
+
+        if let (Some(account_id), Some(yt)) = (&account, &provider) {
+            // The metadata is written first, on purpose: `provision` sends the
+            // title, description and privacy this broadcast now has.
+            if let Err(e) = yt.provision(&uid, &made.id, account_id) {
+                // Nothing half-made is left behind. A broadcast pointed at an
+                // address YouTube never gave us could not be started, and the
+                // row would only be there to confuse whoever found it.
+                let _ = app.db.delete_broadcast_owned(&uid, &made.id);
+                if let Some(d) = &reserved {
+                    let _ = app.db.delete_destination_owned(&uid, &d.id);
+                }
+                return Err(e);
+            }
+            let broadcast = app.db.broadcast_owned(&uid, &made.id)?;
+            return Ok(louver_cloud::BroadcastDetail { broadcast, items });
+        }
+
         Ok(louver_cloud::BroadcastDetail { broadcast, items })
     })
     .await?;
@@ -297,7 +349,28 @@ pub async fn update_broadcast(
     Path(id): Path<String>,
     Json(patch): Json<louver_cloud::BroadcastPatch>,
 ) -> Out<Broadcast> {
-    Ok(Json(crate::blocking(move || app.db.update_broadcast_owned(&uid, &id, &patch)).await?))
+    Ok(Json(
+        crate::blocking(move || {
+            let broadcast = app.db.update_broadcast_owned(&uid, &id, &patch)?;
+            // §10: a title changed here is a title changed on YouTube. Only for
+            // a connected account — a pasted key cannot, and `sync_metadata`
+            // returns `Ok` for one rather than making the caller ask.
+            //
+            // A refusal from YouTube does not fail the save. The edit is already
+            // stored, so answering with an error would tell the user their change
+            // was lost when it was not; YouTube also refuses some fields while a
+            // broadcast is live, which is a thing to be told rather than a thing
+            // to lose work over. `sync_metadata` records the reason against the
+            // broadcast, and the dashboard shows it as "YouTube · …", so the
+            // reply carries the row as it now reads.
+            let Some(yt) = &app.youtube else { return Ok(broadcast) };
+            match yt.sync_metadata(&uid, &id) {
+                Ok(()) => Ok(broadcast),
+                Err(_) => app.db.broadcast_owned(&uid, &id),
+            }
+        })
+        .await?,
+    ))
 }
 
 /// The playlist, in order.

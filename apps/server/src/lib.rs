@@ -11,6 +11,7 @@ pub mod diagnose;
 pub mod error;
 pub mod health;
 pub mod state;
+pub mod youtube;
 
 use crate::state::App;
 use axum::extract::DefaultBodyLimit;
@@ -71,6 +72,13 @@ pub fn router(app: App) -> Router {
         .route("/api/broadcasts/{id}/stop", post(api::stop_broadcast))
         .route("/api/broadcasts/{id}/restart", post(api::restart_broadcast))
         .route("/api/broadcasts/{id}/logs", get(api::broadcast_logs))
+        // §2. `oauth/callback` is the one authenticated-by-state route: see the
+        // module for why a session cookie cannot reach it.
+        .route("/api/youtube", get(youtube::availability))
+        .route("/api/youtube/oauth/start", get(youtube::start))
+        .route("/api/youtube/oauth/callback", get(youtube::callback))
+        .route("/api/youtube/accounts", get(youtube::list_accounts))
+        .route("/api/youtube/accounts/{id}", delete(youtube::delete_account))
         .route("/api/metrics", get(api::metrics))
         .route("/api/events", get(api::events))
         .with_state(app)

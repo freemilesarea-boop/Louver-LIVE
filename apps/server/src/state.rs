@@ -21,6 +21,10 @@ pub struct App {
     /// Kept so `/health` can ask FFmpeg whether it runs, rather than checking
     /// that a file exists where one was once found.
     pub tools: FfmpegTools,
+    /// The YouTube provider, when this server has Google credentials. `None`
+    /// is a supported deployment, not a broken one: manual RTMPS is the path
+    /// that is on air, and it needs nothing from Google.
+    pub youtube: Option<louver_cloud::youtube::Youtube>,
 }
 
 impl App {
@@ -55,8 +59,39 @@ impl App {
             Arc::clone(&keys),
             Arc::new(FfmpegLaunchers { program: tools.ffmpeg.clone() }),
         );
+        // §2: the client id and secret come from the environment. Without them
+        // the routes answer "not configured" and everything else is unaffected.
+        let youtube = build_youtube(&db, &keys);
+        let mgr = match &youtube {
+            Some(yt) => mgr.with_youtube(yt.clone()),
+            None => mgr,
+        };
+
         let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools.clone(), encoder);
 
-        Ok(Self { db, mgr, ingest, storage, keys, upload_tmp, tools })
+        Ok(Self { db, mgr, ingest, storage, keys, upload_tmp, tools, youtube })
     }
+}
+
+/// The provider, if the environment configured one.
+///
+/// `UreqClient` is both the API transport and the token endpoint, which is why
+/// one value is behind both traits. `YOUTUBE_TOKEN_ENDPOINT` exists so an
+/// end-to-end test can point the flow at a fake Google; in production it is
+/// unset and Google's own endpoint is used.
+fn build_youtube(db: &CloudDb, keys: &Arc<dyn SecretStore>) -> Option<louver_cloud::youtube::Youtube> {
+    let config = match louver_cloud::youtube::Config::from_env() {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let transport = Arc::new(louver_core::youtube::http::UreqClient {
+        token_endpoint: std::env::var("YOUTUBE_TOKEN_ENDPOINT").ok().filter(|s| !s.trim().is_empty()),
+    });
+    Some(louver_cloud::youtube::Youtube::new(
+        db.clone(),
+        Arc::clone(keys),
+        Arc::clone(&transport) as Arc<dyn louver_core::youtube::HttpClient>,
+        transport as Arc<dyn louver_core::youtube::oauth::TokenEndpoint>,
+        config,
+    ))
 }
