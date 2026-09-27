@@ -751,6 +751,70 @@ impl CloudDb {
         Ok(sub)
     }
 
+    /// Every account, with enough to tell how it came to be on its plan.
+    ///
+    /// For `louver-server --audit-plans`. The distinguishing signal is
+    /// `terms_accepted_at`: only the public signup form records it, so an account
+    /// that has one came through the browser, and one that does not was made by
+    /// the bootstrap CLI — which is how the operator's own account was made.
+    pub fn plan_audit(&self) -> Result<Vec<PlanAudit>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT u.id, u.email, u.plan_id,
+                    COALESCE(s.status, ?1) AS status,
+                    u.terms_accepted_at IS NOT NULL AS from_signup,
+                    u.created_at
+             FROM users u LEFT JOIN subscriptions s ON s.user_id = u.id
+             ORDER BY u.created_at, u.email",
+        )?;
+        let rows = st.query_map([SUBSCRIPTION_ACTIVE], |r| {
+            Ok(PlanAudit {
+                user_id: r.get(0)?,
+                email: r.get(1)?,
+                plan_id: r.get(2)?,
+                status: r.get(3)?,
+                from_public_signup: r.get::<_, i64>(4)? != 0,
+                created_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Move one account off an entitlement nobody paid for.
+    ///
+    /// The reverse of the accident: a release before paid plans put every public
+    /// signup on `LOUVER_DEFAULT_PLAN`, and those accounts kept a free Basic when
+    /// the paid plans arrived. This is how an operator takes it back, one account
+    /// at a time and only after seeing the list.
+    ///
+    /// Deliberately not a boot-time migration. It removes an entitlement somebody
+    /// is currently using, and that is not a thing to do silently to a production
+    /// database while nobody is looking.
+    ///
+    /// Refuses anything [`PlanAudit::is_unpaid_grant`] would not flag, so the
+    /// operator's own account — made by the CLI, with no consent timestamp —
+    /// cannot be revoked through here even by a typo.
+    ///
+    /// **When payments exist, this must also refuse an account with a billing
+    /// record.** Nobody has paid yet, so there is nothing to check for; the day
+    /// there is, the check belongs here.
+    pub fn revoke_unpaid_grant(&self, user_id: &str) -> Result<()> {
+        let row = self
+            .plan_audit()?
+            .into_iter()
+            .find(|r| r.user_id == user_id)
+            .ok_or(CloudError::NotFound("user"))?;
+        if !row.is_unpaid_grant(UNSUBSCRIBED_PLAN) {
+            return Err(CloudError::Invalid(format!(
+                "{} 계정은 자동 부여된 요금제가 아닙니다 (plan={}, 가입경로={})",
+                row.email,
+                row.plan_id,
+                if row.from_public_signup { "회원가입" } else { "관리자" }
+            )));
+        }
+        self.write_plan(user_id, UNSUBSCRIBED_PLAN, SUBSCRIPTION_UNSUBSCRIBED)
+    }
+
     /// Put a user on a plan, and mark the subscription active. §13.
     ///
     /// **Not reachable from a browser, by design.** There is no route that calls

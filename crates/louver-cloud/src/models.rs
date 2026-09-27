@@ -217,6 +217,40 @@ pub struct Subscription {
     pub plan: Option<Plan>,
 }
 
+/// One account, as `--audit-plans` reports it.
+///
+/// Exists because of a real production question: a release before paid plans
+/// granted every public signup a Basic entitlement, and after that release those
+/// rows are indistinguishable from a paid Basic — except by how the account was
+/// made. This carries the one field that tells them apart.
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanAudit {
+    pub user_id: String,
+    pub email: String,
+    pub plan_id: String,
+    pub status: String,
+    /// Did this account come through the browser's signup form? Only that path
+    /// records consent, so the bootstrap CLI's accounts read `false`.
+    pub from_public_signup: bool,
+    pub created_at: String,
+}
+
+impl PlanAudit {
+    /// Is this an entitlement nobody paid for?
+    ///
+    /// A public signup sitting on a paid plan, which the current code cannot
+    /// produce — `register_user` has no plan argument — so it can only be a row
+    /// left by the release that granted `LOUVER_DEFAULT_PLAN` on signup.
+    ///
+    /// Deliberately conservative: an account the operator made or upgraded by
+    /// hand has no consent timestamp and is never flagged. Once payments exist,
+    /// this must also exclude anyone with a billing record — see the note on
+    /// `CloudDb::revoke_unpaid_grant`.
+    pub fn is_unpaid_grant(&self, unsubscribed_plan: &str) -> bool {
+        self.from_public_signup && self.plan_id != unsubscribed_plan
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CloudMedia {
     pub id: String,

@@ -424,3 +424,128 @@ fn a_price_is_whole_won_in_an_integer_column() {
         guard.query_row("SELECT monthly_price_krw FROM plans WHERE id='basic'", [], |r| r.get(0)).unwrap();
     assert_eq!(raw, 19_900);
 }
+
+// --- the free-Basic rows a previous release left behind ---------------------
+//
+// A release before paid plans put every public signup on `LOUVER_DEFAULT_PLAN`,
+// which was Basic. The current code cannot do that — `register_user` has no plan
+// argument — but the rows it wrote are still in production, and they look exactly
+// like a paid Basic. These are about telling them apart, and about being unable
+// to touch anything else while doing it.
+
+/// A user exactly as the pre-billing public signup wrote one: a paid plan, an
+/// active subscription, and a consent timestamp.
+fn legacy_public_signup(db: &CloudDb, id: &str, email: &str, plan: &str) {
+    let conn = db.raw();
+    let guard = conn.lock().unwrap();
+    guard
+        .execute(
+            "INSERT INTO users (id, email, password_hash, plan_id, name,
+                                terms_accepted_at, privacy_accepted_at, terms_version)
+             VALUES (?1, ?2, 'salt:hash', ?3, '옛가입자',
+                     datetime('now'), datetime('now'), '2026-09-27')",
+            rusqlite::params![id, email, plan],
+        )
+        .unwrap();
+    guard
+        .execute(
+            "INSERT INTO subscriptions (user_id, plan_id, status) VALUES (?1, ?2, 'active')",
+            rusqlite::params![id, plan],
+        )
+        .unwrap();
+}
+
+#[test]
+fn the_current_signup_path_cannot_produce_a_free_paid_plan() {
+    // The fix for the production symptom, asserted at the layer that caused it.
+    // `register_user` takes no plan argument at all, so this is not "we validated
+    // it" — there is nothing to validate.
+    let db = CloudDb::open_in_memory().unwrap();
+    let uid = signed_up(&db, "new@example.com");
+    assert_eq!(db.user(&uid).unwrap().plan_id, UNSUBSCRIBED_PLAN);
+    assert_eq!(db.subscription(&uid).unwrap().status, SUBSCRIPTION_UNSUBSCRIBED);
+    assert!(!db.subscription(&uid).unwrap().active);
+}
+
+#[test]
+fn the_audit_tells_a_left_over_grant_from_an_account_the_operator_made() {
+    let db = CloudDb::open_in_memory().unwrap();
+    // Three shapes: the leftover, the operator's own, and a correct new signup.
+    legacy_public_signup(&db, "u-legacy", "old-signup@example.com", "basic");
+    let ops = db.create_user("ops@example.com", "salt:hash", "business").unwrap();
+    let fresh = signed_up(&db, "new@example.com");
+
+    let rows = db.plan_audit().unwrap();
+    let by_email = |e: &str| rows.iter().find(|r| r.email == e).unwrap_or_else(|| panic!("{e}"));
+
+    // The leftover: came through the form, sitting on a paid plan.
+    let legacy = by_email("old-signup@example.com");
+    assert!(legacy.from_public_signup);
+    assert_eq!(legacy.plan_id, "basic");
+    assert!(legacy.is_unpaid_grant(UNSUBSCRIBED_PLAN));
+
+    // The operator's: made by the CLI, so no consent timestamp, so never flagged
+    // however paid its plan is.
+    let operator = by_email("ops@example.com");
+    assert!(!operator.from_public_signup, "the CLI does not agree to terms on anybody's behalf");
+    assert_eq!(operator.plan_id, "business");
+    assert!(!operator.is_unpaid_grant(UNSUBSCRIBED_PLAN));
+    let _ = ops;
+
+    // A correct new signup is on no plan, so there is nothing to take back.
+    assert!(!by_email("new@example.com").is_unpaid_grant(UNSUBSCRIBED_PLAN));
+    let _ = fresh;
+}
+
+#[test]
+fn revoking_a_left_over_grant_touches_that_account_and_no_other() {
+    let db = CloudDb::open_in_memory().unwrap();
+    legacy_public_signup(&db, "u-legacy", "old-signup@example.com", "basic");
+    let ops = db.create_user("freemilesarea@example.com", "salt:hash", "business").unwrap();
+    // Somebody the operator upgraded deliberately, through the CLI. Same plan as
+    // the leftover; must survive, because the CLI leaves no consent timestamp.
+    let granted = db.create_user("friend@example.com", "salt:hash", "basic").unwrap();
+
+    db.revoke_unpaid_grant("u-legacy").unwrap();
+    assert_eq!(db.user("u-legacy").unwrap().plan_id, UNSUBSCRIBED_PLAN);
+    assert!(!db.subscription("u-legacy").unwrap().active);
+
+    // Neither of the others moved.
+    assert_eq!(db.subscription(&ops.id).unwrap().plan_id, "business");
+    assert!(db.subscription(&ops.id).unwrap().active);
+    assert_eq!(db.limit(&ops.id, MAX_CONCURRENT_STREAMS).unwrap(), 3);
+    assert_eq!(db.subscription(&granted.id).unwrap().plan_id, "basic");
+    assert!(db.subscription(&granted.id).unwrap().active);
+}
+
+#[test]
+fn revoking_refuses_anything_the_audit_would_not_flag() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let ops = db.create_user("freemilesarea@example.com", "salt:hash", "business").unwrap();
+    let fresh = signed_up(&db, "new@example.com");
+
+    // The operator's own account, even by id, even by a typo.
+    let refused = db.revoke_unpaid_grant(&ops.id).unwrap_err();
+    assert!(matches!(refused, CloudError::Invalid(_)), "{refused:?}");
+    assert!(refused.to_string().contains("자동 부여된 요금제가 아닙니다"), "{refused}");
+    assert_eq!(db.subscription(&ops.id).unwrap().plan_id, "business");
+    assert!(db.subscription(&ops.id).unwrap().active);
+
+    // An account already on no plan, and one that does not exist.
+    assert!(db.revoke_unpaid_grant(&fresh).is_err());
+    assert!(matches!(db.revoke_unpaid_grant("no-such-user"), Err(CloudError::NotFound(_))));
+}
+
+#[test]
+fn a_revoked_account_can_be_put_back_on_a_plan() {
+    // Whatever the audit gets wrong is recoverable: nothing is deleted, and the
+    // ordinary activation path puts the account back.
+    let db = CloudDb::open_in_memory().unwrap();
+    legacy_public_signup(&db, "u-legacy", "old-signup@example.com", "basic");
+    db.revoke_unpaid_grant("u-legacy").unwrap();
+
+    let back = db.activate_subscription("u-legacy", "basic").unwrap();
+    assert!(back.active);
+    assert_eq!(back.plan_id, "basic");
+    assert_eq!(db.limit("u-legacy", MAX_CONCURRENT_STREAMS).unwrap(), 1);
+}

@@ -118,6 +118,95 @@ fn create_user(args: &[String]) -> std::process::ExitCode {
     }
 }
 
+/// `--audit-plans [--revoke-unpaid-grants --yes]`
+///
+/// Answers a question a production operator actually had: why does a brand-new
+/// account show Basic?
+///
+/// The release before paid plans put every public signup on
+/// `LOUVER_DEFAULT_PLAN`, which was Basic. The current code cannot do that —
+/// `register_user` has no plan argument — but the rows it already wrote are still
+/// there, and they are indistinguishable from a paid Basic except by how the
+/// account was made: only the browser's signup form records consent, so an
+/// account with a consent timestamp and a paid plan is an entitlement nobody
+/// asked for and nobody paid for.
+///
+/// Read-only unless both `--revoke-unpaid-grants` and `--yes` are given. Taking
+/// an entitlement away from somebody who is using it is not something to do
+/// without looking at the list first.
+fn audit_plans(args: &[String]) -> std::process::ExitCode {
+    let data = std::path::PathBuf::from(
+        std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()),
+    );
+    let db = match louver_cloud::CloudDb::open(&data.join("cloud.db")) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[louver] 데이터베이스를 열 수 없습니다 ({}): {e}", data.display());
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let rows = match db.plan_audit() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[louver] 계정 목록을 읽을 수 없습니다: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    let none = louver_cloud::db::UNSUBSCRIBED_PLAN;
+    // No width on the Korean column: those glyphs are double-width in a terminal,
+    // so `{:<9}` counts nine characters and draws eighteen columns, and
+    // everything after it lands somewhere different on every row.
+    println!("{:<34} {:<10} {:<13} 가입경로", "email", "plan", "status");
+    for r in &rows {
+        println!(
+            "{:<34} {:<10} {:<13} {}{}",
+            r.email,
+            r.plan_id,
+            r.status,
+            if r.from_public_signup { "회원가입" } else { "관리자" },
+            if r.is_unpaid_grant(none) { "   ← 자동 부여" } else { "" }
+        );
+    }
+
+    let flagged: Vec<&louver_cloud::PlanAudit> = rows.iter().filter(|r| r.is_unpaid_grant(none)).collect();
+    println!("\n계정 {}개, 자동 부여로 보이는 계정 {}개", rows.len(), flagged.len());
+    if flagged.is_empty() {
+        println!("조치할 것이 없습니다.");
+        return std::process::ExitCode::SUCCESS;
+    }
+
+    let revoke = args.iter().any(|a| a == "--revoke-unpaid-grants");
+    let confirmed = args.iter().any(|a| a == "--yes");
+    if !revoke {
+        println!("위 계정을 미구독으로 되돌리려면:");
+        println!("  louver-server --audit-plans --revoke-unpaid-grants --yes");
+        return std::process::ExitCode::SUCCESS;
+    }
+    if !confirmed {
+        // Naming the count rather than just asking: the operator should see how
+        // many people are about to lose access before they type --yes.
+        eprintln!(
+            "[louver] {}개 계정의 요금제를 회수합니다. 확인했다면 --yes 를 함께 주세요.",
+            flagged.len()
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+
+    let mut done = 0;
+    for r in &flagged {
+        match db.revoke_unpaid_grant(&r.user_id) {
+            Ok(()) => {
+                done += 1;
+                println!("[louver] {} → 미구독", r.email);
+            }
+            Err(e) => eprintln!("[louver] {} 회수 실패: {e}", r.email),
+        }
+    }
+    println!("[louver] {done}/{}개 계정을 미구독으로 되돌렸습니다", flagged.len());
+    std::process::ExitCode::SUCCESS
+}
+
 fn value_of(args: &[String], flag: &str) -> Option<String> {
     let i = args.iter().position(|a| a == flag)?;
     args.get(i + 1).filter(|v| !v.starts_with("--")).cloned()
@@ -150,6 +239,10 @@ async fn main() -> std::process::ExitCode {
     }
     if args.iter().any(|a| a == "--create-user") {
         return create_user(&args);
+    }
+    // Who is on which plan, and how they got there.
+    if args.iter().any(|a| a == "--audit-plans") {
+        return audit_plans(&args);
     }
     // What is running, where it is sending, and what FFmpeg has said about it.
     if args.iter().any(|a| a == "--diagnose") {

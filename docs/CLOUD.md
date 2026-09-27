@@ -189,6 +189,31 @@ exists, a payment webhook that has already verified a payment — which is the w
 reason they are functions here rather than handlers. `POST /api/plans` and
 `POST /api/me/subscription` do not exist, and a test asserts they answer 404.
 
+### Why a new account might show Basic
+
+A release before paid plans put every public signup on `LOUVER_DEFAULT_PLAN`,
+which defaulted to Basic. The current code cannot do that — `register_user` has no
+plan argument — but the rows that release wrote are still there, and they look
+exactly like a paid Basic.
+
+`louver-server --audit-plans` tells them apart. The signal is `terms_accepted_at`:
+only the browser's signup form records consent, so an account that has one *and*
+sits on a paid plan is an entitlement nobody asked for. An account the operator
+made or upgraded through the CLI has no consent timestamp and is never flagged —
+which is what keeps `freemilesarea@gmail.com` out of it.
+
+```
+louver-server --audit-plans                                  # read-only
+louver-server --audit-plans --revoke-unpaid-grants --yes      # acts
+```
+
+Deliberately **not** a boot-time migration: it removes an entitlement somebody is
+using, and that is not a thing to do silently to a production database. Nothing is
+deleted either, so a mistake is undone with `activate_subscription`.
+
+Once payments exist this command must also refuse an account with a billing
+record. Nobody has paid yet, so there is nothing to check for.
+
 **TODO(billing): there is no payment yet.** The pricing page's buttons say
 "결제 시스템을 준비 중입니다." and send nothing. No PG, no billing key, no
 recurring charge, no webhook, no refunds.
