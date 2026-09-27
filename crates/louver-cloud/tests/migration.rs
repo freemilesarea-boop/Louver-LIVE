@@ -303,3 +303,95 @@ fn columns(c: &Connection, table: &str) -> Vec<String> {
     let rows = st.query_map([], |r| r.get::<_, String>(1)).unwrap();
     rows.map(|r| r.unwrap()).collect()
 }
+
+/// Signup's columns are added to a production database, and the account that is
+/// already using it keeps working.
+///
+/// The thing this is really protecting: the operator's account on the live server
+/// was made before signup asked for a name, so it has none and has never agreed
+/// to anything. If reading it required either, they would be locked out of their
+/// own broadcasts by a deployment.
+#[test]
+fn an_account_from_before_signup_asked_for_a_name_keeps_its_row_and_its_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.db");
+    let (broadcast_id, _) = yesterdays_database(&path);
+
+    // A browser that signed in yesterday and has not signed out.
+    let signed_in = louver_cloud::credentials::token_hash("a-token-from-yesterday");
+    let before: Vec<String> = {
+        let c = Connection::open(&path).unwrap();
+        c.execute(
+            "INSERT INTO auth_sessions (token_hash, user_id, expires_at)
+             VALUES (?1, 'u-old', datetime('now', '+20 days'))",
+            [&signed_in],
+        )
+        .unwrap();
+        columns(&c, "users")
+    };
+    assert!(!before.contains(&"name".to_string()), "the fixture must be the old schema");
+
+    let db = CloudDb::open(&path).unwrap();
+
+    // The columns were appended, and nothing moved.
+    let after = columns(&db.raw().lock().unwrap(), "users");
+    assert_eq!(&after[..before.len()], &before[..], "an existing column was moved or dropped");
+    for added in ["name", "terms_accepted_at", "privacy_accepted_at", "terms_version"] {
+        assert!(after.contains(&added.to_string()), "{added} is missing");
+    }
+
+    // The account reads, with the new fields absent rather than invented.
+    let user = db.user("u-old").unwrap();
+    assert_eq!(user.email, "me@example.com");
+    assert_eq!(user.plan_id, "business", "the plan it was on is the plan it is on");
+    assert_eq!(user.name, None);
+    assert_eq!(user.terms_accepted_at, None, "nobody can retroactively have agreed");
+    assert_eq!(user.privacy_accepted_at, None);
+    assert_eq!(db.user_by_email("me@example.com").unwrap().id, "u-old");
+
+    // Signing in still works: the stored hash is the stored hash.
+    let (id, _) = db.password_hash_for("me@example.com").unwrap();
+    assert_eq!(id, "u-old");
+
+    // The session it already had is still a session — a migration that logged
+    // everybody out would be a migration nobody forgives.
+    assert_eq!(db.user_for_token(&signed_in).unwrap(), "u-old");
+
+    // The subscription row survived, and so did the broadcast that was on air.
+    assert_eq!(db.subscription("u-old").unwrap().plan_id, "business");
+    assert_eq!(db.broadcast_owned("u-old", &broadcast_id).unwrap().name, "COLORISTE 테스트");
+    assert_eq!(db.broadcasts_wanting_to_run().unwrap().len(), 1);
+}
+
+/// A signup on a migrated database records consent; `create_user` still does not.
+#[test]
+fn signup_records_consent_and_the_bootstrap_path_still_does_not() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.db");
+    yesterdays_database(&path);
+    let db = CloudDb::open(&path).unwrap();
+
+    let signed_up = db
+        .register_user(
+            &louver_cloud::db::Signup {
+                name: "홍길동",
+                email: "new@example.com",
+                password_hash: "salt:hash",
+                terms_version: "2026-09-27",
+            },
+            "basic",
+        )
+        .unwrap();
+    assert_eq!(signed_up.name.as_deref(), Some("홍길동"));
+    assert!(signed_up.terms_accepted_at.is_some());
+    assert!(signed_up.privacy_accepted_at.is_some());
+    // A subscription came with it, in the same transaction.
+    assert_eq!(db.subscription(&signed_up.id).unwrap().plan_id, "basic");
+
+    // The CLI's path is unchanged: no name, and no agreement it has no right to
+    // give.
+    let bootstrapped = db.create_user("ops@example.com", "salt:hash", "business").unwrap();
+    assert_eq!(bootstrapped.name, None);
+    assert_eq!(bootstrapped.terms_accepted_at, None);
+    assert_eq!(db.subscription(&bootstrapped.id).unwrap().plan_id, "business");
+}

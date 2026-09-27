@@ -16,6 +16,7 @@ use axum::http::request::Parts;
 use axum::http::HeaderMap;
 use axum::Json;
 use louver_cloud::credentials::{hash_password, new_token, token_hash, verify_password};
+use louver_cloud::db::{clean_name, Signup};
 use louver_cloud::{CloudError, Result};
 use serde::{Deserialize, Serialize};
 
@@ -171,26 +172,91 @@ pub struct Credentials {
     pub password: String,
 }
 
+/// What signup sends.
+///
+/// `deny_unknown_fields` is the reason a request cannot smuggle in a plan. It is
+/// belt as well as braces — nothing below reads a plan from the body, so an
+/// extra field would be ignored anyway — but "ignored" is a property of today's
+/// code, and a rejection is a property of the type. A body carrying
+/// `"plan_id": "business"` now fails outright instead of quietly succeeding and
+/// leaving the reader of a future diff to work out whether it mattered.
+///
+/// There is no `password_confirmation`: the two boxes have to match in the
+/// browser, and sending the password twice would only mean one more copy of it
+/// in one more log the server does not control.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Registration {
+    /// Defaulted so that a body with no `name` reaches [`clean_name`] and gets
+    /// "이름을 입력해주세요." — serde's own "missing field `name`" is English, and
+    /// a 422 carrying it would be the one error on this form a user could not
+    /// read.
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub password: String,
+}
+
 /// What a browser is told about itself. No token, no password hash.
+///
+/// `name` is additive and may be `null`: every account that existed before
+/// signup asked for one has no name, and the UI falls back to the email.
 #[derive(Serialize)]
 pub struct Me {
     pub id: String,
     pub email: String,
     pub plan_id: String,
+    pub name: Option<String>,
 }
+
+impl Me {
+    fn of(u: louver_cloud::User) -> Self {
+        Self { id: u.id, email: u.email, plan_id: u.plan_id, name: u.name }
+    }
+}
+
+/// Which version of the terms a signup today agrees to.
+///
+/// A constant rather than a column's default, so that changing the documents and
+/// re-asking existing users is a matter of bumping this and comparing it against
+/// `users.terms_version`.
+pub const TERMS_VERSION: &str = "2026-09-27";
 
 type Answer = std::result::Result<(HeaderMap, Json<Me>), ApiError>;
 
-pub async fn register(State(app): State<App>, headers: HeaderMap, Json(body): Json<Credentials>) -> Answer {
+/// Make an account, and sign in with it.
+///
+/// Every check here is also made in the browser. That is not duplication to be
+/// removed: the browser's copy is there to answer quickly, and this copy is the
+/// one that decides, because a request does not have to come from the form.
+pub async fn register(State(app): State<App>, headers: HeaderMap, Json(body): Json<Registration>) -> Answer {
     let (me, token) = crate::blocking(move || {
-        check_password(&body.password)?;
+        let name = clean_name(&body.name)?;
         let email = normalize_email(&body.email)?;
-        let hash = hash_password(&body.password)?;
+        check_password(&body.password)?;
+        let password_hash = hash_password(&body.password)?;
+
+        // The plan comes from the server's environment and nowhere else. §12:
+        // signing up must not be a way to choose an entitlement.
         let plan = std::env::var("LOUVER_DEFAULT_PLAN").unwrap_or_else(|_| "basic".into());
-        let user = app.db.create_user(&email, &hash, &plan)?;
-        let (token, hash) = new_token()?;
-        app.db.create_auth_session(&user.id, &hash, SESSION_DAYS)?;
-        Ok((Me { id: user.id, email: user.email, plan_id: user.plan_id }, token))
+        // Agreeing to the terms is a condition of reaching this endpoint at all,
+        // and the moment it happened is the server's clock's to record — a
+        // client-supplied timestamp could claim any date it liked.
+        let user = app.db.register_user(
+            &Signup {
+                name: &name,
+                email: &email,
+                password_hash: &password_hash,
+                terms_version: TERMS_VERSION,
+            },
+            &plan,
+        )?;
+
+        let (token, token_hash) = new_token()?;
+        app.db.create_auth_session(&user.id, &token_hash, SESSION_DAYS)?;
+        Ok((Me::of(user), token))
     })
     .await?;
     Ok((with_cookie(session_cookie(&token, &headers)), Json(me)))
@@ -206,9 +272,9 @@ pub async fn login(State(app): State<App>, headers: HeaderMap, Json(body): Json<
             return Err(CloudError::BadCredentials);
         }
         let user = app.db.user(&user_id)?;
-        let (token, hash) = new_token()?;
-        app.db.create_auth_session(&user.id, &hash, SESSION_DAYS)?;
-        Ok((Me { id: user.id, email: user.email, plan_id: user.plan_id }, token))
+        let (token, token_hash) = new_token()?;
+        app.db.create_auth_session(&user.id, &token_hash, SESSION_DAYS)?;
+        Ok((Me::of(user), token))
     })
     .await?;
     Ok((with_cookie(session_cookie(&token, &headers)), Json(me)))
@@ -225,7 +291,7 @@ pub async fn logout(State(app): State<App>, headers: HeaderMap) -> std::result::
 
 pub async fn me(State(app): State<App>, Caller(user_id): Caller) -> std::result::Result<Json<Me>, ApiError> {
     let u = crate::blocking(move || app.db.user(&user_id)).await?;
-    Ok(Json(Me { id: u.id, email: u.email, plan_id: u.plan_id }))
+    Ok(Json(Me::of(u)))
 }
 
 pub async fn subscription(
@@ -243,19 +309,112 @@ fn with_cookie(value: String) -> HeaderMap {
     h
 }
 
+/// Lower-cased and trimmed, which is also how it is stored and compared.
+///
+/// Deliberately not a full RFC 5322 parser. The only thing an address has to be
+/// here is something a person could receive mail at and type again the same way;
+/// whether it actually exists is a question only sending mail can answer, and
+/// that is a later step. What this does refuse is the shapes that are certainly
+/// mistakes — no `@`, nothing before or after it, a domain with no dot, spaces
+/// in the middle — because each of those is a typo the user can fix now.
 fn normalize_email(raw: &str) -> Result<String> {
     let e = raw.trim().to_lowercase();
-    if e.len() < 3 || !e.contains('@') {
-        return Err(CloudError::Invalid("이메일 주소를 확인해 주세요".into()));
+    let bad = || CloudError::Invalid("올바른 이메일 주소를 입력해주세요.".into());
+    if e.chars().count() > 254 || e.contains(char::is_whitespace) {
+        return Err(bad());
     }
-    Ok(e)
+    let (local, domain) = e.split_once('@').ok_or_else(bad)?;
+    if local.is_empty() || domain.contains('@') {
+        return Err(bad());
+    }
+    // A dot with something either side of it. `user@localhost` is a valid
+    // address in the abstract and never one somebody signs up with.
+    match domain.rsplit_once('.') {
+        Some((host, tld)) if !host.is_empty() && tld.chars().count() >= 2 => Ok(e),
+        _ => Err(bad()),
+    }
 }
 
 fn check_password(p: &str) -> Result<()> {
-    if p.chars().count() < 10 {
-        return Err(CloudError::Invalid("비밀번호는 10자 이상이어야 합니다".into()));
+    // Unchanged: 10 characters, counted as characters. The hashing behind it is
+    // not touched by any of this.
+    if p.chars().count() < MIN_PASSWORD_CHARS {
+        return Err(CloudError::Invalid(format!("비밀번호는 {MIN_PASSWORD_CHARS}자 이상이어야 합니다.")));
     }
     Ok(())
+}
+
+/// The floor the server enforces. The form shows the same number.
+pub const MIN_PASSWORD_CHARS: usize = 10;
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    #[test]
+    fn an_email_has_to_look_like_one() {
+        assert_eq!(normalize_email("  Me@Example.COM ").unwrap(), "me@example.com");
+        for bad in [
+            "",
+            "me",
+            "me@",
+            "@example.com",
+            "me@example",          // no dot in the domain
+            "me@example.c",        // a one-letter TLD is a typo
+            "me@.com",             // nothing before the dot
+            "me @example.com",     // a space is always a mistake
+            "a@b.com\nbcc: x@y.z", // a header injection attempt is also whitespace
+        ] {
+            assert!(normalize_email(bad).is_err(), "{bad:?} was accepted");
+        }
+        // And the message is the one the form shows, not a database word.
+        let e = normalize_email("nope").unwrap_err().to_string();
+        assert!(e.contains("올바른 이메일"), "{e}");
+    }
+
+    #[test]
+    fn a_name_is_trimmed_bounded_and_never_a_control_character() {
+        assert_eq!(clean_name("  홍길동  ").unwrap(), "홍길동");
+        assert_eq!(clean_name("Ada Lovelace").unwrap(), "Ada Lovelace");
+        // A name that would break a log line or a terminal is cleaned, not stored.
+        assert_eq!(clean_name("홍\u{7}길동\n").unwrap(), "홍길동");
+
+        assert!(clean_name("").is_err());
+        assert!(clean_name("      ").is_err());
+        assert!(clean_name("\n\t").is_err());
+        // Counted in characters: 60 Korean characters is fine, 61 is not.
+        assert!(clean_name(&"가".repeat(louver_cloud::db::MAX_NAME_CHARS)).is_ok());
+        assert!(clean_name(&"가".repeat(louver_cloud::db::MAX_NAME_CHARS + 1)).is_err());
+    }
+
+    #[test]
+    fn the_password_floor_is_the_one_the_form_shows() {
+        assert!(check_password(&"a".repeat(MIN_PASSWORD_CHARS)).is_ok());
+        assert!(check_password(&"a".repeat(MIN_PASSWORD_CHARS - 1)).is_err());
+        // Characters, not bytes: nine Korean characters is still nine.
+        assert!(check_password("비밀번호짧아요").is_err());
+    }
+
+    #[test]
+    fn a_registration_body_cannot_smuggle_in_a_plan() {
+        let ok: Registration =
+            serde_json::from_str(r#"{"name":"홍길동","email":"a@b.com","password":"0123456789"}"#).unwrap();
+        assert_eq!(ok.name, "홍길동");
+
+        // §12: not merely ignored — refused, so that a future reader cannot be
+        // left wondering whether some code path started honouring it.
+        for smuggled in [
+            r#"{"name":"n","email":"a@b.com","password":"0123456789","plan_id":"business"}"#,
+            r#"{"name":"n","email":"a@b.com","password":"0123456789","plan":"business"}"#,
+            r#"{"name":"n","email":"a@b.com","password":"0123456789","is_admin":true}"#,
+            r#"{"name":"n","email":"a@b.com","password":"0123456789","terms_accepted_at":"2001-01-01"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Registration>(smuggled).is_err(),
+                "accepted an extra field: {smuggled}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

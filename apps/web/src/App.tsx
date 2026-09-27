@@ -9,9 +9,11 @@ import { Button } from "@/components/ui";
 import { CloudDashboard } from "./pages/CloudDashboard";
 import { Destinations } from "./pages/Destinations";
 import { MediaLibrary } from "./pages/MediaLibrary";
+import { LegalPage, legalPageFor } from "./pages/Legal";
 import { DeploymentBanner, ServerStatus } from "./pages/ServerStatus";
 import { SignIn } from "./pages/SignIn";
 import { useTransport } from "./TransportContext";
+import { displayName } from "./cloud";
 import type { Me } from "./cloud";
 
 /** The service's name, in one place. */
@@ -60,6 +62,14 @@ function consentOutcome(): { outcome: string; detail: string } | null {
 
 export function App() {
   const t = useTransport();
+  // Two static documents signup has to be able to link to. Read once from the
+  // URL rather than through a router: two paths are not a routing problem, and
+  // adding one would change every screen's import graph for no benefit.
+  const [legal] = useState(() =>
+    typeof window === "undefined"
+      ? null
+      : legalPageFor(window.location.pathname),
+  );
   const [me, setMe] = useState<Me | null>(null);
   const [checked, setChecked] = useState(false);
   const [consent] = useState(consentOutcome);
@@ -81,6 +91,12 @@ export function App() {
       live = false;
     };
   }, [t]);
+
+  // Before the session check, so the terms are readable without an account —
+  // which is the whole point of linking to them from the signup form.
+  if (legal) {
+    return <LegalPage which={legal} />;
+  }
 
   if (!checked) {
     return (
@@ -123,7 +139,10 @@ export function App() {
           </nav>
         </div>
         <div className="flex items-center gap-3">
-          <span className="text-xs text-ink-500">{me.email}</span>
+          {/* The name when there is one, the email for every account made
+              before signup asked for one. Rendered as text by React, so a name
+              containing markup is shown, never run. */}
+          <span className="text-xs text-ink-500">{displayName(me)}</span>
           <Button
             size="sm"
             onClick={async () => {

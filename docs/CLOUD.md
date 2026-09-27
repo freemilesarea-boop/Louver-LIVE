@@ -84,6 +84,45 @@ schedules, stream_sessions, stream_events, broadcast_presets, chat_messages`.
 There is no `user_id` anywhere — it is a single-tenant schema, correctly, for a
 desktop app. `Database` is `Clone` over `Arc<Mutex<Connection>>`.
 
+## Accounts and signup
+
+Signing up asks for a name, an email, a password (twice, matched in the browser)
+and agreement to the terms. The server validates every one of those again, because
+a request does not have to come from the form.
+
+`users` gained four nullable columns, all additive: `name`,
+`terms_accepted_at`, `privacy_accepted_at`, `terms_version`. Nullable is the
+point — every account that existed before signup asked for a name has none, and
+nobody can retroactively have agreed to anything. Readers fall back to the email.
+
+Two entry points, deliberately not one:
+
+| | `CloudDb::create_user` | `CloudDb::register_user` |
+| --- | --- | --- |
+| used by | `louver-server --create-user`, tests | `POST /api/auth/register` |
+| name | none | required, trimmed, ≤ 60 characters |
+| consent | none recorded | timestamps from SQLite's clock |
+| plan | the caller's argument | `LOUVER_DEFAULT_PLAN`, never the request body |
+
+The user row and its subscription are written in one transaction: an account with
+no subscription row is one whose limits come from a fallback, which is
+recoverable only after somebody notices.
+
+`Registration` is `#[serde(deny_unknown_fields)]`, so a body carrying
+`"plan_id": "business"` is refused rather than ignored. Nothing in the handler
+reads a plan from the body either — but "ignored" is a property of today's code
+and "refused" is a property of the type.
+
+Duplicate addresses are decided by the `UNIQUE` index, not by a `SELECT` before
+the insert, which is the only arrangement that survives two simultaneous signups
+for one address. The caller sees 409 and a sentence; never a SQLite message.
+
+**TODO(legal): `/terms` and `/privacy` are placeholders.** They render, and they
+say on the page that they are drafts and not reviewed documents, because a 404
+under a required checkbox is worse and a fake agreement is worse still. Replace
+both before charging anybody money, and bump `TERMS_VERSION` in
+`apps/server/src/auth.rs` so existing accounts can be asked again.
+
 ## Media pipeline
 
 `media/probe.rs` decides compatibility; `media/normalize.rs` prepares a cache

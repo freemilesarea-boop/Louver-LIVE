@@ -67,7 +67,7 @@ export class DesktopTransport implements Transport {
   }
 
   async me(): Promise<Me> {
-    return { id: "local", email: "", plan_id: "desktop" };
+    return { id: "local", email: "", plan_id: "desktop", name: null };
   }
 
   async subscription(): Promise<Subscription> {

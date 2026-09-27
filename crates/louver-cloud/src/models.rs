@@ -144,6 +144,16 @@ pub struct User {
     pub email: String,
     pub plan_id: String,
     pub created_at: String,
+    /// What this person is called, as they typed it. A display name and nothing
+    /// more — sign-in is by email, so this is never an identifier and never
+    /// unique. `None` on every account made before signup asked for one.
+    pub name: Option<String>,
+    /// When the terms and the privacy policy were agreed to, written by the
+    /// server's clock. `None` for an account that predates the checkbox, and for
+    /// one the bootstrap CLI made: a shell script cannot agree on a person's
+    /// behalf.
+    pub terms_accepted_at: Option<String>,
+    pub privacy_accepted_at: Option<String>,
 }
 
 /// A plan is a bag of named limits, never a name the code branches on.

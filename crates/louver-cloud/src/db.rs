@@ -247,6 +247,45 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, decl: &str) -> Re
     Ok(())
 }
 
+/// A signup, on its way into the database.
+///
+/// The name is expected to have been through [`clean_name`] and the email
+/// through the API's own normaliser, both of which are where the messages a user
+/// reads come from. Borrows rather than owned strings, so this is a description
+/// of one insert rather than a second place the values live.
+///
+/// There is deliberately **no plan field**. Which plan a new account gets is the
+/// server's decision, so no request body can ask for Business.
+#[derive(Debug, Clone, Copy)]
+pub struct Signup<'a> {
+    pub name: &'a str,
+    pub email: &'a str,
+    pub password_hash: &'a str,
+    /// Which version of the documents was agreed to.
+    pub terms_version: &'a str,
+}
+
+/// Longer than any real name, short enough that a row cannot be used as storage.
+///
+/// Counted in characters rather than bytes: 100 bytes is 33 Korean characters,
+/// which would reject names that are obviously fine.
+pub const MAX_NAME_CHARS: usize = 60;
+
+/// Trim a display name and refuse the ones that are not one. Shared by the API
+/// and by anything else that ever writes this column.
+pub fn clean_name(raw: &str) -> Result<String> {
+    // Control characters would let a name break a log line or a terminal.
+    let name: String = raw.trim().chars().filter(|c| !c.is_control()).collect();
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(CloudError::Invalid("이름을 입력해주세요.".into()));
+    }
+    if name.chars().count() > MAX_NAME_CHARS {
+        return Err(CloudError::Invalid(format!("이름은 {MAX_NAME_CHARS}자 이내로 입력해주세요.")));
+    }
+    Ok(name)
+}
+
 impl CloudDb {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(d) = path.parent() {
@@ -324,6 +363,19 @@ impl CloudDb {
         ] {
             ensure_column(&conn, "broadcasts", column, decl)?;
         }
+        // Signup, which until now asked for an email and a password and nothing
+        // else. All three are nullable and stay NULL on every account that
+        // already exists: a display name is not an identifier, and nobody can
+        // retroactively have agreed to terms.
+        ensure_column(&conn, "users", "name", "TEXT")?;
+        ensure_column(&conn, "users", "terms_accepted_at", "TEXT")?;
+        ensure_column(&conn, "users", "privacy_accepted_at", "TEXT")?;
+        // Which version of the documents was agreed to. One column now rather
+        // than a table, because versioning terms is a string comparison until
+        // somebody needs the history — and a NULL here reads as "before this
+        // was recorded", which is the truth for every existing row.
+        ensure_column(&conn, "users", "terms_version", "TEXT")?;
+
         // §5: which kind of destination this is. Every existing row is a stream
         // key someone pasted, which is exactly what the default says.
         ensure_column(&conn, "stream_destinations", "kind", "TEXT NOT NULL DEFAULT 'manual_rtmps'")?;
@@ -432,21 +484,66 @@ impl CloudDb {
 
     // --- users ------------------------------------------------------------
 
+    /// An account with no display name and no recorded consent.
+    ///
+    /// The bootstrap CLI's path, and every test's. Kept at this exact signature
+    /// on purpose: a deploy script that creates the operator's account must not
+    /// need a name it has no way to ask for, and consent is something a person
+    /// gives, not something a shell script can give on their behalf.
     pub fn create_user(&self, email: &str, password_hash: &str, plan_id: &str) -> Result<User> {
+        self.insert_user(None, email, password_hash, plan_id, None)
+    }
+
+    /// An account made by somebody filling in the signup form.
+    ///
+    /// The one thing worth noticing: [`Signup`] has no plan field. The plan is
+    /// the server's to decide, so a request body cannot ask for Business.
+    pub fn register_user(&self, s: &Signup<'_>, plan_id: &str) -> Result<User> {
+        self.insert_user(Some(s.name), s.email, s.password_hash, plan_id, Some(s.terms_version))
+    }
+
+    /// The user row and its subscription, in one transaction.
+    ///
+    /// Together, because an account with no subscription row is an account whose
+    /// plan lookups fall back to a default — recoverable, but only after
+    /// somebody notices. Two statements that must both land are a transaction.
+    ///
+    /// `consented_to` is `Some(version)` only for a real signup, and the
+    /// timestamps come from SQLite's own clock: a client that could send its own
+    /// `accepted_at` could claim to have agreed last year.
+    fn insert_user(
+        &self,
+        name: Option<&str>,
+        email: &str,
+        password_hash: &str,
+        plan_id: &str,
+        consented_to: Option<&str>,
+    ) -> Result<User> {
         let id = crate::new_id();
-        let c = self.conn.lock().unwrap();
-        c.execute(
-            "INSERT INTO users (id, email, password_hash, plan_id) VALUES (?1, ?2, ?3, ?4)",
-            params![id, email.trim(), password_hash, plan_id],
+        let conn = self.conn.clone();
+        let mut guard = conn.lock().unwrap();
+        let tx = guard.transaction()?;
+        tx.execute(
+            "INSERT INTO users (id, email, password_hash, plan_id, name,
+                                terms_accepted_at, privacy_accepted_at, terms_version)
+             VALUES (?1, ?2, ?3, ?4, ?5,
+                     CASE WHEN ?6 IS NULL THEN NULL ELSE datetime('now') END,
+                     CASE WHEN ?6 IS NULL THEN NULL ELSE datetime('now') END,
+                     ?6)",
+            params![id, email.trim(), password_hash, plan_id, name, consented_to],
         )
         .map_err(|e| match e {
+            // The UNIQUE index is what decides, not a SELECT before the insert:
+            // two simultaneous signups for one address both pass a check and
+            // only one can pass this.
             rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::ConstraintViolation => {
                 CloudError::EmailTaken
             }
             other => CloudError::Db(other),
         })?;
-        c.execute("INSERT INTO subscriptions (user_id, plan_id) VALUES (?1, ?2)", params![id, plan_id])?;
-        drop(c);
+        tx.execute("INSERT INTO subscriptions (user_id, plan_id) VALUES (?1, ?2)", params![id, plan_id])?;
+        tx.commit()?;
+        drop(guard);
         self.user(&id)
     }
 
@@ -454,9 +551,24 @@ impl CloudDb {
         self.conn
             .lock()
             .unwrap()
-            .query_row("SELECT id, email, plan_id, created_at FROM users WHERE id=?1", [id], |r| {
-                Ok(User { id: r.get(0)?, email: r.get(1)?, plan_id: r.get(2)?, created_at: r.get(3)? })
-            })
+            .query_row(
+                "SELECT id, email, plan_id, created_at, name, terms_accepted_at, privacy_accepted_at
+                 FROM users WHERE id=?1",
+                [id],
+                |r| {
+                    Ok(User {
+                        id: r.get(0)?,
+                        email: r.get(1)?,
+                        plan_id: r.get(2)?,
+                        created_at: r.get(3)?,
+                        // NULL on every account that existed before signup asked
+                        // for a name. Readers show the email instead.
+                        name: r.get(4)?,
+                        terms_accepted_at: r.get(5)?,
+                        privacy_accepted_at: r.get(6)?,
+                    })
+                },
+            )
             .optional()?
             .ok_or(CloudError::NotFound("user"))
     }

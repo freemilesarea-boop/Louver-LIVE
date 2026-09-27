@@ -14,6 +14,8 @@ import { CloudDashboard } from "./CloudDashboard";
 import { BroadcastForm } from "./BroadcastForm";
 import { DeploymentBanner, ServerStatus } from "./ServerStatus";
 import { Destinations } from "./Destinations";
+import { SignIn } from "./SignIn";
+import { LegalPage, legalPageFor } from "./Legal";
 import { MediaLibrary } from "./MediaLibrary";
 import { AUTO_SETTINGS, emptySchedule } from "../cloud";
 import type {
@@ -965,5 +967,297 @@ describe("what the dashboard says about YouTube", () => {
     expect(
       await screen.findByText(/liveStreamingNotEnabled/),
     ).toBeInTheDocument();
+  });
+});
+
+describe("signing up", () => {
+  /** Fill in a valid signup, leaving whichever field a test wants to break. */
+  async function fillIn(
+    over: Partial<
+      Record<"name" | "email" | "password" | "confirmation", string>
+    > = {},
+  ) {
+    await userEvent.type(screen.getByLabelText("이름"), over.name ?? "홍길동");
+    await userEvent.type(
+      screen.getByLabelText("이메일"),
+      over.email ?? "new@example.com",
+    );
+    await userEvent.type(
+      screen.getByLabelText("비밀번호"),
+      over.password ?? "correct-horse-battery",
+    );
+    await userEvent.type(
+      screen.getByLabelText("비밀번호 확인"),
+      over.confirmation ?? "correct-horse-battery",
+    );
+  }
+
+  async function toSignup() {
+    await userEvent.click(screen.getByRole("button", { name: /회원가입/ }));
+  }
+
+  function agree() {
+    return userEvent.click(screen.getByLabelText(/동의합니다/));
+  }
+
+  it("asks only for an email and a password when signing in", () => {
+    show(<SignIn onSignedIn={() => undefined} />, fake());
+
+    expect(screen.getByLabelText("이메일")).toBeInTheDocument();
+    expect(screen.getByLabelText("비밀번호")).toBeInTheDocument();
+    // Nothing a returning user does not need.
+    expect(screen.queryByLabelText("이름")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("비밀번호 확인")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(/동의합니다/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "로그인" })).toBeInTheDocument();
+    // The browser is told this is an existing password, so it offers the saved one.
+    expect(screen.getByLabelText("비밀번호")).toHaveAttribute(
+      "autocomplete",
+      "current-password",
+    );
+  });
+
+  it("shows all four fields and the agreement when signing up", async () => {
+    show(<SignIn onSignedIn={() => undefined} />, fake());
+    await toSignup();
+
+    expect(screen.getByText("247streams 시작하기")).toBeInTheDocument();
+    expect(
+      screen.getByText(/24시간 YouTube 라이브를 클라우드에서 운영하세요/),
+    ).toBeInTheDocument();
+    for (const label of ["이름", "이메일", "비밀번호", "비밀번호 확인"]) {
+      expect(screen.getByLabelText(label)).toBeInTheDocument();
+    }
+    expect(screen.getByLabelText(/동의합니다/)).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "무료로 시작하기" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("10자 이상")).toBeInTheDocument();
+
+    // A new password, twice, so no manager offers the old one.
+    expect(screen.getByLabelText("비밀번호")).toHaveAttribute(
+      "autocomplete",
+      "new-password",
+    );
+    expect(screen.getByLabelText("비밀번호 확인")).toHaveAttribute(
+      "autocomplete",
+      "new-password",
+    );
+    // And the two documents are reachable before agreeing to them.
+    expect(screen.getByRole("link", { name: "이용약관" })).toHaveAttribute(
+      "href",
+      "/terms",
+    );
+    expect(
+      screen.getByRole("link", { name: "개인정보처리방침" }),
+    ).toHaveAttribute("href", "/privacy");
+  });
+
+  it("sends the name, the email and one password", async () => {
+    const register = vi.fn().mockResolvedValue({
+      id: "u1",
+      email: "new@example.com",
+      plan_id: "basic",
+      name: "홍길동",
+    });
+    const onSignedIn = vi.fn();
+    show(<SignIn onSignedIn={onSignedIn} />, fake({ register }));
+    await toSignup();
+    await fillIn({ name: "  홍길동  " });
+    await agree();
+    await userEvent.click(
+      screen.getByRole("button", { name: "무료로 시작하기" }),
+    );
+
+    await waitFor(() => expect(register).toHaveBeenCalled());
+    // Trimmed, and the password sent once — a confirmation on the wire is one
+    // more copy of it in one more log.
+    expect(register).toHaveBeenCalledWith(
+      "홍길동",
+      "new@example.com",
+      "correct-horse-battery",
+    );
+    expect(register.mock.calls[0]).toHaveLength(3);
+    await waitFor(() => expect(onSignedIn).toHaveBeenCalled());
+  });
+
+  it("does not ask the server about a password that does not match itself", async () => {
+    const register = vi.fn();
+    show(<SignIn onSignedIn={() => undefined} />, fake({ register }));
+    await toSignup();
+    await fillIn({ confirmation: "correct-horse-batter" });
+    await agree();
+    await userEvent.click(
+      screen.getByRole("button", { name: "무료로 시작하기" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "비밀번호가 일치하지 않습니다.",
+    );
+    expect(register).not.toHaveBeenCalled();
+  });
+
+  it("refuses a short password, a missing name and an unchecked agreement", async () => {
+    const register = vi.fn();
+    const cases: [Parameters<typeof fillIn>[0], boolean, string][] = [
+      [{ name: " " }, true, "이름을 입력해주세요."],
+      [
+        { password: "짧아요", confirmation: "짧아요" },
+        true,
+        "비밀번호는 10자 이상이어야 합니다.",
+      ],
+      [{ email: "not-an-email" }, true, "올바른 이메일 주소를 입력해주세요."],
+      [{}, false, "이용약관 및 개인정보처리방침에 동의해주세요."],
+    ];
+
+    for (const [over, shouldAgree, message] of cases) {
+      const { unmount } = show(
+        <SignIn onSignedIn={() => undefined} />,
+        fake({ register }),
+      );
+      await toSignup();
+      await fillIn(over);
+      if (shouldAgree) await agree();
+      await userEvent.click(
+        screen.getByRole("button", { name: "무료로 시작하기" }),
+      );
+
+      expect(await screen.findByRole("alert")).toHaveTextContent(message);
+      expect(register).not.toHaveBeenCalled();
+      unmount();
+    }
+  });
+
+  it("shows the server's own words when the email is taken", async () => {
+    const register = vi
+      .fn()
+      .mockRejectedValue(new Error("이미 사용 중인 이메일입니다"));
+    show(<SignIn onSignedIn={() => undefined} />, fake({ register }));
+    await toSignup();
+    await fillIn();
+    await agree();
+    await userEvent.click(
+      screen.getByRole("button", { name: "무료로 시작하기" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "이미 사용 중인 이메일입니다",
+    );
+    // The name and the email stay as typed — retyping them is the last thing
+    // anybody wants after a failure. The passwords do not.
+    expect(screen.getByLabelText("이름")).toHaveValue("홍길동");
+    expect(screen.getByLabelText("이메일")).toHaveValue("new@example.com");
+    expect(screen.getByLabelText("비밀번호")).toHaveValue("");
+    expect(screen.getByLabelText("비밀번호 확인")).toHaveValue("");
+  });
+
+  it("cannot be submitted twice while the first attempt is in flight", async () => {
+    let release: (me: unknown) => void = () => undefined;
+    const register = vi
+      .fn()
+      .mockImplementation(() => new Promise((r) => (release = r)));
+    const onSignedIn = vi.fn();
+    show(<SignIn onSignedIn={onSignedIn} />, fake({ register }));
+    await toSignup();
+    await fillIn();
+    await agree();
+
+    const button = screen.getByRole("button", { name: "무료로 시작하기" });
+    await userEvent.click(button);
+    expect(
+      await screen.findByRole("button", { name: "계정 만드는 중…" }),
+    ).toBeDisabled();
+
+    // A second click, and an Enter in the form for good measure.
+    await userEvent.click(
+      screen.getByRole("button", { name: "계정 만드는 중…" }),
+    );
+    await userEvent.type(screen.getByLabelText("이메일"), "{Enter}");
+    expect(register).toHaveBeenCalledTimes(1);
+
+    // Let it finish inside the test, so the state it settles into is asserted
+    // rather than landing after the tree has been torn down.
+    release({
+      id: "u1",
+      email: "new@example.com",
+      plan_id: "basic",
+      name: "홍길동",
+    });
+    await waitFor(() => expect(onSignedIn).toHaveBeenCalledTimes(1));
+  });
+
+  it("carries nothing from one mode into the other", async () => {
+    const login = vi
+      .fn()
+      .mockResolvedValue({ id: "u1", email: "a@b.com", plan_id: "basic" });
+    show(<SignIn onSignedIn={() => undefined} />, fake({ login }));
+
+    await toSignup();
+    await fillIn();
+    await agree();
+    // Back to signing in, and back again.
+    await userEvent.click(screen.getByRole("button", { name: /로그인$/ }));
+    expect(screen.queryByLabelText("비밀번호 확인")).not.toBeInTheDocument();
+    // The email is kept — it is the same person — but no password is.
+    expect(screen.getByLabelText("비밀번호")).toHaveValue("");
+
+    await toSignup();
+    expect(screen.getByLabelText("이름")).toHaveValue("");
+    expect(screen.getByLabelText("비밀번호 확인")).toHaveValue("");
+    // Agreement is not remembered across a mode switch: it has to be given.
+    expect(screen.getByLabelText(/동의합니다/)).not.toBeChecked();
+  });
+
+  it("signs an existing account in with just the two fields", async () => {
+    // The account on the live server has no name; nothing here may require one.
+    const login = vi.fn().mockResolvedValue({
+      id: "u1",
+      email: "owner@example.com",
+      plan_id: "business",
+      name: null,
+    });
+    const onSignedIn = vi.fn();
+    show(<SignIn onSignedIn={onSignedIn} />, fake({ login }));
+
+    await userEvent.type(screen.getByLabelText("이메일"), "owner@example.com");
+    await userEvent.type(
+      screen.getByLabelText("비밀번호"),
+      "correct-horse-battery",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "로그인" }));
+
+    await waitFor(() =>
+      expect(login).toHaveBeenCalledWith(
+        "owner@example.com",
+        "correct-horse-battery",
+      ),
+    );
+    await waitFor(() => expect(onSignedIn).toHaveBeenCalled());
+  });
+});
+
+describe("the documents signup links to", () => {
+  it("answers on both paths and nowhere else", () => {
+    expect(legalPageFor("/terms")).toBe("terms");
+    expect(legalPageFor("/terms/")).toBe("terms");
+    expect(legalPageFor("/privacy")).toBe("privacy");
+    expect(legalPageFor("/")).toBeNull();
+    expect(legalPageFor("/termsandconditions")).toBeNull();
+  });
+
+  it("says it is a draft rather than pretending to be an agreement", () => {
+    render(<LegalPage which="terms" />);
+    expect(screen.getByRole("note")).toHaveTextContent(/준비 중인 초안/);
+    expect(screen.getByRole("note")).toHaveTextContent(
+      /법률 검토를 거친 정식 문서가 아니며/,
+    );
+  });
+
+  it("tells the truth about what is stored", () => {
+    render(<LegalPage which="privacy" />);
+    expect(
+      screen.getByText(/비밀번호 자체는 저장하지 않습니다/),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/스트림 키는 암호화하여 보관/)).toBeInTheDocument();
   });
 });

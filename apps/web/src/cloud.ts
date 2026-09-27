@@ -30,7 +30,20 @@ export interface Me {
   id: string;
   email: string;
   plan_id: string;
+  /** What this person is called. `null` on accounts made before signup asked
+   * for a name — every reader falls back to the email. */
+  name?: string | null;
 }
+
+/** What to call this person in the interface, with a fallback that always works. */
+export function displayName(me: Me): string {
+  return me.name?.trim() || me.email;
+}
+
+/** The floor the server enforces too. Shown on the form so it is not a surprise. */
+export const MIN_PASSWORD_CHARS = 10;
+/** Matches `louver_cloud::db::MAX_NAME_CHARS`, counted in characters. */
+export const MAX_NAME_CHARS = 60;
 
 export interface Subscription {
   user_id: string;

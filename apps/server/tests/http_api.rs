@@ -95,6 +95,8 @@ struct Reply {
     /// Where a redirect points. The OAuth callback answers with one rather than
     /// a body, because what arrives there is a person looking at a browser.
     location: Option<String>,
+    /// So a test can check that a reply is data rather than a document.
+    content_type: Option<String>,
 }
 
 impl Reply {
@@ -128,8 +130,13 @@ async fn send(
     let status = res.status();
     let set_cookie = res.headers().get(header::SET_COOKIE).and_then(|v| v.to_str().ok()).map(str::to_string);
     let location = res.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let content_type = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_string());
     let bytes = axum::body::to_bytes(res.into_body(), 4 * 1024 * 1024).await.unwrap();
-    Reply { status, body: String::from_utf8_lossy(&bytes).to_string(), set_cookie, location }
+    Reply { status, body: String::from_utf8_lossy(&bytes).to_string(), set_cookie, location, content_type }
 }
 
 async fn get(s: &Server, path: &str, token: &str) -> Reply {
@@ -147,7 +154,11 @@ async fn account(s: &Server, email: &str) -> String {
         Method::POST,
         "/api/auth/register",
         None,
-        Some(serde_json::json!({ "email": email, "password": "correct-horse-battery" })),
+        Some(serde_json::json!({
+            "name": "테스트 사용자",
+            "email": email,
+            "password": "correct-horse-battery",
+        })),
     )
     .await;
     assert_eq!(r.status, StatusCode::OK, "register failed: {}", r.body);
@@ -403,7 +414,11 @@ async fn an_account_cannot_be_registered_twice_or_with_a_weak_password() {
         Method::POST,
         "/api/auth/register",
         None,
-        Some(serde_json::json!({ "email": "DUP@example.com", "password": "correct-horse-battery" })),
+        Some(serde_json::json!({
+            "name": "중복",
+            "email": "DUP@example.com",
+            "password": "correct-horse-battery",
+        })),
     )
     .await;
     assert_eq!(again.status, StatusCode::CONFLICT, "{}", again.body);
@@ -413,7 +428,7 @@ async fn an_account_cannot_be_registered_twice_or_with_a_weak_password() {
         Method::POST,
         "/api/auth/register",
         None,
-        Some(serde_json::json!({ "email": "weak@example.com", "password": "short" })),
+        Some(serde_json::json!({ "name": "약함", "email": "weak@example.com", "password": "short" })),
     )
     .await;
     assert_eq!(weak.status, StatusCode::BAD_REQUEST);
@@ -649,4 +664,214 @@ async fn asking_for_a_youtube_broadcast_on_an_unconfigured_server_leaves_nothing
 
 fn location(r: &Reply) -> String {
     r.location.clone().unwrap_or_default()
+}
+
+// --- signup ----------------------------------------------------------------
+//
+// Validation lives twice: once in the browser so the form can answer without a
+// round trip, and once here because a request does not have to come from the
+// form. These test the copy that decides.
+
+/// The signup body a browser sends, with one field overridden.
+fn signup(over: serde_json::Value) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "name": "홍길동",
+        "email": "new@example.com",
+        "password": "correct-horse-battery",
+    });
+    for (k, v) in over.as_object().expect("an object").clone() {
+        body[k] = v;
+    }
+    body
+}
+
+async fn register(s: &Server, body: serde_json::Value) -> Reply {
+    send(s, Method::POST, "/api/auth/register", None, Some(body)).await
+}
+
+#[tokio::test]
+async fn signing_up_stores_the_name_grants_the_default_plan_and_signs_you_in() {
+    let s = server();
+    let r = register(&s, signup(serde_json::json!({}))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    // The reply carries the name, and no credential of any kind.
+    assert_eq!(r.json()["name"], "홍길동");
+    assert_eq!(r.json()["email"], "new@example.com");
+    assert!(r.json()["plan_id"].is_string());
+    for secret in ["correct-horse-battery", "password", "token", "louver_session"] {
+        assert!(!r.body.contains(secret), "{secret} reached the browser: {}", r.body);
+    }
+
+    // Signed in already: the cookie works on the next request.
+    let token = r.set_cookie.clone().expect("a session cookie");
+    let cookie = token.split(';').next().unwrap().trim_start_matches("louver_session=").to_string();
+    let me = get(&s, "/api/me", &cookie).await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert_eq!(me.json()["name"], "홍길동");
+
+    // The plan is the server's, and a subscription row exists for it — a user
+    // without one is a user whose limits come from a fallback.
+    let uid = s.app.db.user_by_email("new@example.com").unwrap().id;
+    let sub = s.app.db.subscription(&uid).unwrap();
+    assert_eq!(sub.plan_id, s.app.db.user(&uid).unwrap().plan_id);
+    assert_eq!(sub.status, "active");
+
+    // §6: the consent timestamps are the server's, and they are set.
+    let user = s.app.db.user(&uid).unwrap();
+    assert!(user.terms_accepted_at.is_some(), "agreeing has to be recorded");
+    assert!(user.privacy_accepted_at.is_some());
+}
+
+#[tokio::test]
+async fn a_name_is_stored_trimmed() {
+    let s = server();
+    let r = register(&s, signup(serde_json::json!({ "name": "  홍길동  " }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.json()["name"], "홍길동");
+    assert_eq!(s.app.db.user_by_email("new@example.com").unwrap().name.as_deref(), Some("홍길동"));
+}
+
+#[tokio::test]
+async fn a_name_that_is_not_one_is_refused_and_no_account_is_made() {
+    let s = server();
+    for name in [serde_json::json!(""), serde_json::json!("    "), serde_json::json!("가".repeat(61))] {
+        let r = register(&s, signup(serde_json::json!({ "name": name }))).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{} → {}", name, r.body);
+        assert!(r.set_cookie.is_none(), "a refused signup must not sign anybody in");
+        assert!(s.app.db.user_by_email("new@example.com").is_err(), "an account was made anyway");
+    }
+}
+
+#[tokio::test]
+async fn an_unusable_email_or_a_short_password_is_refused_before_a_row_exists() {
+    let s = server();
+    let cases = [
+        (serde_json::json!({ "email": "not-an-email" }), "이메일"),
+        (serde_json::json!({ "email": "me@example" }), "이메일"),
+        (serde_json::json!({ "password": "짧아요" }), "10자"),
+        (serde_json::json!({ "password": "123456789" }), "10자"),
+    ];
+    for (over, expect) in cases {
+        let r = register(&s, signup(over.clone())).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{over} → {}", r.body);
+        assert!(r.body.contains(expect), "{over} → {}", r.body);
+        // Nothing internal reaches the browser.
+        for leak in ["SQLite", "sqlite", "UNIQUE", "constraint", "panicked", "/home/"] {
+            assert!(!r.body.contains(leak), "{leak} leaked: {}", r.body);
+        }
+    }
+    assert_eq!(s.app.db.all_user_ids().unwrap().len(), 0, "a refused signup left a row behind");
+}
+
+#[tokio::test]
+async fn the_same_email_cannot_be_registered_twice() {
+    let s = server();
+    assert_eq!(register(&s, signup(serde_json::json!({}))).await.status, StatusCode::OK);
+
+    // Same address, different case and padding: the column is NOCASE and the
+    // value is normalised, so this is the same account.
+    let again = register(&s, signup(serde_json::json!({ "email": " NEW@Example.com " }))).await;
+    assert_eq!(again.status, StatusCode::CONFLICT, "{}", again.body);
+    assert!(again.json()["error"].as_str().unwrap().contains("이메일"), "{}", again.body);
+    assert!(again.set_cookie.is_none());
+    // No raw database words, and exactly one account.
+    assert!(!again.body.contains("UNIQUE"), "{}", again.body);
+    assert_eq!(s.app.db.all_user_ids().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn two_simultaneous_signups_for_one_address_produce_one_account() {
+    let s = server();
+    // The UNIQUE index decides, not a SELECT before the insert — which is the
+    // only arrangement that survives this.
+    let both = tokio::join!(
+        register(&s, signup(serde_json::json!({}))),
+        register(&s, signup(serde_json::json!({}))),
+    );
+    let statuses = [both.0.status, both.1.status];
+    assert!(statuses.contains(&StatusCode::OK), "neither signup succeeded: {statuses:?}");
+    assert!(statuses.contains(&StatusCode::CONFLICT), "both signups succeeded: {statuses:?}");
+    assert_eq!(s.app.db.all_user_ids().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn signing_up_cannot_choose_a_plan_or_grant_itself_anything() {
+    let s = server();
+    for smuggled in [
+        serde_json::json!({ "plan_id": "business" }),
+        serde_json::json!({ "plan": "business" }),
+        serde_json::json!({ "is_admin": true }),
+        serde_json::json!({ "terms_accepted_at": "1999-01-01 00:00:00" }),
+    ] {
+        let mut body = signup(serde_json::json!({}));
+        for (k, v) in smuggled.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let r = register(&s, body).await;
+        // Refused outright rather than ignored, so a future reader cannot be
+        // left guessing whether some path started honouring it. 422 is what axum
+        // answers for a body that does not match the type — `deny_unknown_fields`
+        // rejects before the handler runs, which is the point.
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{smuggled} → {} {}", r.status, r.body);
+        assert!(s.app.db.user_by_email("new@example.com").is_err());
+    }
+
+    // And the plan an honest signup gets is the one the server decided.
+    assert_eq!(register(&s, signup(serde_json::json!({}))).await.status, StatusCode::OK);
+    let user = s.app.db.user_by_email("new@example.com").unwrap();
+    assert_eq!(user.plan_id, "basic", "the default plan is the server's to pick");
+}
+
+#[tokio::test]
+async fn an_account_made_before_signup_asked_for_a_name_still_signs_in() {
+    let s = server();
+    // Exactly what the bootstrap CLI and every earlier release wrote: no name,
+    // no consent timestamps.
+    let hash = louver_cloud::credentials::hash_password("correct-horse-battery").unwrap();
+    let legacy = s.app.db.create_user("owner@example.com", &hash, "business").unwrap();
+    assert!(legacy.name.is_none(), "create_user must keep writing a nameless account");
+    assert!(legacy.terms_accepted_at.is_none(), "a script cannot agree on somebody's behalf");
+
+    let r = send(
+        &s,
+        Method::POST,
+        "/api/auth/login",
+        None,
+        Some(serde_json::json!({ "email": "owner@example.com", "password": "correct-horse-battery" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "a legacy account must still sign in: {}", r.body);
+    // `name` is present and null rather than missing, so a client can tell the
+    // difference between "no name" and "an older server".
+    assert!(r.json()["name"].is_null(), "{}", r.body);
+    assert_eq!(r.json()["plan_id"], "business", "and keeps the plan it was given");
+
+    let cookie =
+        r.set_cookie.unwrap().split(';').next().unwrap().trim_start_matches("louver_session=").to_string();
+    let me = get(&s, "/api/me", &cookie).await;
+    assert_eq!(me.status, StatusCode::OK, "{}", me.body);
+    assert!(me.json()["name"].is_null());
+}
+
+#[tokio::test]
+async fn a_name_containing_markup_is_stored_as_typed_and_escaped_in_json() {
+    let s = server();
+    // React renders text, never HTML, so the defence is at the point of
+    // rendering. What this checks is the layer below: the value is not mangled
+    // on the way in, and it leaves as a JSON string rather than as markup.
+    let r = register(&s, signup(serde_json::json!({ "name": "<script>alert(1)</script>" }))).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    // Stored and returned exactly as typed — mangling somebody's name would be a
+    // bug, and truncating it at `<` would be a worse one.
+    assert_eq!(r.json()["name"], "<script>alert(1)</script>");
+    assert_eq!(
+        s.app.db.user_by_email("new@example.com").unwrap().name.as_deref(),
+        Some("<script>alert(1)</script>")
+    );
+    // It leaves as JSON, not as a document a browser would parse as markup.
+    assert_eq!(r.content_type.as_deref(), Some("application/json"));
+    // And it survives a round trip through the parser, which is what React is
+    // handed — React renders it as text, so this is where the defence ends.
+    assert!(r.json().is_object(), "{}", r.body);
 }

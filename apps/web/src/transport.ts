@@ -31,7 +31,8 @@ export interface Transport {
   /** Which kind of backend this is, for the few places that must say so. */
   readonly kind: "web" | "desktop";
 
-  register(email: string, password: string): Promise<Me>;
+  /** Make an account. `name` is required by the server, which validates it again. */
+  register(name: string, email: string, password: string): Promise<Me>;
   login(email: string, password: string): Promise<Me>;
   logout(): Promise<void>;
   me(): Promise<Me>;
@@ -156,10 +157,13 @@ export class WebTransport implements Transport {
     return (text ? JSON.parse(text) : undefined) as T;
   }
 
-  register(email: string, password: string) {
+  register(name: string, email: string, password: string) {
+    // No password confirmation: the two boxes matching is the form's business,
+    // and sending the password twice would only put another copy of it on the
+    // wire.
     return this.json<Me>("/api/auth/register", {
       method: "POST",
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ name, email, password }),
     });
   }
 
