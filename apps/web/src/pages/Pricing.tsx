@@ -6,28 +6,31 @@
  * prices live, and the two would eventually disagree — with the customer reading
  * one and the server charging the other.
  *
- * The "시작하기" buttons do not start anything. There is no payment yet, and
- * there is deliberately no endpoint they could call that would activate a plan:
- * see `CloudDb::activate_subscription`, which only a verified payment or the
- * operator's own CLI can reach.
+ * Pressing 시작하기 asks the server for a PayApp payment URL and sends the browser
+ * there. It does not activate anything: only a verified PayApp notification does,
+ * and no route a browser can reach touches `activate_subscription`.
  */
 import { useEffect, useState } from "react";
-import { Button, Card } from "@/components/ui";
+import { Button, Card, Field, Input, Modal } from "@/components/ui";
 import { useTransport } from "../TransportContext";
 import {
   PLAN_FEATURES,
   RECOMMENDED_PLAN,
+  billingIsLive,
   concurrentStreams,
   formatWon,
 } from "../cloud";
-import type { Plan } from "../cloud";
+import type { BillingSubscription, Plan } from "../cloud";
 
 export function Pricing({ onClose }: { onClose?: () => void }) {
   const t = useTransport();
   const [plans, setPlans] = useState<Plan[] | null>(null);
   const [error, setError] = useState<string | null>(null);
-  /** Which plan's "not yet" notice is showing. */
+  /** Which plan's checkout is open. */
   const [chosen, setChosen] = useState<Plan | null>(null);
+  /** Can this deployment take a payment, and is one already running? */
+  const [configured, setConfigured] = useState(true);
+  const [existing, setExisting] = useState<BillingSubscription | null>(null);
 
   useEffect(() => {
     let live = true;
@@ -38,6 +41,19 @@ export function Pricing({ onClose }: { onClose?: () => void }) {
           live &&
           setError("요금제를 불러오지 못했습니다. 잠시 후 다시 시도해주세요."),
       );
+    // Signed out, or a desktop build: the price list still renders, and the
+    // buttons say what is possible instead of failing when pressed.
+    t.billingStatus()
+      .then((b) => {
+        if (!live) return;
+        setConfigured(b.configured);
+        setExisting(
+          b.subscription && billingIsLive(b.subscription)
+            ? b.subscription
+            : null,
+        );
+      })
+      .catch(() => undefined);
     return () => {
       live = false;
     };
@@ -71,7 +87,28 @@ export function Pricing({ onClose }: { onClose?: () => void }) {
         </div>
       )}
 
-      {chosen && <NotYet plan={chosen} onDismiss={() => setChosen(null)} />}
+      {/* §14: one recurring registration per account. Said here rather than
+          discovered when the server refuses. */}
+      {existing && (
+        <p
+          className="mt-4 text-center text-sm text-warn"
+          data-testid="already-subscribed"
+        >
+          이미 정기결제가 등록되어 있습니다. 현재 구독을 해지한 후 요금제를
+          변경할 수 있습니다.
+        </p>
+      )}
+
+      {chosen &&
+        (configured && !existing ? (
+          <CheckoutModal plan={chosen} onClose={() => setChosen(null)} />
+        ) : (
+          <NotReady
+            plan={chosen}
+            blocked={existing}
+            onDismiss={() => setChosen(null)}
+          />
+        ))}
 
       {onClose && (
         <p className="mt-6 text-center">
@@ -153,25 +190,136 @@ function PlanCard({ plan, onChoose }: { plan: Plan; onChoose: () => void }) {
 }
 
 /**
- * What "시작하기" actually does today.
+ * The checkout. §10.
  *
- * Nothing is sent. A button that quietly activated a plan would be a way to get
- * a paid entitlement for free, so this says what is true instead: the payment
- * system is not built yet.
+ * Collects the one thing PayApp requires and we do not already know — the mobile
+ * number the payment link is sent to — and then hands the browser to PayApp.
+ *
+ * The price shown is for reading. What is charged is whatever the server's plans
+ * table says, and this component sends no amount at all.
  */
-function NotYet({ plan, onDismiss }: { plan: Plan; onDismiss: () => void }) {
+function CheckoutModal({ plan, onClose }: { plan: Plan; onClose: () => void }) {
+  const t = useTransport();
+  const [phone, setPhone] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const digits = phone.replace(/\D/g, "");
+  const usable =
+    digits.length >= 10 && digits.length <= 11 && digits.startsWith("01");
+
+  async function start() {
+    if (busy) return;
+    if (!usable) {
+      setError("휴대폰 번호를 확인해주세요. (예: 01012345678)");
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const { payurl } = await t.startCheckout(plan.id, digits);
+      // PayApp's page, not ours. Nothing is subscribed until their server tells
+      // ours that the first payment was approved.
+      window.location.assign(payurl);
+    } catch (e) {
+      setError(
+        e instanceof Error
+          ? e.message
+          : "결제를 시작할 수 없습니다. 잠시 후 다시 시도해주세요.",
+      );
+      setBusy(false);
+    }
+  }
+
   return (
-    <Card title="결제 준비 중">
+    <Modal
+      open
+      title="정기결제 시작"
+      onClose={onClose}
+      footer={
+        <>
+          <Button onClick={onClose} disabled={busy}>
+            취소
+          </Button>
+          <Button variant="primary" onClick={start} disabled={busy}>
+            {busy ? "결제 준비 중…" : "정기결제 시작"}
+          </Button>
+        </>
+      }
+    >
+      <dl className="grid gap-y-2 text-sm" data-testid="checkout-summary">
+        <div className="flex justify-between border-b border-ink-800 py-1">
+          <dt className="text-ink-500">선택 요금제</dt>
+          <dd className="text-ink-100">{plan.label}</dd>
+        </div>
+        <div className="flex justify-between border-b border-ink-800 py-1">
+          <dt className="text-ink-500">월 가격</dt>
+          <dd className="text-ink-100">
+            {formatWon(plan.monthly_price_krw)} / 월
+          </dd>
+        </div>
+        <div className="flex justify-between border-b border-ink-800 py-1">
+          <dt className="text-ink-500">동시 송출</dt>
+          <dd className="text-ink-100">{concurrentStreams(plan)}개</dd>
+        </div>
+      </dl>
+
+      <Field
+        label="휴대폰 번호"
+        hint="결제 링크를 받을 번호입니다. 카드 정보는 PayApp 결제창에서 직접 입력합니다."
+      >
+        <Input
+          type="tel"
+          inputMode="numeric"
+          autoComplete="tel"
+          aria-label="휴대폰 번호"
+          placeholder="01012345678"
+          value={phone}
+          onChange={(e) => setPhone(e.target.value)}
+        />
+      </Field>
+
+      <p className="text-xs text-ink-500">
+        다음 화면에서 PayApp 결제창이 열립니다. 첫 결제가 승인되면 매월 같은 날
+        자동으로 결제됩니다. 언제든 해지할 수 있습니다.
+      </p>
+
+      {error && (
+        <p role="alert" className="pt-2 text-sm text-live">
+          {error}
+        </p>
+      )}
+    </Modal>
+  );
+}
+
+/**
+ * Why a checkout cannot start: either this deployment has no PayApp credentials,
+ * or the account already has a registration PayApp is holding.
+ */
+function NotReady({
+  plan,
+  blocked,
+  onDismiss,
+}: {
+  plan: Plan;
+  blocked: BillingSubscription | null;
+  onDismiss: () => void;
+}) {
+  return (
+    <Card title={blocked ? "이미 구독 중입니다" : "결제 준비 중"}>
       <p
         role="status"
         className="text-sm text-ink-100"
-        data-testid="payment-coming-soon"
+        data-testid="checkout-unavailable"
       >
-        결제 시스템을 준비 중입니다.
+        {blocked
+          ? "현재 구독을 해지한 후 요금제를 변경할 수 있습니다."
+          : "결제 시스템을 준비 중입니다."}
       </p>
       <p className="mt-2 text-sm text-ink-400">
         {plan.label} 요금제({formatWon(plan.monthly_price_krw)} / 월)를
-        선택하셨습니다. 결제가 열리면 바로 시작할 수 있도록 안내드리겠습니다.
+        선택하셨습니다.
       </p>
       <div className="mt-4">
         <Button onClick={onDismiss}>확인</Button>

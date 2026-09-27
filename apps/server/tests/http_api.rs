@@ -85,7 +85,10 @@ fn server() -> Server {
     let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools.clone(), "libx264".into());
     let upload_tmp = dir.path().join("uploads");
     std::fs::create_dir_all(&upload_tmp).unwrap();
-    Server { _dir: dir, app: App { db, mgr, ingest, storage, keys, upload_tmp, tools, youtube: None } }
+    Server {
+        _dir: dir,
+        app: App { db, mgr, ingest, storage, keys, upload_tmp, tools, youtube: None, payapp: None },
+    }
 }
 
 struct Reply {
@@ -1149,4 +1152,535 @@ async fn the_operators_business_account_survives_and_keeps_its_three_streams() {
     assert_eq!(dash.json()["plan_label"], "Business");
     assert_eq!(dash.json()["allowed"], 3);
     assert_eq!(dash.json()["subscribed"], true);
+}
+
+// --- billing over HTTP ------------------------------------------------------
+//
+// The provider itself is exercised against a fake PayApp in
+// `crates/louver-cloud/tests/payapp.rs`. What is under test here is the layer
+// above: who each route believes, what a server with no PayApp credentials
+// answers, and — the one that matters most — that no route a browser can reach
+// grants a paid entitlement.
+
+/// A PayApp that answers the way the documentation says, and records what it got.
+#[derive(Debug, Default)]
+struct FakePayapp {
+    calls: std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>,
+}
+
+impl louver_cloud::billing::FormPost for FakePayapp {
+    fn post_form(&self, _url: &str, fields: &[(&str, &str)]) -> louver_cloud::Result<String> {
+        self.calls.lock().unwrap().push(fields.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
+        Ok(format!(
+            "state=1&errno=00000&rebill_no=778899&payurl={}",
+            louver_cloud::billing::urlencode("https://payapp.kr/pay/778899")
+        ))
+    }
+}
+
+const PAY_USERID: &str = "247streams";
+const PAY_LINKKEY: &str = "http-test-link-key";
+const PAY_LINKVAL: &str = "http-test-link-val";
+
+/// The same server, with billing configured.
+fn billing_server() -> (Server, Arc<FakePayapp>) {
+    let s = server();
+    let api = Arc::new(FakePayapp::default());
+    let config = louver_cloud::billing::Config {
+        userid: PAY_USERID.into(),
+        linkkey: PAY_LINKKEY.into(),
+        linkval: PAY_LINKVAL.into(),
+        api_url: "https://fake.payapp.test/oapi/apiLoad.html".into(),
+        public_url: "https://247streams.kr".into(),
+    };
+    let payapp = louver_cloud::billing::Payapp::new(
+        s.app.db.clone(),
+        Arc::clone(&api) as Arc<dyn louver_cloud::billing::FormPost>,
+        config,
+    );
+    (Server { _dir: s._dir, app: App { payapp: Some(payapp), ..s.app } }, api)
+}
+
+/// POST a form body, as PayApp's server-to-server notification does.
+async fn post_form(s: &Server, path: &str, fields: &[(&str, &str)]) -> Reply {
+    let body = fields
+        .iter()
+        .map(|(k, v)| {
+            format!("{}={}", louver_cloud::billing::urlencode(k), louver_cloud::billing::urlencode(v))
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(body))
+        .unwrap();
+    let res = louver_server::router(s.app.clone()).oneshot(req).await.unwrap();
+    let status = res.status();
+    let bytes = axum::body::to_bytes(res.into_body(), 1024 * 1024).await.unwrap();
+    Reply {
+        status,
+        body: String::from_utf8_lossy(&bytes).to_string(),
+        set_cookie: None,
+        location: None,
+        content_type: None,
+    }
+}
+
+/// A verified notification for one order, with fields overridden.
+fn notification(billing_id: &str, over: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut f: Vec<(String, String)> = [
+        ("userid", PAY_USERID),
+        ("linkkey", PAY_LINKKEY),
+        ("linkval", PAY_LINKVAL),
+        ("goodname", "247streams Pro"),
+        ("price", "39900"),
+        ("recvphone", "01012345678"),
+        ("pay_date", "2026-09-27 12:00:05"),
+        ("pay_type", "card"),
+        ("pay_state", "4"),
+        ("mul_no", "990001"),
+        ("rebill_no", "778899"),
+        ("var1", billing_id),
+        ("var2", "pro"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    for (k, v) in over {
+        match f.iter_mut().find(|(key, _)| key == k) {
+            Some(slot) => slot.1 = v.to_string(),
+            None => f.push((k.to_string(), v.to_string())),
+        }
+    }
+    f
+}
+
+fn borrowed(fields: &[(String, String)]) -> Vec<(&str, &str)> {
+    fields.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
+}
+
+#[tokio::test]
+async fn the_billing_routes_need_a_caller_except_the_two_payapp_posts_to() {
+    let (s, _) = billing_server();
+    for (method, path) in [(Method::GET, "/api/billing/status"), (Method::POST, "/api/billing/cancel")] {
+        let r = send(&s, method.clone(), path, None, None).await;
+        assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{method} {path}: {}", r.body);
+    }
+    let r = send(
+        &s,
+        Method::POST,
+        "/api/billing/checkout",
+        None,
+        Some(serde_json::json!({ "plan_id": "pro", "recvphone": "01012345678" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+}
+
+#[tokio::test]
+async fn a_server_without_payapp_credentials_says_so_and_still_works() {
+    // The `server()` harness has no provider, which is every deployment until an
+    // operator sets three environment variables.
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+
+    let checkout = post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "pro", "recvphone": "01012345678" })),
+    )
+    .await;
+    assert_eq!(checkout.status, StatusCode::BAD_REQUEST, "{}", checkout.body);
+    assert!(checkout.body.contains("결제 시스템이 아직 설정되지 않았습니다"), "{}", checkout.body);
+
+    // And everything else answers.
+    let status = get(&s, "/api/billing/status", &a).await;
+    assert_eq!(status.status, StatusCode::OK, "{}", status.body);
+    assert_eq!(status.json()["configured"], false);
+    assert!(status.json()["subscription"].is_null());
+    assert_eq!(get(&s, "/api/plans", &a).await.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn checkout_returns_a_payurl_and_grants_nothing() {
+    let (s, api) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+
+    let r = post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "pro", "recvphone": "010-1234-5678" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.json()["payurl"], "https://payapp.kr/pay/778899");
+    assert_eq!(r.json()["amount_krw"], 39900);
+    assert_eq!(r.json()["plan_id"], "pro");
+
+    // The provider was asked, with the price from the plans table.
+    let call = api.calls.lock().unwrap()[0].clone();
+    assert_eq!(call.get("cmd").unwrap(), "rebillRegist");
+    assert_eq!(call.get("goodprice").unwrap(), "39900");
+
+    // §5: nothing is entitled yet.
+    assert!(!s.app.db.subscription(&me).unwrap().active);
+    assert_eq!(get(&s, "/api/me/subscription", &a).await.json()["status"], "unsubscribed");
+    assert_eq!(get(&s, "/api/broadcasts", &a).await.json()["allowed"], 0);
+
+    // §15: no credential in the response.
+    for secret in [PAY_LINKKEY, PAY_LINKVAL] {
+        assert!(!r.body.contains(secret), "{}", r.body);
+    }
+}
+
+#[tokio::test]
+async fn a_checkout_body_cannot_name_its_own_price() {
+    let (s, _) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+
+    // Refused outright rather than ignored: `deny_unknown_fields` means a future
+    // reader cannot wonder whether some path started honouring it.
+    for smuggled in [
+        serde_json::json!({ "plan_id": "business", "recvphone": "01012345678", "amount_krw": 100 }),
+        serde_json::json!({ "plan_id": "business", "recvphone": "01012345678", "goodprice": 100 }),
+        serde_json::json!({ "plan_id": "business", "recvphone": "01012345678", "price": 0 }),
+        serde_json::json!({ "plan_id": "business", "recvphone": "01012345678", "user_id": "someone" }),
+    ] {
+        let r = post(&s, "/api/billing/checkout", &a, Some(smuggled.clone())).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{smuggled} → {}", r.body);
+    }
+
+    // And an honest one is charged what the server says.
+    let ok = post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "business", "recvphone": "01012345678" })),
+    )
+    .await;
+    assert_eq!(ok.json()["amount_krw"], 59900);
+    assert!(!s.app.db.subscription(&me).unwrap().active);
+}
+
+#[tokio::test]
+async fn a_plan_nobody_can_buy_cannot_be_checked_out() {
+    let (s, api) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+
+    for plan in ["none", "desktop", "enterprise", ""] {
+        let r = post(
+            &s,
+            "/api/billing/checkout",
+            &a,
+            Some(serde_json::json!({ "plan_id": plan, "recvphone": "01012345678" })),
+        )
+        .await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{plan} → {}", r.body);
+    }
+    assert!(api.calls.lock().unwrap().is_empty(), "nothing may reach the provider");
+}
+
+#[tokio::test]
+async fn only_a_verified_notification_activates_a_subscription() {
+    let (s, _) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    let order = post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "pro", "recvphone": "01012345678" })),
+    )
+    .await;
+    let billing_id = order.json()["billing_id"].as_str().unwrap().to_string();
+
+    // A forged notification, in each of the ways somebody would try it.
+    for over in [
+        vec![("linkkey", "wrong")],
+        vec![("linkval", "wrong")],
+        vec![("userid", "someone-else")],
+        vec![("price", "100")],
+        vec![("rebill_no", "000000")],
+        vec![("var1", "not-an-order")],
+    ] {
+        let fields = notification(&billing_id, &over);
+        let r = post_form(&s, "/api/billing/payapp/feedback", &borrowed(&fields)).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{over:?} → {}", r.body);
+        assert_eq!(r.body, "FAIL", "a forgery must not be acknowledged");
+        assert!(!s.app.db.subscription(&me).unwrap().active, "{over:?} granted an entitlement");
+    }
+
+    // The real thing.
+    let fields = notification(&billing_id, &[]);
+    let ok = post_form(&s, "/api/billing/payapp/feedback", &borrowed(&fields)).await;
+    assert_eq!(ok.status, StatusCode::OK, "{}", ok.body);
+    // Exactly `SUCCESS`, no JSON, no redirect.
+    assert_eq!(ok.body, "SUCCESS");
+
+    let sub = get(&s, "/api/me/subscription", &a).await;
+    assert_eq!(sub.json()["status"], "active");
+    assert_eq!(sub.json()["plan"]["id"], "pro");
+    assert_eq!(get(&s, "/api/broadcasts", &a).await.json()["allowed"], 2);
+}
+
+#[tokio::test]
+async fn the_same_notification_ten_times_is_answered_success_and_applied_once() {
+    let (s, _) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    let order = post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "basic", "recvphone": "01012345678" })),
+    )
+    .await;
+    let fields = notification(order.json()["billing_id"].as_str().unwrap(), &[("price", "19900")]);
+
+    for i in 0..10 {
+        let r = post_form(&s, "/api/billing/payapp/feedback", &borrowed(&fields)).await;
+        assert_eq!(r.status, StatusCode::OK, "call {i}: {}", r.body);
+        assert_eq!(r.body, "SUCCESS", "call {i}");
+    }
+
+    assert_eq!(s.app.db.billing_events_for(&me, 50).unwrap().len(), 1, "one payment, one row");
+    assert_eq!(s.app.db.billing_subscriptions_for(&me).unwrap().len(), 1);
+    let sub = s.app.db.subscription(&me).unwrap();
+    assert!(sub.active);
+    assert_eq!(sub.plan_id, "basic");
+    assert_eq!(s.app.db.limit(&me, louver_cloud::entitlement::MAX_CONCURRENT_STREAMS).unwrap(), 1);
+}
+
+#[tokio::test]
+async fn arriving_at_the_return_url_activates_nothing() {
+    // §11: a browser coming back from PayApp is not evidence of a payment.
+    let (s, _) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "pro", "recvphone": "01012345678" })),
+    )
+    .await;
+
+    // Whatever the browser does on its way back, the answer is the same.
+    for path in ["/api/me/subscription", "/api/billing/status"] {
+        let r = get(&s, path, &a).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}");
+    }
+    assert_eq!(get(&s, "/api/me/subscription", &a).await.json()["status"], "unsubscribed");
+    assert!(!s.app.db.subscription(&me).unwrap().active);
+    // The record is visible as pending, which is what the completion page shows.
+    let status = get(&s, "/api/billing/status", &a).await;
+    assert_eq!(status.json()["subscription"]["status"], "pending");
+    assert_eq!(status.json()["provider"], "payapp");
+}
+
+#[tokio::test]
+async fn cancelling_stops_the_next_charge_and_leaves_the_paid_period_alone() {
+    let (s, api) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    let order = post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "pro", "recvphone": "01012345678" })),
+    )
+    .await;
+    let fields = notification(order.json()["billing_id"].as_str().unwrap(), &[]);
+    post_form(&s, "/api/billing/payapp/feedback", &borrowed(&fields)).await;
+    assert!(s.app.db.subscription(&me).unwrap().active);
+
+    let cancelled = post(&s, "/api/billing/cancel", &a, None).await;
+    assert_eq!(cancelled.status, StatusCode::OK, "{}", cancelled.body);
+    assert_eq!(cancelled.json()["status"], "cancel_at_period_end");
+
+    // PayApp was asked, with the four fields it documents.
+    let call = api.calls.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(call.get("cmd").unwrap(), "rebillCancel");
+    assert_eq!(call.get("rebill_no").unwrap(), "778899");
+    assert!(call.contains_key("linkkey"));
+    assert!(!call.contains_key("linkval"));
+
+    // §9: the entitlement is still there. Pressing cancel must not take a
+    // broadcast off air the same day.
+    let sub = get(&s, "/api/me/subscription", &a).await;
+    assert_eq!(sub.json()["status"], "active");
+    assert_eq!(sub.json()["plan"]["id"], "pro");
+    assert_eq!(get(&s, "/api/broadcasts", &a).await.json()["allowed"], 2);
+}
+
+#[tokio::test]
+async fn one_account_cannot_cancel_anothers_subscription() {
+    let (s, api) = billing_server();
+    let a = account(&s, "a@example.com").await;
+    let b = account(&s, "b@example.com").await;
+    let a_id = s.app.db.user_by_email("a@example.com").unwrap().id;
+    let b_id = s.app.db.user_by_email("b@example.com").unwrap().id;
+
+    // B pays; A has nothing.
+    let order = post(
+        &s,
+        "/api/billing/checkout",
+        &b,
+        Some(serde_json::json!({ "plan_id": "pro", "recvphone": "01098765432" })),
+    )
+    .await;
+    let fields = notification(order.json()["billing_id"].as_str().unwrap(), &[]);
+    post_form(&s, "/api/billing/payapp/feedback", &borrowed(&fields)).await;
+    assert!(s.app.db.subscription(&b_id).unwrap().active);
+    let calls_before = api.calls.lock().unwrap().len();
+
+    // A cancelling reaches only A's own, of which there is none.
+    let r = post(&s, "/api/billing/cancel", &a, None).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(r.body.contains("해지할 정기결제가 없습니다"), "{}", r.body);
+    assert_eq!(api.calls.lock().unwrap().len(), calls_before, "the provider was not called");
+
+    // B is untouched.
+    assert!(s.app.db.subscription(&b_id).unwrap().active);
+    assert_eq!(
+        s.app.db.billing_subscriptions_for(&b_id).unwrap()[0].status,
+        louver_cloud::BillingStatus::Active
+    );
+    // And A cannot see B's billing record.
+    let a_status = get(&s, "/api/billing/status", &a).await;
+    assert!(a_status.json()["subscription"].is_null(), "{}", a_status.body);
+    let _ = a_id;
+}
+
+#[tokio::test]
+async fn a_failed_renewal_is_recorded_without_taking_the_entitlement_away() {
+    let (s, _) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    let order = post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "pro", "recvphone": "01012345678" })),
+    )
+    .await;
+    let billing_id = order.json()["billing_id"].as_str().unwrap().to_string();
+    post_form(&s, "/api/billing/payapp/feedback", &borrowed(&notification(&billing_id, &[]))).await;
+
+    // A reversal next month, through the failure URL PayApp is given.
+    let failed = notification(&billing_id, &[("pay_state", "9"), ("mul_no", "990009")]);
+    let r = post_form(&s, "/api/billing/payapp/failure", &borrowed(&failed)).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(r.body, "SUCCESS");
+
+    assert_eq!(
+        s.app.db.billing_subscriptions_for(&me).unwrap()[0].status,
+        louver_cloud::BillingStatus::PaymentFailed
+    );
+    // §8: recorded, and the broadcast stays on air.
+    assert!(s.app.db.subscription(&me).unwrap().active);
+    assert_eq!(get(&s, "/api/broadcasts", &a).await.json()["allowed"], 2);
+}
+
+#[tokio::test]
+async fn a_notification_before_any_payment_never_grants_a_plan() {
+    // §8's other half: a first payment that was never approved must not become an
+    // entitlement by way of some other state arriving.
+    let (s, _) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    let order = post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "business", "recvphone": "01012345678" })),
+    )
+    .await;
+    let billing_id = order.json()["billing_id"].as_str().unwrap().to_string();
+
+    for (i, state) in ["1", "10", "8", "32", "9", "64", "70", "71"].iter().enumerate() {
+        let fields = notification(
+            &billing_id,
+            &[("pay_state", state), ("price", "59900"), ("mul_no", &format!("99{i}"))],
+        );
+        let r = post_form(&s, "/api/billing/payapp/feedback", &borrowed(&fields)).await;
+        // Verified, so acknowledged — and nothing granted.
+        assert_eq!(r.body, "SUCCESS", "pay_state={state}");
+        assert!(!s.app.db.subscription(&me).unwrap().active, "pay_state={state} granted a plan");
+    }
+    assert_eq!(get(&s, "/api/broadcasts", &a).await.json()["allowed"], 0);
+}
+
+#[tokio::test]
+async fn there_is_still_no_route_that_activates_a_subscription() {
+    let (s, _) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+
+    // Every shape somebody would reach for, including the billing ones added here.
+    let attempts: &[(Method, &str)] = &[
+        (Method::POST, "/api/me/subscription"),
+        (Method::PUT, "/api/me/subscription"),
+        (Method::POST, "/api/me/plan"),
+        (Method::POST, "/api/plans"),
+        (Method::POST, "/api/set-plan"),
+        (Method::POST, "/api/billing/activate"),
+        (Method::POST, "/api/billing/subscriptions"),
+        (Method::PUT, "/api/billing/status"),
+        (Method::POST, "/api/subscriptions"),
+    ];
+    for (method, path) in attempts {
+        let r = send(
+            &s,
+            method.clone(),
+            path,
+            Some(&a),
+            Some(serde_json::json!({ "plan_id": "business", "status": "active" })),
+        )
+        .await;
+        assert!(
+            r.status == StatusCode::NOT_FOUND || r.status == StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path} answered {}: {}",
+            r.status,
+            r.body
+        );
+    }
+
+    // The two notification routes exist, and a browser cannot use them to grant
+    // itself anything: without the link keys they are refused.
+    let r = post_form(&s, "/api/billing/payapp/feedback", &[("var1", "anything"), ("pay_state", "4")]).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    assert_eq!(r.body, "FAIL");
+
+    assert!(!s.app.db.subscription(&me).unwrap().active);
+    assert_eq!(get(&s, "/api/me/subscription", &a).await.json()["status"], "unsubscribed");
+}
+
+#[tokio::test]
+async fn no_billing_response_carries_a_credential() {
+    let (s, _) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let order = post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "pro", "recvphone": "01012345678" })),
+    )
+    .await;
+    let fields = notification(order.json()["billing_id"].as_str().unwrap(), &[]);
+    let feedback = post_form(&s, "/api/billing/payapp/feedback", &borrowed(&fields)).await;
+    let status = get(&s, "/api/billing/status", &a).await;
+    let cancelled = post(&s, "/api/billing/cancel", &a, None).await;
+
+    for r in [&order, &feedback, &status, &cancelled] {
+        for secret in [PAY_LINKKEY, PAY_LINKVAL, "linkkey", "linkval"] {
+            assert!(!r.body.contains(secret), "{secret} reached a response: {}", r.body);
+        }
+    }
 }

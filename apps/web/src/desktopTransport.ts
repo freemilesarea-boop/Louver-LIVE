@@ -27,6 +27,9 @@ import type {
   Metrics,
   NewBroadcast,
   NewDestination,
+  BillingStatusResponse,
+  BillingSubscription,
+  Checkout,
   NewItem,
   Plan,
   RuntimeState,
@@ -88,6 +91,24 @@ export class DesktopTransport implements Transport {
   /** Nothing is on sale in the desktop app, so there is no price list. */
   async plans(): Promise<Plan[]> {
     return [];
+  }
+
+  /** The desktop app is the licence; there is nothing to bill. */
+  async billingStatus(): Promise<BillingStatusResponse> {
+    return {
+      subscription: null,
+      plan: await this.subscription(),
+      provider: "none",
+      configured: false,
+    };
+  }
+
+  async startCheckout(): Promise<Checkout> {
+    throw ONLY_ON_THE_WEB("결제");
+  }
+
+  async cancelBilling(): Promise<BillingSubscription> {
+    throw ONLY_ON_THE_WEB("구독 해지");
   }
 
   async listMedia(): Promise<CloudMedia[]> {

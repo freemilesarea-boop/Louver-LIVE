@@ -25,6 +25,10 @@ pub struct App {
     /// is a supported deployment, not a broken one: manual RTMPS is the path
     /// that is on air, and it needs nothing from Google.
     pub youtube: Option<louver_cloud::youtube::Youtube>,
+    /// The payment provider, when this server has PayApp credentials. `None` is
+    /// again a supported deployment: everything but paying works, and the
+    /// checkout route is the only thing that has to say so.
+    pub payapp: Option<louver_cloud::billing::Payapp>,
 }
 
 impl App {
@@ -69,7 +73,22 @@ impl App {
 
         let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools.clone(), encoder);
 
-        Ok(Self { db, mgr, ingest, storage, keys, upload_tmp, tools, youtube })
+        // Same rule as YouTube: absent credentials make one feature unavailable,
+        // not the server unbootable. A production box that has not been given
+        // PayApp keys yet still streams.
+        let payapp = match louver_cloud::billing::Config::from_env() {
+            Ok(config) => Some(louver_cloud::billing::Payapp::new(
+                db.clone(),
+                Arc::new(louver_cloud::billing::UreqForm),
+                config,
+            )),
+            Err(e) => {
+                println!("[louver] 결제: 설정되지 않았습니다 ({e})");
+                None
+            }
+        };
+
+        Ok(Self { db, mgr, ingest, storage, keys, upload_tmp, tools, youtube, payapp })
     }
 }
 

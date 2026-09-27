@@ -157,6 +157,69 @@ CREATE TABLE IF NOT EXISTS oauth_states (
     used_at    TEXT
 );
 
+-- One subscription somebody is paying for, or about to.
+--
+-- Separate from `subscriptions` on purpose. That table says what a user is
+-- entitled to; this one says what a payment provider knows about them. They can
+-- disagree legitimately: a cancelled billing subscription leaves the entitlement
+-- in place until the period it paid for is over.
+CREATE TABLE IF NOT EXISTS billing_subscriptions (
+    -- Ours, opaque, and the value that travels in the provider's `var1`. Never
+    -- a user id or an email: it comes back to us through a callback we do not
+    -- control the transport of.
+    id           TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_id      TEXT NOT NULL REFERENCES plans(id),
+    provider     TEXT NOT NULL DEFAULT 'payapp',
+    -- PayApp's `rebill_no`. NULL between our INSERT and their answer.
+    provider_subscription_id TEXT,
+    status       TEXT NOT NULL,
+    -- What we will check the callback's `price` against. In whole won.
+    amount_krw   INTEGER NOT NULL,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    activated_at TEXT,
+    cancelled_at TEXT,
+    last_paid_at TEXT,
+    -- Through when the last payment has paid for. What a cancellation at period
+    -- end would be measured against; nothing acts on it automatically yet.
+    current_period_end TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_billing_user ON billing_subscriptions(user_id);
+-- One `rebill_no` belongs to one record. A partial index because the column is
+-- NULL until the provider answers, and several pending rows may be NULL at once.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_rebill
+    ON billing_subscriptions(provider, provider_subscription_id)
+    WHERE provider_subscription_id IS NOT NULL;
+
+-- One payment notification, recorded once.
+--
+-- The UNIQUE index on the provider's own event key is the whole idempotency
+-- mechanism: a callback that arrives ten times inserts one row, and the nine
+-- that lose the race do nothing and are answered SUCCESS.
+--
+-- Deliberately not the raw callback body. The provider posts our own link keys
+-- back to us in it, and a table that stored them would be a table that leaked
+-- them. Only these columns, all of them safe to read.
+CREATE TABLE IF NOT EXISTS billing_events (
+    id           TEXT PRIMARY KEY,
+    provider     TEXT NOT NULL,
+    provider_event_key TEXT NOT NULL,
+    billing_id   TEXT,
+    user_id      TEXT,
+    provider_subscription_id TEXT,
+    pay_state    TEXT NOT NULL,
+    amount_krw   INTEGER NOT NULL,
+    pay_date     TEXT,
+    pay_type     TEXT,
+    -- Why we did or did not act on it, in our own words.
+    outcome      TEXT NOT NULL,
+    processed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_billing_event_key
+    ON billing_events(provider, provider_event_key);
+CREATE INDEX IF NOT EXISTS idx_billing_event_user ON billing_events(user_id, processed_at DESC);
+
 -- One video in one broadcast's playlist. §1.
 CREATE TABLE IF NOT EXISTS broadcast_items (
     id           TEXT PRIMARY KEY,
@@ -749,6 +812,204 @@ impl CloudDb {
             return Err(CloudError::NoSubscription);
         }
         Ok(sub)
+    }
+
+    // --- billing (PayApp) --------------------------------------------------
+
+    /// Reserve a billing record before the provider is told anything.
+    ///
+    /// The row has to exist first because its id is what travels in the
+    /// provider's `var1` and comes back in the callback. `status = pending`, which
+    /// grants nothing: a record here is a payment that has been *asked for*.
+    pub fn open_billing_subscription(
+        &self,
+        user_id: &str,
+        plan_id: &str,
+        provider: &str,
+        amount_krw: i64,
+    ) -> Result<BillingSubscription> {
+        let id = crate::new_id();
+        self.conn.lock().unwrap().execute(
+            "INSERT INTO billing_subscriptions (id, user_id, plan_id, provider, status, amount_krw)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, user_id, plan_id, provider, BillingStatus::Pending.id(), amount_krw],
+        )?;
+        self.billing_subscription(&id)
+    }
+
+    pub fn billing_subscription(&self, id: &str) -> Result<BillingSubscription> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(&format!("{BILLING_COLUMNS} WHERE id = ?1"), [id], row_to_billing)
+            .optional()?
+            .ok_or(CloudError::NotFound("billing subscription"))
+    }
+
+    /// A billing record that belongs to this caller, or nothing.
+    ///
+    /// The owner check is in the SQL, so knowing somebody else's billing id buys
+    /// nothing — the same rule every other `*_owned` reader here follows.
+    pub fn billing_subscription_owned(&self, user_id: &str, id: &str) -> Result<BillingSubscription> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!("{BILLING_COLUMNS} WHERE id = ?1 AND user_id = ?2"),
+                params![id, user_id],
+                row_to_billing,
+            )
+            .optional()?
+            .ok_or(CloudError::NotFound("billing subscription"))
+    }
+
+    /// This user's billing records, newest first.
+    pub fn billing_subscriptions_for(&self, user_id: &str) -> Result<Vec<BillingSubscription>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st =
+            conn.prepare(&format!("{BILLING_COLUMNS} WHERE user_id = ?1 ORDER BY created_at DESC"))?;
+        let rows = st.query_map([user_id], row_to_billing)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The one record the provider is still on the hook for, if there is one.
+    ///
+    /// §14's gate. At most one of these should ever exist per user, and the
+    /// checkout path refuses to create a second.
+    pub fn live_billing_subscription(&self, user_id: &str) -> Result<Option<BillingSubscription>> {
+        Ok(self.billing_subscriptions_for(user_id)?.into_iter().find(|b| b.status.holds_the_provider()))
+    }
+
+    /// Store the provider's own reference for a record we just registered.
+    pub fn attach_provider_subscription(&self, id: &str, provider_subscription_id: &str) -> Result<()> {
+        let n = self.conn.lock().unwrap().execute(
+            "UPDATE billing_subscriptions
+             SET provider_subscription_id = ?2, updated_at = datetime('now')
+             WHERE id = ?1",
+            params![id, provider_subscription_id],
+        )?;
+        if n == 0 {
+            return Err(CloudError::NotFound("billing subscription"));
+        }
+        Ok(())
+    }
+
+    pub fn set_billing_status(&self, id: &str, status: BillingStatus) -> Result<()> {
+        let n = self.conn.lock().unwrap().execute(
+            "UPDATE billing_subscriptions
+             SET status = ?2,
+                 updated_at = datetime('now'),
+                 cancelled_at = CASE WHEN ?2 IN ('cancelled', 'cancel_at_period_end')
+                                     THEN COALESCE(cancelled_at, datetime('now'))
+                                     ELSE cancelled_at END
+             WHERE id = ?1",
+            params![id, status.id()],
+        )?;
+        if n == 0 {
+            return Err(CloudError::NotFound("billing subscription"));
+        }
+        Ok(())
+    }
+
+    /// The record a provider callback is about, found by our own opaque id.
+    ///
+    /// By `var1`, not by the user id or the email the callback carries: those
+    /// arrive over a transport we do not control, and a lookup by them would be a
+    /// lookup by something an attacker chooses.
+    pub fn billing_subscription_for_order(
+        &self,
+        provider: &str,
+        order_id: &str,
+    ) -> Result<BillingSubscription> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!("{BILLING_COLUMNS} WHERE id = ?1 AND provider = ?2"),
+                params![order_id, provider],
+                row_to_billing,
+            )
+            .optional()?
+            .ok_or(CloudError::NotFound("billing subscription"))
+    }
+
+    /// Record a payment notification, exactly once.
+    ///
+    /// Returns `true` when this call is the one that inserted it, and `false` when
+    /// the provider has sent this event before. The whole of the idempotency lives
+    /// in the UNIQUE index: ten simultaneous callbacks all run this, one inserts,
+    /// nine are told `false` and do nothing.
+    ///
+    /// Takes the ledger row and the status change together in one transaction, so
+    /// a crash between them cannot leave a payment recorded but unapplied, or an
+    /// entitlement granted with nothing to show for it.
+    pub fn record_billing_payment(&self, p: &BillingPayment<'_>) -> Result<bool> {
+        let conn = self.conn.clone();
+        let mut guard = conn.lock().unwrap();
+        let tx = guard.transaction()?;
+        let inserted = tx.execute(
+            "INSERT INTO billing_events
+                 (id, provider, provider_event_key, billing_id, user_id,
+                  provider_subscription_id, pay_state, amount_krw, pay_date, pay_type, outcome)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             ON CONFLICT(provider, provider_event_key) DO NOTHING",
+            params![
+                crate::new_id(),
+                p.provider,
+                p.event_key,
+                p.billing_id,
+                p.user_id,
+                p.provider_subscription_id,
+                p.pay_state,
+                p.amount_krw,
+                p.pay_date,
+                p.pay_type,
+                p.outcome,
+            ],
+        )?;
+        if inserted == 0 {
+            // Already seen. Nothing else may run: re-applying is the bug this
+            // whole arrangement exists to prevent.
+            return Ok(false);
+        }
+        if let Some(status) = p.status {
+            tx.execute(
+                "UPDATE billing_subscriptions
+                 SET status = ?2,
+                     updated_at = datetime('now'),
+                     activated_at = CASE WHEN ?2 = 'active' THEN COALESCE(activated_at, datetime('now'))
+                                         ELSE activated_at END,
+                     last_paid_at = COALESCE(?3, last_paid_at),
+                     current_period_end = COALESCE(?4, current_period_end)
+                 WHERE id = ?1",
+                params![p.billing_id, status.id(), p.paid_at, p.period_end],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// This user's payment notifications, newest first. For support questions.
+    pub fn billing_events_for(&self, user_id: &str, limit: i64) -> Result<Vec<BillingEventRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT provider, provider_event_key, pay_state, amount_krw, pay_date, pay_type,
+                    outcome, processed_at
+             FROM billing_events WHERE user_id = ?1 ORDER BY processed_at DESC LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![user_id, limit], |r| {
+            Ok(BillingEventRow {
+                provider: r.get(0)?,
+                event_key: r.get(1)?,
+                pay_state: r.get(2)?,
+                amount_krw: r.get(3)?,
+                pay_date: r.get(4)?,
+                pay_type: r.get(5)?,
+                outcome: r.get(6)?,
+                processed_at: r.get(7)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Every account, with enough to tell how it came to be on its plan.
@@ -1957,6 +2218,70 @@ const BROADCAST_COLUMNS: &str = "SELECT * FROM broadcasts";
 
 const PLAN_COLUMNS: &str = "SELECT id, label, limits, monthly_price_krw, description, active, sort_order
      FROM plans";
+
+const BILLING_COLUMNS: &str = "SELECT id, user_id, plan_id, provider, provider_subscription_id, status,
+            amount_krw, created_at, updated_at, activated_at, cancelled_at, last_paid_at,
+            current_period_end
+     FROM billing_subscriptions";
+
+fn row_to_billing(r: &rusqlite::Row<'_>) -> rusqlite::Result<BillingSubscription> {
+    let status: String = r.get("status")?;
+    Ok(BillingSubscription {
+        id: r.get("id")?,
+        user_id: r.get("user_id")?,
+        plan_id: r.get("plan_id")?,
+        provider: r.get("provider")?,
+        provider_subscription_id: r.get("provider_subscription_id")?,
+        // An unreadable status is `pending`, which grants nothing. The only way
+        // to get one is a hand-edited row, and failing closed is the answer.
+        status: BillingStatus::from_id(&status).unwrap_or(BillingStatus::Pending),
+        amount_krw: r.get("amount_krw")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+        activated_at: r.get("activated_at")?,
+        cancelled_at: r.get("cancelled_at")?,
+        last_paid_at: r.get("last_paid_at")?,
+        current_period_end: r.get("current_period_end")?,
+    })
+}
+
+/// One payment notification on its way into the ledger.
+///
+/// A struct because it is eleven fields and every one of them is a string: a
+/// positional call would be a swap waiting to happen, in the one place where a
+/// swap means money.
+#[derive(Debug, Clone)]
+pub struct BillingPayment<'a> {
+    pub provider: &'a str,
+    /// The provider's own id for this payment. The idempotency key.
+    pub event_key: &'a str,
+    pub billing_id: &'a str,
+    pub user_id: &'a str,
+    pub provider_subscription_id: Option<&'a str>,
+    pub pay_state: &'a str,
+    pub amount_krw: i64,
+    pub pay_date: Option<&'a str>,
+    pub pay_type: Option<&'a str>,
+    /// What we did about it, in our own words.
+    pub outcome: &'a str,
+    /// The status to move the subscription to, or `None` to only record.
+    pub status: Option<BillingStatus>,
+    pub paid_at: Option<&'a str>,
+    pub period_end: Option<&'a str>,
+}
+
+/// One row of the payment ledger, as an account screen may show it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BillingEventRow {
+    pub provider: String,
+    pub event_key: String,
+    pub pay_state: String,
+    pub amount_krw: i64,
+    pub pay_date: Option<String>,
+    pub pay_type: Option<String>,
+    pub outcome: String,
+    pub processed_at: String,
+}
 
 fn row_to_plan(r: &rusqlite::Row<'_>) -> rusqlite::Result<Plan> {
     let json: String = r.get("limits")?;

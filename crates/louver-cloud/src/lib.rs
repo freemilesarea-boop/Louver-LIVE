@@ -9,6 +9,7 @@
 //! The rule this crate holds to: if `louver-core` already does something, call
 //! it. Replacing tested code with untested code is not a port.
 
+pub mod billing;
 pub mod credentials;
 pub mod db;
 pub mod entitlement;

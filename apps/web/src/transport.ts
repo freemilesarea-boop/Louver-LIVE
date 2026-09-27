@@ -19,6 +19,9 @@ import type {
   Metrics,
   NewBroadcast,
   NewDestination,
+  BillingStatusResponse,
+  BillingSubscription,
+  Checkout,
   NewItem,
   Plan,
   StreamDestination,
@@ -40,6 +43,18 @@ export interface Transport {
   subscription(): Promise<Subscription>;
   /** The plans on offer. Prices and limits come from here, never from the UI. */
   plans(): Promise<Plan[]>;
+
+  /** What the payment provider knows about this account, and what it is entitled to. */
+  billingStatus(): Promise<BillingStatusResponse>;
+  /**
+   * Start a recurring payment, and get the URL to approve it at.
+   *
+   * No amount is sent: the server reads the price from its own plans table, so
+   * there is no field through which a browser could name one.
+   */
+  startCheckout(planId: string, recvphone: string): Promise<Checkout>;
+  /** Stop the next charge. Does not end the period already paid for. */
+  cancelBilling(): Promise<BillingSubscription>;
 
   listMedia(): Promise<CloudMedia[]>;
   uploadMedia(
@@ -191,6 +206,23 @@ export class WebTransport implements Transport {
 
   plans() {
     return this.json<Plan[]>("/api/plans");
+  }
+
+  billingStatus() {
+    return this.json<BillingStatusResponse>("/api/billing/status");
+  }
+
+  startCheckout(planId: string, recvphone: string) {
+    return this.json<Checkout>("/api/billing/checkout", {
+      method: "POST",
+      body: JSON.stringify({ plan_id: planId, recvphone }),
+    });
+  }
+
+  cancelBilling() {
+    return this.json<BillingSubscription>("/api/billing/cancel", {
+      method: "POST",
+    });
   }
 
   listMedia() {

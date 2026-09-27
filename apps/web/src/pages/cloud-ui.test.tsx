@@ -16,6 +16,7 @@ import { DeploymentBanner, ServerStatus } from "./ServerStatus";
 import { Destinations } from "./Destinations";
 import { SignIn } from "./SignIn";
 import { Pricing } from "./Pricing";
+import { BillingComplete, BillingPanel, isBillingComplete } from "./Billing";
 import { LegalPage, legalPageFor } from "./Legal";
 import { MediaLibrary } from "./MediaLibrary";
 import { AUTO_SETTINGS, emptySchedule } from "../cloud";
@@ -108,6 +109,60 @@ const PLANS = [
   },
 ];
 
+/** No subscription, PayApp configured — the state a new account is in. */
+const NO_BILLING = {
+  subscription: null,
+  plan: {
+    user_id: "u1",
+    plan_id: "none",
+    plan_label: "요금제 없음",
+    status: "unsubscribed",
+    limits: {},
+    active: false,
+    plan: null,
+  },
+  provider: "payapp",
+  configured: true,
+};
+
+/** A PayApp record in whatever state a test needs. */
+function billing(over: Record<string, unknown> = {}) {
+  return {
+    id: "bill-1",
+    user_id: "u1",
+    plan_id: "pro",
+    provider: "payapp",
+    provider_subscription_id: "778899",
+    status: "active",
+    amount_krw: 39900,
+    created_at: "2026-09-27 12:00:00",
+    updated_at: "2026-09-27 12:00:05",
+    activated_at: "2026-09-27 12:00:05",
+    cancelled_at: null,
+    last_paid_at: "2026-09-27 12:00:05",
+    current_period_end: "2026-10-27",
+    ...over,
+  };
+}
+
+/** A paid account, as `/api/billing/status` reports one. */
+function paidBilling(over: Record<string, unknown> = {}) {
+  return {
+    subscription: billing(over),
+    plan: {
+      user_id: "u1",
+      plan_id: "pro",
+      plan_label: "Pro",
+      status: "active",
+      limits: { max_concurrent_streams: 2 },
+      active: true,
+      plan: PLANS[1],
+    },
+    provider: "payapp",
+    configured: true,
+  };
+}
+
 const DESTINATION: StreamDestination = {
   id: "d1",
   user_id: "u1",
@@ -134,6 +189,9 @@ function fake(over: Partial<Transport> = {}): Transport {
     createDestination: vi.fn(),
     deleteDestination: vi.fn().mockResolvedValue(undefined),
     plans: vi.fn().mockResolvedValue(PLANS),
+    billingStatus: vi.fn().mockResolvedValue(NO_BILLING),
+    startCheckout: vi.fn(),
+    cancelBilling: vi.fn(),
     youtubeAvailability: vi
       .fn()
       .mockResolvedValue({ configured: false, redirect_uri: "" }),
@@ -1361,9 +1419,10 @@ describe("the price list", () => {
     expect(screen.getAllByText("추천")).toHaveLength(1);
   });
 
-  it("does not activate anything when a plan is chosen", async () => {
-    // There is no transport method that could activate a plan; this proves the
-    // button does not reach for one, and says what it does instead.
+  it("opens a checkout and touches nothing else on the way", async () => {
+    // Choosing a plan asks PayApp for a payment URL and does nothing else. In
+    // particular there is no transport method that could grant an entitlement,
+    // and this proves the page does not reach for one.
     const t = fake();
     show(<Pricing />, t);
     await screen.findAllByTestId("plan-card");
@@ -1372,19 +1431,22 @@ describe("the price list", () => {
       screen.getByRole("button", { name: "Business 시작하기" }),
     );
 
-    expect(await screen.findByTestId("payment-coming-soon")).toHaveTextContent(
-      "결제 시스템을 준비 중입니다.",
+    // A checkout form, not an activation.
+    expect(await screen.findByTestId("checkout-summary")).toHaveTextContent(
+      "₩59,900 / 월",
     );
-    expect(
-      screen.getByText(/Business 요금제\(₩59,900 \/ 월\)/),
-    ).toBeInTheDocument();
-    // Nothing was sent. `plans` is the only call this page makes, and the loop
-    // below proves the rest were untouched — counted, so that a day when none of
-    // them is a mock cannot make this pass by checking nothing.
+    expect(screen.getByLabelText("휴대폰 번호")).toBeInTheDocument();
+
+    // The page reads the price list and the billing status, and calls nothing
+    // else — counted, so that a day when none of them is a mock cannot make this
+    // pass by checking nothing. `startCheckout` is only reached once the form is
+    // filled in and submitted, which the checkout tests cover.
     expect(t.plans).toHaveBeenCalledTimes(1);
+    expect(t.billingStatus).toHaveBeenCalledTimes(1);
     let checked = 0;
     for (const method of Object.keys(t) as (keyof typeof t)[]) {
-      if (method === "plans" || method === "kind") continue;
+      if (method === "plans" || method === "billingStatus" || method === "kind")
+        continue;
       const fn = t[method];
       if (typeof fn === "function" && "mock" in fn) {
         expect(fn as never).not.toHaveBeenCalled();
@@ -1493,5 +1555,303 @@ describe("what the dashboard says about the plan", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Basic 요금제에서는 동시에 1개의 방송을 송출할 수 있습니다",
     );
+  });
+});
+
+describe("starting a PayApp subscription", () => {
+  async function openCheckout(t: Transport, plan = "Pro") {
+    show(<Pricing />, t);
+    await screen.findAllByTestId("plan-card");
+    await userEvent.click(
+      screen.getByRole("button", { name: `${plan} 시작하기` }),
+    );
+  }
+
+  it("asks for the one thing PayApp needs and shows what is being bought", async () => {
+    await openCheckout(fake());
+
+    const summary = await screen.findByTestId("checkout-summary");
+    expect(summary).toHaveTextContent("Pro");
+    expect(summary).toHaveTextContent("₩39,900 / 월");
+    expect(summary).toHaveTextContent("2개");
+    expect(screen.getByLabelText("휴대폰 번호")).toBeInTheDocument();
+    // Nowhere for a card number: that is PayApp's page, not ours.
+    expect(screen.queryByLabelText(/카드/)).not.toBeInTheDocument();
+    expect(
+      screen.getByText(/카드 정보는 PayApp 결제창에서 직접 입력/),
+    ).toBeInTheDocument();
+  });
+
+  it("sends the plan and the phone number, and no amount at all", async () => {
+    const startCheckout = vi.fn().mockResolvedValue({
+      payurl: "https://payapp.kr/pay/1",
+      billing_id: "b1",
+      plan_id: "pro",
+      amount_krw: 39900,
+    });
+    const assign = vi.fn();
+    Object.defineProperty(window, "location", {
+      value: { ...window.location, assign },
+      writable: true,
+    });
+
+    await openCheckout(fake({ startCheckout }));
+    await userEvent.type(screen.getByLabelText("휴대폰 번호"), "010-1234-5678");
+    await userEvent.click(
+      screen.getByRole("button", { name: "정기결제 시작" }),
+    );
+
+    await waitFor(() => expect(startCheckout).toHaveBeenCalled());
+    // Two arguments, neither of them a price: the server reads that from its own
+    // plans table.
+    expect(startCheckout).toHaveBeenCalledWith("pro", "01012345678");
+    expect(startCheckout.mock.calls[0]).toHaveLength(2);
+    // And the browser goes to PayApp's URL, not to anything of ours.
+    await waitFor(() =>
+      expect(assign).toHaveBeenCalledWith("https://payapp.kr/pay/1"),
+    );
+  });
+
+  it("does not call the server for a number that could not receive the link", async () => {
+    const startCheckout = vi.fn();
+    await openCheckout(fake({ startCheckout }));
+
+    for (const bad of ["123", "0212345678", "010123456789"]) {
+      await userEvent.clear(screen.getByLabelText("휴대폰 번호"));
+      await userEvent.type(screen.getByLabelText("휴대폰 번호"), bad);
+      await userEvent.click(
+        screen.getByRole("button", { name: "정기결제 시작" }),
+      );
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "휴대폰 번호를 확인해주세요",
+      );
+      expect(startCheckout).not.toHaveBeenCalled();
+    }
+  });
+
+  it("shows the server's refusal rather than pretending it worked", async () => {
+    const startCheckout = vi
+      .fn()
+      .mockRejectedValue(
+        new Error("현재 구독을 해지한 후 요금제를 변경할 수 있습니다."),
+      );
+    await openCheckout(fake({ startCheckout }));
+    await userEvent.type(screen.getByLabelText("휴대폰 번호"), "01012345678");
+    await userEvent.click(
+      screen.getByRole("button", { name: "정기결제 시작" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "현재 구독을 해지한 후",
+    );
+    // Still on the form, so the number does not have to be retyped.
+    expect(screen.getByLabelText("휴대폰 번호")).toHaveValue("01012345678");
+  });
+
+  it("says so instead of offering a checkout a server cannot take", async () => {
+    await openCheckout(
+      fake({
+        billingStatus: vi
+          .fn()
+          .mockResolvedValue({ ...NO_BILLING, configured: false }),
+      }),
+    );
+    expect(await screen.findByTestId("checkout-unavailable")).toHaveTextContent(
+      "결제 시스템을 준비 중입니다.",
+    );
+  });
+
+  it("refuses a second registration while PayApp already holds one", async () => {
+    // §14. Two registrations would be two charges a month.
+    const startCheckout = vi.fn();
+    const t = fake({
+      billingStatus: vi.fn().mockResolvedValue(paidBilling()),
+      startCheckout,
+    });
+    show(<Pricing />, t);
+
+    expect(await screen.findByTestId("already-subscribed")).toHaveTextContent(
+      "현재 구독을 해지한 후",
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Business 시작하기" }),
+    );
+    expect(await screen.findByTestId("checkout-unavailable")).toHaveTextContent(
+      "현재 구독을 해지한 후",
+    );
+    expect(startCheckout).not.toHaveBeenCalled();
+  });
+});
+
+describe("coming back from PayApp", () => {
+  it("is the path PayApp returns to, and nothing else", () => {
+    expect(isBillingComplete("/billing/complete")).toBe(true);
+    expect(isBillingComplete("/billing/complete/")).toBe(true);
+    expect(isBillingComplete("/billing")).toBe(false);
+    expect(isBillingComplete("/")).toBe(false);
+  });
+
+  it("says it is checking, and does not claim success from having been loaded", async () => {
+    // §11: the return URL is a browser navigation. It is not evidence.
+    const billingStatus = vi.fn().mockResolvedValue({
+      ...NO_BILLING,
+      subscription: billing({
+        status: "pending",
+        activated_at: null,
+        last_paid_at: null,
+      }),
+    });
+    show(<BillingComplete />, fake({ billingStatus }));
+
+    expect(
+      await screen.findByTestId("billing-complete-waiting"),
+    ).toHaveTextContent("결제 결과를 확인하고 있습니다.");
+    expect(screen.queryByText(/결제가 완료되었습니다/)).not.toBeInTheDocument();
+    await waitFor(() => expect(billingStatus).toHaveBeenCalled());
+  });
+
+  it("says done, and which plan, once the server has verified the payment", async () => {
+    show(
+      <BillingComplete />,
+      fake({ billingStatus: vi.fn().mockResolvedValue(paidBilling()) }),
+    );
+
+    expect(
+      await screen.findByTestId("billing-complete-done"),
+    ).toHaveTextContent("결제가 완료되었습니다.");
+    expect(screen.getByText("Pro")).toBeInTheDocument();
+    expect(screen.getByText(/동시 송출 2개/)).toBeInTheDocument();
+  });
+
+  it("stops waiting rather than spinning for ever", async () => {
+    const billingStatus = vi.fn().mockResolvedValue(NO_BILLING);
+    show(<BillingComplete />, fake({ billingStatus }));
+    await screen.findByTestId("billing-complete-waiting");
+
+    // The user can leave; the payment is not lost by doing so.
+    await userEvent.click(
+      screen.getByRole("button", { name: "기다리지 않고 나가기" }),
+    );
+    expect(
+      await screen.findByTestId("billing-complete-slow"),
+    ).toHaveTextContent("결제 확인이 지연되고 있습니다.");
+  });
+});
+
+describe("the subscription panel", () => {
+  it("shows the plan, the state, the amount and the provider", async () => {
+    show(
+      <BillingPanel />,
+      fake({ billingStatus: vi.fn().mockResolvedValue(paidBilling()) }),
+    );
+
+    expect(await screen.findByText("Pro")).toBeInTheDocument();
+    expect(screen.getByText("구독 중")).toBeInTheDocument();
+    expect(screen.getByText("₩39,900 / 월")).toBeInTheDocument();
+    expect(screen.getByText("PayApp")).toBeInTheDocument();
+    expect(screen.getByText("2026-10-27까지")).toBeInTheDocument();
+  });
+
+  it("offers the price list, not a cancellation, when there is nothing to cancel", async () => {
+    const onSeePricing = vi.fn();
+    show(<BillingPanel onSeePricing={onSeePricing} />, fake());
+
+    expect(await screen.findByText("요금제 없음")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "구독 해지" }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "요금제 보기" }));
+    expect(onSeePricing).toHaveBeenCalled();
+  });
+
+  it("says what cancelling does before doing it", async () => {
+    // §9: pressing this must not read as "stop my broadcast now".
+    const cancelBilling = vi
+      .fn()
+      .mockResolvedValue(billing({ status: "cancel_at_period_end" }));
+    show(
+      <BillingPanel />,
+      fake({
+        billingStatus: vi.fn().mockResolvedValue(paidBilling()),
+        cancelBilling,
+      }),
+    );
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "구독 해지" }),
+    );
+    expect(
+      screen.getByText(/다음 정기결제부터 청구되지 않습니다/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/이미 결제한 기간까지는 그대로 사용할 수 있습니다/),
+    ).toBeInTheDocument();
+    expect(cancelBilling).not.toHaveBeenCalled();
+
+    // And it can be backed out of.
+    await userEvent.click(screen.getByRole("button", { name: "유지하기" }));
+    expect(cancelBilling).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "구독 해지" }),
+    ).toBeInTheDocument();
+  });
+
+  it("cancels once confirmed, and then says the cancellation is scheduled", async () => {
+    const cancelBilling = vi
+      .fn()
+      .mockResolvedValue(billing({ status: "cancel_at_period_end" }));
+    const billingStatus = vi
+      .fn()
+      .mockResolvedValueOnce(paidBilling())
+      .mockResolvedValue(paidBilling({ status: "cancel_at_period_end" }));
+    show(<BillingPanel />, fake({ billingStatus, cancelBilling }));
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "구독 해지" }),
+    );
+    await userEvent.click(screen.getByRole("button", { name: "해지하기" }));
+
+    await waitFor(() => expect(cancelBilling).toHaveBeenCalledTimes(1));
+    expect(await screen.findByTestId("cancel-scheduled")).toHaveTextContent(
+      "해지가 예약되었습니다",
+    );
+    // The plan is still shown as theirs: the period paid for is not over.
+    expect(screen.getByText("Pro")).toBeInTheDocument();
+  });
+
+  it("explains a first payment that has not been approved yet", async () => {
+    show(
+      <BillingPanel />,
+      fake({
+        billingStatus: vi.fn().mockResolvedValue({
+          ...NO_BILLING,
+          subscription: billing({
+            status: "pending",
+            activated_at: null,
+            last_paid_at: null,
+          }),
+        }),
+      }),
+    );
+    expect(await screen.findByText("결제 대기")).toBeInTheDocument();
+    expect(
+      screen.getByText(/첫 결제가 아직 승인되지 않았습니다/),
+    ).toBeInTheDocument();
+    // Unsubscribed, because a pending payment grants nothing.
+    expect(screen.getByText("요금제 없음")).toBeInTheDocument();
+  });
+
+  it("reports a failed renewal without saying the service has stopped", async () => {
+    show(
+      <BillingPanel />,
+      fake({
+        billingStatus: vi
+          .fn()
+          .mockResolvedValue(paidBilling({ status: "payment_failed" })),
+      }),
+    );
+    expect(await screen.findByText("결제 실패")).toBeInTheDocument();
+    expect(screen.getByText(/기존 이용은 계속 유지됩니다/)).toBeInTheDocument();
+    expect(screen.getByText("Pro")).toBeInTheDocument();
   });
 });

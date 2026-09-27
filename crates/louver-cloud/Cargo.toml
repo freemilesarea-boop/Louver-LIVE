@@ -21,6 +21,8 @@ sysinfo.workspace = true
 # adds no new crypto dependency and no new audit surface.
 
 ring = "0.17"
+# Already in the lock file via louver-core; PayApp needs one form POST.
+ureq = "3.2.1"
 
 [dev-dependencies]
 tempfile.workspace = true

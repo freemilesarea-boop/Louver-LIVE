@@ -2308,6 +2308,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
+ "ureq",
  "uuid",
 ]
 

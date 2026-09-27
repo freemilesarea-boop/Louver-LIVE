@@ -103,6 +103,64 @@ export const PLAN_FEATURES = [
   "PC를 종료해도 계속 송출",
 ] as const;
 
+/** Where a paid subscription has got to with PayApp. Matches `BillingStatus`. */
+export type BillingStatusId =
+  | "pending"
+  | "registration_failed"
+  | "active"
+  | "cancel_at_period_end"
+  | "cancelled"
+  | "payment_failed";
+
+export interface BillingSubscription {
+  id: string;
+  user_id: string;
+  plan_id: string;
+  provider: string;
+  /** PayApp's own reference. Safe to show; it is what support asks for. */
+  provider_subscription_id?: string | null;
+  status: BillingStatusId;
+  amount_krw: number;
+  created_at: string;
+  updated_at: string;
+  activated_at?: string | null;
+  cancelled_at?: string | null;
+  last_paid_at?: string | null;
+  current_period_end?: string | null;
+}
+
+export interface BillingStatusResponse {
+  subscription: BillingSubscription | null;
+  /** The entitlement's view, which can differ from the provider's. */
+  plan: Subscription;
+  provider: string;
+  /** Can this deployment take a payment at all? */
+  configured: boolean;
+}
+
+/** What a checkout hands back. The URL is PayApp's, not ours. */
+export interface Checkout {
+  payurl: string;
+  billing_id: string;
+  plan_id: string;
+  amount_krw: number;
+}
+
+/** Korean for each billing state, so no component spells them itself. */
+export const BILLING_STATUS_LABELS: Record<BillingStatusId, string> = {
+  pending: "결제 대기",
+  registration_failed: "등록 실패",
+  active: "구독 중",
+  cancel_at_period_end: "해지 예약",
+  cancelled: "해지됨",
+  payment_failed: "결제 실패",
+};
+
+/** Is PayApp still going to charge for this, or has it charged already? */
+export function billingIsLive(b: BillingSubscription): boolean {
+  return ["pending", "active", "payment_failed"].includes(b.status);
+}
+
 /** The plan singled out on the pricing page. A presentation choice, nothing more. */
 export const RECOMMENDED_PLAN = "pro";
 

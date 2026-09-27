@@ -214,9 +214,27 @@ deleted either, so a mistake is undone with `activate_subscription`.
 Once payments exist this command must also refuse an account with a billing
 record. Nobody has paid yet, so there is nothing to check for.
 
-**TODO(billing): there is no payment yet.** The pricing page's buttons say
-"결제 시스템을 준비 중입니다." and send nothing. No PG, no billing key, no
-recurring charge, no webhook, no refunds.
+### Payments
+
+PayApp recurring subscriptions. The whole of it is in
+[PAYAPP.md](PAYAPP.md); the one sentence that shapes the design is that
+**registering a recurring payment is not a payment** — the buyer approves the
+first charge on PayApp's own page, and only the server-to-server notification
+afterwards says it happened.
+
+So `activate_subscription` has exactly one caller in the request path:
+`Payapp::handle_feedback`, after it has checked the notification's credentials,
+order id, amount and `rebill_no` against what we stored, and only for
+`pay_state=4`. A checkout returns a payment URL and grants nothing; arriving at
+the return URL grants nothing; there is still no route a browser can reach that
+changes a plan.
+
+Cancelling stops the next charge and leaves the period already paid for alone, so
+it does not call `cancel_subscription`. **Nothing revokes at period end yet** —
+`current_period_end` is recorded and no job acts on it, because automating that
+needs a grace-period policy first.
+
+No card details reach this server: they are typed on PayApp's page.
 
 ## Media pipeline
 

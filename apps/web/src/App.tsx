@@ -10,6 +10,11 @@ import { CloudDashboard } from "./pages/CloudDashboard";
 import { Destinations } from "./pages/Destinations";
 import { MediaLibrary } from "./pages/MediaLibrary";
 import { Pricing } from "./pages/Pricing";
+import {
+  BillingComplete,
+  BillingPanel,
+  isBillingComplete,
+} from "./pages/Billing";
 import { LegalPage, legalPageFor } from "./pages/Legal";
 import { DeploymentBanner, ServerStatus } from "./pages/ServerStatus";
 import { SignIn } from "./pages/SignIn";
@@ -72,6 +77,13 @@ export function App() {
       ? null
       : legalPageFor(window.location.pathname),
   );
+  // Where PayApp's `returnurl` sends the browser. It proves nothing on its own —
+  // the page it renders asks the server what actually happened.
+  const [returnedFromPayment, setReturnedFromPayment] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      isBillingComplete(window.location.pathname),
+  );
   // `/pricing` opens the tab it names. Still not a router: one more path read
   // once, rather than a dependency every screen would then import.
   const [landedOnPricing] = useState(
@@ -123,6 +135,23 @@ export function App() {
         <DeploymentBanner />
         <SignIn onSignedIn={setMe} />
       </>
+    );
+  }
+
+  // After the sign-in gate, unlike the legal pages: knowing whether a payment
+  // landed means knowing whose payment it was.
+  if (returnedFromPayment) {
+    return (
+      <BillingComplete
+        onDone={() => {
+          // Back into the app, without the return path left in the URL. The flag
+          // has to be cleared as well: it is read once from the path, so leaving
+          // it set keeps this page on screen however the URL is rewritten.
+          window.history.replaceState({}, "", "/");
+          setReturnedFromPayment(false);
+          setTab("broadcasts");
+        }}
+      />
     );
   }
 
@@ -194,7 +223,14 @@ export function App() {
         )}
         {tab === "media" && <MediaLibrary />}
         {tab === "destinations" && <Destinations />}
-        {tab === "pricing" && <Pricing onClose={() => setTab("broadcasts")} />}
+        {tab === "pricing" && (
+          <div className="space-y-6">
+            {/* The account's own subscription first: somebody opening this tab
+                usually wants to know what they are on, not what is on offer. */}
+            <BillingPanel />
+            <Pricing onClose={() => setTab("broadcasts")} />
+          </div>
+        )}
         {tab === "status" && <ServerStatus />}
       </main>
     </div>

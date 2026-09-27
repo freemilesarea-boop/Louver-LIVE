@@ -217,6 +217,89 @@ pub struct Subscription {
     pub plan: Option<Plan>,
 }
 
+/// Where a paid subscription has got to with the payment provider.
+///
+/// Its own vocabulary, not `subscriptions.status`, because the two answer
+/// different questions. This says what the provider will do next month; that says
+/// what the user may do today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingStatus {
+    /// Registered with the provider, payment URL handed out, nothing paid yet.
+    /// **Grants nothing.**
+    Pending,
+    /// The provider could not register it. Kept rather than deleted, because a
+    /// failed payment attempt is a thing an operator may need to look at.
+    RegistrationFailed,
+    /// A verified payment arrived. This is the only status that ever accompanied
+    /// an `activate_subscription`.
+    Active,
+    /// The user asked to stop. The provider will not charge again; the
+    /// entitlement stays until the period already paid for runs out.
+    CancelAtPeriodEnd,
+    /// Over, and the entitlement with it.
+    Cancelled,
+    /// A renewal failed. Recorded, and deliberately **not** a reason to take the
+    /// entitlement away on its own — see `docs/PAYAPP.md`.
+    PaymentFailed,
+}
+
+impl BillingStatus {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::RegistrationFailed => "registration_failed",
+            Self::Active => "active",
+            Self::CancelAtPeriodEnd => "cancel_at_period_end",
+            Self::Cancelled => "cancelled",
+            Self::PaymentFailed => "payment_failed",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "registration_failed" => Some(Self::RegistrationFailed),
+            "active" => Some(Self::Active),
+            "cancel_at_period_end" => Some(Self::CancelAtPeriodEnd),
+            "cancelled" => Some(Self::Cancelled),
+            "payment_failed" => Some(Self::PaymentFailed),
+            _ => None,
+        }
+    }
+
+    /// Is the provider still going to charge for this, or has it charged already?
+    ///
+    /// What §14's plan-change rule asks about: a user in one of these states must
+    /// not be allowed to start a second recurring registration, or they would be
+    /// charged twice a month for ever.
+    pub fn holds_the_provider(self) -> bool {
+        matches!(self, Self::Pending | Self::Active | Self::PaymentFailed)
+    }
+}
+
+/// A billing subscription, as the account screen shows it.
+///
+/// Carries no provider credential and no card detail — there is no field here
+/// that could. `provider_subscription_id` is PayApp's own reference, which is
+/// safe to show and is what an operator quotes to their support.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BillingSubscription {
+    pub id: String,
+    pub user_id: String,
+    pub plan_id: String,
+    pub provider: String,
+    pub provider_subscription_id: Option<String>,
+    pub status: BillingStatus,
+    pub amount_krw: i64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub activated_at: Option<String>,
+    pub cancelled_at: Option<String>,
+    pub last_paid_at: Option<String>,
+    pub current_period_end: Option<String>,
+}
+
 /// One account, as `--audit-plans` reports it.
 ///
 /// Exists because of a real production question: a release before paid plans

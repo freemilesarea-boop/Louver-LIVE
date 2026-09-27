@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod billing;
 pub mod diagnose;
 pub mod error;
 pub mod health;
@@ -60,6 +61,16 @@ pub fn router(app: App) -> Router {
         // not a price list. There is deliberately **no** route that writes a
         // plan — see `CloudDb::activate_subscription`.
         .route("/api/plans", get(auth::plans))
+        // Billing. `checkout` and `cancel` need a session; the two notification
+        // routes do not, because PayApp posts to them server-to-server and what
+        // authenticates those is the link keys in the body. There is still no
+        // route that activates a subscription — `feedback` does, and only after
+        // the provider has verified what it was sent.
+        .route("/api/billing/status", get(billing::status))
+        .route("/api/billing/checkout", post(billing::checkout))
+        .route("/api/billing/cancel", post(billing::cancel))
+        .route("/api/billing/payapp/feedback", post(billing::feedback))
+        .route("/api/billing/payapp/failure", post(billing::failure))
         .merge(media)
         .route("/api/stream-destinations", get(api::list_destinations).post(api::create_destination))
         .route("/api/stream-destinations/{id}", delete(api::delete_destination))
