@@ -1749,14 +1749,14 @@ describe("the subscription panel", () => {
     expect(screen.getByText("구독 중")).toBeInTheDocument();
     expect(screen.getByText("₩39,900 / 월")).toBeInTheDocument();
     expect(screen.getByText("PayApp")).toBeInTheDocument();
-    expect(screen.getByText("2026-10-27까지")).toBeInTheDocument();
   });
 
   it("offers the price list, not a cancellation, when there is nothing to cancel", async () => {
     const onSeePricing = vi.fn();
     show(<BillingPanel onSeePricing={onSeePricing} />, fake());
 
-    expect(await screen.findByText("요금제 없음")).toBeInTheDocument();
+    // Both rows: no plan, and no subscription behind it.
+    expect(await screen.findAllByText("미구독")).toHaveLength(2);
     expect(
       screen.queryByRole("button", { name: "구독 해지" }),
     ).not.toBeInTheDocument();
@@ -1765,10 +1765,12 @@ describe("the subscription panel", () => {
   });
 
   it("says what cancelling does before doing it", async () => {
-    // §9: pressing this must not read as "stop my broadcast now".
+    // The confirmation has to say what actually happens: the paid features stop
+    // at once. It used to promise the rest of the paid month, which the server
+    // no longer honours.
     const cancelBilling = vi
       .fn()
-      .mockResolvedValue(billing({ status: "cancel_at_period_end" }));
+      .mockResolvedValue(billing({ status: "cancelled" }));
     show(
       <BillingPanel />,
       fake({
@@ -1781,11 +1783,13 @@ describe("the subscription panel", () => {
       await screen.findByRole("button", { name: "구독 해지" }),
     );
     expect(
-      screen.getByText(/다음 정기결제부터 청구되지 않습니다/),
+      screen.getByText(
+        /자동결제가 해지되며 247streams 유료 기능을 즉시 사용할 수 없게 됩니다/,
+      ),
     ).toBeInTheDocument();
     expect(
-      screen.getByText(/이미 결제한 기간까지는 그대로 사용할 수 있습니다/),
-    ).toBeInTheDocument();
+      screen.queryByText(/이미 결제한 기간까지는 그대로 사용할 수 있습니다/),
+    ).not.toBeInTheDocument();
     expect(cancelBilling).not.toHaveBeenCalled();
 
     // And it can be backed out of.
@@ -1796,14 +1800,25 @@ describe("the subscription panel", () => {
     ).toBeInTheDocument();
   });
 
-  it("cancels once confirmed, and then says the cancellation is scheduled", async () => {
+  it("cancels once confirmed, and then shows no plan at all", async () => {
+    // Test J. After the cancellation the panel asks the server again, and what
+    // comes back is 미구독 / 해지됨. The Pro card must not survive the refresh —
+    // a screen that still says Pro is a screen that is lying about what the
+    // account can do.
     const cancelBilling = vi
       .fn()
-      .mockResolvedValue(billing({ status: "cancel_at_period_end" }));
+      .mockResolvedValue(billing({ status: "cancelled" }));
+    const cancelledStatus = {
+      ...NO_BILLING,
+      subscription: billing({
+        status: "cancelled",
+        cancelled_at: "2026-09-27 13:00:00",
+      }),
+    };
     const billingStatus = vi
       .fn()
       .mockResolvedValueOnce(paidBilling())
-      .mockResolvedValue(paidBilling({ status: "cancel_at_period_end" }));
+      .mockResolvedValue(cancelledStatus);
     show(<BillingPanel />, fake({ billingStatus, cancelBilling }));
 
     await userEvent.click(
@@ -1812,11 +1827,33 @@ describe("the subscription panel", () => {
     await userEvent.click(screen.getByRole("button", { name: "해지하기" }));
 
     await waitFor(() => expect(cancelBilling).toHaveBeenCalledTimes(1));
-    expect(await screen.findByTestId("cancel-scheduled")).toHaveTextContent(
-      "해지가 예약되었습니다",
+    expect(await screen.findByTestId("cancel-done")).toHaveTextContent(
+      "유료 기능은 사용할 수 없습니다",
     );
-    // The plan is still shown as theirs: the period paid for is not over.
-    expect(screen.getByText("Pro")).toBeInTheDocument();
+    expect(await screen.findByText("미구독")).toBeInTheDocument();
+    expect(screen.getByText("해지됨")).toBeInTheDocument();
+    expect(screen.queryByText("Pro")).not.toBeInTheDocument();
+    // And there is nothing left to cancel.
+    expect(
+      screen.queryByRole("button", { name: "구독 해지" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not promise a period of use after cancelling", async () => {
+    // The paid period is still recorded — the server writes it from the payment
+    // notification — but it is not an entitlement any more, so it is not shown as
+    // one.
+    show(
+      <BillingPanel />,
+      fake({
+        billingStatus: vi.fn().mockResolvedValue(
+          paidBilling({ current_period_end: "2099-12-31" }),
+        ),
+      }),
+    );
+    expect(await screen.findByText("Pro")).toBeInTheDocument();
+    expect(screen.queryByText(/2099-12-31까지/)).not.toBeInTheDocument();
+    expect(screen.queryByText("이용 기간")).not.toBeInTheDocument();
   });
 
   it("explains a first payment that has not been approved yet", async () => {
@@ -1838,7 +1875,7 @@ describe("the subscription panel", () => {
       screen.getByText(/첫 결제가 아직 승인되지 않았습니다/),
     ).toBeInTheDocument();
     // Unsubscribed, because a pending payment grants nothing.
-    expect(screen.getByText("요금제 없음")).toBeInTheDocument();
+    expect(screen.getByText("미구독")).toBeInTheDocument();
   });
 
   it("reports a failed renewal without saying the service has stopped", async () => {

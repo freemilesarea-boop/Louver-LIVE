@@ -530,16 +530,17 @@ fn an_unknown_field_in_a_notification_changes_nothing() {
 // --- cancellation -----------------------------------------------------------
 
 #[test]
-fn cancelling_stops_the_next_charge_and_keeps_the_period_already_paid_for() {
-    // §5, §9. PayApp's cancellation ends the registration; it does not reverse an
-    // approved payment.
+fn cancelling_stops_the_next_charge_and_takes_the_entitlement_back_at_once() {
+    // Test A. Basic → 미구독, immediately. The service policy is that cancelling
+    // ends the paid features there and then; the remainder of the month is not
+    // honoured, so nothing here may keep the plan alive.
     let e = env();
-    let out = e.pay.checkout(&e.user, "pro", "01012345678").unwrap();
-    e.pay.handle_feedback(&e.feedback(&[("var1", &out.billing_id)]));
+    let out = e.pay.checkout(&e.user, "basic", "01012345678").unwrap();
+    e.pay.handle_feedback(&e.feedback(&[("var1", &out.billing_id), ("price", "19900")]));
     assert!(e.db.subscription(&e.user).unwrap().active);
 
     let after = e.pay.cancel(&e.user).unwrap();
-    assert_eq!(after.status, BillingStatus::CancelAtPeriodEnd);
+    assert_eq!(after.status, BillingStatus::Cancelled);
     assert!(after.cancelled_at.is_some());
 
     // The request is exactly the four fields the documentation lists, and no
@@ -551,11 +552,220 @@ fn cancelling_stops_the_next_charge_and_keeps_the_period_already_paid_for() {
     assert!(!req.contains_key("linkval"), "rebillCancel takes no linkval");
     assert_eq!(req.len(), 4, "no field beyond cmd/userid/rebill_no/linkkey: {req:?}");
 
-    // And the entitlement is still there. This is the whole point.
+    // And the entitlement is gone. This is the whole point.
     let sub = e.db.subscription(&e.user).unwrap();
-    assert!(sub.active, "cancelling must not take away a period that was paid for");
-    assert_eq!(sub.plan_id, "pro");
+    assert!(!sub.active, "cancelling revokes the paid features immediately");
+    assert_eq!(sub.plan_id, louver_cloud::db::UNSUBSCRIBED_PLAN);
+    assert_eq!(e.db.limit(&e.user, louver_cloud::entitlement::MAX_CONCURRENT_STREAMS).unwrap(), 0);
+}
+
+#[test]
+fn cancelling_pro_revokes_both_of_its_concurrent_streams() {
+    // Test B. The same for a plan that allowed more than one stream: the
+    // concurrency allowance goes to zero, not down by one.
+    let e = env();
+    let out = e.pay.checkout(&e.user, "pro", "01012345678").unwrap();
+    e.pay.handle_feedback(&e.feedback(&[("var1", &out.billing_id)]));
     assert_eq!(e.db.limit(&e.user, louver_cloud::entitlement::MAX_CONCURRENT_STREAMS).unwrap(), 2);
+
+    e.pay.cancel(&e.user).unwrap();
+    let sub = e.db.subscription(&e.user).unwrap();
+    assert!(!sub.active);
+    assert_eq!(e.db.limit(&e.user, louver_cloud::entitlement::MAX_CONCURRENT_STREAMS).unwrap(), 0);
+}
+
+#[test]
+fn a_refused_rebill_cancel_changes_nothing_at_all() {
+    // Test C, and the reason the provider is called before anything local is
+    // written. If we revoked first and PayApp then refused, the account would go
+    // on being charged every month with nothing to show for it — the one outcome
+    // this ordering exists to make impossible.
+    let e = env();
+    let out = e.pay.checkout(&e.user, "pro", "01012345678").unwrap();
+    e.pay.handle_feedback(&e.feedback(&[("var1", &out.billing_id)]));
+
+    e.api.answer_next_with("state=0&errno=00009&errorMessage=%EC%B2%98%EB%A6%AC%EC%8B%A4%ED%8C%A8");
+    let err = e.pay.cancel(&e.user).expect_err("a refused cancellation must not report success");
+    let said = err.to_string();
+    assert!(!said.contains(LINKKEY) && !said.contains(LINKVAL), "no credential in the message: {said}");
+
+    // Still subscribed, still billable, still cancellable.
+    let sub = e.db.subscription(&e.user).unwrap();
+    assert!(sub.active, "the entitlement must survive a failed provider call");
+    assert_eq!(sub.plan_id, "pro");
+    let record = e.billing();
+    assert_eq!(record.status, BillingStatus::Active, "the record must not be marked cancelled");
+    assert!(record.cancelled_at.is_none());
+
+    // Retryable: the next attempt reaches PayApp and this time it works.
+    e.pay.cancel(&e.user).unwrap();
+    assert!(!e.db.subscription(&e.user).unwrap().active);
+}
+
+#[test]
+fn cancelling_is_confined_to_the_callers_own_billing_record() {
+    // Test D. There is no billing id on the cancellation path — `cancel` takes a
+    // user id and finds that user's own record — so another user's record cannot
+    // be named. The operator repair path, which does take an id, refuses one that
+    // is not a mismatch of its own.
+    let e = env();
+    let out = e.pay.checkout(&e.user, "pro", "01012345678").unwrap();
+    e.pay.handle_feedback(&e.feedback(&[("var1", &out.billing_id)]));
+
+    let other =
+        e.db.register_user(&Signup {
+            name: "이몽룡",
+            email: "other@example.com",
+            password_hash: "salt:hash",
+            terms_version: "2026-09-27",
+        })
+        .unwrap()
+        .id;
+
+    // The other account has nothing to cancel, and saying so must not disturb the
+    // first account's subscription.
+    assert!(e.pay.cancel(&other).is_err());
+    assert!(e.db.subscription(&e.user).unwrap().active);
+    assert_eq!(e.billing().status, BillingStatus::Active);
+
+    // And the audit's fix refuses a live record outright.
+    assert!(e.db.fix_billing_mismatch(&out.billing_id).is_err());
+    assert!(e.db.subscription(&e.user).unwrap().active);
+}
+
+#[test]
+fn cancelling_twice_leaves_one_cancellation() {
+    // Test E. PayApp is asked once; the second attempt finds nothing live and
+    // says so, rather than writing the record again or revoking something else.
+    let e = env();
+    let out = e.pay.checkout(&e.user, "pro", "01012345678").unwrap();
+    e.pay.handle_feedback(&e.feedback(&[("var1", &out.billing_id)]));
+
+    let first = e.pay.cancel(&e.user).unwrap();
+    assert!(e.pay.cancel(&e.user).is_err(), "there is nothing left to cancel");
+
+    let cancels =
+        e.api.calls().iter().filter(|c| c.get("cmd").map(String::as_str) == Some("rebillCancel")).count();
+    assert_eq!(cancels, 1, "PayApp is not asked twice");
+    let record = e.billing();
+    assert_eq!(record.status, BillingStatus::Cancelled);
+    assert_eq!(record.cancelled_at, first.cancelled_at, "the cancellation time is not rewritten");
+    assert_eq!(e.db.billing_subscriptions_for(&e.user).unwrap().len(), 1);
+    assert!(!e.db.subscription(&e.user).unwrap().active);
+}
+
+#[test]
+fn an_operator_granted_plan_is_not_collateral_damage() {
+    // Test F. The Business account an operator made with `--create-user` has no
+    // billing record at all, and a cancellation on another account must not reach
+    // it. The second half is the sharper case: an account that *does* have a
+    // cancelled PayApp record but has since been moved to a plan an operator
+    // granted keeps that grant, because the revocation only ever moves an account
+    // off the plan the cancelled record itself paid for.
+    let e = env();
+    let operator =
+        e.db.register_user(&Signup {
+            name: "운영자",
+            email: "ops@example.com",
+            password_hash: "salt:hash",
+            terms_version: "2026-09-27",
+        })
+        .unwrap()
+        .id;
+    e.db.activate_subscription(&operator, "business").unwrap();
+
+    let out = e.pay.checkout(&e.user, "basic", "01012345678").unwrap();
+    e.pay.handle_feedback(&e.feedback(&[("var1", &out.billing_id), ("price", "19900")]));
+    // An operator lifts this account to Business by hand, outside PayApp.
+    e.db.activate_subscription(&e.user, "business").unwrap();
+
+    e.pay.cancel(&e.user).unwrap();
+
+    let granted = e.db.subscription(&e.user).unwrap();
+    assert!(granted.active, "the hand-granted plan is not PayApp's to take away");
+    assert_eq!(granted.plan_id, "business");
+    assert_eq!(e.billing().status, BillingStatus::Cancelled, "the recurring payment still stops");
+
+    let untouched = e.db.subscription(&operator).unwrap();
+    assert!(untouched.active);
+    assert_eq!(untouched.plan_id, "business");
+}
+
+#[test]
+fn a_registration_that_never_paid_takes_nothing_away() {
+    // The other side of the same guard: cancelling a pending registration must not
+    // move an account that is on a plan for some other reason.
+    let e = env();
+    e.db.activate_subscription(&e.user, "business").unwrap();
+    e.pay.checkout(&e.user, "basic", "01012345678").unwrap();
+
+    e.pay.cancel(&e.user).unwrap();
+    let sub = e.db.subscription(&e.user).unwrap();
+    assert!(sub.active);
+    assert_eq!(sub.plan_id, "business");
+}
+
+#[test]
+fn the_audit_finds_only_the_account_whose_billing_is_already_cancelled() {
+    // Test H. The production case: an account that ran `rebillCancel` under the
+    // old policy and still holds Basic. The audit must find it, must not list an
+    // account that is simply on a plan, and fixing it must move that one account.
+    let e = env();
+    let out = e.pay.checkout(&e.user, "basic", "01012345678").unwrap();
+    e.pay.handle_feedback(&e.feedback(&[("var1", &out.billing_id), ("price", "19900")]));
+    // The shape the old code left behind: billing cancelled, entitlement live.
+    e.db.set_billing_status(&out.billing_id, BillingStatus::CancelAtPeriodEnd).unwrap();
+
+    let paying =
+        e.db.register_user(&Signup {
+            name: "김구독",
+            email: "paying@example.com",
+            password_hash: "salt:hash",
+            terms_version: "2026-09-27",
+        })
+        .unwrap()
+        .id;
+    let live = e.pay.checkout(&paying, "basic", "01012345678").unwrap();
+    e.pay.handle_feedback(&e.feedback(&[
+        ("var1", &live.billing_id),
+        ("price", "19900"),
+        ("mul_no", "550002"),
+        (
+            "rebill_no",
+            &e.db.billing_subscription(&live.billing_id).unwrap().provider_subscription_id.unwrap(),
+        ),
+    ]));
+    assert!(e.db.subscription(&paying).unwrap().active);
+
+    let found = e.db.billing_mismatches().unwrap();
+    assert_eq!(found.len(), 1, "only the cancelled-but-entitled account: {found:?}");
+    assert_eq!(found[0].email, "dj@example.com");
+
+    e.db.fix_billing_mismatch(&out.billing_id).unwrap();
+    assert!(!e.db.subscription(&e.user).unwrap().active);
+    assert!(e.db.subscription(&paying).unwrap().active, "the paying account is untouched");
+    assert!(e.db.billing_mismatches().unwrap().is_empty());
+    // And the repair is not a second cancellation at PayApp: the audit repairs
+    // our own records, it does not re-ask the provider.
+    assert!(e.api.calls().iter().all(|c| c.get("cmd").map(String::as_str) != Some("rebillCancel")));
+}
+
+#[test]
+fn a_paid_period_running_into_next_month_does_not_delay_the_revocation() {
+    // Test I. The payment notification writes `current_period_end` a month out.
+    // The column stays — it is what the account screen's "last paid" story is
+    // built from, and dropping a column from a production table is not additive —
+    // but no entitlement decision may read it.
+    let e = env();
+    let out = e.pay.checkout(&e.user, "pro", "01012345678").unwrap();
+    e.pay.handle_feedback(&e.feedback(&[("var1", &out.billing_id)]));
+    let before = e.billing();
+    assert!(before.current_period_end.is_some(), "the period end is still recorded");
+
+    e.pay.cancel(&e.user).unwrap();
+    let after = e.billing();
+    assert_eq!(after.current_period_end, before.current_period_end, "and is left as it was");
+    assert!(!e.db.subscription(&e.user).unwrap().active, "but grants nothing after cancellation");
 }
 
 #[test]

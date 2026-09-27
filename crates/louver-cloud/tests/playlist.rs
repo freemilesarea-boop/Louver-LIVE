@@ -725,6 +725,109 @@ fn a_restart_does_not_revive_an_unsubscribed_accounts_broadcast() {
     e.mgr.shutdown();
 }
 
+/// A PayApp that always agrees, so a cancellation can be driven end to end here.
+/// What it answers with is pinned down in `payapp.rs`; what this file cares about
+/// is what the manager does afterwards.
+#[derive(Debug)]
+struct AgreeableProvider;
+
+impl louver_cloud::billing::FormPost for AgreeableProvider {
+    fn post_form(&self, _url: &str, fields: &[(&str, &str)]) -> louver_cloud::Result<String> {
+        let cmd = fields.iter().find(|(k, _)| *k == "cmd").map(|(_, v)| *v).unwrap_or("");
+        Ok(match cmd {
+            "rebillRegist" => {
+                "state=1&errno=00000&rebill_no=99001&payurl=https%3A%2F%2Fpayapp.kr%2Fp%2F1".into()
+            }
+            _ => "state=1&errno=00000".to_string(),
+        })
+    }
+}
+
+#[test]
+fn cancelling_a_subscription_closes_every_way_of_getting_on_air() {
+    // Test G. The cancellation itself is PayApp's business; this is about what is
+    // left afterwards. Creating, starting, restarting, the scheduler and a boot
+    // recovery all have to be shut at once, because they are five different doors
+    // into the same room and the last two have nobody watching them.
+    let e = env("none");
+    let config = louver_cloud::billing::Config {
+        userid: "247streams".into(),
+        linkkey: "link-key-for-tests-only".into(),
+        linkval: "link-val-for-tests-only".into(),
+        api_url: "https://fake.payapp.test/oapi/apiLoad.html".into(),
+        public_url: "https://247streams.kr".into(),
+    };
+    let pay = louver_cloud::billing::Payapp::new(e.db.clone(), Arc::new(AgreeableProvider), config);
+
+    // Pay for Pro, the way a real account does: register, then a verified
+    // notification.
+    let order = pay.checkout(&e.user, "pro", "01012345678").unwrap();
+    let feedback: std::collections::BTreeMap<String, String> = [
+        ("userid", "247streams"),
+        ("linkkey", "link-key-for-tests-only"),
+        ("linkval", "link-val-for-tests-only"),
+        ("price", "39900"),
+        ("pay_state", "4"),
+        ("pay_date", "2026-09-27 12:00:05"),
+        ("pay_type", "card"),
+        ("mul_no", "990001"),
+        ("rebill_no", "99001"),
+        ("var1", &order.billing_id),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    assert!(pay.handle_feedback(&feedback).is_accepted());
+
+    // On air on Pro, and a schedule set for a moment that has just passed.
+    let a = e.video("one.mp4", 60.0);
+    let id = e.broadcast("밤 라디오", &[a], true);
+    let now = chrono::Utc::now();
+    e.db.update_broadcast_owned(
+        &e.user,
+        &id,
+        &louver_cloud::BroadcastPatch {
+            schedule: Some(louver_cloud::Schedule {
+                enabled: true,
+                start_at: Some((now - chrono::Duration::minutes(1)).to_rfc3339()),
+                stop_at: None,
+                timezone: "UTC".into(),
+                offset_minutes: 0,
+                repeat_days: 0,
+                last_run_at: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    e.mgr.start(&e.user, &id).unwrap();
+    e.wait_for_launches(1);
+    e.mgr.shutdown();
+    let launches = e.rec.launches();
+
+    // Cancel, for real: PayApp is asked, and the entitlement goes with it.
+    pay.cancel(&e.user).unwrap();
+    assert!(!e.db.subscription(&e.user).unwrap().active);
+
+    // 1. A new broadcast cannot be created.
+    let b = e.video("two.mp4", 30.0);
+    let refused = e.db.create_broadcast(&e.user, "새 방송", &b, &e.dest, true).unwrap_err();
+    assert!(matches!(refused, louver_cloud::CloudError::NoSubscription), "{refused:?}");
+
+    // 2. START is refused, and 3. so is a restart, which goes through it.
+    assert!(matches!(e.mgr.start(&e.user, &id).unwrap_err(), louver_cloud::CloudError::NoSubscription));
+    assert!(matches!(e.mgr.restart(&e.user, &id).unwrap_err(), louver_cloud::CloudError::NoSubscription));
+
+    // 4. The scheduler passes its occurrence and starts nothing.
+    e.mgr.run_schedules(chrono::Utc::now());
+
+    // 5. And a boot does not bring it back.
+    assert_eq!(e.mgr.recover_all().unwrap(), 0);
+
+    assert_eq!(e.rec.launches(), launches, "nothing may be spawned after a cancellation");
+    e.mgr.shutdown();
+}
+
 #[test]
 fn a_paying_accounts_plan_decides_how_many_streams_it_gets() {
     for (plan, allowed) in [("basic", 1usize), ("pro", 2), ("business", 3)] {

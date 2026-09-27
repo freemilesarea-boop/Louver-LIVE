@@ -86,11 +86,11 @@ pub async fn status(State(app): State<App>, Caller(uid): Caller) -> Out<BillingS
     ))
 }
 
-/// Stop the next charge. §9.
+/// Cancel the subscription, and the entitlement with it.
 ///
-/// Deliberately does not call `cancel_subscription`: PayApp's cancellation ends the
-/// registration and does not reverse an approved payment, so the period already
-/// paid for stays the user's.
+/// The provider is asked first and the local writes happen only after it agrees,
+/// so a refused `rebillCancel` leaves the user paying *and* able to broadcast —
+/// the safe way round. See `Payapp::cancel`.
 pub async fn cancel(State(app): State<App>, Caller(uid): Caller) -> Out<louver_cloud::BillingSubscription> {
     let payapp = provider(&app)?;
     Ok(Json(crate::blocking(move || payapp.cancel(&uid)).await?))

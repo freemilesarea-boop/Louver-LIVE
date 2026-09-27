@@ -410,17 +410,29 @@ impl Payapp {
         Ok(payurl)
     }
 
-    /// Stop the provider charging again. §5.
+    /// Stop the provider charging again, and take the paid entitlement back.
     ///
-    /// Does **not** touch the entitlement. PayApp's cancellation ends the
-    /// registration; it does not reverse a payment that has already been approved,
-    /// so the period the user paid for is still theirs.
+    /// The order matters more than anything else here. PayApp goes first: if the
+    /// provider refuses, nothing local has changed and the user can try again,
+    /// still paying and still able to broadcast. Were it the other way round, a
+    /// failed `rebillCancel` would leave an account that keeps being charged
+    /// every month with nothing to show for it.
+    ///
+    /// Once the provider has confirmed, the revocation is immediate — the paid
+    /// period is not honoured past the cancellation, which is the service policy.
+    /// `current_period_end` is still written by the payment notification, but no
+    /// entitlement decision reads it.
     pub fn cancel(&self, user_id: &str) -> Result<BillingSubscription> {
+        // 1. The record has to be this user's own; `live_billing_subscription`
+        //    only ever looks inside one account, so another user's billing id
+        //    cannot be reached from here at all.
         let record = self
             .db
             .live_billing_subscription(user_id)?
             .ok_or_else(|| CloudError::Invalid("해지할 정기결제가 없습니다.".into()))?;
 
+        // 2-4. Ask the provider, and let a failure out before any local write.
+        //      `call` already returns Err on anything but `state=1`.
         if let Some(rebill_no) = record.provider_subscription_id.clone() {
             // `rebillCancel` takes linkkey and, per the documentation, not linkval.
             let fields: Vec<(&str, &str)> = vec![
@@ -432,15 +444,13 @@ impl Payapp {
             self.call(&fields)?;
         }
 
-        // A record that never got as far as a payment has nothing to keep: it goes
-        // straight to cancelled. One that has been paid keeps its entitlement.
-        let next = if record.status == BillingStatus::Pending {
-            BillingStatus::Cancelled
-        } else {
-            BillingStatus::CancelAtPeriodEnd
-        };
-        self.db.set_billing_status(&record.id, next)?;
-        self.db.billing_subscription(&record.id)
+        // 5. One transaction: the record is cancelled and the entitlement this
+        //    record paid for is taken back together, or neither happens.
+        let (updated, revoked) = self.db.cancel_billing_and_revoke(&record.id)?;
+        if revoked {
+            eprintln!("[louver] payapp: 정기결제를 해지하고 유료 권한을 회수했습니다");
+        }
+        Ok(updated)
     }
 
     /// One PayApp request, with the reply turned into something safe.

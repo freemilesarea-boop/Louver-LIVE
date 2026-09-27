@@ -196,20 +196,45 @@ ledger 삽입과 상태 변경은 **한 트랜잭션**이라, 그 사이에 서�
 
 `POST /api/billing/cancel` →  `cmd=rebillCancel`
 
-PayApp 해지는 등록을 끝내는 것이고 **이미 승인된 결제를 취소하지 않습니다.**
-그래서 이 코드는:
+**정책: 사용자가 해지를 확정하면 유료 권한을 즉시 회수합니다.** 이미 결제한
+기간의 남은 일수는 유지하지 않습니다. 해지된 구독은 `cancelled`이 되고 계정은
+`none`(동시 송출 0)으로 내려갑니다.
 
-- 결제된 적 있는 구독 → `cancel_at_period_end`, **entitlement 유지**
-- 결제된 적 없는 구독(`pending`) → `cancelled`, 유지할 기간이 없음
+**순서가 정책보다 중요합니다.** `Payapp::cancel`은:
 
-`cancel_subscription()`을 해지 버튼 직후에 부르지 않습니다. 당일 방송이 끊기지
-않습니다.
+1. 호출자 본인의 billing record를 찾습니다 (billing id는 API 표면에 없습니다)
+2. `cmd=rebillCancel` — `cmd` / `userid` / `rebill_no` / `linkkey` 네 개뿐
+3. `state=1`을 확인합니다
+4. 그 다음에야 한 트랜잭션으로 `status=cancelled` + `cancelled_at` + entitlement 회수
 
-> **아직 구현되지 않은 것:** `current_period_end`가 지났을 때 자동으로
-> `cancel_subscription()`을 부르는 작업은 없습니다. 값은 매 결제마다
-> (`pay_date` + 1개월) 기록되지만, 그 시점에 실제로 권한을 회수하는 스케줄러가
-> 없습니다. 운영자가 판단해서 수동으로 처리해야 합니다. 자동화에는 유예 기간
-> 정책(며칠 더 허용할지, 송출 중이면 어떻게 할지)이 먼저 필요합니다.
+PayApp이 거부하면 **로컬은 아무것도 바뀌지 않습니다.** 오류를 반환하고, 계정은
+그대로 구독 중이며 재시도할 수 있습니다. 반대 순서였다면 *PayApp은 매달 계속
+청구하는데 247streams 권한만 없어진* 계정이 생길 수 있습니다 — 이 순서는 그 상태를
+불가능하게 만들기 위해 존재합니다.
+
+**운영자가 직접 부여한 요금제는 건드리지 않습니다.** 회수는
+`UPDATE users SET plan_id='none' WHERE id=? AND plan_id=?`로, *그 billing record가
+결제한 플랜*에 한해서만 이뤄집니다. CLI로 준 Business, 다른 구독으로 결제한 플랜,
+결제된 적 없는 `pending` 등록은 그대로 남습니다.
+
+`current_period_end`는 컬럼과 값 모두 그대로 둡니다(스키마 호환, 결제 이력).
+**다만 어떤 entitlement 판단도 이 값을 읽지 않습니다.** 기간 만료 스케줄러도
+필요 없습니다.
+
+### 이전 정책이 남긴 행 정리
+
+해지했는데 권한이 남아 있는 계정(`billing.status`는 cancelled인데 `users.plan_id`는
+유료)은 이전 정책에서 만들어진 것입니다. 부팅 migration이 production DB의 요금제를
+자동으로 바꾸지는 않습니다. 운영자가 직접:
+
+```bash
+docker compose exec app louver-server --audit-billing          # 읽기만 함
+docker compose exec app louver-server --audit-billing --fix --yes
+```
+
+쿼리는 billing record와 해당 사용자의 entitlement를 join해서 *해지됐는데 아직
+그 플랜을 들고 있는* 행만 찾습니다. "Basic 사용자 전부"를 대상으로 하는 경로는
+없습니다.
 
 ## 9. 요금제 변경
 
@@ -272,5 +297,20 @@ LINKKEY 오류, 금액 정책 위반입니다.
 (`crates/louver-cloud/tests/payapp.rs`, `apps/server/tests/http_api.rs`). CI에서
 `api.payapp.kr`으로 나가는 요청은 하나도 없습니다.
 
-**REAL PAYAPP NOT VERIFIED** — 실제 PayApp 판매자 계정과 실제 카드 결제로 확인한
-항목은 없습니다. 위 설정을 끝낸 뒤 소액으로 한 번 실제 결제를 해서 확인해야 합니다.
+운영자가 실제 PayApp 판매자 계정으로 확인했다고 알려준 항목:
+
+- checkout → PayApp 결제창
+- 1회차 실제 카드 결제
+- 정기결제 등록
+- `rebillCancel` (해지 요청)
+
+**위 확인은 즉시 회수 정책 이전 코드에서 이뤄졌습니다.** 이번 변경(해지 확정 시
+entitlement 즉시 회수) 이후의 production 해지 동작은 **아직 검증되지 않았습니다.**
+배포 후 실제 계정으로 한 번 해지해서 다음을 확인해야 합니다:
+
+1. PayApp 관리페이지에서 정기결제가 해지되었는지
+2. `/api/billing/status`가 `cancelled` + `plan.active=false`인지
+3. 새 방송 시작이 402로 거부되는지
+
+`--audit-billing`은 배포 직후 한 번 읽기 모드로 실행해서, 이전 정책이 남긴 계정이
+있는지 먼저 눈으로 확인하세요.

@@ -140,9 +140,10 @@ export function BillingComplete({ onDone }: { onDone?: () => void }) {
  * The subscription panel. §12.
  *
  * Shows the plan, the provider's state and the monthly amount, and offers a
- * cancellation that stops the next charge without ending the period already paid
- * for — which is what the confirmation text has to say, or somebody will press it
- * expecting their broadcast to stop and be surprised either way.
+ * cancellation that takes effect at once: the recurring payment stops and the paid
+ * features go with it. That is what the confirmation has to say in so many words —
+ * the previous wording promised the rest of the paid period, which the server no
+ * longer honours, and a promise the server breaks is worse than no promise.
  */
 export function BillingPanel({ onSeePricing }: { onSeePricing?: () => void }) {
   const t = useTransport();
@@ -205,7 +206,7 @@ export function BillingPanel({ onSeePricing }: { onSeePricing?: () => void }) {
       <dl className="grid gap-y-2 text-sm">
         <Row
           label="현재 요금제"
-          value={plan?.active ? (plan.plan?.label ?? "—") : "요금제 없음"}
+          value={plan?.active ? (plan.plan?.label ?? "—") : "미구독"}
         />
         <Row
           label="구독 상태"
@@ -236,15 +237,12 @@ export function BillingPanel({ onSeePricing }: { onSeePricing?: () => void }) {
         {sub?.last_paid_at && (
           <Row label="최근 결제" value={sub.last_paid_at} />
         )}
-        {sub?.current_period_end && (
-          <Row label="이용 기간" value={`${sub.current_period_end}까지`} />
-        )}
       </dl>
 
-      {sub?.status === "cancel_at_period_end" && (
-        <p className="mt-3 text-xs text-warn" data-testid="cancel-scheduled">
-          해지가 예약되었습니다. 다음 결제는 진행되지 않으며, 이미 결제한
-          기간까지는 그대로 사용할 수 있습니다.
+      {(sub?.status === "cancelled" || sub?.status === "cancel_at_period_end") && (
+        <p className="mt-3 text-xs text-warn" data-testid="cancel-done">
+          구독이 해지되었습니다. 자동결제가 중단되었으며 유료 기능은 사용할 수
+          없습니다. 다시 이용하시려면 요금제를 새로 결제해주세요.
         </p>
       )}
       {sub?.status === "payment_failed" && (
@@ -265,8 +263,8 @@ export function BillingPanel({ onSeePricing }: { onSeePricing?: () => void }) {
           <div className="mt-4 rounded-md border border-ink-700 bg-ink-900 p-3">
             <p className="text-sm text-ink-100">구독을 해지하시겠습니까?</p>
             <p className="mt-1 text-xs text-ink-400">
-              다음 정기결제부터 청구되지 않습니다. 이미 결제한 기간까지는 그대로
-              사용할 수 있습니다.
+              구독을 취소하면 자동결제가 해지되며 247streams 유료 기능을 즉시
+              사용할 수 없게 됩니다. 진행 중인 방송이 있다면 먼저 확인해주세요.
             </p>
             <div className="mt-3 flex gap-2">
               <Button

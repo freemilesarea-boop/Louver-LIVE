@@ -1166,15 +1166,27 @@ async fn the_operators_business_account_survives_and_keeps_its_three_streams() {
 #[derive(Debug, Default)]
 struct FakePayapp {
     calls: std::sync::Mutex<Vec<std::collections::BTreeMap<String, String>>>,
+    /// Scripted answers, popped from the front. Empty means "agree".
+    replies: std::sync::Mutex<Vec<String>>,
 }
 
 impl louver_cloud::billing::FormPost for FakePayapp {
     fn post_form(&self, _url: &str, fields: &[(&str, &str)]) -> louver_cloud::Result<String> {
         self.calls.lock().unwrap().push(fields.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect());
-        Ok(format!(
-            "state=1&errno=00000&rebill_no=778899&payurl={}",
-            louver_cloud::billing::urlencode("https://payapp.kr/pay/778899")
-        ))
+        let scripted = {
+            let mut r = self.replies.lock().unwrap();
+            if r.is_empty() {
+                None
+            } else {
+                Some(r.remove(0))
+            }
+        };
+        Ok(scripted.unwrap_or_else(|| {
+            format!(
+                "state=1&errno=00000&rebill_no=778899&payurl={}",
+                louver_cloud::billing::urlencode("https://payapp.kr/pay/778899")
+            )
+        }))
     }
 }
 
@@ -1485,7 +1497,7 @@ async fn arriving_at_the_return_url_activates_nothing() {
 }
 
 #[tokio::test]
-async fn cancelling_stops_the_next_charge_and_leaves_the_paid_period_alone() {
+async fn cancelling_revokes_the_paid_plan_straight_away() {
     let (s, api) = billing_server();
     let a = account(&s, "dj@example.com").await;
     let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
@@ -1502,7 +1514,7 @@ async fn cancelling_stops_the_next_charge_and_leaves_the_paid_period_alone() {
 
     let cancelled = post(&s, "/api/billing/cancel", &a, None).await;
     assert_eq!(cancelled.status, StatusCode::OK, "{}", cancelled.body);
-    assert_eq!(cancelled.json()["status"], "cancel_at_period_end");
+    assert_eq!(cancelled.json()["status"], "cancelled");
 
     // PayApp was asked, with the four fields it documents.
     let call = api.calls.lock().unwrap().last().cloned().unwrap();
@@ -1511,12 +1523,49 @@ async fn cancelling_stops_the_next_charge_and_leaves_the_paid_period_alone() {
     assert!(call.contains_key("linkkey"));
     assert!(!call.contains_key("linkval"));
 
-    // §9: the entitlement is still there. Pressing cancel must not take a
-    // broadcast off air the same day.
+    // The entitlement is gone the moment the provider agreed, and the account
+    // screen says so on its next question rather than on some later date.
     let sub = get(&s, "/api/me/subscription", &a).await;
-    assert_eq!(sub.json()["status"], "active");
-    assert_eq!(sub.json()["plan"]["id"], "pro");
+    assert_eq!(sub.json()["status"], "unsubscribed");
+    assert_eq!(sub.json()["active"], false);
+    assert!(sub.json()["plan"].is_null());
+    assert_eq!(get(&s, "/api/broadcasts", &a).await.json()["allowed"], 0);
+
+    // And the billing panel's own endpoint agrees: 해지됨, with no plan behind it.
+    let billing = get(&s, "/api/billing/status", &a).await;
+    assert_eq!(billing.json()["subscription"]["status"], "cancelled");
+    assert_eq!(billing.json()["plan"]["active"], false);
+}
+
+#[tokio::test]
+async fn a_provider_that_refuses_the_cancellation_leaves_the_subscription_running() {
+    // The user-facing half of the ordering rule: a failed `rebillCancel` is an
+    // error, and the account is still paying and still able to broadcast.
+    let (s, api) = billing_server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    let order = post(
+        &s,
+        "/api/billing/checkout",
+        &a,
+        Some(serde_json::json!({ "plan_id": "pro", "recvphone": "01012345678" })),
+    )
+    .await;
+    let fields = notification(order.json()["billing_id"].as_str().unwrap(), &[]);
+    post_form(&s, "/api/billing/payapp/feedback", &borrowed(&fields)).await;
+
+    api.replies.lock().unwrap().push("state=0&errno=00009".into());
+    let refused = post(&s, "/api/billing/cancel", &a, None).await;
+    assert_ne!(refused.status, StatusCode::OK, "{}", refused.body);
+    assert!(!refused.body.contains("link-"), "no credential in the answer: {}", refused.body);
+
+    assert!(s.app.db.subscription(&me).unwrap().active);
     assert_eq!(get(&s, "/api/broadcasts", &a).await.json()["allowed"], 2);
+    assert_eq!(get(&s, "/api/billing/status", &a).await.json()["subscription"]["status"], "active");
+
+    // Retryable.
+    assert_eq!(post(&s, "/api/billing/cancel", &a, None).await.status, StatusCode::OK);
+    assert!(!s.app.db.subscription(&me).unwrap().active);
 }
 
 #[tokio::test]

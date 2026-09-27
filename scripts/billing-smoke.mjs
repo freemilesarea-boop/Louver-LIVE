@@ -205,14 +205,32 @@ try {
   if (slots !== '0 / 2') fail(`slots=${slots}, expected 0 / 2`)
   log('completion page and dashboard agree ✓', `slots=${slots}`)
 
-  // Cancelling stops the next charge and keeps the paid period.
+  // Cancelling stops the next charge and takes the paid features with it.
   await page.getByRole('button', { name: '요금제', exact: true }).click()
   await page.getByRole('button', { name: '구독 해지' }).click()
+  const warning = await page.locator('text=즉시 사용할 수 없게 됩니다').count()
+  if (warning === 0) fail('the confirmation does not say the features stop at once')
   await page.getByRole('button', { name: '해지하기' }).click()
-  await page.getByTestId('cancel-scheduled').waitFor({ timeout: 10000 })
-  const kept = await (await ctx.request.get(`${BASE}/api/me/subscription`)).json()
-  if (kept.active !== true) fail('cancelling removed a paid-for entitlement')
-  log('cancelled; entitlement kept ✓', `status=${kept.status}`)
+  await page.getByTestId('cancel-done').waitFor({ timeout: 10000 })
+  const gone = await (await ctx.request.get(`${BASE}/api/me/subscription`)).json()
+  if (gone.active !== false) fail(`cancelling left the entitlement: ${JSON.stringify(gone)}`)
+  if (gone.plan) fail('a cancelled account still has a plan')
+  log('cancelled; entitlement revoked ✓', `status=${gone.status}`)
+
+  // And the browser shows it after a reload, not only in the moment.
+  await page.reload()
+  await page.getByRole('button', { name: '요금제', exact: true }).click()
+  await page.locator('text=미구독').first().waitFor({ timeout: 10000 })
+  if ((await page.getByRole('button', { name: '구독 해지' }).count()) !== 0) {
+    fail('the cancel button is still offered after cancelling')
+  }
+  log('the account screen says 미구독 after a reload ✓')
+
+  // And the server refuses to put anything on air. (402 here: the subscription
+  // gate is asked before the broadcast is even looked up.)
+  const start = await ctx.request.post(`${BASE}/api/broadcasts/whatever/start`)
+  if (start.status() !== 402) fail(`an unsubscribed start answered ${start.status()}, expected 402`)
+  log('broadcast start is refused after cancellation ✓', 'http=402')
 
   // No credential in the server log.
   const logs = serverLog.join('')

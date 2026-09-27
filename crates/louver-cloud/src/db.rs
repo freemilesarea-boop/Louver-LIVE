@@ -911,6 +911,136 @@ impl CloudDb {
         Ok(())
     }
 
+    /// End a billing subscription and take back the entitlement it paid for, in
+    /// one transaction.
+    ///
+    /// The whole reason this is one function rather than two calls: the two halves
+    /// must not be separable. Half of it landing would leave either an entitlement
+    /// nobody is paying for, or — worse — a cancelled entitlement whose recurring
+    /// payment is still running at the provider.
+    ///
+    /// **Only the entitlement this record actually granted is taken back.** The
+    /// test is `users.plan_id == billing.plan_id`, plus the record having been paid
+    /// at least once (`activated_at`). So:
+    ///
+    /// * an account the operator put on Business by hand, with no billing record,
+    ///   is never reached — there is nothing to cancel;
+    /// * an account that pays for Basic *and* was granted Business by the operator
+    ///   keeps the Business when the Basic is cancelled, because the plans differ;
+    /// * a registration that was never paid revokes nothing, because it granted
+    ///   nothing.
+    ///
+    /// Returns the record as it now reads, and whether an entitlement was taken.
+    pub fn cancel_billing_and_revoke(&self, billing_id: &str) -> Result<(BillingSubscription, bool)> {
+        let conn = self.conn.clone();
+        let mut guard = conn.lock().unwrap();
+        let tx = guard.transaction()?;
+
+        let (user_id, plan_id, activated_at): (String, String, Option<String>) = tx
+            .query_row(
+                "SELECT user_id, plan_id, activated_at FROM billing_subscriptions WHERE id = ?1",
+                [billing_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?
+            .ok_or(CloudError::NotFound("billing subscription"))?;
+
+        tx.execute(
+            "UPDATE billing_subscriptions
+             SET status = ?2,
+                 updated_at = datetime('now'),
+                 cancelled_at = COALESCE(cancelled_at, datetime('now'))
+             WHERE id = ?1",
+            params![billing_id, BillingStatus::Cancelled.id()],
+        )?;
+
+        // Nothing was ever paid, so nothing was ever granted by this record.
+        let mut revoked = false;
+        if activated_at.is_some() {
+            // `AND plan_id = ?2` is the guard. Without it this would revoke
+            // whatever the account happens to be on, including a plan an operator
+            // granted deliberately and a different subscription paid for.
+            let moved = tx.execute(
+                "UPDATE users SET plan_id = ?3 WHERE id = ?1 AND plan_id = ?2",
+                params![user_id, plan_id, UNSUBSCRIBED_PLAN],
+            )?;
+            if moved > 0 {
+                tx.execute(
+                    "INSERT INTO subscriptions (user_id, plan_id, status) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(user_id) DO UPDATE SET plan_id = excluded.plan_id,
+                                                        status = excluded.status,
+                                                        updated_at = datetime('now')",
+                    params![user_id, UNSUBSCRIBED_PLAN, SUBSCRIPTION_UNSUBSCRIBED],
+                )?;
+                revoked = true;
+            }
+        }
+        tx.commit()?;
+        drop(guard);
+        Ok((self.billing_subscription(billing_id)?, revoked))
+    }
+
+    /// Accounts whose provider subscription is over but whose entitlement is not.
+    ///
+    /// For `louver-server --audit-billing`. This state was reachable under the old
+    /// policy, which kept the entitlement until the end of the period already paid
+    /// for; under the current one it should never appear again, and an entry here
+    /// means either a row from before the change or something that went wrong
+    /// halfway.
+    ///
+    /// Narrow on purpose. It joins the billing record to the entitlement and
+    /// requires the plans to be the same one, so an operator-granted plan is not
+    /// in the answer — the fix must never be "set every Basic to none".
+    pub fn billing_mismatches(&self) -> Result<Vec<BillingMismatch>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT b.id, b.user_id, u.email, b.plan_id, b.status, b.cancelled_at,
+                    COALESCE(s.status, ?1) AS entitlement_status
+             FROM billing_subscriptions b
+             JOIN users u ON u.id = b.user_id
+             LEFT JOIN subscriptions s ON s.user_id = b.user_id
+             WHERE b.status IN ('cancelled', 'cancel_at_period_end')
+               -- Only a record that actually paid for something can have granted
+               -- the entitlement that is still standing.
+               AND b.activated_at IS NOT NULL
+               -- The entitlement has to be the one this record bought.
+               AND u.plan_id = b.plan_id
+               AND u.plan_id <> ?2
+               AND COALESCE(s.status, ?1) = ?1
+             ORDER BY b.cancelled_at DESC",
+        )?;
+        let rows = st.query_map(params![SUBSCRIPTION_ACTIVE, UNSUBSCRIBED_PLAN], |r| {
+            Ok(BillingMismatch {
+                billing_id: r.get(0)?,
+                user_id: r.get(1)?,
+                email: r.get(2)?,
+                plan_id: r.get(3)?,
+                billing_status: r.get(4)?,
+                cancelled_at: r.get(5)?,
+                entitlement_status: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Bring one mismatched account in line with the provider. §4.
+    ///
+    /// Refuses anything [`CloudDb::billing_mismatches`] does not list, so a typo
+    /// cannot take a plan off an account that is paying for it or was given it by
+    /// the operator. No provider call: the recurring payment was already cancelled,
+    /// which is what put the row in this state.
+    pub fn fix_billing_mismatch(&self, billing_id: &str) -> Result<BillingMismatch> {
+        let row =
+            self.billing_mismatches()?.into_iter().find(|m| m.billing_id == billing_id).ok_or_else(|| {
+                CloudError::Invalid("이 billing 기록은 '해지됐지만 권한이 남아 있는' 상태가 아닙니다".into())
+            })?;
+        let (_, revoked) = self.cancel_billing_and_revoke(billing_id)?;
+        if !revoked {
+            return Err(CloudError::Invalid("권한을 회수하지 못했습니다".into()));
+        }
+        Ok(row)
+    }
+
     /// The record a provider callback is about, found by our own opaque id.
     ///
     /// By `var1`, not by the user id or the email the callback carries: those
@@ -2268,6 +2398,19 @@ pub struct BillingPayment<'a> {
     pub status: Option<BillingStatus>,
     pub paid_at: Option<&'a str>,
     pub period_end: Option<&'a str>,
+}
+
+/// A billing record whose provider subscription is over while the entitlement it
+/// paid for is still standing.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BillingMismatch {
+    pub billing_id: String,
+    pub user_id: String,
+    pub email: String,
+    pub plan_id: String,
+    pub billing_status: String,
+    pub cancelled_at: Option<String>,
+    pub entitlement_status: String,
 }
 
 /// One row of the payment ledger, as an account screen may show it.

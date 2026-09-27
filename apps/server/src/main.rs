@@ -207,6 +207,91 @@ fn audit_plans(args: &[String]) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// `--audit-billing [--fix --yes]`
+///
+/// The mirror image of `--audit-plans`, for the other way an entitlement can be
+/// wrong: the billing record says the recurring payment was cancelled, but the
+/// account is still on the plan it paid for.
+///
+/// Rows like this exist because cancellation used to keep the entitlement until
+/// the end of the paid period. That policy is gone, and the code no longer
+/// writes such a row — but the rows written before it changed are still in the
+/// production database, and the accounts they belong to still hold a plan they
+/// have cancelled.
+///
+/// This is deliberately *not* a boot migration. A migration that moved accounts
+/// between plans on every start would be a migration nobody reads the output of,
+/// running against a database with paying customers in it. So: read-only unless
+/// both `--fix` and `--yes` are given, and even then it only ever touches the
+/// accounts printed above — the query finds cancelled-but-still-entitled, never
+/// "everyone on Basic".
+fn audit_billing(args: &[String]) -> std::process::ExitCode {
+    let data = std::path::PathBuf::from(
+        std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()),
+    );
+    let db = match louver_cloud::CloudDb::open(&data.join("cloud.db")) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[louver] 데이터베이스를 열 수 없습니다 ({}): {e}", data.display());
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let rows = match db.billing_mismatches() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[louver] 결제 기록을 읽을 수 없습니다: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    if rows.is_empty() {
+        println!("해지됐는데도 유료 권한이 남아 있는 계정은 없습니다.");
+        return std::process::ExitCode::SUCCESS;
+    }
+    println!("{:<34} {:<10} {:<22} 해지 시각", "email", "plan", "billing status");
+    for r in &rows {
+        println!(
+            "{:<34} {:<10} {:<22} {}",
+            r.email,
+            r.plan_id,
+            r.billing_status,
+            r.cancelled_at.as_deref().unwrap_or("-")
+        );
+    }
+    println!("\n{}개 계정이 해지 상태인데 아직 유료 권한을 갖고 있습니다", rows.len());
+
+    let fix = args.iter().any(|a| a == "--fix");
+    let confirmed = args.iter().any(|a| a == "--yes");
+    if !fix {
+        println!("위 계정의 권한을 회수하려면:");
+        println!("  louver-server --audit-billing --fix --yes");
+        return std::process::ExitCode::SUCCESS;
+    }
+    if !confirmed {
+        eprintln!(
+            "[louver] {}개 계정의 유료 권한을 회수합니다. 확인했다면 --yes 를 함께 주세요.",
+            rows.len()
+        );
+        return std::process::ExitCode::FAILURE;
+    }
+
+    let mut done = 0;
+    for r in &rows {
+        // Each row is fixed by its own billing id, and `fix_billing_mismatch`
+        // re-checks that the row is still a mismatch before it writes. Nothing
+        // here can touch an account that is not in the list above.
+        match db.fix_billing_mismatch(&r.billing_id) {
+            Ok(_) => {
+                done += 1;
+                println!("[louver] {} → 미구독", r.email);
+            }
+            Err(e) => eprintln!("[louver] {} 회수 실패: {e}", r.email),
+        }
+    }
+    println!("[louver] {done}/{}개 계정의 유료 권한을 회수했습니다", rows.len());
+    std::process::ExitCode::SUCCESS
+}
+
 fn value_of(args: &[String], flag: &str) -> Option<String> {
     let i = args.iter().position(|a| a == flag)?;
     args.get(i + 1).filter(|v| !v.starts_with("--")).cloned()
@@ -243,6 +328,10 @@ async fn main() -> std::process::ExitCode {
     // Who is on which plan, and how they got there.
     if args.iter().any(|a| a == "--audit-plans") {
         return audit_plans(&args);
+    }
+    // Cancelled at the provider, but still holding the plan here.
+    if args.iter().any(|a| a == "--audit-billing") {
+        return audit_billing(&args);
     }
     // What is running, where it is sending, and what FFmpeg has said about it.
     if args.iter().any(|a| a == "--diagnose") {

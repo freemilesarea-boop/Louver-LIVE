@@ -229,10 +229,15 @@ order id, amount and `rebill_no` against what we stored, and only for
 the return URL grants nothing; there is still no route a browser can reach that
 changes a plan.
 
-Cancelling stops the next charge and leaves the period already paid for alone, so
-it does not call `cancel_subscription`. **Nothing revokes at period end yet** —
-`current_period_end` is recorded and no job acts on it, because automating that
-needs a grace-period policy first.
+Cancelling stops the next charge **and takes the paid features back at once** —
+the remainder of the paid month is not honoured, which is the service policy. The
+provider is asked first and the local writes happen only after it agrees, so a
+refused `rebillCancel` leaves the account paying and still able to broadcast
+rather than the other way round. Only the plan that cancelled record paid for is
+revoked, so a plan an operator granted by hand is untouched.
+`current_period_end` is still recorded and no entitlement decision reads it. Rows
+left cancelled-but-entitled by the previous policy are found and fixed by
+`louver-server --audit-billing [--fix --yes]`, never by a boot migration.
 
 No card details reach this server: they are typed on PayApp's page.
 
