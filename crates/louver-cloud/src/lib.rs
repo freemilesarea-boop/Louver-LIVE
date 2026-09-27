@@ -15,6 +15,7 @@ pub mod entitlement;
 pub mod ingest;
 pub mod manager;
 pub mod models;
+pub mod schedule;
 pub mod storage;
 
 pub use db::CloudDb;

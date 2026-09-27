@@ -58,7 +58,14 @@ pub fn router(app: App) -> Router {
         .route("/api/stream-destinations", get(api::list_destinations).post(api::create_destination))
         .route("/api/stream-destinations/{id}", delete(api::delete_destination))
         .route("/api/broadcasts", get(api::list_broadcasts).post(api::create_broadcast))
-        .route("/api/broadcasts/{id}", get(api::get_broadcast).delete(api::delete_broadcast))
+        .route(
+            "/api/broadcasts/{id}",
+            get(api::get_broadcast)
+                .patch(api::update_broadcast)
+                .put(api::update_broadcast)
+                .delete(api::delete_broadcast),
+        )
+        .route("/api/broadcasts/{id}/items", get(api::list_items).put(api::replace_items))
         .route("/api/broadcasts/{id}/start", post(api::start_broadcast))
         .route("/api/broadcasts/{id}/stop", post(api::stop_broadcast))
         .route("/api/broadcasts/{id}/restart", post(api::restart_broadcast))

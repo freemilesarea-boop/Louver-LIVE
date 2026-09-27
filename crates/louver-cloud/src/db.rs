@@ -16,6 +16,27 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// A playlist long enough for a day of music and short enough to draw.
+pub const MAX_PLAYLIST_ITEMS: usize = 200;
+
+/// What the API hands [`CloudDb::replace_items`].
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewItem {
+    pub media_id: String,
+    #[serde(default = "crate::db::yes")]
+    pub enabled: bool,
+    #[serde(default = "crate::db::one")]
+    pub repeat_count: i64,
+}
+
+pub(crate) fn yes() -> bool {
+    true
+}
+
+pub(crate) fn one() -> i64 {
+    1
+}
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS plans (
     id      TEXT PRIMARY KEY,
@@ -107,6 +128,18 @@ CREATE TABLE IF NOT EXISTS broadcasts (
 );
 CREATE INDEX IF NOT EXISTS idx_broadcast_user ON broadcasts(user_id);
 CREATE INDEX IF NOT EXISTS idx_broadcast_desired ON broadcasts(desired_state);
+
+-- One video in one broadcast's playlist. §1.
+CREATE TABLE IF NOT EXISTS broadcast_items (
+    id           TEXT PRIMARY KEY,
+    broadcast_id TEXT NOT NULL REFERENCES broadcasts(id) ON DELETE CASCADE,
+    media_id     TEXT NOT NULL REFERENCES media(id),
+    position     INTEGER NOT NULL,
+    enabled      INTEGER NOT NULL DEFAULT 1,
+    repeat_count INTEGER NOT NULL DEFAULT 1,
+    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_item_broadcast ON broadcast_items(broadcast_id, position);
 
 CREATE TABLE IF NOT EXISTS broadcast_events (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -212,8 +245,56 @@ impl CloudDb {
         // Adding one that exists is an error, not a no-op, hence the check.
         ensure_column(&conn, "broadcasts", "ffmpeg_pid", "INTEGER")?;
 
+        // Everything below arrived with playlists, metadata, settings and
+        // schedules. A column at a time, each with the default the old rows
+        // should be read as, so a database from the previous release opens and
+        // keeps working rather than being migrated by hand.
+        for (column, decl) in [
+            // §4 metadata
+            ("title", "TEXT NOT NULL DEFAULT ''"),
+            ("description", "TEXT NOT NULL DEFAULT ''"),
+            ("tags", "TEXT NOT NULL DEFAULT ''"),
+            ("category", "TEXT NOT NULL DEFAULT ''"),
+            ("privacy", "TEXT NOT NULL DEFAULT 'private'"),
+            // §6 settings
+            ("resolution", "TEXT NOT NULL DEFAULT 'auto'"),
+            ("fps", "TEXT NOT NULL DEFAULT 'auto'"),
+            ("video_bitrate_kbps", "INTEGER NOT NULL DEFAULT 0"),
+            ("audio_bitrate_kbps", "INTEGER NOT NULL DEFAULT 0"),
+            // §8 schedule
+            ("sched_enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("sched_start_at", "TEXT"),
+            ("sched_stop_at", "TEXT"),
+            ("sched_timezone", "TEXT NOT NULL DEFAULT 'UTC'"),
+            ("sched_repeat_days", "INTEGER NOT NULL DEFAULT 0"),
+            // Minutes east of UTC, captured from the browser when the schedule
+            // was set. Enough to know which local day an instant falls on
+            // without shipping a timezone database; the name above is what the
+            // UI shows.
+            ("sched_offset_minutes", "INTEGER NOT NULL DEFAULT 0"),
+            ("sched_last_run_at", "TEXT"),
+            // §2/§9 playlist runtime, checkpointed as it plays
+            ("item_count", "INTEGER NOT NULL DEFAULT 0"),
+            // Entries in one pass once repeats are expanded, and where the
+            // playlist was rotated to when it was last started (§9's resume).
+            ("play_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("playlist_offset", "INTEGER NOT NULL DEFAULT 0"),
+            ("current_index", "INTEGER NOT NULL DEFAULT 0"),
+            ("current_item", "TEXT"),
+            ("next_item", "TEXT"),
+            ("current_position_secs", "REAL NOT NULL DEFAULT 0"),
+            ("current_duration_secs", "REAL NOT NULL DEFAULT 0"),
+            ("cycle_duration_secs", "REAL NOT NULL DEFAULT 0"),
+        ] {
+            ensure_column(&conn, "broadcasts", column, decl)?;
+        }
+        // §5: which kind of destination this is. Every existing row is a stream
+        // key someone pasted, which is exactly what the default says.
+        ensure_column(&conn, "stream_destinations", "kind", "TEXT NOT NULL DEFAULT 'manual_rtmps'")?;
+
         let db = Self { conn: Arc::new(Mutex::new(conn)) };
         db.seed_plans()?;
+        db.adopt_single_video_broadcasts()?;
         Ok(db)
     }
 
@@ -248,6 +329,39 @@ impl CloudDb {
     /// The connection, for the credential store to share.
     pub fn raw(&self) -> Arc<Mutex<Connection>> {
         Arc::clone(&self.conn)
+    }
+
+    /// Give every pre-playlist broadcast the one-item playlist it always was.
+    ///
+    /// A broadcast used to be a row with a `media_id`. That column is still
+    /// there and still written, so nothing that reads it breaks; this adds the
+    /// `broadcast_items` row the new code reads, for the broadcasts that were
+    /// created before the table existed. Idempotent, and it never touches a
+    /// broadcast that already has items — including one whose items were all
+    /// removed on purpose.
+    fn adopt_single_video_broadcasts(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let orphans: Vec<(String, String)> = {
+            let mut st = conn.prepare(
+                "SELECT b.id, b.media_id FROM broadcasts b
+                 WHERE NOT EXISTS (SELECT 1 FROM broadcast_items i WHERE i.broadcast_id = b.id)",
+            )?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for (broadcast_id, media_id) in orphans {
+            conn.execute(
+                "INSERT INTO broadcast_items (id, broadcast_id, media_id, position, enabled, repeat_count)
+                 VALUES (?1, ?2, ?3, 0, 1, 1)",
+                params![crate::new_id(), broadcast_id, media_id],
+            )?;
+            conn.execute(
+                "UPDATE broadcasts SET item_count = 1, title = CASE WHEN title = '' THEN name ELSE title END
+                 WHERE id = ?1",
+                [&broadcast_id],
+            )?;
+        }
+        Ok(())
     }
 
     fn seed_plans(&self) -> Result<()> {
@@ -636,6 +750,125 @@ impl CloudDb {
         Ok(())
     }
 
+    // --- playlists (§1, §2) -----------------------------------------------
+
+    /// One broadcast's playlist, in order, with what the UI needs to draw it.
+    pub fn items_owned(&self, user_id: &str, broadcast_id: &str) -> Result<Vec<BroadcastItem>> {
+        self.broadcast_owned(user_id, broadcast_id)?;
+        self.items_for(broadcast_id)
+    }
+
+    /// Without an owner check. For the manager, which already established it.
+    pub fn items_for(&self, broadcast_id: &str) -> Result<Vec<BroadcastItem>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare(
+            "SELECT i.id, i.broadcast_id, i.media_id, i.position, i.enabled, i.repeat_count,
+                    m.filename, COALESCE(m.prepared_duration_secs, m.duration_secs) AS duration_secs,
+                    m.state
+             FROM broadcast_items i JOIN media m ON m.id = i.media_id
+             WHERE i.broadcast_id = ?1
+             ORDER BY i.position",
+        )?;
+        let rows = st.query_map([broadcast_id], |r| {
+            let state: String = r.get("state")?;
+            Ok(BroadcastItem {
+                id: r.get("id")?,
+                broadcast_id: r.get("broadcast_id")?,
+                media_id: r.get("media_id")?,
+                position: r.get("position")?,
+                enabled: r.get::<_, i64>("enabled")? != 0,
+                repeat_count: r.get("repeat_count")?,
+                filename: r.get("filename")?,
+                duration_secs: r.get("duration_secs")?,
+                state: MediaState::from_id(&state).unwrap_or(MediaState::Failed),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Replace the whole playlist, in one transaction.
+    ///
+    /// The whole list rather than one item at a time, because that is what the
+    /// screen actually produces: a drag leaves every following position changed,
+    /// and sending the result as a list makes the stored order and the drawn
+    /// order the same thing by construction.
+    pub fn replace_items(
+        &self,
+        user_id: &str,
+        broadcast_id: &str,
+        items: &[NewItem],
+    ) -> Result<Vec<BroadcastItem>> {
+        self.broadcast_owned(user_id, broadcast_id)?;
+        if items.is_empty() {
+            return Err(CloudError::Invalid("영상을 최소 한 개 선택해 주세요".into()));
+        }
+        if items.len() > MAX_PLAYLIST_ITEMS {
+            return Err(CloudError::Invalid(format!("플레이리스트는 최대 {MAX_PLAYLIST_ITEMS}개까지입니다")));
+        }
+        for it in items {
+            if !(1..=100).contains(&it.repeat_count) {
+                return Err(CloudError::Invalid("반복 횟수는 1~100 사이여야 합니다".into()));
+            }
+            // Every video must be the caller's. Without this, a playlist would
+            // be a way to broadcast someone else's upload.
+            self.media_owned(user_id, &it.media_id)?;
+        }
+
+        let conn = self.raw();
+        let mut guard = conn.lock().unwrap();
+        let tx = guard.transaction()?;
+        tx.execute("DELETE FROM broadcast_items WHERE broadcast_id = ?1", [broadcast_id])?;
+        for (position, it) in items.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO broadcast_items
+                     (id, broadcast_id, media_id, position, enabled, repeat_count)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    crate::new_id(),
+                    broadcast_id,
+                    it.media_id,
+                    position as i64,
+                    it.enabled as i64,
+                    it.repeat_count,
+                ],
+            )?;
+        }
+        // `media_id` stays in step with the first item so that anything reading
+        // the old column — including the previous release — still works.
+        tx.execute(
+            "UPDATE broadcasts SET item_count = ?2, media_id = ?3 WHERE id = ?1",
+            params![broadcast_id, items.len() as i64, items[0].media_id],
+        )?;
+        tx.commit()?;
+        drop(guard);
+        self.items_for(broadcast_id)
+    }
+
+    /// What the worker will actually play, in order, ready to stream.
+    ///
+    /// Disabled items are left out, `repeat_count` is expanded into repeats, and
+    /// a broadcast with no rows at all falls back to its `media_id` — which is
+    /// what makes a broadcast created before playlists existed start unchanged.
+    pub fn prepared_items_for(&self, broadcast_id: &str) -> Result<Vec<crate::manager::PreparedMedia>> {
+        let items = self.items_for(broadcast_id)?;
+        if items.is_empty() {
+            let b = self.broadcast(broadcast_id)?;
+            return Ok(vec![self.prepared_media_for(&b.media_id)?]);
+        }
+        let mut out = Vec::new();
+        for it in items.iter().filter(|i| i.enabled) {
+            let prepared = self.prepared_media_for(&it.media_id)?;
+            for _ in 0..it.repeat_count.max(1) {
+                out.push(prepared.clone());
+            }
+        }
+        if out.is_empty() {
+            return Err(CloudError::Invalid("사용 가능한 영상이 없습니다".into()));
+        }
+        Ok(out)
+    }
+
     // --- broadcasts -------------------------------------------------------
 
     pub fn create_broadcast(
@@ -736,6 +969,140 @@ impl CloudDb {
         Ok(())
     }
 
+    /// Change what a broadcast is, without touching what it is doing.
+    ///
+    /// Only the fields present are written. A playlist, a destination or a
+    /// settings change takes effect at the next start — the running FFmpeg is
+    /// deliberately not interrupted, because an edit is not a reason to drop a
+    /// live stream.
+    pub fn update_broadcast_owned(
+        &self,
+        user_id: &str,
+        id: &str,
+        patch: &BroadcastPatch,
+    ) -> Result<Broadcast> {
+        self.broadcast_owned(user_id, id)?;
+        if let Some(s) = &patch.settings {
+            s.validate()?;
+        }
+        if let Some(sc) = &patch.schedule {
+            crate::schedule::validate(sc)?;
+        }
+        if let Some(d) = &patch.destination_id {
+            // Moving a broadcast to a destination that is not yours would be a
+            // way to send your video to someone else's channel.
+            self.destination_owned(user_id, d)?;
+        }
+
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let set = |sql: &str, value: &dyn rusqlite::ToSql| -> Result<()> {
+            guard.execute(&format!("UPDATE broadcasts SET {sql} WHERE id = ?1"), params![id, value])?;
+            Ok(())
+        };
+        if let Some(v) = &patch.name {
+            set("name = ?2", v)?;
+        }
+        if let Some(v) = &patch.title {
+            set("title = ?2", v)?;
+        }
+        if let Some(v) = &patch.description {
+            set("description = ?2", v)?;
+        }
+        if let Some(v) = &patch.tags {
+            set("tags = ?2", v)?;
+        }
+        if let Some(v) = &patch.category {
+            set("category = ?2", v)?;
+        }
+        if let Some(v) = &patch.privacy {
+            set("privacy = ?2", &v.id())?;
+        }
+        if let Some(v) = patch.loop_forever {
+            set("loop_forever = ?2", &(v as i64))?;
+        }
+        if let Some(v) = &patch.destination_id {
+            set("destination_id = ?2", v)?;
+        }
+        if let Some(v) = &patch.settings {
+            set("resolution = ?2", &v.resolution)?;
+            set("fps = ?2", &v.fps)?;
+            set("video_bitrate_kbps = ?2", &v.video_bitrate_kbps)?;
+            set("audio_bitrate_kbps = ?2", &v.audio_bitrate_kbps)?;
+        }
+        if let Some(v) = &patch.schedule {
+            set("sched_enabled = ?2", &(v.enabled as i64))?;
+            set("sched_start_at = ?2", &v.start_at)?;
+            set("sched_stop_at = ?2", &v.stop_at)?;
+            set("sched_timezone = ?2", &v.timezone)?;
+            set("sched_offset_minutes = ?2", &v.offset_minutes)?;
+            set("sched_repeat_days = ?2", &v.repeat_days)?;
+        }
+        drop(guard);
+        self.broadcast_owned(user_id, id)
+    }
+
+    /// Where the playlist has got to. Written every tick while it plays. §9.
+    pub fn record_playlist_progress(&self, id: &str, p: &PlaylistProgress) -> Result<()> {
+        self.raw().lock().unwrap().execute(
+            "UPDATE broadcasts SET current_index = ?2, current_item = ?3, next_item = ?4,
+                    current_position_secs = ?5, current_duration_secs = ?6, cycle_duration_secs = ?7,
+                    play_count = CASE WHEN ?8 > 0 THEN ?8 ELSE play_count END
+             WHERE id = ?1",
+            params![
+                id,
+                p.index,
+                p.current_item,
+                p.next_item,
+                p.position_secs,
+                p.duration_secs,
+                p.cycle_secs,
+                p.play_count,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remember which entry the playlist was rotated to when it started, so a
+    /// display index can be mapped back to the order the user sees.
+    pub fn record_playlist_offset(&self, id: &str, offset: i64, play_count: i64) -> Result<()> {
+        self.raw().lock().unwrap().execute(
+            "UPDATE broadcasts SET playlist_offset = ?2, play_count = ?3 WHERE id = ?1",
+            params![id, offset, play_count],
+        )?;
+        Ok(())
+    }
+
+    /// The entry a recovered worker should resume at, and where it rotated from.
+    pub fn playlist_resume_point(&self, id: &str) -> Result<(i64, i64)> {
+        Ok(self.raw().lock().unwrap().query_row(
+            "SELECT current_index, playlist_offset FROM broadcasts WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
+    /// Every broadcast with a schedule switched on. The scheduler reads this and
+    /// decides in one place; nothing about a due time is stored in memory, which
+    /// is what makes a restart recover schedules for free.
+    pub fn scheduled_broadcasts(&self) -> Result<Vec<Broadcast>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare(&format!("{BROADCAST_COLUMNS} WHERE sched_enabled = 1"))?;
+        let rows = st.query_map([], row_to_broadcast)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Remember which occurrence was started, so the same window cannot start
+    /// twice — including after the server is restarted inside it.
+    pub fn mark_scheduled_run(&self, id: &str, occurrence: &str) -> Result<()> {
+        self.raw()
+            .lock()
+            .unwrap()
+            .execute("UPDATE broadcasts SET sched_last_run_at = ?2 WHERE id = ?1", params![id, occurrence])?;
+        Ok(())
+    }
+
     // --- what the manager writes back -------------------------------------
 
     /// The engine's own report: state, restarts and uptime. §17, §22.
@@ -833,10 +1200,9 @@ impl CloudDb {
     }
 }
 
-const BROADCAST_COLUMNS: &str = "SELECT id, user_id, name, media_id, destination_id, loop_forever,
-        desired_state, runtime_state, restart_count, last_error, created_at, started_at,
-        stopped_at, last_heartbeat, bytes_sent, uptime_secs, ffmpeg_exit_code, ffmpeg_pid
-        FROM broadcasts";
+// `SELECT *` would break the moment a migration adds a column in a different
+// order, and reading by name means adding one here is the only edit needed.
+const BROADCAST_COLUMNS: &str = "SELECT * FROM broadcasts";
 
 fn row_to_media(r: &rusqlite::Row<'_>) -> rusqlite::Result<CloudMedia> {
     let state: String = r.get(4)?;
@@ -874,27 +1240,59 @@ fn row_to_destination(r: &rusqlite::Row<'_>) -> rusqlite::Result<StreamDestinati
 }
 
 fn row_to_broadcast(r: &rusqlite::Row<'_>) -> rusqlite::Result<Broadcast> {
-    let desired: String = r.get(6)?;
-    let runtime: String = r.get(7)?;
+    // By name, not by position: there are now thirty-odd columns and a
+    // migration appends to the end, so counting them was a bug waiting to
+    // happen.
+    let desired: String = r.get("desired_state")?;
+    let runtime: String = r.get("runtime_state")?;
+    let privacy: String = r.get("privacy")?;
     Ok(Broadcast {
-        id: r.get(0)?,
-        user_id: r.get(1)?,
-        name: r.get(2)?,
-        media_id: r.get(3)?,
-        destination_id: r.get(4)?,
-        loop_forever: r.get::<_, i64>(5)? != 0,
+        id: r.get("id")?,
+        user_id: r.get("user_id")?,
+        name: r.get("name")?,
+        media_id: r.get("media_id")?,
+        destination_id: r.get("destination_id")?,
+        loop_forever: r.get::<_, i64>("loop_forever")? != 0,
         desired_state: DesiredState::from_id(&desired).unwrap_or(DesiredState::Stopped),
         runtime_state: RuntimeState::from_id(&runtime).unwrap_or(RuntimeState::Failed),
-        restart_count: r.get(8)?,
-        last_error: r.get(9)?,
-        created_at: r.get(10)?,
-        started_at: r.get(11)?,
-        stopped_at: r.get(12)?,
-        last_heartbeat: r.get(13)?,
-        bytes_sent: r.get(14)?,
-        uptime_secs: r.get(15)?,
-        ffmpeg_exit_code: r.get(16)?,
-        ffmpeg_pid: r.get(17)?,
+        restart_count: r.get("restart_count")?,
+        last_error: r.get("last_error")?,
+        created_at: r.get("created_at")?,
+        started_at: r.get("started_at")?,
+        stopped_at: r.get("stopped_at")?,
+        last_heartbeat: r.get("last_heartbeat")?,
+        bytes_sent: r.get("bytes_sent")?,
+        uptime_secs: r.get("uptime_secs")?,
+        ffmpeg_exit_code: r.get("ffmpeg_exit_code")?,
+        ffmpeg_pid: r.get("ffmpeg_pid")?,
+        title: r.get("title")?,
+        description: r.get("description")?,
+        tags: r.get("tags")?,
+        category: r.get("category")?,
+        privacy: Privacy::from_id(&privacy).unwrap_or(Privacy::Private),
+        settings: StreamSettings {
+            resolution: r.get("resolution")?,
+            fps: r.get("fps")?,
+            video_bitrate_kbps: r.get("video_bitrate_kbps")?,
+            audio_bitrate_kbps: r.get("audio_bitrate_kbps")?,
+        },
+        schedule: Schedule {
+            enabled: r.get::<_, i64>("sched_enabled")? != 0,
+            start_at: r.get("sched_start_at")?,
+            stop_at: r.get("sched_stop_at")?,
+            timezone: r.get("sched_timezone")?,
+            offset_minutes: r.get("sched_offset_minutes")?,
+            repeat_days: r.get("sched_repeat_days")?,
+            last_run_at: r.get("sched_last_run_at")?,
+        },
+        item_count: r.get("item_count")?,
+        play_count: r.get("play_count")?,
+        current_index: r.get("current_index")?,
+        current_item: r.get("current_item")?,
+        next_item: r.get("next_item")?,
+        current_position_secs: r.get("current_position_secs")?,
+        current_duration_secs: r.get("current_duration_secs")?,
+        cycle_duration_secs: r.get("cycle_duration_secs")?,
     })
 }
 

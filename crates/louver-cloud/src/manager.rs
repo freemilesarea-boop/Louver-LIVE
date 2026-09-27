@@ -31,7 +31,7 @@ use louver_core::streaming::ffmpeg::{FfmpegCommandBuilder, FfmpegTools};
 use louver_core::streaming::playlist::PlaybackMode;
 use louver_core::system::NoopSleepPreventer;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -44,6 +44,10 @@ const TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// which is right for a desktop a person is watching and wrong for a server.
 /// §5 asks for a ceiling, so past this the broadcast becomes `FAILED` and the
 /// thread stops rather than reconnecting into the night.
+/// How often the clock is checked. A minute's granularity is what a schedule
+/// form offers, so half of that is enough to never be late.
+const SCHEDULE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+
 const MAX_RESTARTS: i64 = 10;
 
 /// Makes the thing that launches a broadcast's process.
@@ -92,6 +96,9 @@ struct DbEvents {
     db: CloudDb,
     broadcast_id: String,
     sent: Mutex<Meter>,
+    /// Where this run rotated the playlist to, so a position can be reported in
+    /// the order the user arranged rather than the order FFmpeg was given.
+    offset: i64,
 }
 
 /// Bytes pushed to the ingest, accumulated across restarts.
@@ -131,6 +138,23 @@ impl RuntimeEvents for DbEvents {
             status.elapsed_secs,
             sent,
             status.supervisor.pid.map(i64::from),
+        );
+
+        // What the dashboard shows as NOW PLAYING / NEXT. The engine already
+        // tracks it — this only turns its rotated index back into the user's.
+        let count = status.item_count.max(1) as i64;
+        let engine_index = status.current_index.unwrap_or(0) as i64;
+        let _ = self.db.record_playlist_progress(
+            &self.broadcast_id,
+            &crate::models::PlaylistProgress {
+                index: (engine_index + self.offset).rem_euclid(count) + 1,
+                current_item: status.current_item.clone(),
+                next_item: status.next_item.clone(),
+                position_secs: position_in_item(status),
+                duration_secs: status.cycle_duration_secs / count as f64,
+                cycle_secs: status.cycle_duration_secs,
+                play_count: count,
+            },
         );
     }
 
@@ -251,6 +275,61 @@ impl BroadcastManager {
         Ok(started)
     }
 
+    /// Start the thread that watches the clock. §8.
+    ///
+    /// It holds nothing: every tick re-reads the schedules from the database and
+    /// asks [`crate::schedule::decide`] what to do. That is what makes a restart
+    /// recover schedules without recovery code — and what makes the behaviour
+    /// testable without a thread at all.
+    pub fn spawn_scheduler(&self) -> std::thread::JoinHandle<()> {
+        let mgr = self.clone();
+        std::thread::spawn(move || loop {
+            mgr.run_schedules(chrono::Utc::now());
+            std::thread::sleep(SCHEDULE_TICK);
+        })
+    }
+
+    /// One pass of the scheduler. Public so a test can drive it with its own
+    /// clock rather than waiting for one.
+    pub fn run_schedules(&self, now: chrono::DateTime<chrono::Utc>) {
+        let Ok(scheduled) = self.db.scheduled_broadcasts() else { return };
+        for b in scheduled {
+            match crate::schedule::decide(&b.schedule, b.desired_state, now) {
+                Some(crate::schedule::ScheduleAction::Start { occurrence }) => {
+                    // Recorded before the attempt, not after: a start that fails
+                    // on the plan limit must not be retried every thirty seconds
+                    // for the rest of the window.
+                    let _ = self.db.mark_scheduled_run(&b.id, &occurrence.to_rfc3339());
+                    match self.start(&b.user_id, &b.id) {
+                        Ok(()) => {
+                            let _ = self.db.append_event(
+                                &b.id,
+                                EventLevel::Info,
+                                "예약된 시각이 되어 방송을 시작했습니다",
+                            );
+                        }
+                        Err(e) => {
+                            let _ = self.db.append_event(
+                                &b.id,
+                                EventLevel::Error,
+                                &format!("예약 시작 실패: {e}"),
+                            );
+                        }
+                    }
+                }
+                Some(crate::schedule::ScheduleAction::Stop) => {
+                    let _ = self.stop(&b.user_id, &b.id);
+                    let _ = self.db.append_event(
+                        &b.id,
+                        EventLevel::Info,
+                        "예약된 종료 시각이 되어 방송을 중지했습니다",
+                    );
+                }
+                None => {}
+            }
+        }
+    }
+
     /// Ask every worker to finish, and wait. For a clean shutdown.
     pub fn shutdown(&self) {
         let ids: Vec<String> = self.running_ids();
@@ -276,18 +355,33 @@ impl BroadcastManager {
         }
 
         let b = self.db.broadcast(broadcast_id)?;
-        let prepared = self.db.prepared_media_for(&b.media_id)?;
+        let playlist = self.db.prepared_items_for(broadcast_id)?;
         let dest = self.db.destination(&b.destination_id)?;
 
         let dir = self.work_dir(broadcast_id);
         std::fs::create_dir_all(&dir)?;
 
-        // A core database of this broadcast's own, holding one playlist and one
-        // media row. The engine then behaves exactly as it does on a desktop,
+        // A core database of this broadcast's own, holding one playlist and its
+        // media rows. The engine then behaves exactly as it does on a desktop,
         // against the schema its own tests were written for.
         let core_db = Database::open(&dir.join("louver.db"))?;
-        let local = self.storage.localize(&prepared.prepared_key)?;
-        let playlist_id = project_into_core(&core_db, &local, &prepared)?;
+        let mut localized = Vec::with_capacity(playlist.len());
+        for m in &playlist {
+            let local = self.storage.localize(&m.prepared_key)?;
+            localized.push((m.clone(), local));
+        }
+
+        // Resume where it was, when there is a where. `current_index` is 1-based
+        // and already mapped into the user's order, so the rotation this run
+        // needs is that index minus one.
+        let resume_at = self
+            .db
+            .playlist_resume_point(broadcast_id)
+            .map(|(index, _)| (index.max(1) - 1) as usize)
+            .unwrap_or(0);
+        let rotated = rotate(&localized, resume_at.min(localized.len().saturating_sub(1)));
+        let playlist_id = project_into_core(&core_db, &rotated, &b.name)?;
+        let _ = self.db.record_playlist_offset(broadcast_id, resume_at as i64, rotated.len() as i64);
 
         core_db.set_setting(louver_core::settings_keys::RTMPS_URL, &dest.rtmps_url)?;
 
@@ -304,6 +398,7 @@ impl BroadcastManager {
             db: self.db.clone(),
             broadcast_id: broadcast_id.to_string(),
             sent: Mutex::new(Meter::default()),
+            offset: resume_at as i64,
         });
         let launcher = self.launchers.for_broadcast(&self.db, broadcast_id);
 
@@ -349,8 +444,10 @@ impl BroadcastManager {
             let db = self.db.clone();
             let id = broadcast_id.to_string();
             let workers = Arc::clone(&self.workers);
+            let loop_forever = b.loop_forever;
+            let user_id = b.user_id.clone();
             std::thread::spawn(move || {
-                run_until_stopped(rt, &db, &id, &stop);
+                run_until_stopped(rt, &db, &id, &stop, loop_forever, user_id);
                 // The thread is finishing; drop its own entry so a later start
                 // is not refused by a worker that no longer exists.
                 workers.lock().unwrap().remove(&id);
@@ -366,7 +463,14 @@ impl BroadcastManager {
 ///
 /// Deliberately thin: `tick()` already health-checks the child, applies the
 /// backoff and restarts. This decides only when to give up and when to leave.
-fn run_until_stopped(mut rt: BroadcastRuntime, db: &CloudDb, broadcast_id: &str, stop: &AtomicBool) {
+fn run_until_stopped(
+    mut rt: BroadcastRuntime,
+    db: &CloudDb,
+    broadcast_id: &str,
+    stop: &AtomicBool,
+    loop_forever: bool,
+    user_id: String,
+) {
     loop {
         if stop.load(Ordering::SeqCst) {
             let _ = rt.stop(true);
@@ -391,6 +495,27 @@ fn run_until_stopped(mut rt: BroadcastRuntime, db: &CloudDb, broadcast_id: &str,
 
         rt.tick();
         let _ = db.touch_heartbeat(broadcast_id);
+
+        // §2's "repeat off": FFmpeg is always started with `-stream_loop -1`,
+        // because a sender that exits is a sender the supervisor would restart.
+        // One pass is therefore ended here, by the server, once the engine says
+        // it has played as long as the playlist is — and it is ended as a
+        // deliberate stop, so nothing brings it back.
+        if !loop_forever {
+            let status = rt.status();
+            if status.cycle_duration_secs > 0.5 && (status.elapsed_secs as f64) >= status.cycle_duration_secs
+            {
+                let _ = rt.stop(true);
+                let _ = db.append_event(
+                    broadcast_id,
+                    EventLevel::Info,
+                    "플레이리스트를 한 번 재생하고 종료했습니다",
+                );
+                let _ = db.release_stream_slot(&user_id, broadcast_id);
+                let _ = db.record_runtime_only(broadcast_id, RuntimeState::Stopped);
+                return;
+            }
+        }
 
         if rt.status().supervisor.restart_count as i64 > MAX_RESTARTS {
             let _ = rt.stop(true);
@@ -418,39 +543,71 @@ pub struct PreparedMedia {
     pub fps: f64,
 }
 
-/// Write one playlist and one media row into a fresh core database.
+/// Write one playlist and its videos into a fresh core database.
 ///
 /// The engine reads playlists and media from a `louver-core` `Database`; the
 /// cloud's tables are its own. This is the whole of the translation, and it is
 /// the price of not altering migrations that run on customers' machines.
-fn project_into_core(db: &Database, local: &Path, m: &PreparedMedia) -> Result<i64> {
-    let playlist_id = db.create_playlist(&m.filename, PlaybackMode::Sequential, OutputProfile::P1080p30)?;
-    let path = local.to_string_lossy().into_owned();
-    let media_id = db.upsert_media(&CoreMedia {
-        id: 0,
-        source_path: path.clone(),
-        display_name: m.filename.clone(),
-        // Already prepared by the upload pipeline, so the engine treats it as
-        // broadcastable and never re-encodes at broadcast time.
-        status: MediaStatus::Normalized,
-        media_hash: m.media_id.clone(),
-        normalized_path: Some(path),
-        normalized_profile: Some(OutputProfile::P1080p30.id().to_string()),
-        normalized_duration_secs: Some(m.duration_secs),
-        duration_secs: m.duration_secs,
-        width: u32::try_from(m.width).unwrap_or(0),
-        height: u32::try_from(m.height).unwrap_or(0),
-        fps: m.fps,
-        video_codec: "h264".into(),
-        audio_codec: Some("aac".into()),
-        pixel_format: Some("yuv420p".into()),
-        is_hdr: false,
-        file_size: std::fs::metadata(local).map(|x| x.len()).unwrap_or(0),
-        added_at: String::new(),
-        last_error: None,
-    })?;
-    db.add_playlist_item(playlist_id, media_id)?;
+///
+/// One playlist with N items is what makes continuous streaming work: the engine
+/// writes a concat manifest of all of them and runs **one** FFmpeg with
+/// `-stream_loop -1 -c copy`, so moving from one video to the next is a file
+/// boundary inside a single RTMP connection. YouTube sees one uninterrupted
+/// stream; it never sees a disconnect between videos.
+fn project_into_core(db: &Database, items: &[(PreparedMedia, PathBuf)], name: &str) -> Result<i64> {
+    let playlist_id = db.create_playlist(name, PlaybackMode::Sequential, OutputProfile::P1080p30)?;
+    // The same video can appear more than once (a repeat), and one core media
+    // row should serve every appearance.
+    let mut seen: HashMap<String, i64> = HashMap::new();
+    for (m, local) in items {
+        let path = local.to_string_lossy().into_owned();
+        let media_id = match seen.get(&path) {
+            Some(id) => *id,
+            None => {
+                let id = db.upsert_media(&CoreMedia {
+                    id: 0,
+                    source_path: path.clone(),
+                    display_name: m.filename.clone(),
+                    // Already prepared by the upload pipeline, so the engine
+                    // treats it as broadcastable and never re-encodes at
+                    // broadcast time.
+                    status: MediaStatus::Normalized,
+                    media_hash: m.media_id.clone(),
+                    normalized_path: Some(path.clone()),
+                    normalized_profile: Some(OutputProfile::P1080p30.id().to_string()),
+                    normalized_duration_secs: Some(m.duration_secs),
+                    duration_secs: m.duration_secs,
+                    width: u32::try_from(m.width).unwrap_or(0),
+                    height: u32::try_from(m.height).unwrap_or(0),
+                    fps: m.fps,
+                    video_codec: "h264".into(),
+                    audio_codec: Some("aac".into()),
+                    pixel_format: Some("yuv420p".into()),
+                    is_hdr: false,
+                    file_size: std::fs::metadata(local).map(|x| x.len()).unwrap_or(0),
+                    added_at: String::new(),
+                    last_error: None,
+                })?;
+                seen.insert(path, id);
+                id
+            }
+        };
+        db.add_playlist_item(playlist_id, media_id)?;
+    }
     Ok(playlist_id)
+}
+
+/// Rotate a playlist so that `start_at` plays first.
+///
+/// This is §9's resume, done without touching the engine: a worker that comes
+/// back after a crash is handed the same videos in the same order, beginning at
+/// the one that was playing. The offset is stored so the dashboard can still
+/// show the position in the order the user arranged.
+fn rotate<T: Clone>(items: &[T], start_at: usize) -> Vec<T> {
+    if items.is_empty() || start_at == 0 || start_at >= items.len() {
+        return items.to_vec();
+    }
+    items[start_at..].iter().chain(items[..start_at].iter()).cloned().collect()
 }
 
 /// Stream mode the cloud broadcasts in. Copy, always — the file was prepared.
@@ -473,6 +630,21 @@ pub struct Dashboard {
     pub active: i64,
     pub allowed: i64,
     pub broadcasts: Vec<Broadcast>,
+}
+
+/// How far into the current video the engine is.
+///
+/// The engine reports elapsed time for the session and the length of one pass
+/// through the playlist; the position inside the current item is the remainder
+/// once whole items are taken out. Derived rather than stored because FFmpeg
+/// reports one clock for the whole concat input, not one per file.
+fn position_in_item(status: &RuntimeStatus) -> f64 {
+    let count = status.item_count.max(1) as f64;
+    let per_item = status.cycle_duration_secs / count;
+    if per_item <= 0.0 {
+        return status.elapsed_secs as f64;
+    }
+    (status.elapsed_secs as f64) % per_item
 }
 
 #[cfg(test)]

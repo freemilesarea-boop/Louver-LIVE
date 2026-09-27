@@ -163,6 +163,10 @@ async fn main() -> std::process::ExitCode {
         Err(e) => eprintln!("[louver] 복구 실패: {e}"),
     }
 
+    // §8: the clock is watched by the server, not by a browser. It holds no
+    // state, so it needs nothing from recovery.
+    let _scheduler = app.mgr.spawn_scheduler();
+
     let addr = std::env::var("LOUVER_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,

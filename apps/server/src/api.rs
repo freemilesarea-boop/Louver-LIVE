@@ -197,10 +197,50 @@ const MASK: &str = "••••••••••••";
 #[derive(Deserialize)]
 pub struct NewBroadcast {
     pub name: String,
-    pub media_id: String,
     pub destination_id: String,
+    /// The playlist, in order. This is what the web app sends.
+    #[serde(default)]
+    pub items: Vec<louver_cloud::db::NewItem>,
+    /// Shorthand for a playlist of plain videos.
+    #[serde(default)]
+    pub media_ids: Vec<String>,
+    /// One video, as the first release's clients sent it. Still accepted so
+    /// that a script written against that API keeps working.
+    #[serde(default)]
+    pub media_id: Option<String>,
     #[serde(default = "yes")]
     pub loop_forever: bool,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub privacy: Option<louver_cloud::Privacy>,
+    #[serde(default)]
+    pub settings: Option<louver_cloud::StreamSettings>,
+    #[serde(default)]
+    pub schedule: Option<louver_cloud::Schedule>,
+}
+
+impl NewBroadcast {
+    /// One playlist out of the three shapes a client may send.
+    fn playlist(&self) -> Vec<louver_cloud::db::NewItem> {
+        if !self.items.is_empty() {
+            return self.items.clone();
+        }
+        let ids = if !self.media_ids.is_empty() {
+            self.media_ids.clone()
+        } else {
+            self.media_id.clone().into_iter().collect()
+        };
+        ids.into_iter()
+            .map(|media_id| louver_cloud::db::NewItem { media_id, enabled: true, repeat_count: 1 })
+            .collect()
+    }
 }
 
 fn yes() -> bool {
@@ -214,25 +254,89 @@ pub async fn list_broadcasts(
     Ok(Json(crate::blocking(move || app.mgr.dashboard(&uid)).await?))
 }
 
+/// Create a broadcast with its playlist, metadata, settings and schedule.
+///
+/// The playlist is written in the same request rather than left for a second
+/// call: a broadcast with no videos cannot be started, and leaving one in the
+/// database would mean a dashboard row that fails the moment it is used.
 pub async fn create_broadcast(
     State(app): State<App>,
     Caller(uid): Caller,
     Json(b): Json<NewBroadcast>,
+) -> Out<louver_cloud::BroadcastDetail> {
+    let made = crate::blocking(move || {
+        let playlist = b.playlist();
+        let first = playlist
+            .first()
+            .ok_or_else(|| CloudError::Invalid("영상을 최소 한 개 선택해 주세요".into()))?
+            .media_id
+            .clone();
+        let made = app.db.create_broadcast(&uid, b.name.trim(), &first, &b.destination_id, b.loop_forever)?;
+        let items = app.db.replace_items(&uid, &made.id, &playlist)?;
+        let patch = louver_cloud::BroadcastPatch {
+            title: Some(b.title.clone().unwrap_or_else(|| b.name.trim().to_string())),
+            description: b.description.clone(),
+            tags: b.tags.clone(),
+            category: b.category.clone(),
+            privacy: b.privacy,
+            settings: b.settings.clone(),
+            schedule: b.schedule.clone(),
+            ..Default::default()
+        };
+        let broadcast = app.db.update_broadcast_owned(&uid, &made.id, &patch)?;
+        Ok(louver_cloud::BroadcastDetail { broadcast, items })
+    })
+    .await?;
+    Ok(Json(made))
+}
+
+/// Change a broadcast. Anything absent is left as it was.
+pub async fn update_broadcast(
+    State(app): State<App>,
+    Caller(uid): Caller,
+    Path(id): Path<String>,
+    Json(patch): Json<louver_cloud::BroadcastPatch>,
 ) -> Out<Broadcast> {
-    Ok(Json(
-        crate::blocking(move || {
-            app.db.create_broadcast(&uid, b.name.trim(), &b.media_id, &b.destination_id, b.loop_forever)
-        })
-        .await?,
-    ))
+    Ok(Json(crate::blocking(move || app.db.update_broadcast_owned(&uid, &id, &patch)).await?))
+}
+
+/// The playlist, in order.
+pub async fn list_items(
+    State(app): State<App>,
+    Caller(uid): Caller,
+    Path(id): Path<String>,
+) -> Out<Vec<louver_cloud::BroadcastItem>> {
+    Ok(Json(crate::blocking(move || app.db.items_owned(&uid, &id)).await?))
+}
+
+/// Replace the playlist with this list, in this order.
+///
+/// The whole list, because that is what a drag produces: every position after
+/// the moved row changed, and sending the result makes the stored order and the
+/// drawn order the same thing.
+pub async fn replace_items(
+    State(app): State<App>,
+    Caller(uid): Caller,
+    Path(id): Path<String>,
+    Json(items): Json<Vec<louver_cloud::db::NewItem>>,
+) -> Out<Vec<louver_cloud::BroadcastItem>> {
+    Ok(Json(crate::blocking(move || app.db.replace_items(&uid, &id, &items)).await?))
 }
 
 pub async fn get_broadcast(
     State(app): State<App>,
     Caller(uid): Caller,
     Path(id): Path<String>,
-) -> Out<Broadcast> {
-    Ok(Json(crate::blocking(move || app.db.broadcast_owned(&uid, &id)).await?))
+) -> Out<louver_cloud::BroadcastDetail> {
+    Ok(Json(
+        crate::blocking(move || {
+            Ok(louver_cloud::BroadcastDetail {
+                broadcast: app.db.broadcast_owned(&uid, &id)?,
+                items: app.db.items_for(&id)?,
+            })
+        })
+        .await?,
+    ))
 }
 
 pub async fn start_broadcast(

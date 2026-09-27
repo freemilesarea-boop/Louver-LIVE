@@ -206,13 +206,217 @@ pub struct StreamDestination {
     pub created_at: String,
 }
 
+/// Who may watch, on the destination that is eventually connected.
+///
+/// Stored and shown by 247streams. It is **not** applied to YouTube: a manual
+/// RTMPS key cannot set privacy, and pretending otherwise would be the one
+/// mistake here a user could not recover from. See `DestinationKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Privacy {
+    Public,
+    Unlisted,
+    Private,
+}
+
+impl Privacy {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Unlisted => "unlisted",
+            Self::Private => "private",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<Self> {
+        match s {
+            "public" => Some(Self::Public),
+            "unlisted" => Some(Self::Unlisted),
+            "private" => Some(Self::Private),
+            _ => None,
+        }
+    }
+}
+
+/// How a destination is driven.
+///
+/// Today there is one kind. The reason this enum exists before the second one
+/// does is §5: a YouTube-connected destination can set a title and a privacy,
+/// and a manual key cannot, so every feature that depends on that has to ask
+/// which it is rather than assume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DestinationKind {
+    /// A stream key pasted from YouTube Studio. Sends video; changes nothing
+    /// about the broadcast on YouTube's side.
+    ManualRtmps,
+    /// An account connected through OAuth, able to create and title a live
+    /// broadcast. Not implemented yet; the column exists so that the day it is,
+    /// old rows do not have to be guessed at.
+    YoutubeAccount,
+}
+
+impl DestinationKind {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::ManualRtmps => "manual_rtmps",
+            Self::YoutubeAccount => "youtube_account",
+        }
+    }
+
+    pub fn from_id(s: &str) -> Option<Self> {
+        match s {
+            "manual_rtmps" => Some(Self::ManualRtmps),
+            "youtube_account" => Some(Self::YoutubeAccount),
+            _ => None,
+        }
+    }
+
+    /// Can this destination carry a title, description or privacy to the
+    /// platform? Only an account can.
+    pub fn can_publish_metadata(self) -> bool {
+        matches!(self, Self::YoutubeAccount)
+    }
+}
+
+/// What the sender is asked to produce. §6.
+///
+/// `Auto` everywhere is the default and the only combination a user has to
+/// understand: the server sends the prepared file as it is, which is the
+/// cheapest and most stable thing it can do. The explicit values are stored and
+/// validated so that a broadcast keeps them, and are applied by the encoder path
+/// rather than the copy path.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StreamSettings {
+    /// `auto`, `720p` or `1080p`.
+    pub resolution: String,
+    /// `auto`, `30` or `60`.
+    pub fps: String,
+    /// 0 means auto.
+    pub video_bitrate_kbps: i64,
+    /// 0 means auto.
+    pub audio_bitrate_kbps: i64,
+}
+
+impl Default for StreamSettings {
+    fn default() -> Self {
+        Self { resolution: "auto".into(), fps: "auto".into(), video_bitrate_kbps: 0, audio_bitrate_kbps: 0 }
+    }
+}
+
+impl StreamSettings {
+    pub fn is_auto(&self) -> bool {
+        self.resolution == "auto"
+            && self.fps == "auto"
+            && self.video_bitrate_kbps == 0
+            && self.audio_bitrate_kbps == 0
+    }
+
+    /// Refuse a combination that would produce a stream YouTube drops.
+    ///
+    /// The ranges are YouTube's own recommendations, widened enough not to argue
+    /// with someone who knows what they are doing.
+    pub fn validate(&self) -> crate::Result<()> {
+        use crate::CloudError::Invalid;
+        if !["auto", "720p", "1080p"].contains(&self.resolution.as_str()) {
+            return Err(Invalid("해상도는 auto, 720p, 1080p 중 하나여야 합니다".into()));
+        }
+        if !["auto", "30", "60"].contains(&self.fps.as_str()) {
+            return Err(Invalid("프레임레이트는 auto, 30, 60 중 하나여야 합니다".into()));
+        }
+        if self.video_bitrate_kbps != 0 && !(1_000..=51_000).contains(&self.video_bitrate_kbps) {
+            return Err(Invalid("영상 비트레이트는 1000~51000 kbps 범위여야 합니다".into()));
+        }
+        if self.audio_bitrate_kbps != 0 && !(64..=512).contains(&self.audio_bitrate_kbps) {
+            return Err(Invalid("음성 비트레이트는 64~512 kbps 범위여야 합니다".into()));
+        }
+        // 1080p60 at a bitrate meant for 720p30 looks worse than either. The
+        // floor is what YouTube itself asks for at that size.
+        let floor = match (self.resolution.as_str(), self.fps.as_str()) {
+            ("1080p", "60") => 4_500,
+            ("1080p", _) => 3_000,
+            ("720p", "60") => 2_250,
+            ("720p", _) => 1_500,
+            _ => 0,
+        };
+        if self.video_bitrate_kbps != 0 && floor != 0 && self.video_bitrate_kbps < floor {
+            return Err(Invalid(format!(
+                "{} {}fps 에는 최소 {floor} kbps 가 필요합니다",
+                self.resolution, self.fps
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// When a broadcast should start by itself. §8.
+///
+/// Times are stored as UTC and only ever rendered in the user's zone, because a
+/// server that moves between regions must not move a broadcast with it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Schedule {
+    pub enabled: bool,
+    /// RFC 3339, UTC. The first (or next) start.
+    pub start_at: Option<String>,
+    /// RFC 3339, UTC. Optional automatic stop.
+    pub stop_at: Option<String>,
+    /// IANA zone the user chose. Shown to them, and never used for arithmetic.
+    pub timezone: String,
+    /// Minutes east of UTC when the schedule was set. Which local day an
+    /// instant falls on is decided with this, so that a daily repeat means the
+    /// same clock time to the user without this service carrying a timezone
+    /// database. A DST change moves a repeat by an hour until it is saved again.
+    #[serde(default)]
+    pub offset_minutes: i64,
+    /// Bitmask, Monday = bit 0. `0` means "once, at `start_at`".
+    pub repeat_days: i64,
+    /// The last occurrence this schedule actually started, so one window is
+    /// never started twice — including after a restart.
+    pub last_run_at: Option<String>,
+}
+
+impl Default for Schedule {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_at: None,
+            stop_at: None,
+            timezone: "UTC".into(),
+            offset_minutes: 0,
+            repeat_days: 0,
+            last_run_at: None,
+        }
+    }
+}
+
+/// One video in a broadcast's playlist. §1.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BroadcastItem {
+    pub id: String,
+    pub broadcast_id: String,
+    pub media_id: String,
+    /// 0-based, and dense: reordering rewrites every row's position.
+    pub position: i64,
+    pub enabled: bool,
+    /// How many times in a row this item plays. 1 is once.
+    pub repeat_count: i64,
+    // --- joined from `media`, for a UI that must not fetch twice -----------
+    pub filename: String,
+    pub duration_secs: f64,
+    pub state: MediaState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Broadcast {
     pub id: String,
     pub user_id: String,
     pub name: String,
+    /// The first item's media, kept so that every reader written before
+    /// playlists — including a rollback to the previous release — still finds
+    /// the column it expects.
     pub media_id: String,
     pub destination_id: String,
+    /// Play the whole playlist again when it ends. §2's 24/7 setting.
     pub loop_forever: bool,
     pub desired_state: DesiredState,
     pub runtime_state: RuntimeState,
@@ -230,6 +434,42 @@ pub struct Broadcast {
     /// looking at `top` beside the dashboard, and for nothing else: it is not
     /// a handle anything in the API acts on.
     pub ffmpeg_pid: Option<i64>,
+
+    // --- 247streams broadcast metadata (§4) -------------------------------
+    // Ours. Applied to the platform only by a destination that can
+    // (`DestinationKind::can_publish_metadata`).
+    pub title: String,
+    pub description: String,
+    /// Comma separated, as typed.
+    pub tags: String,
+    pub category: String,
+    pub privacy: Privacy,
+
+    pub settings: StreamSettings,
+    pub schedule: Schedule,
+
+    // --- playlist runtime, written by the worker (§2, §10) ---------------
+    /// Videos in the playlist, as the editor shows them.
+    pub item_count: i64,
+    /// Entries in one pass, once `repeat_count` is expanded. What the
+    /// "2 / 8" on the dashboard counts.
+    pub play_count: i64,
+    /// 1-based for display; 0 when nothing is playing.
+    pub current_index: i64,
+    pub current_item: Option<String>,
+    pub next_item: Option<String>,
+    pub current_position_secs: f64,
+    pub current_duration_secs: f64,
+    /// One pass through the playlist, in seconds.
+    pub cycle_duration_secs: f64,
+}
+
+/// A broadcast plus its playlist, for the screen that edits one.
+#[derive(Debug, Clone, Serialize)]
+pub struct BroadcastDetail {
+    #[serde(flatten)]
+    pub broadcast: Broadcast,
+    pub items: Vec<BroadcastItem>,
 }
 
 impl Broadcast {
@@ -252,4 +492,33 @@ pub struct BroadcastEvent {
     pub at: String,
     pub level: String,
     pub message: String,
+}
+
+/// The fields of a broadcast a user may change. Absent means "leave it".
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BroadcastPatch {
+    pub name: Option<String>,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub tags: Option<String>,
+    pub category: Option<String>,
+    pub privacy: Option<Privacy>,
+    pub loop_forever: Option<bool>,
+    pub destination_id: Option<String>,
+    pub settings: Option<StreamSettings>,
+    pub schedule: Option<Schedule>,
+}
+
+/// Where the playlist has got to, as the worker sees it.
+#[derive(Debug, Clone, Default)]
+pub struct PlaylistProgress {
+    /// 1-based for display. 0 when nothing is playing.
+    pub index: i64,
+    pub current_item: Option<String>,
+    pub next_item: Option<String>,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    pub cycle_secs: f64,
+    /// Entries in one pass. 0 leaves the stored value alone.
+    pub play_count: i64,
 }
