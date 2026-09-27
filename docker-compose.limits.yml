@@ -1,0 +1,15 @@
+# Optional resource ceilings. Apply with:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.limits.yml up -d --build
+#
+# Set LOUVER_CPUS to at most the number of cores the host actually has —
+# Docker rejects a larger value outright rather than treating it as "no limit".
+# Worth doing when something else shares the machine; pointless when the server
+# is dedicated to broadcasting.
+services:
+  louver:
+    deploy:
+      resources:
+        limits:
+          cpus: '${LOUVER_CPUS:-2}'
+          memory: ${LOUVER_MEMORY:-3g}

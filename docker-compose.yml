@@ -2,7 +2,8 @@
 # difference is the environment, not the topology.
 #
 #   cp .env.example .env        # then set LOUVER_MASTER_KEY
-#   docker compose up --build
+#   docker compose up -d --build            # http://<ip>:8080
+#   docker compose --profile https up -d --build   # needs LOUVER_DOMAIN
 services:
   louver:
     build: .
@@ -26,14 +27,11 @@ services:
     volumes:
       # The database, the originals and the prepared copies.
       - louver-data:/var/lib/louver
-    # FFmpeg is the whole workload: one stream-copy send is cheap, a transcode
-    # at upload is not. Give it room and cap it so one tenant's upload cannot
-    # starve everyone's broadcasts.
-    deploy:
-      resources:
-        limits:
-          cpus: '${LOUVER_CPUS:-4}'
-          memory: ${LOUVER_MEMORY:-4g}
+    # No CPU or memory ceiling by default. Docker refuses a `cpus` limit larger
+    # than the host has, so a default of 4 made every 2-vCPU server fail to
+    # start — and the server is one process whose work is FFmpeg, which there is
+    # no reason to starve on a box dedicated to it. To cap it anyway:
+    #   docker compose -f docker-compose.yml -f docker-compose.limits.yml up -d
     healthcheck:
       test: ['CMD', 'louver-server', '--health-check']
       interval: 30s
@@ -53,7 +51,11 @@ services:
       - '80:80'
       - '443:443'
     environment:
-      LOUVER_DOMAIN: ${LOUVER_DOMAIN:?set LOUVER_DOMAIN in .env to use the https profile}
+      # No `:?` here. Compose interpolates the entire file before it decides
+      # which profiles are active, so a required-variable marker in this
+      # inactive service aborted every IP-only deployment. The `https` profile
+      # is opt-in; when it is on and this is empty, Caddy says so itself.
+      LOUVER_DOMAIN: ${LOUVER_DOMAIN:-}
       LOUVER_TLS_EMAIL: ${LOUVER_TLS_EMAIL:-}
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro

@@ -137,13 +137,28 @@ scripts/deploy-vps.sh root@203.0.113.10 \
 > docker compose exec -T louver louver-server --create-user me@example.com --plan business
 > ```
 
+### 1-1. 방화벽 (Hetzner 등 클라우드에서 거의 항상 걸립니다)
+
+도메인 없이 IP로 접속하려면 **인바운드 TCP 8080**이 열려 있어야 합니다.
+도메인을 쓰면 **80, 443**입니다.
+
+- Hetzner Cloud: 콘솔 → Firewalls → 해당 방화벽 → Inbound rules에 추가
+- 서버 안에서 `ufw`를 켜 두었다면: `ufw allow 8080/tcp`
+
+배포 스크립트가 마지막에 내 컴퓨터에서 직접 접속을 시도해 보고, 닿지 않으면
+이 안내를 출력합니다. 방화벽을 건드리고 싶지 않으면 아래 SSH 터널을 쓰면 됩니다
+(포트를 하나도 열지 않아도 됩니다).
+
 ### 2. 접속 — 세 가지 중 하나
 
 | 방법 | 명령 / 주소 | 언제 |
 | --- | --- | --- |
 | **SSH 터널** (권장, 도메인 불필요) | `ssh -N -L 8080:127.0.0.1:8080 root@203.0.113.10` → `http://localhost:8080` | 도메인 없이 안전하게. 통신이 SSH로 암호화됩니다 |
 | **도메인 + HTTPS** | `https://live.example.com` | 다른 사람도 쓰게 할 때. 인증서는 Caddy가 자동 발급/갱신 |
-| **IP 직접** | `http://203.0.113.10:8080` | 가장 간단하지만 **암호화되지 않습니다** — 로그인 토큰이 평문으로 지나갑니다 |
+| **IP 직접** | `http://203.0.113.10:8080` | 가장 간단하지만 **암호화되지 않습니다** — 로그인 토큰이 평문으로 지나갑니다. 8080 포트를 열어야 합니다 |
+
+도메인이 없어도 배포는 완전히 지원됩니다. `--domain` 을 주지 않으면 Caddy(HTTPS)
+서비스는 아예 생성되지 않고, 앱만 8080에서 뜹니다.
 
 화면 맨 위에 **REMOTE CLOUD SERVER**가 보이면 제대로 올라간 것입니다.
 
@@ -182,6 +197,17 @@ YouTube 송출이 안 됩니다(방송을 시작해 보고 알게 되는 대신 
 서버(VPS)를 재부팅해도 방송은 돌아옵니다. `restart: unless-stopped` 로 컨테이너가
 다시 뜨고, 뜨자마자 `desired_state=running`이던 방송을 복구합니다. 30초 안팎의
 끊김이 있습니다.
+
+### 4-1. 자원 제한 (선택)
+
+기본값은 **제한 없음**입니다. Docker는 호스트 코어 수보다 큰 `cpus` 값을 무시하지
+않고 거부하기 때문에, 2 vCPU 서버에서 기본 제한이 들어 있으면 컨테이너가 아예
+시작되지 않습니다. 굳이 걸고 싶으면:
+
+```bash
+# .env 에 LOUVER_CPUS / LOUVER_MEMORY 를 넣고 (코어 수 이하로)
+docker compose -f docker-compose.yml -f docker-compose.limits.yml up -d --build
+```
 
 ### 5. 백업해야 하는 것
 

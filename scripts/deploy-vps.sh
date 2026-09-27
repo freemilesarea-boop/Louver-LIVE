@@ -128,20 +128,45 @@ REMOTE
 
 say "빌드 및 실행 (처음에는 몇 분 걸립니다)"
 if [ -n "$DOMAIN" ]; then
+  # Compose interpolates the whole file before it filters profiles, so the
+  # `https` service can no longer declare its variable as required — that marker
+  # broke every deployment that did not use it. The check moved here, where it
+  # only applies to the run that actually needs it.
+  ssh "$TARGET" "cd '$REMOTE_DIR' && grep -qE '^LOUVER_DOMAIN=.+' .env" || {
+    echo "  .env 에 LOUVER_DOMAIN 이 없습니다. --domain 없이 다시 실행하면 IP로 접속합니다." >&2
+    exit 1
+  }
   ssh "$TARGET" "cd '$REMOTE_DIR' && docker compose --profile https up -d --build"
 else
   ssh "$TARGET" "cd '$REMOTE_DIR' && docker compose up -d --build"
 fi
 
 say "상태 확인"
-# `--health-check` prints the body it got, so this shows which part is up.
-ssh "$TARGET" "cd '$REMOTE_DIR' && for i in \$(seq 1 60); do
-    if docker compose exec -T louver louver-server --health-check 2>/dev/null; then
-      exit 0
+# `--health-check` prints the body it got even when a check failed, so this can
+# tell a server that is still starting from one that is up but missing
+# something — and only the first is a reason to stop.
+set +e
+ssh "$TARGET" "cd '$REMOTE_DIR' && for i in \$(seq 1 90); do
+    out=\$(docker compose exec -T louver louver-server --health-check 2>/dev/null)
+    if [ -n \"\$out\" ]; then
+      echo \"  \$out\"
+      case \"\$out\" in
+        *'\"status\":\"ok\"'*) exit 0 ;;
+        *) exit 3 ;;
+      esac
     fi
     sleep 2
   done
-  echo '  서버가 응답하지 않습니다. 로그:'; docker compose logs --tail 40 louver; exit 1"
+  echo '  서버가 응답하지 않습니다. 최근 로그:'
+  docker compose logs --tail 40 louver
+  exit 1"
+HEALTH_RC=$?
+set -e
+case "$HEALTH_RC" in
+  0) ;;
+  3) echo "  경고: 위 JSON에서 false인 항목이 있습니다. 서버는 응답하므로 계속 진행합니다." ;;
+  *) exit 1 ;;
+esac
 
 if [ -n "$ACCOUNT" ]; then
   say "계정 만들기: $ACCOUNT ($PLAN)"
@@ -155,6 +180,30 @@ if [ -n "$ACCOUNT" ]; then
 fi
 
 HOST_ONLY="${TARGET#*@}"
+
+say "밖에서 접속되는지 확인"
+if [ -n "$DOMAIN" ]; then
+  PROBE="https://$DOMAIN/health"
+else
+  PROBE="http://$HOST_ONLY:8080/health"
+fi
+if curl -fsS --max-time 8 "$PROBE" 2>/dev/null; then
+  printf '\n  %s 로 접속됩니다\n' "$PROBE"
+else
+  cat <<EOF
+  이 컴퓨터에서 $PROBE 에 닿지 않습니다. 서버 안에서는 정상이므로 방화벽입니다.
+
+  - Hetzner Cloud Firewall: 콘솔 → Firewalls → 인바운드 TCP $( [ -n "$DOMAIN" ] && echo '80, 443' || echo '8080' ) 허용
+  - 서버 안의 ufw 를 쓰고 있다면:
+EOF
+  ssh "$TARGET" 'if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+      echo "      ufw 가 켜져 있습니다. 서버에서:  ufw allow 8080/tcp   (도메인 사용 시 80,443)"
+    else
+      echo "      ufw 는 꺼져 있습니다 — 클라우드 방화벽 쪽을 보세요."
+    fi'
+  echo "  또는 방화벽을 건드리지 않고 SSH 터널로 접속하세요 (아래)."
+fi
+
 say "완료"
 if [ -n "$DOMAIN" ]; then
   cat <<EOF
