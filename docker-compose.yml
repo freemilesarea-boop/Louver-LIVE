@@ -40,5 +40,29 @@ services:
       timeout: 5s
       start_period: 15s
 
+  # HTTPS, only when you ask for it:  docker compose --profile https up -d --build
+  #
+  # A domain pointed at this server gets a real certificate automatically. With
+  # it in front, set LOUVER_COOKIE_SECURE=always and publish the app on
+  # loopback only (LOUVER_PORT=127.0.0.1:8080) so nothing reaches it unencrypted.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ['https']
+    restart: unless-stopped
+    ports:
+      - '80:80'
+      - '443:443'
+    environment:
+      LOUVER_DOMAIN: ${LOUVER_DOMAIN:?set LOUVER_DOMAIN in .env to use the https profile}
+      LOUVER_TLS_EMAIL: ${LOUVER_TLS_EMAIL:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - louver
+
 volumes:
   louver-data:
+  caddy-data:
+  caddy-config:

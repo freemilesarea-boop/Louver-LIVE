@@ -18,6 +18,10 @@ pub struct Health {
     /// `local` or `cloud`. What decides whether closing a laptop ends a
     /// broadcast, so it is the first thing the UI shows.
     pub deployment: String,
+    /// `auto`, `always` or `never` — when the session cookie carries `Secure`.
+    /// Here because a login that appears to succeed and then 401s is almost
+    /// always this, and this is the fastest place to see it.
+    pub cookies: &'static str,
     pub checks: Checks,
 }
 
@@ -26,6 +30,10 @@ pub struct Checks {
     pub api: bool,
     pub database: bool,
     pub ffmpeg: bool,
+    /// Can this FFmpeg speak `rtmps`? YouTube accepts nothing else, and a build
+    /// without TLS support fails only at the moment a broadcast starts — which
+    /// is the worst time to find out. Checked here so a deploy says it up front.
+    pub ffmpeg_rtmps: bool,
     pub storage: bool,
 }
 
@@ -42,41 +50,57 @@ pub fn deployment() -> String {
 }
 
 pub async fn health(State(app): State<App>) -> (StatusCode, Json<Health>) {
-    let checks = tokio::task::spawn_blocking(move || Checks {
-        api: true,
-        database: app.db.ping().is_ok(),
-        ffmpeg: ffmpeg_runs(&app.tools.ffmpeg),
-        storage: storage_writable(&app),
+    let checks = tokio::task::spawn_blocking(move || {
+        let (ffmpeg, rtmps) = ffmpeg_state(&app.tools.ffmpeg);
+        Checks {
+            api: true,
+            database: app.db.ping().is_ok(),
+            ffmpeg,
+            ffmpeg_rtmps: rtmps,
+            storage: storage_writable(&app),
+        }
     })
     .await
-    .unwrap_or(Checks { api: true, database: false, ffmpeg: false, storage: false });
+    .unwrap_or(Checks {
+        api: true,
+        database: false,
+        ffmpeg: false,
+        ffmpeg_rtmps: false,
+        storage: false,
+    });
 
-    let ok = checks.api && checks.database && checks.ffmpeg && checks.storage;
+    let ok = checks.api && checks.database && checks.ffmpeg && checks.ffmpeg_rtmps && checks.storage;
     let body = Health {
         status: if ok { "ok" } else { "degraded" },
         version: env!("CARGO_PKG_VERSION"),
         deployment: deployment(),
+        cookies: crate::auth::CookiePolicy::from_env().name(),
         checks,
     };
     // 503 when degraded, so an orchestrator does not have to parse the body.
     (if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(body))
 }
 
-/// Does FFmpeg actually run? Not "is there a file at this path".
+/// Does FFmpeg run, and can it reach an RTMPS ingest?
 ///
 /// Spawned every time rather than cached. A cache would have to be keyed on
-/// nothing — the path cannot change while the process lives — and it would
-/// mean a health answer that is up to a minute stale about the one part of the
-/// system that a bad deploy actually breaks. `-version` costs milliseconds.
-fn ffmpeg_runs(program: &std::path::Path) -> bool {
-    std::process::Command::new(program)
-        .arg("-version")
+/// nothing — the path cannot change while the process lives — and it would mean
+/// a health answer that is up to a minute stale about the one part of the system
+/// a bad deploy actually breaks. Listing protocols costs milliseconds.
+fn ffmpeg_state(program: &std::path::Path) -> (bool, bool) {
+    let Ok(out) = std::process::Command::new(program)
+        .args(["-hide_banner", "-protocols"])
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .output()
+    else {
+        return (false, false);
+    };
+    if !out.status.success() {
+        return (false, false);
+    }
+    let listed = String::from_utf8_lossy(&out.stdout);
+    let rtmps = listed.split_whitespace().any(|p| p == "rtmps");
+    (true, rtmps)
 }
 
 /// Write a byte and take it back. A full or read-only volume fails here rather

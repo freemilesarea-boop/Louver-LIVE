@@ -444,7 +444,7 @@ async fn health_answers_without_a_session_and_names_what_is_broken() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
     assert_eq!(r.json()["status"], "ok");
     // The four things the operator asked for, each its own answer.
-    for check in ["api", "database", "ffmpeg", "storage"] {
+    for check in ["api", "database", "ffmpeg", "ffmpeg_rtmps", "storage"] {
         assert_eq!(r.json()["checks"][check], true, "{check} failed: {}", r.body);
     }
     // And where this is running, which is what decides whether closing a
@@ -461,6 +461,7 @@ async fn health_answers_without_a_session_and_names_what_is_broken() {
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(r.json()["status"], "degraded");
     assert_eq!(r.json()["checks"]["ffmpeg"], false);
+    assert_eq!(r.json()["checks"]["ffmpeg_rtmps"], false, "a missing FFmpeg cannot speak rtmps");
     assert_eq!(r.json()["checks"]["database"], true, "one failure must not mask the rest");
 }
 

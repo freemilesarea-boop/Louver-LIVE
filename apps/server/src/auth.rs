@@ -65,17 +65,98 @@ fn token_from(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// A session cookie the page's JavaScript cannot read.
+/// When the session cookie carries `Secure`.
 ///
-/// `Secure` is on unless a developer asks for plain HTTP explicitly, because
-/// the safe default has to be the one you get by doing nothing.
-fn session_cookie(token: &str) -> String {
+/// This exists because "always Secure" silently breaks the most common first
+/// deployment there is. A `Secure` cookie is never returned by a browser over
+/// plain `http://`, so a server reached at `http://<ip>:8080` accepts the
+/// password, sets a cookie the browser throws away, and answers 401 to
+/// everything after it. The login page then reappears with no error — the worst
+/// kind of failure, because nothing looks broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CookiePolicy {
+    /// `Secure` when the request arrived over HTTPS, and not when it did not.
+    /// The default: correct behind a TLS proxy, and working over a bare IP.
+    Auto,
+    /// Always `Secure`. What to set once HTTPS is in front of this.
+    Always,
+    /// Never `Secure`. Plain HTTP only.
+    Never,
+}
+
+impl CookiePolicy {
+    pub fn from_env() -> Self {
+        // The older flag keeps working; it was documented before this existed.
+        if std::env::var("LOUVER_INSECURE_COOKIES").as_deref() == Ok("1") {
+            return Self::Never;
+        }
+        match std::env::var("LOUVER_COOKIE_SECURE").unwrap_or_default().trim().to_lowercase().as_str() {
+            "always" | "1" | "true" => Self::Always,
+            "never" | "0" | "false" => Self::Never,
+            _ => Self::Auto,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Always => "always",
+            Self::Never => "never",
+        }
+    }
+}
+
+/// Did this request reach us over TLS?
+///
+/// Read from the proxy's own headers, because the server itself always speaks
+/// plain HTTP — TLS is terminated by Caddy, nginx or whatever is in front.
+fn arrived_over_https(headers: &HeaderMap) -> bool {
+    if let Some(proto) = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()) {
+        // A chain of proxies appends, so the first entry is the client's.
+        if proto.split(',').next().map(str::trim).is_some_and(|p| p.eq_ignore_ascii_case("https")) {
+            return true;
+        }
+    }
+    // RFC 7239, for proxies that send the standard header instead.
+    headers
+        .get("forwarded")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|f| f.to_ascii_lowercase().contains("proto=https"))
+}
+
+pub fn secure_flag(policy: CookiePolicy, headers: &HeaderMap) -> bool {
+    match policy {
+        CookiePolicy::Always => true,
+        CookiePolicy::Never => false,
+        CookiePolicy::Auto => arrived_over_https(headers),
+    }
+}
+
+/// Is the browser somewhere that plain HTTP is not a real exposure?
+///
+/// `localhost` is a secure context in every current browser — a `Secure` cookie
+/// is both accepted and returned there — and nothing leaves the machine.
+fn host_is_local(headers: &HeaderMap) -> bool {
+    let host = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let name = host.split(':').next().unwrap_or("");
+    matches!(name, "localhost" | "127.0.0.1" | "::1" | "[::1]") || name.is_empty()
+}
+
+/// A session cookie the page's JavaScript cannot read.
+fn session_cookie(token: &str, headers: &HeaderMap) -> String {
     let mut c = format!(
         "{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}",
         SESSION_DAYS * 24 * 60 * 60
     );
-    if std::env::var("LOUVER_INSECURE_COOKIES").as_deref() != Ok("1") {
+    if secure_flag(CookiePolicy::from_env(), headers) {
         c.push_str("; Secure");
+    } else if !host_is_local(headers) {
+        // Said once per sign-in rather than hidden in a doc: the token just
+        // travelled in the clear to something that is not this machine.
+        eprintln!(
+            "[louver] 경고: 세션 쿠키가 암호화되지 않은 연결로 전달되었습니다. \
+             공개 서버라면 HTTPS를 앞에 두고 LOUVER_COOKIE_SECURE=always 를 설정하세요."
+        );
     }
     c
 }
@@ -100,7 +181,7 @@ pub struct Me {
 
 type Answer = std::result::Result<(HeaderMap, Json<Me>), ApiError>;
 
-pub async fn register(State(app): State<App>, Json(body): Json<Credentials>) -> Answer {
+pub async fn register(State(app): State<App>, headers: HeaderMap, Json(body): Json<Credentials>) -> Answer {
     let (me, token) = crate::blocking(move || {
         check_password(&body.password)?;
         let email = normalize_email(&body.email)?;
@@ -112,10 +193,10 @@ pub async fn register(State(app): State<App>, Json(body): Json<Credentials>) -> 
         Ok((Me { id: user.id, email: user.email, plan_id: user.plan_id }, token))
     })
     .await?;
-    Ok((with_cookie(session_cookie(&token)), Json(me)))
+    Ok((with_cookie(session_cookie(&token, &headers)), Json(me)))
 }
 
-pub async fn login(State(app): State<App>, Json(body): Json<Credentials>) -> Answer {
+pub async fn login(State(app): State<App>, headers: HeaderMap, Json(body): Json<Credentials>) -> Answer {
     let (me, token) = crate::blocking(move || {
         let email = normalize_email(&body.email)?;
         // The same error for an unknown address as for a wrong password, so the
@@ -130,7 +211,7 @@ pub async fn login(State(app): State<App>, Json(body): Json<Credentials>) -> Ans
         Ok((Me { id: user.id, email: user.email, plan_id: user.plan_id }, token))
     })
     .await?;
-    Ok((with_cookie(session_cookie(&token)), Json(me)))
+    Ok((with_cookie(session_cookie(&token, &headers)), Json(me)))
 }
 
 /// Ends this session server-side, not only in the browser.
@@ -175,4 +256,62 @@ fn check_password(p: &str) -> Result<()> {
         return Err(CloudError::Invalid("비밀번호는 10자 이상이어야 합니다".into()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod cookie_policy_tests {
+    use super::*;
+    use axum::http::header::HeaderValue;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn auto_follows_the_proxy_and_therefore_works_over_a_bare_ip() {
+        let plain = headers(&[("host", "203.0.113.10:8080")]);
+        let tls = headers(&[("host", "live.example.com"), ("x-forwarded-proto", "https")]);
+
+        // No TLS in front: a Secure cookie would be discarded by the browser
+        // and every request after the login would answer 401.
+        assert!(!secure_flag(CookiePolicy::Auto, &plain));
+        assert!(secure_flag(CookiePolicy::Auto, &tls));
+
+        // A chain of proxies appends; the client's entry comes first.
+        let chained = headers(&[("x-forwarded-proto", "https, http")]);
+        assert!(secure_flag(CookiePolicy::Auto, &chained));
+
+        // And the RFC 7239 spelling, for proxies that send that instead.
+        let forwarded = headers(&[("forwarded", "for=192.0.2.1;proto=https;by=proxy")]);
+        assert!(secure_flag(CookiePolicy::Auto, &forwarded));
+    }
+
+    #[test]
+    fn always_and_never_ignore_the_request() {
+        let plain = headers(&[("host", "203.0.113.10:8080")]);
+        assert!(secure_flag(CookiePolicy::Always, &plain));
+        assert!(!secure_flag(CookiePolicy::Never, &headers(&[("x-forwarded-proto", "https")])));
+    }
+
+    #[test]
+    fn a_cookie_is_httponly_and_samesite_whatever_the_policy() {
+        let c = session_cookie("t", &headers(&[("host", "localhost:8080")]));
+        assert!(c.contains("HttpOnly"), "{c}");
+        assert!(c.contains("SameSite=Strict"), "{c}");
+        assert!(c.contains("Path=/"), "{c}");
+    }
+
+    #[test]
+    fn localhost_is_not_treated_as_an_exposure() {
+        assert!(host_is_local(&headers(&[("host", "localhost:8080")])));
+        assert!(host_is_local(&headers(&[("host", "127.0.0.1:8080")])));
+        assert!(!host_is_local(&headers(&[("host", "203.0.113.10:8080")])));
+    }
 }

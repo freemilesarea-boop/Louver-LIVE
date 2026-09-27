@@ -1,0 +1,20 @@
+# TLS for the cloud deployment. Used only by the `https` compose profile.
+#
+# Caddy gets a certificate for LOUVER_DOMAIN by itself, renews it, and tells the
+# app the request arrived over HTTPS — which is what makes the session cookie
+# `Secure` under the default `auto` policy.
+
+{
+	email {$LOUVER_TLS_EMAIL}
+}
+
+{$LOUVER_DOMAIN} {
+	encode zstd gzip
+
+	reverse_proxy louver:8080 {
+		# The dashboard's live updates are one long server-sent-events response.
+		# Buffering it would make the page look frozen for as long as the buffer
+		# takes to fill, so nothing here is buffered.
+		flush_interval -1
+	}
+}

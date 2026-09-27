@@ -23,6 +23,11 @@ fn health_check() -> std::process::ExitCode {
     }
     let mut answer = String::new();
     let _ = sock.read_to_string(&mut answer);
+    // The body, so an operator running this by hand — or a deploy script — sees
+    // which check failed rather than only that something did.
+    if let Some(body) = answer.split("\r\n\r\n").nth(1) {
+        println!("{}", body.trim());
+    }
     if answer.starts_with("HTTP/1.") && answer.contains(" 200 ") {
         std::process::ExitCode::SUCCESS
     } else {

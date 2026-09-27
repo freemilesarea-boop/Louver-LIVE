@@ -97,56 +97,111 @@ curl -s http://127.0.0.1:8080/health
 
 ---
 
-## B. VPS 배포 (컴퓨터를 꺼도 유지되는 진짜 테스트)
+## B. VPS 배포 — 컴퓨터를 꺼도 유지되는 진짜 테스트
 
-리눅스 서버(Ubuntu 22.04 이상, Docker 설치)에서:
+**내 Mac에서 명령 한 번으로 리눅스 서버에 올립니다.**
 
-```bash
-git clone <이 저장소> louver && cd louver
-cp .env.example .env
-# .env 를 열어 LOUVER_MASTER_KEY 를 채웁니다:
-#   openssl rand -hex 32
-docker compose up -d --build
-```
+준비물: Ubuntu 22.04 이상(또는 Debian 12) VPS 하나, SSH 접속, 그리고 그 서버의
+IP. 사양은 **2 vCPU / 4 GB RAM / 40 GB 디스크**면 동시 3개 방송에 충분합니다
+(스트림 복사라 CPU를 거의 쓰지 않습니다. 업로드 변환할 때만 코어 하나를 씁니다).
 
-`docker compose up` 한 번으로 Web, API, 데이터베이스(SQLite), Broadcast
-Manager, FFmpeg Worker가 전부 한 컨테이너에서 실행됩니다.
+> **대역폭을 먼저 보세요.** 1080p 6 Mbps로 24시간 송출하면 한 방송이 **월 약
+> 1.9 TB**, 3개면 **약 5.8 TB**입니다. "월 1 TB 트래픽" 요금제라면 며칠 만에
+> 한도를 넘습니다. 하루짜리 테스트는 한 방송당 약 65 GB이므로 대부분 괜찮지만,
+> 계속 돌릴 거라면 트래픽 무제한(또는 수십 TB) VPS를 고르세요.
 
-계정 만들기:
+### 1. 배포
 
 ```bash
-docker compose exec -e LOUVER_BOOTSTRAP_PASSWORD='내가정한긴비밀번호' \
-  louver louver-server --create-user me@example.com --plan business
+# IP만 있을 때
+scripts/deploy-vps.sh root@203.0.113.10 --user 내이메일@example.com
+
+# 도메인이 있을 때 (HTTPS 자동 발급)
+scripts/deploy-vps.sh root@203.0.113.10 \
+  --domain live.example.com --email 내이메일@example.com \
+  --user 내이메일@example.com
 ```
 
-접속은 `http://<서버IP>:8080`. 화면 맨 위에 **REMOTE CLOUD SERVER**가 보이면
-제대로 올라간 것입니다.
+이 명령이 하는 일: 서버 확인 → Docker 없으면 설치 → 코드 전송(0.8 MB) →
+`.env` 생성(master key는 **서버에서** 만들어 서버에만 남습니다) →
+`docker compose up -d --build` → `/health` 통과까지 대기 → 계정 생성(비밀번호는
+화면에 안 보이고, 명령줄 인자로 전달되지 않습니다) → 접속 방법 안내.
 
-> **HTTPS**: 그대로 열면 평문 HTTP입니다. 인터넷에 공개할 거라면 Caddy나 Nginx를
-> 앞에 두고 TLS를 붙이세요. 세션 쿠키는 기본적으로 `Secure`라서 HTTPS에서 제대로
-> 동작합니다. (로컬 개발 스크립트만 이 플래그를 끕니다.)
+다시 실행하면 업데이트입니다. `.env`의 master key는 절대 다시 만들지 않습니다.
 
-| 확인 | 값 |
+> 스크립트를 쓰지 않고 서버에서 직접 하려면:
+> ```bash
+> cp .env.example .env
+> echo "LOUVER_MASTER_KEY=$(openssl rand -hex 32)" >> .env   # 한 번만
+> docker compose up -d --build
+> docker compose exec -T louver louver-server --create-user me@example.com --plan business
+> ```
+
+### 2. 접속 — 세 가지 중 하나
+
+| 방법 | 명령 / 주소 | 언제 |
+| --- | --- | --- |
+| **SSH 터널** (권장, 도메인 불필요) | `ssh -N -L 8080:127.0.0.1:8080 root@203.0.113.10` → `http://localhost:8080` | 도메인 없이 안전하게. 통신이 SSH로 암호화됩니다 |
+| **도메인 + HTTPS** | `https://live.example.com` | 다른 사람도 쓰게 할 때. 인증서는 Caddy가 자동 발급/갱신 |
+| **IP 직접** | `http://203.0.113.10:8080` | 가장 간단하지만 **암호화되지 않습니다** — 로그인 토큰이 평문으로 지나갑니다 |
+
+화면 맨 위에 **REMOTE CLOUD SERVER**가 보이면 제대로 올라간 것입니다.
+
+> **로그인했는데 다시 로그인 화면이 나온다면** 쿠키 문제입니다.
+> `curl -s http://서버:8080/health` 의 `"cookies"` 값을 보세요. HTTPS 없이
+> `always`로 되어 있으면 브라우저가 쿠키를 버립니다. 기본값 `auto`로 두면
+> HTTP·HTTPS 양쪽에서 동작합니다.
+
+### 3. 확인 명령
+
+```bash
+ssh root@203.0.113.10 'cd louver-live && docker compose ps'
+ssh root@203.0.113.10 'cd louver-live && docker compose logs -f louver'
+ssh root@203.0.113.10 'cd louver-live && docker compose exec -T louver louver-server --health-check'
+```
+
+마지막 명령은 이렇게 답합니다. `ffmpeg_rtmps`가 false면 그 서버의 FFmpeg로는
+YouTube 송출이 안 됩니다(방송을 시작해 보고 알게 되는 대신 여기서 알 수 있게
+했습니다).
+
+```json
+{"status":"ok","version":"1.0.8","deployment":"cloud","cookies":"auto",
+ "checks":{"api":true,"database":true,"ffmpeg":true,"ffmpeg_rtmps":true,"storage":true}}
+```
+
+### 4. 컴퓨터 종료 테스트 (TEST B)
+
+1. 위 방법으로 접속해서 **A. 로컬 실행 3번**과 똑같이 방송을 시작합니다
+   (영상 업로드 → YouTube 스트림 키 등록 → 방송 생성 → START).
+2. YouTube Studio에서 수신되는 것을 확인하고 "실시간 시작"을 누릅니다.
+3. **브라우저를 닫고, SSH 터널도 닫고, Mac을 완전히 종료합니다.**
+4. 휴대폰으로 YouTube 채널을 열어 방송이 계속되는지 봅니다.
+5. Mac을 다시 켜고 접속하면 대시보드에 여전히 `송출 중`, 송출 시간이 계속
+   올라가 있습니다.
+
+서버(VPS)를 재부팅해도 방송은 돌아옵니다. `restart: unless-stopped` 로 컨테이너가
+다시 뜨고, 뜨자마자 `desired_state=running`이던 방송을 복구합니다. 30초 안팎의
+끊김이 있습니다.
+
+### 5. 백업해야 하는 것
+
+| | |
 | --- | --- |
-| 상태 | `curl -s http://<서버IP>:8080/health` |
-| 로그 | `docker compose logs -f louver` |
-| 데이터 | `louver-data` 볼륨 (데이터베이스 + 영상). 백업 대상은 이미지가 아니라 이 볼륨입니다. |
+| `~/louver-live/.env` | master key. 잃으면 저장된 스트림 키를 전부 다시 입력해야 합니다 |
+| `louver-data` 볼륨 | 데이터베이스 + 업로드한 영상 + 변환본 |
 
-`LOUVER_MASTER_KEY`를 잃어버리면 저장해 둔 스트림 키를 전부 다시 입력해야
-합니다. 이미지 안에는 들어 있지 않습니다(레지스트리에 키를 같이 배포하는 셈이
-되므로).
-
----
+이미지는 백업 대상이 아닙니다. master key는 이미지에 들어 있지 않습니다
+(레지스트리에 키를 함께 배포하는 셈이 되므로).
 
 ## C. 직접 해 볼 테스트
 
 | 테스트 | 하는 법 | 기대 결과 |
 | --- | --- | --- |
 | **A. 브라우저 종료 후 유지** | 방송 시작 → 브라우저 완전히 종료 → 다시 접속 | 여전히 `송출 중` |
-| **B. 컴퓨터 종료 후 유지** | VPS 배포에서 방송 시작 → 내 컴퓨터 종료 → 휴대폰으로 YouTube 확인 | 방송 계속 (LOCAL에서는 끝나는 게 정상) |
+| **B. 컴퓨터 종료 후 유지** | VPS 배포(B)에서 방송 시작 → 브라우저·터널·컴퓨터 모두 종료 → 휴대폰으로 YouTube 확인 | 방송 계속 (LOCAL에서는 끝나는 게 정상) |
 | **C. 동시 3개** | Business 계정으로 서로 다른 스트림 키 3개 등록 → 3개 시작 | 대시보드 `3 / 3`, 4번째 시작은 요금제 한도로 거절 |
 | **D. FFmpeg 강제 종료** | 서버 상태 탭에서 PID 확인 → `kill -9 <PID>` | 그 방송만 `재연결 중` → `송출 중`, 나머지는 그대로 |
-| **E. 서버 재시작** | `docker compose restart louver` (또는 로컬에서 Ctrl-C 후 재실행) | `desired_state=running`이던 방송이 자동 복구 |
+| **E. 서버 재시작** | `docker compose restart louver` (또는 VPS 자체를 재부팅) | `desired_state=running`이던 방송이 자동 복구 |
 | **F. 사용자가 중지한 방송** | 방송 하나를 중지 → 서버 재시작 | 그 방송은 계속 `중지됨` |
 
 ### 이미 확인된 것
@@ -161,7 +216,10 @@ TEST F  사용자가 중지한 방송은 재시작 후에도 desired=stopped / S
 ```
 
 브라우저 전체 흐름(가입 → 업로드 → 대상 등록 → 방송 생성 → START → 브라우저
-종료 후 재접속 → STOP)도 실제 Chromium으로 확인했습니다. 다시 돌려보려면:
+종료 후 재접속 → STOP)도 실제 Chromium으로 두 번 확인했습니다. 한 번은
+`http://localhost`(로컬 실행), 한 번은 컨테이너와 같은 설정(`LOUVER_DEPLOYMENT=cloud`,
+Secure 쿠키 정책 기본값)으로 **localhost가 아닌 IP 주소**에 접속해서 — VPS를 IP로
+쓰는 경우와 같은 조건입니다. 다시 돌려보려면:
 
 ```bash
 npx playwright install chromium          # 처음 한 번
@@ -180,3 +238,11 @@ node scripts/browser-smoke.mjs --video ./어떤영상.mp4
   바뀝니다.
 - **저장 용량 한도**는 파일 하나 크기(`max_upload_bytes`)만 막습니다. 계정 전체
   합계(`max_storage_bytes`)는 기록만 하고 아직 거절하지 않습니다.
+- **Docker 이미지는 아직 한 번도 빌드된 적이 없습니다.** 개발 환경에 Docker
+  데몬이 없어서입니다. 대신 이미지가 복사하는 파일만으로 웹 번들이 빌드되는지,
+  워크스페이스가 파싱되는지 따로 확인했고, `.env` 생성 로직과 쿠키 정책은
+  테스트했습니다. 그래도 서버에서 `docker compose up --build`가 처음 실패할
+  가능성은 남아 있습니다. 실패하면 `docker compose logs louver` 출력을 그대로
+  알려주세요.
+- **VPS 자체는 직접 만드셔야 합니다.** 결제 수단이 필요한 일이라 대신 만들 수
+  없습니다. IP와 SSH 접속만 준비되면 나머지는 배포 스크립트가 합니다.

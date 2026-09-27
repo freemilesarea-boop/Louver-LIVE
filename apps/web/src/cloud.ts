@@ -144,6 +144,8 @@ export interface Health {
     api: boolean
     database: boolean
     ffmpeg: boolean
+    /** Whether this FFmpeg can publish to YouTube's RTMPS ingest at all. */
+    ffmpeg_rtmps: boolean
     storage: boolean
   }
 }

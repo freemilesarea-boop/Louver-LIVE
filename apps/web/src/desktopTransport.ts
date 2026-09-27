@@ -141,7 +141,7 @@ export class DesktopTransport implements Transport {
       status: 'ok',
       version: '',
       deployment: 'local',
-      checks: { api: true, database: true, ffmpeg: true, storage: true },
+      checks: { api: true, database: true, ffmpeg: true, ffmpeg_rtmps: true, storage: true },
     }
   }
 

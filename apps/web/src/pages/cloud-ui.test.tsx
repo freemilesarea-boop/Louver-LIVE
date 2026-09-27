@@ -93,7 +93,7 @@ function fake(over: Partial<Transport> = {}): Transport {
       status: 'ok',
       version: '1.0.8',
       deployment: 'cloud',
-      checks: { api: true, database: true, ffmpeg: true, storage: true },
+      checks: { api: true, database: true, ffmpeg: true, ffmpeg_rtmps: true, storage: true },
     }),
     metrics: vi.fn().mockResolvedValue({
       deployment: 'cloud',
@@ -270,7 +270,7 @@ describe('where this is running', () => {
         status: 'ok',
         version: '1.0.8',
         deployment: 'local',
-        checks: { api: true, database: true, ffmpeg: true, storage: true },
+        checks: { api: true, database: true, ffmpeg: true, ffmpeg_rtmps: true, storage: true },
       }),
     })
     show(<DeploymentBanner />, t)
@@ -287,7 +287,7 @@ describe('where this is running', () => {
         status: 'degraded',
         version: '1.0.8',
         deployment: 'cloud',
-        checks: { api: true, database: true, ffmpeg: false, storage: true },
+        checks: { api: true, database: true, ffmpeg: false, ffmpeg_rtmps: false, storage: true },
       }),
     })
     show(<DeploymentBanner />, t)
