@@ -41,14 +41,14 @@ export function DeploymentBanner() {
     <div
       data-testid="deployment-banner"
       data-deployment={health.deployment}
-      className={`border-b px-6 py-2 text-xs ${
-        cloud ? 'border-ok-dim bg-ok-dim/10 text-ok' : 'border-warn-dim bg-warn-dim/10 text-warn'
+      className={`flex flex-wrap items-baseline gap-x-3 border-b px-6 py-1.5 text-[11px] ${
+        cloud ? 'border-ink-800 bg-ink-900 text-ok' : 'border-warn-dim bg-warn-dim/10 text-warn'
       }`}
     >
-      <span className="font-semibold tracking-widest">{label.title}</span>
-      <span className="ml-3 text-ink-300">{label.hint}</span>
+      <span className="font-semibold uppercase tracking-[0.2em]">{label.title}</span>
+      <span className="text-ink-400">{label.hint}</span>
       {failing.length > 0 && (
-        <span className="ml-3 font-semibold text-live" data-testid="health-degraded">
+        <span className="font-semibold text-live" data-testid="health-degraded">
           점검 필요: {failing.map(([name]) => name).join(', ')}
         </span>
       )}

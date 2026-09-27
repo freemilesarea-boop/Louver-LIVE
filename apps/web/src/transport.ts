@@ -7,8 +7,8 @@
  * in a browser against a server" lives in exactly two classes in this file.
  */
 import type {
-  Broadcast, BroadcastEvent, CloudMedia, Dashboard, Health, Me, Metrics, NewBroadcast,
-  NewDestination, StreamDestination, Subscription,
+  Broadcast, BroadcastDetail, BroadcastEvent, BroadcastItem, BroadcastPatch, CloudMedia, Dashboard,
+  Health, Me, Metrics, NewBroadcast, NewDestination, NewItem, StreamDestination, Subscription,
 } from './cloud'
 import type { LouverError } from '@/types'
 
@@ -31,7 +31,12 @@ export interface Transport {
   deleteDestination(id: string): Promise<void>
 
   dashboard(): Promise<Dashboard>
-  createBroadcast(input: NewBroadcast): Promise<Broadcast>
+  createBroadcast(input: NewBroadcast): Promise<BroadcastDetail>
+  /** One broadcast with its playlist. */
+  getBroadcast(id: string): Promise<BroadcastDetail>
+  updateBroadcast(id: string, patch: BroadcastPatch): Promise<Broadcast>
+  /** Replace the playlist with this list, in this order. */
+  replaceItems(id: string, items: NewItem[]): Promise<BroadcastItem[]>
   startBroadcast(id: string): Promise<Broadcast>
   stopBroadcast(id: string): Promise<Broadcast>
   restartBroadcast(id: string): Promise<Broadcast>
@@ -205,9 +210,27 @@ export class WebTransport implements Transport {
   }
 
   createBroadcast(input: NewBroadcast) {
-    return this.json<Broadcast>('/api/broadcasts', {
+    return this.json<BroadcastDetail>('/api/broadcasts', {
       method: 'POST',
       body: JSON.stringify(input),
+    })
+  }
+
+  getBroadcast(id: string) {
+    return this.json<BroadcastDetail>(`/api/broadcasts/${encodeURIComponent(id)}`)
+  }
+
+  updateBroadcast(id: string, patch: BroadcastPatch) {
+    return this.json<Broadcast>(`/api/broadcasts/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    })
+  }
+
+  replaceItems(id: string, items: NewItem[]) {
+    return this.json<BroadcastItem[]>(`/api/broadcasts/${encodeURIComponent(id)}/items`, {
+      method: 'PUT',
+      body: JSON.stringify(items),
     })
   }
 

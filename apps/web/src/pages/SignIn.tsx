@@ -1,6 +1,7 @@
 /** Sign in, or make an account. Nothing else is reachable until this succeeds. */
 import { useState } from 'react'
 import { Button, Card, Field, Input } from '@/components/ui'
+import { Wordmark } from '../App'
 import { useTransport } from '../TransportContext'
 import type { Me } from '../cloud'
 
@@ -32,7 +33,9 @@ export function SignIn({ onSignedIn }: { onSignedIn: (me: Me) => void }) {
   return (
     <div className="flex min-h-screen items-center justify-center bg-ink-950 p-6">
       <div className="w-full max-w-sm">
-        <h1 className="mb-6 text-center text-lg font-semibold text-ink-100">Louver Live</h1>
+        <h1 className="mb-6 text-center text-2xl">
+          <Wordmark />
+        </h1>
         <Card title={mode === 'login' ? '로그인' : '계정 만들기'}>
           <form onSubmit={submit}>
             <Field label="이메일">

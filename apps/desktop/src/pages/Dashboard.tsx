@@ -344,7 +344,7 @@ export function Dashboard() {
                   pricing. The project carries no billing account, so there is
                   nothing for a spent quota to bill against. */}
               <p className="mt-1 text-[11px] text-ink-500">
-                Louver Live는 유료 Google Cloud 서비스를 사용하지 않으므로 추가 요금이 발생하지 않습니다.
+                247streams는 유료 Google Cloud 서비스를 사용하지 않으므로 추가 요금이 발생하지 않습니다.
               </p>
             </div>
           ) : applyState?.stage === 'skipped' ? (

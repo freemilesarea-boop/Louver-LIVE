@@ -11,10 +11,14 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ReactElement } from 'react'
 import { TransportProvider } from '../TransportContext'
 import { CloudDashboard } from './CloudDashboard'
+import { BroadcastForm } from './BroadcastForm'
 import { DeploymentBanner, ServerStatus } from './ServerStatus'
 import { Destinations } from './Destinations'
 import { MediaLibrary } from './MediaLibrary'
-import type { Broadcast, CloudMedia, Dashboard, StreamDestination } from '../cloud'
+import { AUTO_SETTINGS, emptySchedule } from '../cloud'
+import type {
+  Broadcast, BroadcastDetail, CloudMedia, Dashboard, StreamDestination,
+} from '../cloud'
 import type { Transport } from '../transport'
 
 function broadcast(over: Partial<Broadcast> = {}): Broadcast {
@@ -31,6 +35,19 @@ function broadcast(over: Partial<Broadcast> = {}): Broadcast {
     created_at: '',
     bytes_sent: 0,
     uptime_secs: 0,
+    title: '밤 라디오',
+    description: '',
+    tags: '',
+    category: '',
+    privacy: 'private',
+    settings: AUTO_SETTINGS,
+    schedule: emptySchedule(),
+    item_count: 1,
+    play_count: 1,
+    current_index: 0,
+    current_position_secs: 0,
+    current_duration_secs: 0,
+    cycle_duration_secs: 0,
     ...over,
   }
 }
@@ -87,6 +104,9 @@ function fake(over: Partial<Transport> = {}): Transport {
     stopBroadcast: vi.fn(),
     restartBroadcast: vi.fn(),
     deleteBroadcast: vi.fn().mockResolvedValue(undefined),
+    getBroadcast: vi.fn(),
+    updateBroadcast: vi.fn(),
+    replaceItems: vi.fn().mockResolvedValue([]),
     logs: vi.fn().mockResolvedValue([]),
     watchDashboard: vi.fn().mockReturnValue(() => undefined),
     health: vi.fn().mockResolvedValue({
@@ -124,7 +144,18 @@ describe('the broadcast dashboard', () => {
         active: 2,
         allowed: 3,
         broadcasts: [
-          broadcast({ id: 'b1', desired_state: 'running', runtime_state: 'RUNNING', uptime_secs: 3725 }),
+          broadcast({
+            id: 'b1',
+            desired_state: 'running',
+            runtime_state: 'RUNNING',
+            uptime_secs: 3725,
+            current_index: 2,
+            play_count: 8,
+            current_item: 'Jazz Night 02.mp4',
+            next_item: 'Jazz Night 03.mp4',
+            current_position_secs: 1934,
+            current_duration_secs: 5400,
+          }),
           broadcast({ id: 'b2', name: '낮 라디오', desired_state: 'running', runtime_state: 'RECONNECTING', restart_count: 2 }),
           broadcast({ id: 'b3', name: '쉬는 방송' }),
         ],
@@ -138,7 +169,7 @@ describe('the broadcast dashboard', () => {
     // Reconnecting holds a slot, so it must not look idle.
     expect(screen.getByText('재연결 중')).toBeInTheDocument()
     expect(screen.getByText('재시작 2회')).toBeInTheDocument()
-    expect(screen.getByText('송출 1시간 02분 05초')).toBeInTheDocument()
+    expect(screen.getByText('1시간 02분 05초')).toBeInTheDocument()
   })
 
   it('warns when the slots are full, and still lets a running broadcast be stopped', async () => {
@@ -340,5 +371,220 @@ describe('the metrics a long test needs', () => {
     for (const name of ['api', 'database', 'ffmpeg', 'storage']) {
       expect(checks).toHaveTextContent(name)
     }
+  })
+})
+
+describe('the operations card', () => {
+  it('shows what is playing, what is next, and where in the playlist', async () => {
+    const t = fake({
+      dashboard: vi.fn().mockResolvedValue({
+        plan_label: 'Business',
+        active: 1,
+        allowed: 3,
+        broadcasts: [
+          broadcast({
+            desired_state: 'running',
+            runtime_state: 'RUNNING',
+            uptime_secs: 7200,
+            bytes_sent: 5_400_000_000,
+            item_count: 8,
+            play_count: 8,
+            current_index: 2,
+            current_item: 'Jazz Night 02.mp4',
+            next_item: 'Jazz Night 03.mp4',
+            current_position_secs: 1934,
+            current_duration_secs: 5400,
+          }),
+        ],
+      } satisfies Dashboard),
+    })
+
+    show(<CloudDashboard />, t)
+
+    expect(await screen.findByTestId('now-playing')).toHaveTextContent('Jazz Night 02.mp4')
+    expect(screen.getByTestId('next-up')).toHaveTextContent('Jazz Night 03.mp4')
+    expect(screen.getByTestId('playlist-progress')).toHaveTextContent('2 / 8')
+    // 32:14 of 1:30:00, as the brief's example asks for.
+    expect(screen.getByText('32분 14초 / 1시간 30분 00초')).toBeInTheDocument()
+    // 5.4 GB over two hours is 6 Mbps.
+    expect(screen.getByText('6.00 Mbps')).toBeInTheDocument()
+    // A live broadcast offers a stop, never a delete.
+    expect(screen.getByRole('button', { name: '중지' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '삭제' })).not.toBeInTheDocument()
+  })
+
+  it('says a stopped broadcast is scheduled, and when', async () => {
+    const tomorrow = new Date(Date.now() + 86_400_000)
+    tomorrow.setHours(21, 0, 0, 0)
+    const t = fake({
+      dashboard: vi.fn().mockResolvedValue({
+        plan_label: 'Pro',
+        active: 0,
+        allowed: 2,
+        broadcasts: [
+          broadcast({
+            schedule: { ...emptySchedule(), enabled: true, start_at: tomorrow.toISOString(), repeat_days: 0b111_1111 },
+          }),
+        ],
+      } satisfies Dashboard),
+    })
+
+    show(<CloudDashboard />, t)
+    expect(await screen.findByText('예약됨')).toBeInTheDocument()
+    expect(screen.getByTestId('schedule-label')).toHaveTextContent('매일')
+  })
+})
+
+describe('making a broadcast', () => {
+  const VIDEOS: CloudMedia[] = [
+    { ...READY_MEDIA, id: 'm1', filename: 'one.mp4', duration_secs: 60 },
+    { ...READY_MEDIA, id: 'm2', filename: 'two.mp4', duration_secs: 120 },
+    { ...READY_MEDIA, id: 'm3', filename: 'three.mp4', duration_secs: 30 },
+  ]
+
+  function withVideos(over: Partial<Transport> = {}) {
+    return fake({ listMedia: vi.fn().mockResolvedValue(VIDEOS), ...over })
+  }
+
+  it('builds a playlist of several videos and sends it in order', async () => {
+    const created = vi.fn().mockResolvedValue({})
+    const t = withVideos({ createBroadcast: created })
+    show(<BroadcastForm onDone={() => undefined} onCancel={() => undefined} />, t)
+
+    for (const name of ['+ one.mp4', '+ two.mp4', '+ three.mp4']) {
+      await userEvent.click(await screen.findByRole('button', { name }))
+    }
+    expect(screen.getAllByTestId('playlist-row')).toHaveLength(3)
+
+    await userEvent.type(screen.getByLabelText('이름'), '밤 라디오')
+    await userEvent.click(screen.getByRole('button', { name: /^방송 만들기$/ }))
+
+    await waitFor(() => expect(created).toHaveBeenCalled())
+    const sent = created.mock.calls[0]?.[0]
+    expect(sent.items.map((i: { media_id: string }) => i.media_id)).toEqual(['m1', 'm2', 'm3'])
+    expect(sent.name).toBe('밤 라디오')
+    expect(sent.loop_forever).toBe(true)
+    expect(sent.destination_id).toBe('d1')
+  })
+
+  it('reorders, repeats and disables, and sends exactly that', async () => {
+    const created = vi.fn().mockResolvedValue({})
+    const t = withVideos({ createBroadcast: created })
+    show(<BroadcastForm onDone={() => undefined} onCancel={() => undefined} />, t)
+
+    await userEvent.click(await screen.findByRole('button', { name: '+ one.mp4' }))
+    await userEvent.click(screen.getByRole('button', { name: '+ two.mp4' }))
+    await userEvent.click(screen.getByRole('button', { name: '+ three.mp4' }))
+
+    // Move the third to the top, repeat it twice, and switch the second off.
+    await userEvent.click(screen.getByRole('button', { name: 'three.mp4 위로' }))
+    await userEvent.click(screen.getByRole('button', { name: 'three.mp4 위로' }))
+    await userEvent.clear(screen.getByLabelText('three.mp4 반복 횟수'))
+    await userEvent.type(screen.getByLabelText('three.mp4 반복 횟수'), '2')
+    await userEvent.click(screen.getByLabelText('two.mp4 사용'))
+
+    await userEvent.click(screen.getByRole('button', { name: /^방송 만들기$/ }))
+    await waitFor(() => expect(created).toHaveBeenCalled())
+
+    expect(created.mock.calls[0]?.[0].items).toEqual([
+      { media_id: 'm3', enabled: true, repeat_count: 2 },
+      { media_id: 'm1', enabled: true, repeat_count: 1 },
+      { media_id: 'm2', enabled: false, repeat_count: 1 },
+    ])
+  })
+
+  it('cannot be saved with an empty playlist', async () => {
+    const t = withVideos()
+    show(<BroadcastForm onDone={() => undefined} onCancel={() => undefined} />, t)
+    expect(await screen.findByRole('button', { name: /^방송 만들기$/ })).toBeDisabled()
+    await userEvent.click(screen.getByRole('button', { name: '+ one.mp4' }))
+    expect(screen.getByRole('button', { name: /^방송 만들기$/ })).toBeEnabled()
+  })
+
+  it('keeps 247streams metadata separate from what YouTube shows', async () => {
+    const t = withVideos()
+    show(<BroadcastForm onDone={() => undefined} onCancel={() => undefined} />, t)
+    // The warning is the point: a pasted stream key cannot set a YouTube title,
+    // and the form says so where the title is typed.
+    expect(await screen.findByText(/YouTube의 제목·설명·공개/)).toBeInTheDocument()
+  })
+
+  it('hides the sending settings until asked, and defaults to auto', async () => {
+    const created = vi.fn().mockResolvedValue({})
+    const t = withVideos({ createBroadcast: created })
+    show(<BroadcastForm onDone={() => undefined} onCancel={() => undefined} />, t)
+
+    expect(await screen.findByText(/자동 — 서버가 영상에 맞는/)).toBeInTheDocument()
+    expect(screen.queryByLabelText('해상도')).not.toBeInTheDocument()
+
+    await userEvent.click(screen.getByRole('button', { name: '고급 설정' }))
+    expect(screen.getByLabelText('해상도')).toHaveValue('auto')
+
+    await userEvent.click(screen.getByRole('button', { name: '+ one.mp4' }))
+    await userEvent.click(screen.getByRole('button', { name: /^방송 만들기$/ }))
+    await waitFor(() => expect(created).toHaveBeenCalled())
+    expect(created.mock.calls[0]?.[0].settings).toEqual({
+      resolution: 'auto',
+      fps: 'auto',
+      video_bitrate_kbps: 0,
+      audio_bitrate_kbps: 0,
+    })
+  })
+
+  it('schedules in the reader own clock and sends UTC', async () => {
+    const created = vi.fn().mockResolvedValue({})
+    const t = withVideos({ createBroadcast: created })
+    show(<BroadcastForm onDone={() => undefined} onCancel={() => undefined} />, t)
+
+    await userEvent.click(await screen.findByRole('button', { name: '+ one.mp4' }))
+    await userEvent.click(screen.getByRole('switch', { name: '예약 시작' }))
+    const box = screen.getByLabelText('시작 시각')
+    await userEvent.type(box, '2026-11-01T21:00')
+    await userEvent.click(screen.getByRole('button', { name: '매일' }))
+    await userEvent.click(screen.getByRole('button', { name: /^방송 만들기$/ }))
+
+    await waitFor(() => expect(created).toHaveBeenCalled())
+    const sched = created.mock.calls[0]?.[0].schedule
+    expect(sched.enabled).toBe(true)
+    expect(sched.repeat_days).toBe(0b111_1111)
+    // Stored as an instant, not as the text that was typed.
+    expect(new Date(sched.start_at).toISOString()).toBe(sched.start_at)
+    expect(new Date(sched.start_at).getHours()).toBe(21)
+  })
+
+  it('saves an edit as a patch and a playlist replacement', async () => {
+    const detail: BroadcastDetail = {
+      ...broadcast({ id: 'b9', name: '기존', item_count: 1 }),
+      items: [
+        {
+          id: 'i1',
+          broadcast_id: 'b9',
+          media_id: 'm1',
+          position: 0,
+          enabled: true,
+          repeat_count: 1,
+          filename: 'one.mp4',
+          duration_secs: 60,
+          state: 'ready',
+        },
+      ],
+    }
+    const update = vi.fn().mockResolvedValue(detail)
+    const replace = vi.fn().mockResolvedValue([])
+    const t = withVideos({ updateBroadcast: update, replaceItems: replace })
+
+    show(<BroadcastForm editing={detail} onDone={() => undefined} onCancel={() => undefined} />, t)
+
+    // The existing playlist is there to edit, not a blank one.
+    expect(await screen.findByText('one.mp4')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: '+ two.mp4' }))
+    await userEvent.click(screen.getByRole('button', { name: '저장' }))
+
+    await waitFor(() => expect(replace).toHaveBeenCalled())
+    expect(update.mock.calls[0]?.[0]).toBe('b9')
+    expect(replace.mock.calls[0]?.[1]).toEqual([
+      { media_id: 'm1', enabled: true, repeat_count: 1 },
+      { media_id: 'm2', enabled: true, repeat_count: 1 },
+    ])
   })
 })

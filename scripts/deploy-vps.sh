@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Put Louver Live Cloud on a Linux server, from this machine, in one command.
+# Put 247streams on a Linux server, from this machine, in one command.
 #
 #   scripts/deploy-vps.sh root@203.0.113.10
 #   scripts/deploy-vps.sh root@203.0.113.10 --domain live.example.com --email me@you.com

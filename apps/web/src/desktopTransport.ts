@@ -11,9 +11,11 @@
  */
 import { api, listen } from '@/services/ipc'
 import type { Media, RuntimeStatus, StreamState } from '@/types'
+import { AUTO_SETTINGS, emptySchedule } from './cloud'
 import type {
-  Broadcast, BroadcastEvent, CloudMedia, Dashboard, DesiredState, Health, Me, MediaState, Metrics,
-  NewBroadcast, NewDestination, RuntimeState, StreamDestination, Subscription,
+  Broadcast, BroadcastDetail, BroadcastEvent, BroadcastItem, BroadcastPatch, CloudMedia, Dashboard,
+  DesiredState, Health, Me, MediaState, Metrics, NewBroadcast, NewDestination, NewItem, RuntimeState,
+  StreamDestination, Subscription,
 } from './cloud'
 import type { Transport } from './transport'
 
@@ -101,8 +103,24 @@ export class DesktopTransport implements Transport {
     }
   }
 
-  async createBroadcast(_input: NewBroadcast): Promise<Broadcast> {
+  async createBroadcast(_input: NewBroadcast): Promise<BroadcastDetail> {
     throw ONLY_ON_THE_WEB('방송 만들기')
+  }
+
+  async getBroadcast(id: string): Promise<BroadcastDetail> {
+    const d = await this.dashboard()
+    const b = d.broadcasts.find((x) => x.id === id)
+    if (!b) throw new Error('방송을 찾을 수 없습니다')
+    // The desktop's playlists are edited on its own screens, not through this.
+    return { ...b, items: [] }
+  }
+
+  async updateBroadcast(_id: string, _patch: BroadcastPatch): Promise<Broadcast> {
+    throw ONLY_ON_THE_WEB('방송 정보 수정')
+  }
+
+  async replaceItems(_id: string, _items: NewItem[]): Promise<BroadcastItem[]> {
+    throw ONLY_ON_THE_WEB('플레이리스트 편집')
   }
 
   async startBroadcast(id: string): Promise<Broadcast> {
@@ -262,5 +280,21 @@ function toBroadcast(playlistId: number, name: string, status: RuntimeStatus): B
     bytes_sent: 0,
     uptime_secs: isThisOne ? status.elapsed_secs : 0,
     ffmpeg_exit_code: null,
+    ffmpeg_pid: isThisOne ? (status.supervisor.pid ?? null) : null,
+    title: name,
+    description: '',
+    tags: '',
+    category: '',
+    privacy: 'private',
+    settings: AUTO_SETTINGS,
+    schedule: emptySchedule(),
+    item_count: status.item_count,
+    play_count: status.item_count,
+    current_index: isThisOne ? (status.current_index ?? 0) + 1 : 0,
+    current_item: isThisOne ? (status.current_item ?? null) : null,
+    next_item: isThisOne ? (status.next_item ?? null) : null,
+    current_position_secs: 0,
+    current_duration_secs: 0,
+    cycle_duration_secs: status.cycle_duration_secs,
   }
 }

@@ -14,6 +14,16 @@ import { SignIn } from './pages/SignIn'
 import { useTransport } from './TransportContext'
 import type { Me } from './cloud'
 
+/** The service's name, in one place. */
+export function Wordmark({ className = '' }: { className?: string }) {
+  return (
+    <span className={`font-semibold tracking-tight ${className}`}>
+      <span className="text-ink-100">247</span>
+      <span className="text-ok">streams</span>
+    </span>
+  )
+}
+
 type Tab = 'broadcasts' | 'media' | 'destinations' | 'status'
 
 const TABS: { id: Tab; label: string }[] = [
@@ -60,7 +70,7 @@ export function App() {
       <DeploymentBanner />
       <header className="flex items-center justify-between border-b border-ink-700 px-6 py-3">
         <div className="flex items-center gap-6">
-          <span className="text-sm font-semibold">Louver Live</span>
+          <Wordmark />
           <nav className="flex gap-1">
             {TABS.map((x) => (
               <button

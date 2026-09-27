@@ -98,22 +98,30 @@ const masked = await page.getByTestId('masked-key').textContent()
 log('destination saved, key shown as', masked)
 if ((await page.content()).includes(KEY)) problems.push('the stream key is in the page')
 
-// --- broadcast -------------------------------------------------------------
+// --- broadcast, with a playlist --------------------------------------------
 await page.getByRole('button', { name: '방송', exact: true }).click()
 await page.getByRole('button', { name: '방송 만들기' }).click()
-await page.getByLabel('방송 이름').fill('브라우저 테스트')
-await page.getByRole('button', { name: '만들기', exact: true }).click()
-await page.getByTestId('broadcast-row').waitFor({ timeout: 10000 })
+await page.getByTestId('broadcast-form').waitFor({ timeout: 10000 })
+await page.getByLabel('이름').fill('브라우저 테스트')
+// Every ready video, in the order they are offered.
+const addable = page.getByTestId('add-media')
+const howMany = await addable.count()
+for (let i = 0; i < howMany; i++) await addable.first().click()
+log(`playlist rows: ${await page.getByTestId('playlist-row').count()}`)
+await page.getByRole('button', { name: /^방송 만들기$/ }).click()
+await page.getByTestId('broadcast-row').waitFor({ timeout: 15000 })
 log('broadcast created')
 
 await page.getByRole('button', { name: '시작' }).click()
 await page.getByText('송출 중').waitFor({ timeout: 30000 })
-log('LIVE:', (await page.getByTestId('broadcast-row').textContent()).trim().replace(/\s+/g, ' '))
+await page.getByTestId('now-playing').waitFor({ timeout: 30000 })
+log('now playing:', (await page.getByTestId('now-playing').textContent())?.trim())
+log('playlist:', (await page.getByTestId('playlist-progress').textContent())?.trim())
 log('slots:', await page.getByTestId('slots').textContent())
 
 // The SSE stream must keep the row live without a reload.
 await page.waitForTimeout(6000)
-log('after 6s, still:', (await page.getByTestId('broadcast-row').textContent()).trim().replace(/\s+/g, ' '))
+log('after 6s:', (await page.getByTestId('playlist-progress').textContent())?.trim(), 'still 송출 중')
 
 // --- metrics ---------------------------------------------------------------
 await page.getByRole('button', { name: '서버 상태' }).click()
@@ -135,7 +143,9 @@ log('slots:', await again.getByTestId('slots').textContent())
 
 // --- stop ------------------------------------------------------------------
 await again.getByRole('button', { name: '중지' }).click()
-await again.getByTestId('broadcast-row').getByText('중지됨').first().waitFor({ timeout: 20000 })
+// The card body carries the state, which is steadier to wait on than a badge
+// that lives in the header.
+await again.locator('[data-testid="broadcast-row"][data-state="STOPPED"]').waitFor({ timeout: 20000 })
 log('stopped')
 
 if ((await again.content()).includes(KEY)) problems.push('the stream key is in the page after reload')

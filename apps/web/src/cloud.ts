@@ -56,6 +56,74 @@ export interface StreamDestination {
   /** Always dots. The key itself never leaves the server. */
   key_masked: string
   created_at: string
+  /** `manual_rtmps` today. A connected account could carry a title and a
+   * privacy to the platform; a pasted key cannot. */
+  kind?: DestinationKind
+}
+
+export type Privacy = 'public' | 'unlisted' | 'private'
+export type DestinationKind = 'manual_rtmps' | 'youtube_account'
+
+/** What the sender is asked to produce. `auto` everywhere is the default. */
+export interface StreamSettings {
+  resolution: 'auto' | '720p' | '1080p'
+  fps: 'auto' | '30' | '60'
+  /** 0 = auto. */
+  video_bitrate_kbps: number
+  /** 0 = auto. */
+  audio_bitrate_kbps: number
+}
+
+export const AUTO_SETTINGS: StreamSettings = {
+  resolution: 'auto',
+  fps: 'auto',
+  video_bitrate_kbps: 0,
+  audio_bitrate_kbps: 0,
+}
+
+/** When a broadcast starts by itself. Times are UTC; the UI shows local. */
+export interface Schedule {
+  enabled: boolean
+  start_at?: string | null
+  stop_at?: string | null
+  timezone: string
+  /** Minutes east of UTC, so a daily repeat keeps the user's clock time. */
+  offset_minutes: number
+  /** Monday is bit 0. 0 means once. */
+  repeat_days: number
+  last_run_at?: string | null
+}
+
+export function emptySchedule(): Schedule {
+  return {
+    enabled: false,
+    start_at: null,
+    stop_at: null,
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
+    offset_minutes: -new Date().getTimezoneOffset(),
+    repeat_days: 0,
+    last_run_at: null,
+  }
+}
+
+/** One video in a broadcast's playlist. */
+export interface BroadcastItem {
+  id: string
+  broadcast_id: string
+  media_id: string
+  position: number
+  enabled: boolean
+  repeat_count: number
+  filename: string
+  duration_secs: number
+  state: MediaState
+}
+
+/** What the API takes when the playlist is replaced. */
+export interface NewItem {
+  media_id: string
+  enabled: boolean
+  repeat_count: number
 }
 
 export interface Broadcast {
@@ -76,6 +144,62 @@ export interface Broadcast {
   bytes_sent: number
   uptime_secs: number
   ffmpeg_exit_code?: number | null
+  ffmpeg_pid?: number | null
+
+  /** 247streams' own broadcast information. Not applied to YouTube — see
+   * `DestinationKind`. */
+  title: string
+  description: string
+  tags: string
+  category: string
+  privacy: Privacy
+
+  settings: StreamSettings
+  schedule: Schedule
+
+  /** Videos in the playlist, as the editor shows them. */
+  item_count: number
+  /** Entries in one pass once repeats are expanded. What "2 / 8" counts. */
+  play_count: number
+  current_index: number
+  current_item?: string | null
+  next_item?: string | null
+  current_position_secs: number
+  current_duration_secs: number
+  cycle_duration_secs: number
+}
+
+/** A broadcast with its playlist, for the screen that edits one. */
+export interface BroadcastDetail extends Broadcast {
+  items: BroadcastItem[]
+}
+
+/** Only the fields being changed need to be sent. */
+export interface BroadcastPatch {
+  name?: string
+  title?: string
+  description?: string
+  tags?: string
+  category?: string
+  privacy?: Privacy
+  loop_forever?: boolean
+  destination_id?: string
+  settings?: StreamSettings
+  schedule?: Schedule
+}
+
+export interface NewBroadcast {
+  name: string
+  destination_id: string
+  items: NewItem[]
+  loop_forever: boolean
+  title?: string
+  description?: string
+  tags?: string
+  category?: string
+  privacy?: Privacy
+  settings?: StreamSettings
+  schedule?: Schedule
 }
 
 export interface Dashboard {
@@ -100,13 +224,6 @@ export interface NewDestination {
   rtmps_url: string
   /** Passed straight through to the server and never kept afterwards. */
   stream_key: string
-}
-
-export interface NewBroadcast {
-  name: string
-  media_id: string
-  destination_id: string
-  loop_forever?: boolean
 }
 
 /** Korean labels for §2's states, so no component spells them itself. */
@@ -187,4 +304,50 @@ export const DEPLOYMENT_LABELS: Record<Health['deployment'], { title: string; hi
     title: 'REMOTE CLOUD SERVER',
     hint: '서버에서 방송이 실행됩니다. 브라우저나 이 컴퓨터를 꺼도 방송은 계속됩니다.',
   },
+}
+
+export const PRIVACY_LABELS: Record<Privacy, string> = {
+  public: '공개',
+  unlisted: '일부 공개',
+  private: '비공개',
+}
+
+export const DAY_NAMES = ['월', '화', '수', '목', '금', '토', '일'] as const
+export const EVERY_DAY = 0b111_1111
+export const WEEKDAYS = 0b001_1111
+
+export function dayOn(mask: number, day: number): boolean {
+  return (mask & (1 << day)) !== 0
+}
+
+export function toggleDayMask(mask: number, day: number): number {
+  return mask ^ (1 << day)
+}
+
+/** "2 / 8" and the rest of what a card shows about the playlist. */
+export function playlistLabel(b: Broadcast): string {
+  const total = b.play_count || b.item_count
+  if (total <= 0) return '—'
+  const at = b.current_index > 0 ? b.current_index : 1
+  return `${at} / ${total}`
+}
+
+/** How far into the current video, 0–100. */
+export function itemPercent(b: Broadcast): number {
+  if (b.current_duration_secs <= 0) return 0
+  return Math.min(100, (b.current_position_secs / b.current_duration_secs) * 100)
+}
+
+/** The schedule in the reader's own timezone, or null when there is none. */
+export function scheduleLabel(s: Schedule): string | null {
+  if (!s.enabled || !s.start_at) return null
+  const start = new Date(s.start_at)
+  const time = start.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+  if (s.repeat_days === EVERY_DAY) return `매일 ${time}`
+  if (s.repeat_days === WEEKDAYS) return `주중 ${time}`
+  if (s.repeat_days > 0) {
+    const days = DAY_NAMES.filter((_, i) => dayOn(s.repeat_days, i)).join('·')
+    return `${days} ${time}`
+  }
+  return `${start.toLocaleDateString()} ${time}`
 }
