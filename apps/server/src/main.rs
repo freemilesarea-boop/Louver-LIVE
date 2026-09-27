@@ -146,6 +146,10 @@ async fn main() -> std::process::ExitCode {
     if args.iter().any(|a| a == "--create-user") {
         return create_user(&args);
     }
+    // What is running, where it is sending, and what FFmpeg has said about it.
+    if args.iter().any(|a| a == "--diagnose") {
+        return louver_server::diagnose::run();
+    }
 
     let app = match App::boot() {
         Ok(a) => a,

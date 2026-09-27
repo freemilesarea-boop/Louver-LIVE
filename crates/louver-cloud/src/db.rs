@@ -691,7 +691,7 @@ impl CloudDb {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT id, user_id, label, rtmps_url, key_masked, created_at
+                "SELECT id, user_id, label, rtmps_url, key_masked, created_at, kind
                  FROM stream_destinations WHERE id=?1 AND user_id=?2",
                 params![id, user_id],
                 row_to_destination,
@@ -707,7 +707,7 @@ impl CloudDb {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT id, user_id, label, rtmps_url, key_masked, created_at
+                "SELECT id, user_id, label, rtmps_url, key_masked, created_at, kind
                  FROM stream_destinations WHERE id=?1",
                 [id],
                 row_to_destination,
@@ -720,7 +720,7 @@ impl CloudDb {
         let conn = self.raw();
         let guard = conn.lock().unwrap();
         let mut st = guard.prepare(
-            "SELECT id, user_id, label, rtmps_url, key_masked, created_at
+            "SELECT id, user_id, label, rtmps_url, key_masked, created_at, kind
              FROM stream_destinations WHERE user_id=?1 ORDER BY created_at DESC, id DESC",
         )?;
         let rows = st.query_map([user_id], row_to_destination)?;
@@ -1082,6 +1082,36 @@ impl CloudDb {
         )?)
     }
 
+    /// Every broadcast, for the operator's diagnostic command. No owner filter,
+    /// because the caller is a shell on the server rather than a request.
+    pub fn all_broadcasts(&self) -> Result<Vec<Broadcast>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare(&format!("{BROADCAST_COLUMNS} ORDER BY created_at"))?;
+        let rows = st.query_map([], row_to_broadcast)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// One broadcast's events, without an owner check. Same reason.
+    pub fn events_for(&self, broadcast_id: &str, limit: i64) -> Result<Vec<BroadcastEvent>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare(
+            "SELECT id, broadcast_id, at, level, message FROM broadcast_events
+             WHERE broadcast_id=?1 ORDER BY id DESC LIMIT ?2",
+        )?;
+        let rows = st.query_map(params![broadcast_id, limit], |r| {
+            Ok(BroadcastEvent {
+                id: r.get(0)?,
+                broadcast_id: r.get(1)?,
+                at: r.get(2)?,
+                level: r.get(3)?,
+                message: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Every broadcast with a schedule switched on. The scheduler reads this and
     /// decides in one place; nothing about a due time is stored in memory, which
     /// is what makes a restart recover schedules for free.
@@ -1229,13 +1259,15 @@ fn row_to_media(r: &rusqlite::Row<'_>) -> rusqlite::Result<CloudMedia> {
 }
 
 fn row_to_destination(r: &rusqlite::Row<'_>) -> rusqlite::Result<StreamDestination> {
+    let kind: String = r.get("kind")?;
     Ok(StreamDestination {
-        id: r.get(0)?,
-        user_id: r.get(1)?,
-        label: r.get(2)?,
-        rtmps_url: r.get(3)?,
-        key_masked: r.get(4)?,
-        created_at: r.get(5)?,
+        id: r.get("id")?,
+        user_id: r.get("user_id")?,
+        label: r.get("label")?,
+        rtmps_url: r.get("rtmps_url")?,
+        key_masked: r.get("key_masked")?,
+        created_at: r.get("created_at")?,
+        kind: DestinationKind::from_id(&kind).unwrap_or(DestinationKind::ManualRtmps),
     })
 }
 

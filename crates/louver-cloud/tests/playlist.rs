@@ -518,3 +518,108 @@ fn a_stream_key_saved_before_this_release_still_opens_and_sends() {
     assert!(!text.contains("olde-keyy"), "the key reached the event log: {text}");
     e.mgr.shutdown();
 }
+
+// --- the output path, pinned -------------------------------------------------
+
+/// The exact command that reached YouTube before playlists existed, and has to
+/// keep reaching it.
+///
+/// This is not a style check. The change that introduced playlists touched only
+/// the input side — one playlist row became N — and this asserts that: the
+/// flags, their order, the muxer, the stream copy and the shape of the ingest
+/// URL are what the working version sent, whether the playlist has one video or
+/// three.
+#[test]
+fn the_output_path_is_exactly_what_youtube_was_given_before() {
+    for videos in [1usize, 3] {
+        let e = env("business");
+        e.mgr
+            .secret_store()
+            .set(&louver_cloud::credentials::destination_account(&e.dest), "abcd-1234-efgh-5678")
+            .unwrap();
+        let media: Vec<String> = (0..videos).map(|i| e.video(&format!("v{i}.mp4"), 60.0)).collect();
+        let id = e.broadcast("출력 경로", &media, true);
+
+        e.mgr.start(&e.user, &id).unwrap();
+        e.wait_for_launches(1);
+        let args = e.rec.last().args;
+
+        // The input side: one concat manifest, looping for ever.
+        let i = args.iter().position(|a| a == "-i").expect("no input");
+        assert_eq!(args.iter().filter(|a| *a == "-i").count(), 1, "more than one input");
+        assert_eq!(
+            args[i - 6..i],
+            ["-stream_loop", "-1", "-f", "concat", "-safe", "0"].map(String::from),
+            "the input flags changed: {args:?}"
+        );
+
+        // Read at wall-clock speed, or the whole playlist would be pushed as
+        // fast as the disk can read it.
+        assert!(args.contains(&"-re".to_string()), "{args:?}");
+
+        // The output side: a straight copy into FLV over RTMPS, with the flag
+        // that stops FFmpeg writing a duration into a live stream.
+        let n = args.len();
+        assert_eq!(
+            args[n - 7..n - 1],
+            ["-c", "copy", "-f", "flv", "-flvflags", "no_duration_filesize"].map(String::from),
+            "the output flags changed: {args:?}"
+        );
+
+        // And the destination is the ingest URL, key last, nothing added.
+        let destination = args.last().unwrap();
+        assert_eq!(destination, "rtmps://a/live2/abcd-1234-efgh-5678", "{args:?}");
+
+        // Nothing that would re-encode: no scaler, no encoder, no bitrate.
+        for forbidden in ["-vf", "-s", "-r", "-b:v", "libx264", "-c:v", "-c:a"] {
+            assert!(!args.iter().any(|a| a == forbidden), "{forbidden} in a stream copy: {args:?}");
+        }
+
+        // The manifest holds exactly the videos, in order, and nothing else.
+        assert_eq!(e.rec.last().files.len(), videos);
+        e.mgr.shutdown();
+    }
+}
+
+/// A single-video broadcast and a one-item playlist must be the same command.
+///
+/// The regression this guards against is the one that was suspected: that the
+/// playlist rewrite changed what a broadcast made before it sends.
+#[test]
+fn a_legacy_broadcast_and_a_one_item_playlist_send_the_same_command() {
+    let e = env("business");
+    e.mgr
+        .secret_store()
+        .set(&louver_cloud::credentials::destination_account(&e.dest), "abcd-1234-efgh-5678")
+        .unwrap();
+    let a = e.video("only.mp4", 90.0);
+
+    // The pre-playlist shape: a row with a media_id and no items.
+    let legacy = e.db.create_broadcast(&e.user, "옛 방송", &a, &e.dest, true).unwrap().id;
+    e.db.raw()
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM broadcast_items WHERE broadcast_id=?1", [&legacy])
+        .unwrap();
+    e.mgr.start(&e.user, &legacy).unwrap();
+    e.wait_for_launches(1);
+    let before = e.rec.last();
+    e.mgr.stop(&e.user, &legacy).unwrap();
+
+    // The new shape: the same video as a one-item playlist.
+    let modern = e.broadcast("새 방송", &[a], true);
+    e.mgr.start(&e.user, &modern).unwrap();
+    e.wait_for_launches(2);
+    let after = e.rec.last();
+    e.mgr.shutdown();
+
+    // Same files, and the same argv apart from the working directory each
+    // broadcast gets for its own manifest.
+    assert_eq!(before.files, after.files);
+    let strip = |args: Vec<String>| -> Vec<String> {
+        args.into_iter()
+            .map(|a| if a.ends_with("manifest.txt") { "MANIFEST".to_string() } else { a })
+            .collect()
+    };
+    assert_eq!(strip(before.args), strip(after.args));
+}

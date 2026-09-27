@@ -1055,6 +1055,15 @@ impl BroadcastRuntime {
         Ok(path)
     }
 
+    /// The masked tail of what FFmpeg has written to stderr.
+    ///
+    /// Already key-masked by the reader thread. Exposed because a server has no
+    /// developer panel to look at: the only way an operator sees "non-monotonous
+    /// DTS" or "broken pipe" is if something forwards it to a log.
+    pub fn ffmpeg_stderr_tail(&self) -> Vec<String> {
+        self.supervisor.stderr_tail()
+    }
+
     pub fn diagnostics(&self) -> StreamDiagnostics {
         let status = self.supervisor.status();
         let argv = &self.last_args;

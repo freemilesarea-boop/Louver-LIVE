@@ -151,3 +151,65 @@ keyframe 간격, audio codec(AAC), sample rate(48 kHz), 채널 수, 컨테이너
 명시합니다. `DestinationKind::can_publish_metadata()` 가 코드에서 같은 구분을
 강제하므로, 나중에 메타데이터를 플랫폼에 보내는 기능을 붙일 때 "이 대상은 할 수
 있는가"를 반드시 묻게 됩니다.
+
+---
+
+## 8. 방송이 안 보일 때 (진단)
+
+대시보드가 "송출 중"인데 YouTube 채널에 나타나지 않을 때, 서버에서:
+
+```bash
+docker compose exec -T louver louver-server --diagnose
+```
+
+이 출력에 방송별로 다음이 나옵니다.
+
+- desired / runtime 상태, 재시작 횟수, uptime
+- 플레이리스트 위치, 지금/다음 영상
+- **대상**: `scheme=rtmps host=a.rtmps.youtube.com path=/live2`
+- **실행 중인 FFmpeg의 실제 명령줄** (`/proc/<pid>/cmdline`, 스트림 키는
+  `[REDACTED:19자]`로 치환)
+- concat 매니페스트의 내용
+- 최근 기록 15줄
+
+`docker compose logs -f louver` 에도 이제 방송별 줄이 나옵니다.
+
+```
+[louver][79a9baa6][info] 송출 대상: scheme=rtmps host=a.rtmps.youtube.com path=/live2 key=[REDACTED len=24 sha256:029b9036] 영상=3개
+[louver][79a9baa6][info] RTMPS 전송을 시작합니다. 스트림 키 방식이므로 …
+[louver][79a9baa6][info] spawn: …ffmpeg … -i …/manifest.txt -c copy -f flv … rtmps://a.rtmps.youtube.com/live2/••••••••
+[louver][79a9baa6][info] 방송이 시작되었습니다
+[louver][79a9baa6][ffmpeg] <FFmpeg가 stderr에 쓴 내용, 있을 때>
+[louver][79a9baa6][warn] 방송이 중단되었습니다. 2초 후 자동으로 다시 연결합니다
+```
+
+`key=[REDACTED … sha256:xxxxxxxx]` 의 지문은 **키를 노출하지 않고** "어제
+작동했던 그 키인가"를 두 로그 줄을 비교해 확인하기 위한 것입니다.
+
+### "송출 중"이 뜻하는 것과 뜻하지 않는 것
+
+| | |
+| --- | --- |
+| 뜻함 | FFmpeg가 RTMP(S) 연결을 열고 바이트를 쓰고 있다 (ingest가 publish를 받았다) |
+| **뜻하지 않음** | **YouTube가 그 방송을 공개했다** |
+
+247streams는 스트림 키 방식에서 **YouTube API를 호출하지 않습니다**. 라이브를
+만들거나 "실시간 시작"을 누르지 않습니다. 그래서 대시보드가 송출 중이어도
+Studio에서 공개 전환을 하지 않으면 채널에는 나타나지 않습니다. 카드와 로그가
+이 사실을 그 자리에서 말합니다.
+
+### 알려진 결함: 루프 이음새의 오디오 타임스탬프
+
+`-stream_loop -1` 이 마지막 영상에서 처음으로 돌아갈 때, 받은 스트림의 오디오
+DTS가 약 0.17 ms 뒤로 물러납니다(48 kHz 기준 8 샘플). AAC 프레임(1024 샘플)이
+영상 길이와 정확히 나누어떨어지지 않기 때문입니다.
+
+- **플레이리스트 기능 때문에 생긴 것이 아닙니다.** 영상 1개를 루프해도 같은
+  지점에서 같은 결함이 나타납니다 — 즉 YouTube 송출이 정상 작동하던 버전에도
+  있었습니다.
+- 영상 *사이*의 이음새(같은 한 바퀴 안)는 깨끗합니다. 준비 단계의 whole-frame
+  컷이 그 부분을 처리합니다.
+- 한 바퀴에 한 번뿐입니다(1시간 29분 영상이면 89분마다 한 번).
+- 고치려면 준비 단계에서 오디오를 영상 길이에 맞춰 자르거나 채워야 하고
+  (`apad` + 정확한 `-t`), **이미 준비된 파일을 다시 준비해야** 합니다. 실송출
+  경로를 건드리는 변경이므로 이번 긴급 조사에서는 하지 않았습니다.

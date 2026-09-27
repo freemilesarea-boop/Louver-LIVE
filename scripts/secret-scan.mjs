@@ -58,6 +58,10 @@ const ALLOWLIST = [
   // The cloud's own suites do the same: a key-shaped string is the only way to
   // prove that a key-shaped string never reaches a response, a log or the DOM.
   /^apps\/server\/tests\//,
+  // `diagnose.rs` proves that a key-shaped string is redacted out of a command
+  // line, which needs a key-shaped string to redact. Same grounds as the core's
+  // src above; the rule this suppresses is the key shape only.
+  /^apps\/server\/src\//,
   /^crates\/louver-cloud\/tests\//,
   /^apps\/web\/src\/.*\.test\.tsx?$/,
   /^README\.md$/,

@@ -75,10 +75,23 @@ impl LauncherFactory for FfmpegLaunchers {
             program: self.program.clone(),
             // The core masks the stream key before a line reaches here.
             log: Arc::new(move |line: &str| {
+                say(&id, "info", line);
                 let _ = db.append_event(&id, EventLevel::Info, line);
             }),
         })
     }
+}
+
+/// Put a broadcast's line where an operator will actually find it.
+///
+/// The event table is the right home for these — a user reads them in the
+/// dashboard — but `docker compose logs` is where someone looks when a stream is
+/// not appearing, and until now it held nothing but the boot lines. Every line
+/// here has already been through the core's masking, so a stream key cannot
+/// reach it.
+pub(crate) fn say(broadcast_id: &str, level: &str, line: &str) {
+    let short: String = broadcast_id.chars().take(8).collect();
+    println!("[louver][{short}][{level}] {line}");
 }
 
 /// Everything a worker thread needs, owned rather than borrowed.
@@ -161,6 +174,7 @@ impl RuntimeEvents for DbEvents {
     fn on_log(&self, level: EventLevel, message: &str) {
         // `message` has already been through the core's masking on its way
         // here; nothing in this module adds a secret to it.
+        say(&self.broadcast_id, &format!("{level:?}").to_lowercase(), message);
         let _ = self.db.append_event(&self.broadcast_id, level, message);
     }
 }
@@ -385,6 +399,13 @@ impl BroadcastManager {
 
         core_db.set_setting(louver_core::settings_keys::RTMPS_URL, &dest.rtmps_url)?;
 
+        // Say where this is about to send, in a form that can be pasted into a
+        // bug report. A stream not appearing on a channel is almost always one
+        // of: the wrong host, a key that is not the one that used to work, or a
+        // destination that is not RTMP at all — and none of those could be told
+        // apart from the outside before this line existed.
+        describe_destination(broadcast_id, &dest, &self.keys, rotated.len());
+
         // The key store the engine reads. Scoped to this destination's account,
         // so one broadcast cannot read another's key.
         let key_store = Arc::new(StreamKeyStore::with_account(
@@ -471,6 +492,7 @@ fn run_until_stopped(
     loop_forever: bool,
     user_id: String,
 ) {
+    let mut stderr_cursor = StderrCursor::default();
     loop {
         if stop.load(Ordering::SeqCst) {
             let _ = rt.stop(true);
@@ -495,6 +517,17 @@ fn run_until_stopped(
 
         rt.tick();
         let _ = db.touch_heartbeat(broadcast_id);
+
+        // What FFmpeg is complaining about, as it complains. At `-loglevel
+        // warning` this is exactly the set of things that break a live stream —
+        // non-monotonous DTS, av_interleaved_write_frame, a broken pipe, a TLS
+        // failure — and before this it was only ever read after the process had
+        // already died, which is too late to explain a stream that is running
+        // and invisible.
+        for line in stderr_cursor.fresh(&rt.ffmpeg_stderr_tail()) {
+            say(broadcast_id, "ffmpeg", &line);
+            let _ = db.append_event(broadcast_id, EventLevel::Warn, &format!("ffmpeg: {line}"));
+        }
 
         // §2's "repeat off": FFmpeg is always started with `-stream_loop -1`,
         // because a sender that exits is a sender the supervisor would restart.
@@ -662,5 +695,140 @@ mod meter_tests {
         // A second restart banks the second process too.
         assert_eq!(m.observe(0), 7_000);
         assert_eq!(m.observe(500), 7_500);
+    }
+}
+
+/// Reads a rotating tail without repeating itself and without losing a line.
+///
+/// The core keeps the last twenty stderr lines and drops the oldest, so a count
+/// is not a usable cursor: once it is full the length stops changing while the
+/// content keeps moving. Nor is "the last line I saw", because FFmpeg repeats the
+/// same warning and each repeat is news. So this keeps the previous window and
+/// finds how far it slid: the smallest shift whose remainder still matches the
+/// front of the new window. When nothing matches, the window moved further than
+/// it is long and everything in it is forwarded.
+#[derive(Default, Debug)]
+struct StderrCursor {
+    previous: Vec<String>,
+}
+
+impl StderrCursor {
+    fn fresh(&mut self, tail: &[String]) -> Vec<String> {
+        if tail.is_empty() {
+            return Vec::new();
+        }
+        let mut new_from = 0;
+        for shift in 0..=self.previous.len() {
+            let overlap = self.previous.len() - shift;
+            if overlap > tail.len() {
+                continue;
+            }
+            if self.previous[shift..] == tail[..overlap] {
+                new_from = overlap;
+                break;
+            }
+        }
+        self.previous = tail.to_vec();
+        tail[new_from..].to_vec()
+    }
+}
+
+/// Log where a broadcast is about to send, without logging the key.
+///
+/// The fingerprint is a truncated SHA-256 of the key. It is enough to answer
+/// "is this the same key that worked yesterday?" by comparing two log lines, and
+/// it reveals nothing: the key itself never leaves the sealed store.
+fn describe_destination(
+    broadcast_id: &str,
+    dest: &crate::models::StreamDestination,
+    keys: &Arc<dyn louver_core::security::SecretStore>,
+    items: usize,
+) {
+    let url = dest.rtmps_url.trim_end_matches('/');
+    let scheme = url.split("://").next().unwrap_or("").to_string();
+    let rest = url.split("://").nth(1).unwrap_or("");
+    let host = rest.split('/').next().unwrap_or("").to_string();
+    let path = rest.strip_prefix(&host).unwrap_or("").to_string();
+
+    let account = crate::credentials::destination_account(&dest.id);
+    let (len, fingerprint) = match keys.get(&account) {
+        Ok(Some(key)) => {
+            let digest = ring::digest::digest(&ring::digest::SHA256, key.trim().as_bytes());
+            let hex: String = digest.as_ref().iter().take(4).map(|b| format!("{b:02x}")).collect();
+            (key.trim().chars().count(), hex)
+        }
+        // No key at all is why FFmpeg would never have started; say so rather
+        // than leaving an empty URL to be guessed at.
+        Ok(None) => (0, "none".to_string()),
+        Err(_) => (0, "unreadable".to_string()),
+    };
+
+    say(
+        broadcast_id,
+        "info",
+        &format!(
+            "송출 대상: scheme={scheme} host={host} path={path} key=[REDACTED len={len} sha256:{fingerprint}] 영상={items}개"
+        ),
+    );
+    if !matches!(scheme.as_str(), "rtmp" | "rtmps") {
+        say(
+            broadcast_id,
+            "error",
+            &format!("송출 대상이 RTMP(S)가 아닙니다 (scheme={scheme}). YouTube에는 도달하지 않습니다."),
+        );
+    }
+    if len == 0 {
+        say(broadcast_id, "error", "스트림 키를 읽을 수 없습니다. 대상을 다시 저장해 주세요.");
+    }
+    // The limit of what a pasted key can do, said at the moment it matters.
+    // 247streams sends video to the ingest; it does not create the live
+    // broadcast, set its title or press "go live", because none of that is
+    // possible without the account being connected (§5).
+    if !dest.kind.can_publish_metadata() {
+        say(
+            broadcast_id,
+            "info",
+            "RTMPS 전송을 시작합니다. 스트림 키 방식이므로 247streams는 YouTube에 \
+             라이브를 만들거나 공개로 전환하지 않습니다 — YouTube Studio에서 수신을 \
+             확인하고 '실시간 시작'을 눌러야 채널에 나타납니다.",
+        );
+    }
+}
+
+#[cfg(test)]
+mod stderr_cursor_tests {
+    use super::StderrCursor;
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn it_forwards_each_line_once() {
+        let mut c = StderrCursor::default();
+        assert_eq!(c.fresh(&lines(&[])), Vec::<String>::new());
+        assert_eq!(c.fresh(&lines(&["a", "b"])), lines(&["a", "b"]));
+        assert_eq!(c.fresh(&lines(&["a", "b"])), Vec::<String>::new(), "nothing new");
+        assert_eq!(c.fresh(&lines(&["a", "b", "c"])), lines(&["c"]));
+    }
+
+    #[test]
+    fn a_rotated_tail_does_not_silently_repeat_or_stall() {
+        let mut c = StderrCursor::default();
+        c.fresh(&lines(&["1", "2", "3"]));
+        // The window slid: "1" is gone and two new lines arrived. A length-based
+        // cursor would have reported nothing at all here.
+        assert_eq!(c.fresh(&lines(&["2", "3", "4", "5"])), lines(&["4", "5"]));
+        // And when the last seen line is gone entirely, the whole window is
+        // forwarded rather than skipped.
+        assert_eq!(c.fresh(&lines(&["8", "9"])), lines(&["8", "9"]));
+    }
+
+    #[test]
+    fn a_repeated_warning_is_not_mistaken_for_an_old_one() {
+        let mut c = StderrCursor::default();
+        // FFmpeg repeats the same DTS warning; each occurrence is news.
+        assert_eq!(c.fresh(&lines(&["dts"])), lines(&["dts"]));
+        assert_eq!(c.fresh(&lines(&["dts", "dts"])), lines(&["dts"]));
     }
 }

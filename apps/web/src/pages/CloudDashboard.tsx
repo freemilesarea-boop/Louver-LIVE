@@ -14,6 +14,12 @@ import { RUNTIME_LABELS, holdsASlot, itemPercent, playlistLabel, scheduleLabel }
 import { BroadcastForm } from './BroadcastForm'
 import type { Broadcast, BroadcastDetail, Dashboard, StreamDestination } from '../cloud'
 
+/** The host a stream is going to, which is the first thing to check when a
+ * channel shows nothing. */
+function hostOf(url: string): string {
+  return url.split('://')[1]?.split('/')[0] ?? url
+}
+
 function tone(b: Broadcast): 'default' | 'ok' | 'warn' | 'live' {
   if (b.runtime_state === 'RUNNING') return 'ok'
   if (b.runtime_state === 'FAILED') return 'live'
@@ -228,6 +234,19 @@ function BroadcastCard({
           />
           <Stat label="전송량" value={b.bytes_sent > 0 ? formatBytes(b.bytes_sent) : '—'} />
         </div>
+
+        {live && (
+          <p className="mt-3 rounded-md border border-ink-700 bg-ink-900 px-3 py-2 text-xs text-ink-400">
+            <span className="text-ink-100">RTMPS 전송 중</span>
+            {destination ? ` → ${hostOf(destination.rtmps_url)}` : ''}
+            {destination?.kind !== 'youtube_account' && (
+              <>
+                {' · '}스트림 키 방식이므로 채널에 공개하려면 YouTube Studio에서 수신을 확인하고
+                <span className="text-ink-100"> 실시간 시작</span>을 눌러야 합니다.
+              </>
+            )}
+          </p>
+        )}
 
         <div className="mt-4 flex flex-wrap gap-x-6 gap-y-1 border-t border-ink-800 pt-3 text-xs text-ink-500">
           <span>대상 · {destination?.label ?? b.destination_id.slice(0, 8)}</span>

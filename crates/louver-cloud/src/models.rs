@@ -204,6 +204,10 @@ pub struct StreamDestination {
     pub rtmps_url: String,
     pub key_masked: String,
     pub created_at: String,
+    /// How this destination is driven. Every row written so far is a stream key
+    /// somebody pasted, which can send video and can change nothing else about
+    /// the broadcast on the platform. §5.
+    pub kind: DestinationKind,
 }
 
 /// Who may watch, on the destination that is eventually connected.

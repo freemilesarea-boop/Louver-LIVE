@@ -76,6 +76,7 @@ const DESTINATION: StreamDestination = {
   rtmps_url: 'rtmps://a.rtmps.youtube.com/live2',
   key_masked: '••••••••••••',
   created_at: '',
+  kind: 'manual_rtmps',
 }
 
 /** A transport a test can steer, with every method present. */
@@ -408,6 +409,11 @@ describe('the operations card', () => {
     expect(screen.getByText('32분 14초 / 1시간 30분 00초')).toBeInTheDocument()
     // 5.4 GB over two hours is 6 Mbps.
     expect(screen.getByText('6.00 Mbps')).toBeInTheDocument()
+    // "송출 중" means FFmpeg is publishing to an ingest — not that YouTube has
+    // made it public. The card says which, and where it is sending.
+    expect(screen.getByText('RTMPS 전송 중')).toBeInTheDocument()
+    expect(screen.getByText(/a\.rtmps\.youtube\.com/)).toBeInTheDocument()
+    expect(screen.getByText(/실시간 시작/)).toBeInTheDocument()
     // A live broadcast offers a stop, never a delete.
     expect(screen.getByRole('button', { name: '중지' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '삭제' })).not.toBeInTheDocument()

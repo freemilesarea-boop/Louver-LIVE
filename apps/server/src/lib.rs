@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod diagnose;
 pub mod error;
 pub mod health;
 pub mod state;
