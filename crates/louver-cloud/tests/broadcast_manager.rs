@@ -274,10 +274,18 @@ fn the_manager_refuses_a_stream_the_plan_does_not_allow() {
     eventually("first launched", || h.fleet.launches(&b[0]) == 1);
 
     let second = h.mgr.start(&h.user, &b[1]);
-    assert!(
-        matches!(second, Err(louver_cloud::CloudError::LimitReached { .. })),
-        "a Basic account started a second stream: {second:?}",
-    );
+    match &second {
+        Err(louver_cloud::CloudError::ConcurrencyReached { plan_label, used, allowed }) => {
+            // The refusal a user reads names their plan and their number, not a
+            // database key.
+            assert_eq!((plan_label.as_str(), *used, *allowed), ("Basic", 1, 1));
+            assert_eq!(
+                second.as_ref().unwrap_err().to_string(),
+                "Basic 요금제에서는 동시에 1개의 방송을 송출할 수 있습니다"
+            );
+        }
+        other => panic!("a Basic account started a second stream: {other:?}"),
+    }
     assert_eq!(h.fleet.launches(&b[1]), 0, "a refused broadcast spawned a process anyway");
     assert_eq!(h.mgr.running_ids().len(), 1);
 

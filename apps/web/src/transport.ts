@@ -20,6 +20,7 @@ import type {
   NewBroadcast,
   NewDestination,
   NewItem,
+  Plan,
   StreamDestination,
   Subscription,
   YoutubeAccount,
@@ -37,6 +38,8 @@ export interface Transport {
   logout(): Promise<void>;
   me(): Promise<Me>;
   subscription(): Promise<Subscription>;
+  /** The plans on offer. Prices and limits come from here, never from the UI. */
+  plans(): Promise<Plan[]>;
 
   listMedia(): Promise<CloudMedia[]>;
   uploadMedia(
@@ -184,6 +187,10 @@ export class WebTransport implements Transport {
 
   subscription() {
     return this.json<Subscription>("/api/me/subscription");
+  }
+
+  plans() {
+    return this.json<Plan[]>("/api/plans");
   }
 
   listMedia() {

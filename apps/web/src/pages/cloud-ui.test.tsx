@@ -15,6 +15,7 @@ import { BroadcastForm } from "./BroadcastForm";
 import { DeploymentBanner, ServerStatus } from "./ServerStatus";
 import { Destinations } from "./Destinations";
 import { SignIn } from "./SignIn";
+import { Pricing } from "./Pricing";
 import { LegalPage, legalPageFor } from "./Legal";
 import { MediaLibrary } from "./MediaLibrary";
 import { AUTO_SETTINGS, emptySchedule } from "../cloud";
@@ -76,6 +77,37 @@ const READY_MEDIA: CloudMedia = {
   created_at: "",
 };
 
+/** The three plans, exactly as `GET /api/plans` serves them. */
+const PLANS = [
+  {
+    id: "basic",
+    label: "Basic",
+    limits: { max_concurrent_streams: 1 },
+    monthly_price_krw: 19900,
+    description: "개인 크리에이터 / 테스트",
+    active: true,
+    sort_order: 1,
+  },
+  {
+    id: "pro",
+    label: "Pro",
+    limits: { max_concurrent_streams: 2 },
+    monthly_price_krw: 39900,
+    description: "여러 채널 운영자",
+    active: true,
+    sort_order: 2,
+  },
+  {
+    id: "business",
+    label: "Business",
+    limits: { max_concurrent_streams: 3 },
+    monthly_price_krw: 59900,
+    description: "전문 채널 / 다중 라이브 운영",
+    active: true,
+    sort_order: 3,
+  },
+];
+
 const DESTINATION: StreamDestination = {
   id: "d1",
   user_id: "u1",
@@ -101,6 +133,7 @@ function fake(over: Partial<Transport> = {}): Transport {
     listDestinations: vi.fn().mockResolvedValue([DESTINATION]),
     createDestination: vi.fn(),
     deleteDestination: vi.fn().mockResolvedValue(undefined),
+    plans: vi.fn().mockResolvedValue(PLANS),
     youtubeAvailability: vi
       .fn()
       .mockResolvedValue({ configured: false, redirect_uri: "" }),
@@ -1259,5 +1292,206 @@ describe("the documents signup links to", () => {
       screen.getByText(/비밀번호 자체는 저장하지 않습니다/),
     ).toBeInTheDocument();
     expect(screen.getByText(/스트림 키는 암호화하여 보관/)).toBeInTheDocument();
+  });
+});
+
+describe("the price list", () => {
+  it("shows the three plans with the server's prices and limits", async () => {
+    show(<Pricing />, fake());
+
+    const cards = await screen.findAllByTestId("plan-card");
+    expect(cards).toHaveLength(3);
+    // In the server's order, which is `sort_order` and not alphabetical.
+    expect(cards.map((c) => c.getAttribute("data-plan"))).toEqual([
+      "basic",
+      "pro",
+      "business",
+    ]);
+
+    // Prices and concurrency both come from the payload. Nothing on this page
+    // is allowed to know them independently.
+    expect(screen.getByText("₩19,900")).toBeInTheDocument();
+    expect(screen.getByText("₩39,900")).toBeInTheDocument();
+    expect(screen.getByText("₩59,900")).toBeInTheDocument();
+    expect(screen.getByText("동시 송출 1개")).toBeInTheDocument();
+    expect(screen.getByText("동시 송출 2개")).toBeInTheDocument();
+    expect(screen.getByText("동시 송출 3개")).toBeInTheDocument();
+
+    expect(screen.getByText("개인 크리에이터 / 테스트")).toBeInTheDocument();
+    expect(screen.getByText("여러 채널 운영자")).toBeInTheDocument();
+    expect(
+      screen.getByText("전문 채널 / 다중 라이브 운영"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders a price the server changed, without this file knowing the number", async () => {
+    // The point of the request: a price is whatever the server says it is.
+    const raised = PLANS.map((p) =>
+      p.id === "basic" ? { ...p, monthly_price_krw: 24900 } : p,
+    );
+    show(<Pricing />, fake({ plans: vi.fn().mockResolvedValue(raised) }));
+
+    expect(await screen.findByText("₩24,900")).toBeInTheDocument();
+    expect(screen.queryByText("₩19,900")).not.toBeInTheDocument();
+  });
+
+  it("lists the common features on every plan", async () => {
+    show(<Pricing />, fake());
+    await screen.findAllByTestId("plan-card");
+
+    for (const feature of [
+      "24/7 클라우드 송출",
+      "YouTube 계정 연결",
+      "플레이리스트 방송",
+      "예약 송출",
+      "PC를 종료해도 계속 송출",
+    ]) {
+      // Once per card.
+      expect(screen.getAllByText(feature)).toHaveLength(3);
+    }
+  });
+
+  it("singles out Pro without shouting about it", async () => {
+    show(<Pricing />, fake());
+    const cards = await screen.findAllByTestId("plan-card");
+    const pro = cards.find((c) => c.getAttribute("data-plan") === "pro")!;
+
+    expect(pro).toHaveTextContent("추천");
+    // Exactly one card is recommended.
+    expect(screen.getAllByText("추천")).toHaveLength(1);
+  });
+
+  it("does not activate anything when a plan is chosen", async () => {
+    // There is no transport method that could activate a plan; this proves the
+    // button does not reach for one, and says what it does instead.
+    const t = fake();
+    show(<Pricing />, t);
+    await screen.findAllByTestId("plan-card");
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Business 시작하기" }),
+    );
+
+    expect(await screen.findByTestId("payment-coming-soon")).toHaveTextContent(
+      "결제 시스템을 준비 중입니다.",
+    );
+    expect(
+      screen.getByText(/Business 요금제\(₩59,900 \/ 월\)/),
+    ).toBeInTheDocument();
+    // Nothing was sent. `plans` is the only call this page makes, and the loop
+    // below proves the rest were untouched — counted, so that a day when none of
+    // them is a mock cannot make this pass by checking nothing.
+    expect(t.plans).toHaveBeenCalledTimes(1);
+    let checked = 0;
+    for (const method of Object.keys(t) as (keyof typeof t)[]) {
+      if (method === "plans" || method === "kind") continue;
+      const fn = t[method];
+      if (typeof fn === "function" && "mock" in fn) {
+        expect(fn as never).not.toHaveBeenCalled();
+        checked += 1;
+      }
+    }
+    expect(checked).toBeGreaterThan(20);
+  });
+
+  it("says so when the price list cannot be loaded", async () => {
+    show(
+      <Pricing />,
+      fake({ plans: vi.fn().mockRejectedValue(new Error("nope")) }),
+    );
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "요금제를 불러오지 못했습니다",
+    );
+  });
+});
+
+describe("what the dashboard says about the plan", () => {
+  function dashboard(over: Partial<Dashboard>) {
+    return fake({
+      dashboard: vi.fn().mockResolvedValue({
+        plan_label: "요금제 없음",
+        active: 0,
+        allowed: 0,
+        broadcasts: [],
+        ...over,
+      } satisfies Dashboard),
+    });
+  }
+
+  it("tells an unsubscribed account what to do, and offers the price list", async () => {
+    const onSeePricing = vi.fn();
+    show(
+      <CloudDashboard onSeePricing={onSeePricing} />,
+      dashboard({ subscribed: false, plan_id: "none" }),
+    );
+
+    const banner = await screen.findByTestId("no-subscription-banner");
+    expect(banner).toHaveTextContent("현재 활성화된 요금제가 없습니다.");
+    expect(banner).toHaveTextContent(
+      "방송을 시작하려면 요금제를 선택해주세요.",
+    );
+    expect(screen.getByTestId("plan-label")).toHaveTextContent("요금제 없음");
+
+    await userEvent.click(screen.getByRole("button", { name: "요금제 보기" }));
+    expect(onSeePricing).toHaveBeenCalled();
+  });
+
+  it("shows a paid account its plan and its slots, with no banner", async () => {
+    show(
+      <CloudDashboard />,
+      dashboard({
+        plan_label: "Pro",
+        allowed: 2,
+        active: 0,
+        subscribed: true,
+        plan_id: "pro",
+      }),
+    );
+
+    expect(await screen.findByTestId("plan-label")).toHaveTextContent("Pro");
+    expect(screen.getByTestId("slots")).toHaveTextContent("0 / 2");
+    expect(
+      screen.queryByTestId("no-subscription-banner"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("treats a payload from an older server as subscribed", async () => {
+    // `subscribed` is additive. Absent must not blank out a working account.
+    show(
+      <CloudDashboard />,
+      dashboard({ plan_label: "Business", allowed: 3, active: 1 }),
+    );
+    expect(await screen.findByTestId("plan-label")).toHaveTextContent(
+      "Business",
+    );
+    expect(
+      screen.queryByTestId("no-subscription-banner"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows the server's concurrency refusal as it was written", async () => {
+    const t = fake({
+      dashboard: vi.fn().mockResolvedValue({
+        plan_label: "Basic",
+        active: 1,
+        allowed: 1,
+        subscribed: true,
+        plan_id: "basic",
+        broadcasts: [broadcast()],
+      } satisfies Dashboard),
+      startBroadcast: vi
+        .fn()
+        .mockRejectedValue(
+          new Error(
+            "Basic 요금제에서는 동시에 1개의 방송을 송출할 수 있습니다",
+          ),
+        ),
+    });
+    show(<CloudDashboard />, t);
+
+    await userEvent.click(await screen.findByRole("button", { name: "시작" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Basic 요금제에서는 동시에 1개의 방송을 송출할 수 있습니다",
+    );
   });
 });

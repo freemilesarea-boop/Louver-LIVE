@@ -38,6 +38,15 @@ pub enum CloudError {
     Invalid(String),
     #[error("{limit} 한도를 초과했습니다 ({used}/{allowed})")]
     LimitReached { limit: &'static str, used: i64, allowed: i64 },
+    /// The concurrency ceiling, which is the entitlement that distinguishes the
+    /// paid plans and therefore the one a user meets most often. Separate from
+    /// `LimitReached` so the message can name their plan and their number
+    /// instead of a database key.
+    #[error("{plan_label} 요금제에서는 동시에 {allowed}개의 방송을 송출할 수 있습니다")]
+    ConcurrencyReached { plan_label: String, used: i64, allowed: i64 },
+    /// No subscription, or one that is no longer active.
+    #[error("방송을 시작하려면 활성화된 요금제가 필요합니다")]
+    NoSubscription,
     #[error("이미 사용 중인 이메일입니다")]
     EmailTaken,
     #[error("이메일 또는 비밀번호가 올바르지 않습니다")]

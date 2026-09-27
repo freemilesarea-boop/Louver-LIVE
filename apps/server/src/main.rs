@@ -51,7 +51,12 @@ fn create_user(args: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let plan = value_of(args, "--plan").unwrap_or_else(|| "basic".into());
+    // `LOUVER_DEFAULT_PLAN` used to be what a public signup got. Signups are
+    // unsubscribed now, so this is where it still means something: the plan an
+    // operator's account gets when `--plan` is not given.
+    let plan = value_of(args, "--plan")
+        .or_else(|| std::env::var("LOUVER_DEFAULT_PLAN").ok().filter(|p| !p.trim().is_empty()))
+        .unwrap_or_else(|| "basic".into());
 
     let data = std::path::PathBuf::from(
         std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()),

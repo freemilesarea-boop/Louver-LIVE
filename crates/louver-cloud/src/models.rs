@@ -166,15 +166,55 @@ pub struct Plan {
     pub id: String,
     pub label: String,
     pub limits: std::collections::BTreeMap<String, i64>,
+    /// Whole won. Money is never a float: ₩19,900 is `19900`, and there is no
+    /// arithmetic below the won in Korea anyway.
+    pub monthly_price_krw: i64,
+    /// Who the plan is for, in one line, for the pricing page.
+    pub description: String,
+    /// Is this plan offered? The unsubscribed plan and any internal one are not,
+    /// and `GET /api/plans` filters on this rather than on a list of names.
+    pub active: bool,
+    pub sort_order: i64,
 }
 
+impl Plan {
+    /// How many broadcasts this plan may run at once. The entitlement that
+    /// distinguishes the three paid plans.
+    pub fn max_concurrent_streams(&self) -> i64 {
+        self.limits.get(crate::entitlement::MAX_CONCURRENT_STREAMS).copied().unwrap_or(0)
+    }
+
+    /// Can somebody on this plan broadcast at all?
+    ///
+    /// Asked of the plan rather than of its name, so the unsubscribed plan is
+    /// simply a plan whose answer is no.
+    pub fn can_broadcast(&self) -> bool {
+        self.max_concurrent_streams() > 0
+    }
+}
+
+/// What a user is entitled to, and why.
+///
+/// `status` and `plan` are reported separately because they fail separately: a
+/// lapsed card leaves the plan in place and the status not active, and the
+/// difference is what the dashboard has to explain.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Subscription {
     pub user_id: String,
+    /// Kept for the clients written before `plan` existed. For an unsubscribed
+    /// account this is the unsubscribed plan's id, not an empty string.
     pub plan_id: String,
     pub plan_label: String,
+    /// `active` or `unsubscribed`.
     pub status: String,
     pub limits: std::collections::BTreeMap<String, i64>,
+    /// The single question every caller actually asks. True only when the
+    /// status is active **and** the plan grants something — so an account on the
+    /// unsubscribed plan cannot become entitled by a status column alone.
+    pub active: bool,
+    /// The plan being paid for. `None` when there is no subscription, which is
+    /// what lets a client tell "no plan" from "Basic".
+    pub plan: Option<Plan>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

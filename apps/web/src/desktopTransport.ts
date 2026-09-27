@@ -28,6 +28,7 @@ import type {
   NewBroadcast,
   NewDestination,
   NewItem,
+  Plan,
   RuntimeState,
   StreamDestination,
   Subscription,
@@ -78,7 +79,15 @@ export class DesktopTransport implements Transport {
       status: "active",
       // One machine sends one stream. The number is the truth here, not a plan.
       limits: { max_concurrent_streams: 1 },
+      // Nothing is being sold here: the desktop app is the licence.
+      active: true,
+      plan: null,
     };
+  }
+
+  /** Nothing is on sale in the desktop app, so there is no price list. */
+  async plans(): Promise<Plan[]> {
+    return [];
   }
 
   async listMedia(): Promise<CloudMedia[]> {

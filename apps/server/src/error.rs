@@ -27,7 +27,11 @@ impl IntoResponse for ApiError {
             CloudError::BadCredentials => (StatusCode::UNAUTHORIZED, self.0.to_string()),
             CloudError::EmailTaken => (StatusCode::CONFLICT, self.0.to_string()),
             CloudError::Invalid(_) => (StatusCode::BAD_REQUEST, self.0.to_string()),
-            CloudError::LimitReached { .. } => (StatusCode::PAYMENT_REQUIRED, self.0.to_string()),
+            // 402 for all three: the caller has asked for something their plan
+            // does not cover, and paying is what changes the answer.
+            CloudError::LimitReached { .. }
+            | CloudError::ConcurrencyReached { .. }
+            | CloudError::NoSubscription => (StatusCode::PAYMENT_REQUIRED, self.0.to_string()),
             // Anything internal keeps its detail in the log, not in the body.
             CloudError::Db(_) | CloudError::Io(_) | CloudError::Crypto => {
                 eprintln!("[louver] internal: {}", self.0);

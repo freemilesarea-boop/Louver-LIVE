@@ -238,21 +238,21 @@ pub async fn register(State(app): State<App>, headers: HeaderMap, Json(body): Js
         check_password(&body.password)?;
         let password_hash = hash_password(&body.password)?;
 
-        // The plan comes from the server's environment and nowhere else. §12:
-        // signing up must not be a way to choose an entitlement.
-        let plan = std::env::var("LOUVER_DEFAULT_PLAN").unwrap_or_else(|_| "basic".into());
+        // No plan argument at all, by design: a new account is unsubscribed, and
+        // choosing a plan is what a verified payment does. That is a stronger
+        // guarantee than validating one would be — signing up cannot grant an
+        // entitlement because there is no parameter through which it could. See
+        // `CloudDb::register_user`.
+        //
         // Agreeing to the terms is a condition of reaching this endpoint at all,
         // and the moment it happened is the server's clock's to record — a
         // client-supplied timestamp could claim any date it liked.
-        let user = app.db.register_user(
-            &Signup {
-                name: &name,
-                email: &email,
-                password_hash: &password_hash,
-                terms_version: TERMS_VERSION,
-            },
-            &plan,
-        )?;
+        let user = app.db.register_user(&Signup {
+            name: &name,
+            email: &email,
+            password_hash: &password_hash,
+            terms_version: TERMS_VERSION,
+        })?;
 
         let (token, token_hash) = new_token()?;
         app.db.create_auth_session(&user.id, &token_hash, SESSION_DAYS)?;
@@ -294,11 +294,24 @@ pub async fn me(State(app): State<App>, Caller(user_id): Caller) -> std::result:
     Ok(Json(Me::of(u)))
 }
 
+/// What this account is entitled to. The front end reads `active` and `plan`.
 pub async fn subscription(
     State(app): State<App>,
     Caller(user_id): Caller,
 ) -> std::result::Result<Json<louver_cloud::Subscription>, ApiError> {
     Ok(Json(crate::blocking(move || app.db.subscription(&user_id)).await?))
+}
+
+/// The plans on offer, for the pricing page.
+///
+/// Unauthenticated: a price list is public, and requiring a session to read one
+/// would mean nobody could see what the service costs before signing up.
+///
+/// The prices and the concurrency figures come from here and are never written
+/// into the front end, so there is exactly one place they can disagree with what
+/// the server charges: none.
+pub async fn plans(State(app): State<App>) -> std::result::Result<Json<Vec<louver_cloud::Plan>>, ApiError> {
+    Ok(Json(crate::blocking(move || app.db.plans_for_sale()).await?))
 }
 
 fn with_cookie(value: String) -> HeaderMap {

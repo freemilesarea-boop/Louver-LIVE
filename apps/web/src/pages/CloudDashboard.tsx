@@ -19,6 +19,7 @@ import { formatBytes, formatDurationKo } from "@/services/format";
 import { useTransport } from "../TransportContext";
 import {
   RUNTIME_LABELS,
+  isSubscribed,
   holdsASlot,
   itemPercent,
   playlistLabel,
@@ -66,7 +67,14 @@ function youtubeTone(b: Broadcast): "default" | "ok" | "warn" | "live" {
   }
 }
 
-export function CloudDashboard({ onChanged }: { onChanged?: () => void }) {
+export function CloudDashboard({
+  onChanged,
+  onSeePricing,
+}: {
+  onChanged?: () => void;
+  /** Take the user to the price list. Absent in tests that do not need it. */
+  onSeePricing?: () => void;
+}) {
   const t = useTransport();
   const [dash, setDash] = useState<Dashboard | null>(null);
   const [destinations, setDestinations] = useState<StreamDestination[]>([]);
@@ -134,9 +142,36 @@ export function CloudDashboard({ onChanged }: { onChanged?: () => void }) {
   }
 
   const full = !!dash && dash.active >= dash.allowed;
+  // Absent means an older server, where every account was subscribed. Only an
+  // explicit `false` hides anything.
+  const subscribed = !dash || isSubscribed(dash);
 
   return (
     <div className="space-y-4">
+      {/* §8: said before anything else, because every button below it will
+          otherwise be pressed and refused. */}
+      {!subscribed && (
+        <div
+          role="status"
+          data-testid="no-subscription-banner"
+          className="flex flex-wrap items-center justify-between gap-3 rounded-md border border-warn/40 bg-warn/10 px-4 py-3"
+        >
+          <div className="text-sm">
+            <p className="font-medium text-warn">
+              현재 활성화된 요금제가 없습니다.
+            </p>
+            <p className="mt-0.5 text-ink-400">
+              방송을 시작하려면 요금제를 선택해주세요.
+            </p>
+          </div>
+          {onSeePricing && (
+            <Button size="sm" variant="primary" onClick={onSeePricing}>
+              요금제 보기
+            </Button>
+          )}
+        </div>
+      )}
+
       <Card
         title="동시 방송"
         action={
@@ -155,10 +190,18 @@ export function CloudDashboard({ onChanged }: { onChanged?: () => void }) {
             }
             tone={full ? "warn" : "live"}
           />
-          <Stat label="요금제" value={dash?.plan_label ?? "—"} />
+          <Stat
+            label="요금제"
+            value={
+              <span data-testid="plan-label">
+                {subscribed ? (dash?.plan_label ?? "—") : "요금제 없음"}
+              </span>
+            }
+            tone={subscribed ? "default" : "warn"}
+          />
           <Stat label="방송" value={dash?.broadcasts.length ?? 0} />
         </div>
-        {full && (
+        {full && subscribed && (
           <p className="mt-3 text-xs text-warn">
             요금제의 동시 방송 수를 모두 사용하고 있습니다. 하나를 중지하면 다른
             방송을 시작할 수 있습니다.

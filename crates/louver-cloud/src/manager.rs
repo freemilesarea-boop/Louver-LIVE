@@ -17,7 +17,7 @@
 use crate::db::CloudDb;
 use crate::models::{Broadcast, DesiredState, RuntimeState};
 use crate::storage::Storage;
-use crate::Result;
+use crate::{CloudError, Result};
 use louver_core::clock::SystemClock;
 use louver_core::config::{OutputProfile, StreamMode};
 use louver_core::database::models::{EventLevel, Media as CoreMedia, MediaStatus};
@@ -261,6 +261,11 @@ impl BroadcastManager {
     /// decision is made before any process is spawned. A start that then fails
     /// releases the slot rather than leaving it held by nothing.
     pub fn start(&self, user_id: &str, broadcast_id: &str) -> Result<()> {
+        // The subscription first, before anything is spent. `claim_stream_slot`
+        // asks again inside its transaction — that is the check that counts —
+        // but asking here as well keeps an account with no plan from costing us
+        // a YouTube token refresh and an API call on its way to being refused.
+        self.db.require_active_subscription(user_id)?;
         // §8: a connected account's broadcast is checked with YouTube before
         // anything is claimed or spawned — a token that will not refresh or a
         // broadcast YouTube has already completed is a reason not to start, not
@@ -310,6 +315,23 @@ impl BroadcastManager {
         let wanted = self.db.broadcasts_wanting_to_run()?;
         let mut started = 0;
         for b in wanted {
+            // Recovery spawns workers directly rather than going through
+            // `start`, so the subscription gate has to be repeated here. Without
+            // it, a restart would revive the broadcasts of an account whose
+            // subscription has since ended — the one thing §10 forbids, and the
+            // easiest to miss, because nobody is watching a boot.
+            if let Err(e) = self.db.require_active_subscription(&b.user_id) {
+                let _ = self.db.append_event(
+                    &b.id,
+                    EventLevel::Warn,
+                    "활성화된 요금제가 없어 방송을 복구하지 않았습니다",
+                );
+                // `desired_state` is left alone. When they subscribe again this
+                // broadcast is meant to come back, and rewriting it to stopped
+                // would silently discard that intent.
+                let _ = self.db.record_failure(&b.id, &format!("복구하지 않음: {e}"));
+                continue;
+            }
             // §14: a YouTube-connected broadcast has to be checked before its
             // worker is spawned — the access token has almost certainly expired
             // while the server was down, and the broadcast itself may have been
@@ -372,6 +394,16 @@ impl BroadcastManager {
                                 &b.id,
                                 EventLevel::Info,
                                 "예약된 시각이 되어 방송을 시작했습니다",
+                            );
+                        }
+                        Err(CloudError::NoSubscription) => {
+                            // Distinguished from every other failure because it
+                            // is the one the user can fix, and the one that will
+                            // otherwise repeat at every occurrence.
+                            let _ = self.db.append_event(
+                                &b.id,
+                                EventLevel::Warn,
+                                "활성화된 요금제가 없어 예약 방송을 시작하지 못했습니다",
                             );
                         }
                         Err(e) => {
@@ -716,7 +748,17 @@ impl BroadcastManager {
         let broadcasts = self.db.broadcasts_for(user_id)?;
         let allowed = sub.limits.get(crate::entitlement::MAX_CONCURRENT_STREAMS).copied().unwrap_or(0);
         let active = self.db.active_stream_count(user_id)?;
-        Ok(Dashboard { plan_label: sub.plan_label, active, allowed, broadcasts })
+        Ok(Dashboard {
+            plan_label: sub.plan_label.clone(),
+            active,
+            allowed,
+            broadcasts,
+            // So the dashboard can explain itself without a second request. It
+            // is the same value `/api/me/subscription` reports; the screen that
+            // needs it is the one this payload already feeds.
+            subscribed: sub.active,
+            plan_id: sub.plan_id,
+        })
     }
 }
 
@@ -726,6 +768,10 @@ pub struct Dashboard {
     pub active: i64,
     pub allowed: i64,
     pub broadcasts: Vec<Broadcast>,
+    /// Is there an active subscription behind this? Additive, so a client
+    /// written before plans existed keeps reading the fields it knows.
+    pub subscribed: bool,
+    pub plan_id: String,
 }
 
 /// How far into the current video the engine is.

@@ -171,7 +171,16 @@ async fn account(s: &Server, email: &str) -> String {
 const A_REAL_LOOKING_KEY: &str = "abcd-1234-efgh-5678-ijkl";
 
 /// A destination plus a broadcast that is ready to start.
+///
+/// Puts the account on a plan first. Owning a broadcast is a paid entitlement
+/// now, so every test that needs one needs a subscription to get there — Business
+/// by default, because these tests are about ownership, metrics and stream keys
+/// rather than about ceilings. A test that cares which plan sets its own with
+/// `activate_subscription` before calling this.
 async fn ready_broadcast(s: &Server, token: &str, user_id: &str, name: &str) -> (String, String) {
+    if !s.app.db.subscription(user_id).unwrap().active {
+        s.app.db.activate_subscription(user_id, "business").unwrap();
+    }
     let dest = post(
         s,
         "/api/stream-destinations",
@@ -238,7 +247,13 @@ async fn knowing_another_users_ids_buys_nothing() {
     let s = server();
     let a = account(&s, "a@example.com").await;
     let b = account(&s, "b@example.com").await;
+    let a_id = get(&s, "/api/me", &a).await.id();
     let b_id = get(&s, "/api/me", &b).await.id();
+    // A is a fully paid account. Otherwise `start` would refuse on the
+    // subscription before it ever looked at whose broadcast this is, and the
+    // test would be passing for the wrong reason — what is under test is
+    // ownership, not billing.
+    s.app.db.activate_subscription(&a_id, "business").unwrap();
     let (b_broadcast, b_media) = ready_broadcast(&s, &b, &b_id, "B의 방송").await;
     let b_dest = get(&s, "/api/stream-destinations", &b).await.json()[0]["id"].as_str().unwrap().to_string();
 
@@ -317,7 +332,8 @@ async fn the_plan_limit_is_the_servers_answer_not_the_browsers() {
     let s = server();
     let token = account(&s, "basic@example.com").await;
     let uid = get(&s, "/api/me", &token).await.id();
-    // The default plan allows one concurrent stream.
+    // Basic, whose entitlement is one concurrent stream.
+    s.app.db.activate_subscription(&uid, "basic").unwrap();
     let (first, _) = ready_broadcast(&s, &token, &uid, "첫 방송").await;
     let (second, _) = ready_broadcast(&s, &token, &uid, "둘째 방송").await;
 
@@ -326,7 +342,12 @@ async fn the_plan_limit_is_the_servers_answer_not_the_browsers() {
 
     let refused = post(&s, &format!("/api/broadcasts/{second}/start"), &token, None).await;
     assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED, "{}", refused.body);
-    assert!(refused.body.contains("max_concurrent_streams"), "{}", refused.body);
+    assert_eq!(
+        refused.json()["error"],
+        "Basic 요금제에서는 동시에 1개의 방송을 송출할 수 있습니다",
+        "the refusal a user reads must name their plan, not a database key: {}",
+        refused.body
+    );
 
     // The refusal left nothing half-started.
     let still = get(&s, &format!("/api/broadcasts/{second}"), &token).await;
@@ -690,7 +711,7 @@ async fn register(s: &Server, body: serde_json::Value) -> Reply {
 }
 
 #[tokio::test]
-async fn signing_up_stores_the_name_grants_the_default_plan_and_signs_you_in() {
+async fn signing_up_stores_the_name_leaves_you_unsubscribed_and_signs_you_in() {
     let s = server();
     let r = register(&s, signup(serde_json::json!({}))).await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
@@ -698,7 +719,7 @@ async fn signing_up_stores_the_name_grants_the_default_plan_and_signs_you_in() {
     // The reply carries the name, and no credential of any kind.
     assert_eq!(r.json()["name"], "홍길동");
     assert_eq!(r.json()["email"], "new@example.com");
-    assert!(r.json()["plan_id"].is_string());
+    assert_eq!(r.json()["plan_id"], louver_cloud::db::UNSUBSCRIBED_PLAN);
     for secret in ["correct-horse-battery", "password", "token", "louver_session"] {
         assert!(!r.body.contains(secret), "{secret} reached the browser: {}", r.body);
     }
@@ -710,12 +731,14 @@ async fn signing_up_stores_the_name_grants_the_default_plan_and_signs_you_in() {
     assert_eq!(me.status, StatusCode::OK, "{}", me.body);
     assert_eq!(me.json()["name"], "홍길동");
 
-    // The plan is the server's, and a subscription row exists for it — a user
-    // without one is a user whose limits come from a fallback.
+    // A subscription row exists — a user without one is a user whose limits come
+    // from a fallback — and it is an unsubscribed one. Signing up is not a way to
+    // get a paid entitlement.
     let uid = s.app.db.user_by_email("new@example.com").unwrap().id;
     let sub = s.app.db.subscription(&uid).unwrap();
     assert_eq!(sub.plan_id, s.app.db.user(&uid).unwrap().plan_id);
-    assert_eq!(sub.status, "active");
+    assert_eq!(sub.status, "unsubscribed");
+    assert!(!sub.active);
 
     // §6: the consent timestamps are the server's, and they are set.
     let user = s.app.db.user(&uid).unwrap();
@@ -817,10 +840,12 @@ async fn signing_up_cannot_choose_a_plan_or_grant_itself_anything() {
         assert!(s.app.db.user_by_email("new@example.com").is_err());
     }
 
-    // And the plan an honest signup gets is the one the server decided.
+    // And an honest signup gets no plan at all: the only way onto a paid one is
+    // `activate_subscription`, which no route reaches.
     assert_eq!(register(&s, signup(serde_json::json!({}))).await.status, StatusCode::OK);
     let user = s.app.db.user_by_email("new@example.com").unwrap();
-    assert_eq!(user.plan_id, "basic", "the default plan is the server's to pick");
+    assert_eq!(user.plan_id, louver_cloud::db::UNSUBSCRIBED_PLAN);
+    assert!(!s.app.db.subscription(&user.id).unwrap().active);
 }
 
 #[tokio::test]
@@ -874,4 +899,254 @@ async fn a_name_containing_markup_is_stored_as_typed_and_escaped_in_json() {
     // And it survives a round trip through the parser, which is what React is
     // handed — React renders it as text, so this is where the defence ends.
     assert!(r.json().is_object(), "{}", r.body);
+}
+
+// --- plans and subscriptions ------------------------------------------------
+
+#[tokio::test]
+async fn the_price_list_is_public_and_is_the_only_place_prices_come_from() {
+    let s = server();
+    // No session: a price list nobody can read before signing up is not one.
+    let r = send(&s, Method::GET, "/api/plans", None, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    let plans = r.json();
+    let rows = plans.as_array().expect("an array");
+    assert_eq!(rows.len(), 3, "{}", r.body);
+
+    let expected =
+        [("basic", "Basic", 19_900, 1), ("pro", "Pro", 39_900, 2), ("business", "Business", 59_900, 3)];
+    for (i, (id, label, price, streams)) in expected.iter().enumerate() {
+        let p = &rows[i];
+        assert_eq!(p["id"], *id, "order: {}", r.body);
+        assert_eq!(p["label"], *label);
+        assert_eq!(p["monthly_price_krw"], *price, "{id}");
+        assert_eq!(p["limits"]["max_concurrent_streams"], *streams, "{id}");
+        assert!(p["description"].as_str().is_some_and(|d| !d.is_empty()), "{id}");
+        // Whole won: a price that arrived as 19900.0 would round correctly today
+        // and surprise somebody later.
+        assert!(p["monthly_price_krw"].is_i64(), "money must not be a float: {}", r.body);
+    }
+
+    // The unsubscribed plan is a state, not something to buy.
+    assert!(!r.body.contains("\"none\""), "{}", r.body);
+    assert!(!r.body.contains("요금제 없음"), "{}", r.body);
+}
+
+#[tokio::test]
+async fn a_plan_an_operator_takes_off_sale_disappears_from_the_public_list() {
+    let s = server();
+    s.app.db.raw().lock().unwrap().execute("UPDATE plans SET active = 0 WHERE id = 'business'", []).unwrap();
+
+    let r = send(&s, Method::GET, "/api/plans", None, None).await;
+    let json = r.json();
+    let ids: Vec<&str> = json.as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["basic", "pro"], "{}", r.body);
+}
+
+#[tokio::test]
+async fn a_new_account_is_unsubscribed_and_is_told_so() {
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+
+    let sub = get(&s, "/api/me/subscription", &a).await;
+    assert_eq!(sub.status, StatusCode::OK, "{}", sub.body);
+    assert_eq!(sub.json()["status"], "unsubscribed");
+    assert_eq!(sub.json()["active"], false);
+    assert!(sub.json()["plan"].is_null(), "there is no plan to report: {}", sub.body);
+
+    // The dashboard says the same thing, so the banner needs no second request.
+    let dash = get(&s, "/api/broadcasts", &a).await;
+    assert_eq!(dash.json()["subscribed"], false, "{}", dash.body);
+    assert_eq!(dash.json()["allowed"], 0);
+}
+
+#[tokio::test]
+async fn an_unsubscribed_account_can_look_around_and_cannot_spend_anything() {
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+
+    // §8: signing in, the dashboard, the price list and the account all work.
+    for path in ["/api/me", "/api/me/subscription", "/api/broadcasts", "/api/plans", "/api/media"] {
+        assert_eq!(get(&s, path, &a).await.status, StatusCode::OK, "{path}");
+    }
+
+    // Making a broadcast is refused, with a sentence and a 402 rather than a
+    // limit of zero out of zero.
+    let src = s._dir.path().join("x.mp4");
+    std::fs::write(&src, b"prepared video bytes").unwrap();
+    let key = s.app.storage.put_file(&me, "x.mp4", &src).unwrap();
+    let m = s.app.db.create_media(&me, "x.mp4", 20, &key).unwrap();
+    s.app.db.record_media_prepared(&m.id, &key, 60.0, 20).unwrap();
+    let dest = post(
+        &s,
+        "/api/stream-destinations",
+        &a,
+        Some(serde_json::json!({
+            "label": "내 채널",
+            "rtmps_url": "rtmps://a.rtmps.youtube.com/live2",
+            "stream_key": A_REAL_LOOKING_KEY,
+        })),
+    )
+    .await;
+    assert_eq!(dest.status, StatusCode::OK, "{}", dest.body);
+
+    let made = post(
+        &s,
+        "/api/broadcasts",
+        &a,
+        Some(serde_json::json!({ "name": "밤 라디오", "media_id": m.id, "destination_id": dest.id() })),
+    )
+    .await;
+    assert_eq!(made.status, StatusCode::PAYMENT_REQUIRED, "{}", made.body);
+    assert!(made.body.contains("요금제"), "{}", made.body);
+}
+
+#[tokio::test]
+async fn an_unsubscribed_account_cannot_start_a_broadcast_it_already_owns() {
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+
+    // Paid for, made, then cancelled — a lapsed card, not a new signup.
+    s.app.db.activate_subscription(&me, "basic").unwrap();
+    let (broadcast, _) = ready_broadcast(&s, &a, &me, "one").await;
+    s.app.db.cancel_subscription(&me).unwrap();
+
+    let start = post(&s, &format!("/api/broadcasts/{broadcast}/start"), &a, None).await;
+    assert_eq!(start.status, StatusCode::PAYMENT_REQUIRED, "{}", start.body);
+    assert!(start.body.contains("활성화된 요금제가 필요합니다"), "{}", start.body);
+    // Nothing started, and the broadcast is not left wanting to run.
+    assert_eq!(s.app.db.broadcast(&broadcast).unwrap().desired_state, louver_cloud::DesiredState::Stopped);
+    // The broadcast and the video are still theirs: cancelling took the
+    // entitlement, not the work.
+    assert_eq!(get(&s, "/api/broadcasts", &a).await.json()["broadcasts"].as_array().unwrap().len(), 1);
+
+    s.app.mgr.shutdown();
+}
+
+#[tokio::test]
+async fn the_concurrency_refusal_names_the_plan_and_the_number() {
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    s.app.db.activate_subscription(&me, "basic").unwrap();
+
+    let (first, media) = ready_broadcast(&s, &a, &me, "one").await;
+    let second = post(
+        &s,
+        "/api/broadcasts",
+        &a,
+        Some(serde_json::json!({ "name": "둘", "media_id": media, "destination_id": s.app.db.destinations_for(&me).unwrap()[0].id })),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+
+    assert_eq!(post(&s, &format!("/api/broadcasts/{first}/start"), &a, None).await.status, StatusCode::OK);
+    let refused = post(&s, &format!("/api/broadcasts/{}/start", second.id()), &a, None).await;
+    assert_eq!(refused.status, StatusCode::PAYMENT_REQUIRED, "{}", refused.body);
+    assert_eq!(
+        refused.json()["error"],
+        "Basic 요금제에서는 동시에 1개의 방송을 송출할 수 있습니다",
+        "{}",
+        refused.body
+    );
+
+    s.app.mgr.shutdown();
+}
+
+#[tokio::test]
+async fn there_is_no_route_through_which_a_user_can_give_themselves_a_plan() {
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+
+    // Every shape somebody would try. None of these routes exists, and the point
+    // of the test is that adding one would fail here.
+    let attempts: &[(Method, &str)] = &[
+        (Method::POST, "/api/me/subscription"),
+        (Method::PUT, "/api/me/subscription"),
+        (Method::PATCH, "/api/me/subscription"),
+        (Method::POST, "/api/me/plan"),
+        (Method::PUT, "/api/me/plan"),
+        (Method::POST, "/api/plans"),
+        (Method::POST, "/api/subscriptions"),
+        (Method::POST, "/api/set-plan"),
+        (Method::POST, "/api/billing/activate"),
+    ];
+    for (method, path) in attempts {
+        let r = send(
+            &s,
+            method.clone(),
+            path,
+            Some(&a),
+            Some(serde_json::json!({ "plan_id": "business", "status": "active" })),
+        )
+        .await;
+        assert!(
+            r.status == StatusCode::NOT_FOUND || r.status == StatusCode::METHOD_NOT_ALLOWED,
+            "{method} {path} answered {} — a user must not be able to grant themselves a plan: {}",
+            r.status,
+            r.body
+        );
+    }
+
+    // And after all of that they are still unsubscribed.
+    assert!(!s.app.db.subscription(&me).unwrap().active);
+    assert_eq!(get(&s, "/api/me/subscription", &a).await.json()["status"], "unsubscribed");
+}
+
+#[tokio::test]
+async fn a_paid_account_is_told_which_plan_and_how_many_streams() {
+    let s = server();
+    let a = account(&s, "dj@example.com").await;
+    let me = s.app.db.user_by_email("dj@example.com").unwrap().id;
+    // What a verified payment will do. Not reachable from a browser.
+    s.app.db.activate_subscription(&me, "pro").unwrap();
+
+    let sub = get(&s, "/api/me/subscription", &a).await;
+    assert_eq!(sub.json()["status"], "active");
+    assert_eq!(sub.json()["active"], true);
+    assert_eq!(sub.json()["plan"]["id"], "pro");
+    assert_eq!(sub.json()["plan"]["label"], "Pro");
+    assert_eq!(sub.json()["plan"]["limits"]["max_concurrent_streams"], 2);
+
+    let dash = get(&s, "/api/broadcasts", &a).await;
+    assert_eq!(dash.json()["subscribed"], true);
+    assert_eq!(dash.json()["plan_label"], "Pro");
+    assert_eq!(dash.json()["allowed"], 2);
+}
+
+#[tokio::test]
+async fn the_operators_business_account_survives_and_keeps_its_three_streams() {
+    let s = server();
+    // Exactly what the deploy script runs: `--create-user … --plan business`.
+    let hash = louver_cloud::credentials::hash_password("correct-horse-battery").unwrap();
+    let ops = s.app.db.create_user("freemilesarea@example.com", &hash, "business").unwrap();
+
+    let sub = s.app.db.subscription(&ops.id).unwrap();
+    assert!(sub.active, "the operator's account must not be unsubscribed by any of this");
+    assert_eq!(sub.plan_id, "business");
+    assert_eq!(sub.plan.as_ref().map(|p| p.max_concurrent_streams()), Some(3));
+
+    // And it signs in and reads its plan over HTTP.
+    let r = send(
+        &s,
+        Method::POST,
+        "/api/auth/login",
+        None,
+        Some(serde_json::json!({
+            "email": "freemilesarea@example.com",
+            "password": "correct-horse-battery",
+        })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let cookie =
+        r.set_cookie.unwrap().split(';').next().unwrap().trim_start_matches("louver_session=").to_string();
+    let dash = get(&s, "/api/broadcasts", &cookie).await;
+    assert_eq!(dash.json()["plan_label"], "Business");
+    assert_eq!(dash.json()["allowed"], 3);
+    assert_eq!(dash.json()["subscribed"], true);
 }

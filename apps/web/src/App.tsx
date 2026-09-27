@@ -9,6 +9,7 @@ import { Button } from "@/components/ui";
 import { CloudDashboard } from "./pages/CloudDashboard";
 import { Destinations } from "./pages/Destinations";
 import { MediaLibrary } from "./pages/MediaLibrary";
+import { Pricing } from "./pages/Pricing";
 import { LegalPage, legalPageFor } from "./pages/Legal";
 import { DeploymentBanner, ServerStatus } from "./pages/ServerStatus";
 import { SignIn } from "./pages/SignIn";
@@ -26,12 +27,13 @@ export function Wordmark({ className = "" }: { className?: string }) {
   );
 }
 
-type Tab = "broadcasts" | "media" | "destinations" | "status";
+type Tab = "broadcasts" | "media" | "destinations" | "pricing" | "status";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "broadcasts", label: "방송" },
   { id: "media", label: "영상" },
   { id: "destinations", label: "송출 대상" },
+  { id: "pricing", label: "요금제" },
   { id: "status", label: "서버 상태" },
 ];
 
@@ -70,10 +72,19 @@ export function App() {
       ? null
       : legalPageFor(window.location.pathname),
   );
+  // `/pricing` opens the tab it names. Still not a router: one more path read
+  // once, rather than a dependency every screen would then import.
+  const [landedOnPricing] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      window.location.pathname.replace(/\/+$/, "") === "/pricing",
+  );
   const [me, setMe] = useState<Me | null>(null);
   const [checked, setChecked] = useState(false);
   const [consent] = useState(consentOutcome);
-  const [tab, setTab] = useState<Tab>(consent ? "destinations" : "broadcasts");
+  const [tab, setTab] = useState<Tab>(
+    consent ? "destinations" : landedOnPricing ? "pricing" : "broadcasts",
+  );
   const [notice, setNotice] = useState<{
     outcome: string;
     detail: string;
@@ -178,9 +189,12 @@ export function App() {
             </button>
           </div>
         )}
-        {tab === "broadcasts" && <CloudDashboard />}
+        {tab === "broadcasts" && (
+          <CloudDashboard onSeePricing={() => setTab("pricing")} />
+        )}
         {tab === "media" && <MediaLibrary />}
         {tab === "destinations" && <Destinations />}
+        {tab === "pricing" && <Pricing onClose={() => setTab("broadcasts")} />}
         {tab === "status" && <ServerStatus />}
       </main>
     </div>

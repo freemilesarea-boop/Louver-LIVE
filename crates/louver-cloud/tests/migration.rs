@@ -372,26 +372,96 @@ fn signup_records_consent_and_the_bootstrap_path_still_does_not() {
     let db = CloudDb::open(&path).unwrap();
 
     let signed_up = db
-        .register_user(
-            &louver_cloud::db::Signup {
-                name: "홍길동",
-                email: "new@example.com",
-                password_hash: "salt:hash",
-                terms_version: "2026-09-27",
-            },
-            "basic",
-        )
+        .register_user(&louver_cloud::db::Signup {
+            name: "홍길동",
+            email: "new@example.com",
+            password_hash: "salt:hash",
+            terms_version: "2026-09-27",
+        })
         .unwrap();
     assert_eq!(signed_up.name.as_deref(), Some("홍길동"));
     assert!(signed_up.terms_accepted_at.is_some());
     assert!(signed_up.privacy_accepted_at.is_some());
-    // A subscription came with it, in the same transaction.
-    assert_eq!(db.subscription(&signed_up.id).unwrap().plan_id, "basic");
+    // A subscription row came with it, in the same transaction — and it is an
+    // unsubscribed one. Signing up no longer grants a paid entitlement.
+    let sub = db.subscription(&signed_up.id).unwrap();
+    assert_eq!(sub.plan_id, louver_cloud::db::UNSUBSCRIBED_PLAN);
+    assert_eq!(sub.status, louver_cloud::db::SUBSCRIPTION_UNSUBSCRIBED);
+    assert!(!sub.active);
+    assert!(sub.plan.is_none(), "there is no plan to report");
 
     // The CLI's path is unchanged: no name, and no agreement it has no right to
     // give.
     let bootstrapped = db.create_user("ops@example.com", "salt:hash", "business").unwrap();
     assert_eq!(bootstrapped.name, None);
     assert_eq!(bootstrapped.terms_accepted_at, None);
-    assert_eq!(db.subscription(&bootstrapped.id).unwrap().plan_id, "business");
+    let ops = db.subscription(&bootstrapped.id).unwrap();
+    assert_eq!(ops.plan_id, "business");
+    assert!(ops.active, "the bootstrap path still grants what it is told to");
+    assert_eq!(ops.plan.map(|p| p.max_concurrent_streams()), Some(3));
+}
+
+/// Pricing is added to a production database without touching what is on it.
+///
+/// The account this fixture holds is the shape of the operator's: on Business,
+/// with a running broadcast, a sealed stream key and a subscription row written
+/// before `status` meant anything. It has to come out of the migration on
+/// Business, entitled to three streams, with all of it still there.
+#[test]
+fn a_production_database_gains_prices_and_keeps_every_entitlement_it_had() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.db");
+    let (broadcast_id, sealed) = yesterdays_database(&path);
+
+    let before = {
+        let c = Connection::open(&path).unwrap();
+        // The fixture is the old schema: a label and a bag of limits, no price.
+        let cols = columns(&c, "plans");
+        assert!(!cols.contains(&"monthly_price_krw".to_string()), "the fixture must predate pricing");
+        cols
+    };
+
+    let db = CloudDb::open(&path).unwrap();
+
+    // Appended, not rearranged.
+    let after = columns(&db.raw().lock().unwrap(), "plans");
+    assert_eq!(&after[..before.len()], &before[..], "an existing column was moved or dropped");
+    for added in ["monthly_price_krw", "description", "active", "sort_order"] {
+        assert!(after.contains(&added.to_string()), "{added} is missing");
+    }
+
+    // The operator's account is untouched, and still entitled to three streams.
+    let sub = db.subscription("u-old").unwrap();
+    assert_eq!(sub.plan_id, "business");
+    assert_eq!(sub.status, "active");
+    assert!(sub.active, "a production account must not come out of this unsubscribed");
+    assert_eq!(sub.plan.as_ref().map(|p| p.max_concurrent_streams()), Some(3));
+    assert_eq!(
+        db.limit("u-old", louver_cloud::entitlement::MAX_CONCURRENT_STREAMS).unwrap(),
+        3,
+        "the enforcement path reads the same three"
+    );
+
+    // Its plan row, which existed before prices did, now carries one — this is
+    // why `seed_plans` updates the presentation columns on conflict rather than
+    // doing nothing. Left alone, the pricing page would show ₩0 for ever.
+    assert_eq!(db.plan("business").unwrap().monthly_price_krw, 59_900);
+    assert_eq!(db.plan("basic").unwrap().monthly_price_krw, 19_900);
+    assert_eq!(db.plan("pro").unwrap().monthly_price_krw, 39_900);
+
+    // The limits on those rows were *not* overwritten: an operator may have
+    // raised one for a customer, and this fixture's Business row says 3.
+    assert_eq!(db.plan("business").unwrap().max_concurrent_streams(), 3);
+
+    // And everything the account owns is where it was.
+    assert_eq!(db.broadcast_owned("u-old", &broadcast_id).unwrap().name, "COLORISTE 테스트");
+    assert_eq!(db.broadcasts_wanting_to_run().unwrap().len(), 1, "it was running and it still is");
+    let still: Vec<u8> = db
+        .raw()
+        .lock()
+        .unwrap()
+        .query_row("SELECT sealed FROM credentials WHERE account='destination:d-old'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(still, sealed, "a migration must never touch an encrypted value");
+    assert_eq!(db.items_owned("u-old", &broadcast_id).unwrap().len(), 1);
 }

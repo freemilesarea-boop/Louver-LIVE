@@ -8,6 +8,11 @@
 //!
 //! Nothing here branches on a plan's name. Limits are looked up by key, which is
 //! what lets a fourth plan, or one customer's raised ceiling, be a row.
+//!
+//! There are two questions, not one. *Is there a subscription* is asked by
+//! [`CloudDb::require_active_subscription`]; *how much does it allow* is asked of
+//! the plan's limits. Keeping them apart is what lets an account with no plan be
+//! told "요금제가 필요합니다" instead of "0개 중 0개를 사용했습니다".
 
 use crate::db::CloudDb;
 use crate::models::{DesiredState, RuntimeState};
@@ -65,7 +70,12 @@ impl CloudDb {
     /// Idempotent: a broadcast already marked running keeps its slot instead of
     /// being counted twice, so a repeated click cannot consume two.
     pub fn claim_stream_slot(&self, user_id: &str, broadcast_id: &str) -> Result<()> {
-        let allowed = self.limit(user_id, MAX_CONCURRENT_STREAMS)?;
+        // No subscription, no slot. Asked first so the answer is "요금제가
+        // 필요합니다" rather than a concurrency ceiling of zero, which reads like
+        // a bug to whoever hits it.
+        let sub = self.require_active_subscription(user_id)?;
+        let allowed = sub.plan.as_ref().map(|p| p.max_concurrent_streams()).unwrap_or(0);
+        let plan_label = sub.plan_label.clone();
         let conn = self.raw();
         let mut guard = conn.lock().unwrap();
         let tx = guard.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -90,7 +100,7 @@ impl CloudDb {
             |r| r.get(0),
         )?;
         if used >= allowed {
-            return Err(CloudError::LimitReached { limit: MAX_CONCURRENT_STREAMS, used, allowed });
+            return Err(CloudError::ConcurrencyReached { plan_label, used, allowed });
         }
 
         tx.execute(
@@ -148,6 +158,12 @@ impl CloudDb {
     }
 
     pub fn check_can_create_broadcast(&self, user_id: &str) -> Result<()> {
+        // §8: making a broadcast is where a user puts in the work — choosing
+        // videos, setting a title, arranging a playlist. Letting them do all of
+        // that and only refusing at START would waste it. `max_broadcasts` is 0
+        // on the unsubscribed plan, so this would refuse anyway; the gate is here
+        // so the refusal says why.
+        self.require_active_subscription(user_id)?;
         let allowed = self.limit(user_id, MAX_BROADCASTS)?;
         let used: i64 = self.raw().lock().unwrap().query_row(
             "SELECT COUNT(*) FROM broadcasts WHERE user_id=?1",

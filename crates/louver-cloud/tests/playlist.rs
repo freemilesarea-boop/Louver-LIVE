@@ -457,7 +457,7 @@ fn the_plan_limit_counts_playlists_the_same_as_anything_else() {
     e.mgr.start(&e.user, &first).unwrap();
     e.wait_for_launches(1);
     let refused = e.mgr.start(&e.user, &second).unwrap_err();
-    assert!(matches!(refused, louver_cloud::CloudError::LimitReached { .. }), "{refused:?}");
+    assert!(matches!(refused, louver_cloud::CloudError::ConcurrencyReached { .. }), "{refused:?}");
     assert_eq!(e.rec.launches(), 1, "the refusal must not have spawned anything");
     e.mgr.shutdown();
 }
@@ -622,4 +622,131 @@ fn a_legacy_broadcast_and_a_one_item_playlist_send_the_same_command() {
             .collect()
     };
     assert_eq!(strip(before.args), strip(after.args));
+}
+
+// --- subscription enforcement through the manager ---------------------------
+//
+// The gate lives in the database, but the paths that reach it are the manager's:
+// a user pressing START, the scheduler reaching an occurrence, and a boot
+// recovering whatever was running. The third is the one that would be missed,
+// because nobody is watching a boot.
+
+/// Take away the subscription an account has, the way cancelling does.
+fn unsubscribe(e: &Env) {
+    e.db.cancel_subscription(&e.user).unwrap();
+}
+
+#[test]
+fn an_account_with_no_subscription_cannot_start_a_broadcast() {
+    let e = env("business");
+    let a = e.video("one.mp4", 60.0);
+    let id = e.broadcast("밤 라디오", &[a], true);
+    unsubscribe(&e);
+
+    let refused = e.mgr.start(&e.user, &id).unwrap_err();
+    assert!(matches!(refused, louver_cloud::CloudError::NoSubscription), "{refused:?}");
+    assert_eq!(e.rec.launches(), 0, "no FFmpeg may be spawned for an unsubscribed account");
+    assert_eq!(
+        e.db.broadcast(&id).unwrap().desired_state,
+        DesiredState::Stopped,
+        "a refused start must not leave the broadcast wanting to run"
+    );
+    e.mgr.shutdown();
+}
+
+#[test]
+fn the_scheduler_does_not_start_an_unsubscribed_accounts_broadcast() {
+    let e = env("business");
+    let a = e.video("one.mp4", 60.0);
+    let id = e.broadcast("예약 방송", &[a], true);
+
+    // A schedule whose moment is now.
+    let now = chrono::Utc::now();
+    e.db.update_broadcast_owned(
+        &e.user,
+        &id,
+        &louver_cloud::BroadcastPatch {
+            schedule: Some(louver_cloud::Schedule {
+                enabled: true,
+                start_at: Some((now - chrono::Duration::minutes(1)).to_rfc3339()),
+                stop_at: None,
+                timezone: "UTC".into(),
+                offset_minutes: 0,
+                repeat_days: 0,
+                last_run_at: None,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    unsubscribe(&e);
+
+    e.mgr.run_schedules(now);
+
+    assert_eq!(e.rec.launches(), 0, "the scheduler started a broadcast with no subscription behind it");
+    assert_eq!(e.db.broadcast(&id).unwrap().desired_state, DesiredState::Stopped);
+    // And it said why, in words the user can act on.
+    let log = e.db.events_for(&id, 50).unwrap().into_iter().map(|x| x.message).collect::<Vec<_>>().join("\n");
+    assert!(log.contains("활성화된 요금제가 없어 예약 방송을 시작하지 못했습니다"), "{log}");
+    e.mgr.shutdown();
+}
+
+#[test]
+fn a_restart_does_not_revive_an_unsubscribed_accounts_broadcast() {
+    let e = env("business");
+    let a = e.video("one.mp4", 60.0);
+    let id = e.broadcast("밤 라디오", &[a], true);
+
+    // On air, legitimately, on Business.
+    e.mgr.start(&e.user, &id).unwrap();
+    e.wait_for_launches(1);
+    e.mgr.shutdown();
+
+    // The subscription ends while the server is down. `desired_state` is still
+    // running, which is exactly what recovery reads.
+    unsubscribe(&e);
+    assert_eq!(e.db.broadcast(&id).unwrap().desired_state, DesiredState::Running);
+
+    let launches_before = e.rec.launches();
+    let recovered = e.mgr.recover_all().unwrap();
+    assert_eq!(recovered, 0, "recovery revived a broadcast with no subscription behind it");
+    assert_eq!(e.rec.launches(), launches_before, "and spawned nothing");
+
+    // The intent is kept, not rewritten: subscribing again is meant to bring
+    // this back, and discarding `desired_state` would silently lose that.
+    assert_eq!(e.db.broadcast(&id).unwrap().desired_state, DesiredState::Running);
+    let log = e.db.events_for(&id, 50).unwrap().into_iter().map(|x| x.message).collect::<Vec<_>>().join("\n");
+    assert!(log.contains("활성화된 요금제가 없어 방송을 복구하지 않았습니다"), "{log}");
+
+    // Subscribe again, and the same recovery brings it back.
+    e.db.activate_subscription(&e.user, "business").unwrap();
+    assert_eq!(e.mgr.recover_all().unwrap(), 1, "a paying account's recovery must still work");
+    e.wait_for_launches(launches_before + 1);
+    e.mgr.shutdown();
+}
+
+#[test]
+fn a_paying_accounts_plan_decides_how_many_streams_it_gets() {
+    for (plan, allowed) in [("basic", 1usize), ("pro", 2), ("business", 3)] {
+        let e = env(plan);
+        let clip = e.video("one.mp4", 60.0);
+        let ids: Vec<String> = (0..allowed + 1)
+            .map(|i| e.broadcast(&format!("{i}"), std::slice::from_ref(&clip), true))
+            .collect();
+
+        for (i, id) in ids.iter().take(allowed).enumerate() {
+            e.mgr.start(&e.user, id).unwrap_or_else(|x| panic!("{plan} stream {i} refused: {x}"));
+        }
+        e.wait_for_launches(allowed);
+
+        let refused = e.mgr.start(&e.user, &ids[allowed]).unwrap_err();
+        match &refused {
+            louver_cloud::CloudError::ConcurrencyReached { allowed: a, .. } => {
+                assert_eq!(*a as usize, allowed, "{plan}")
+            }
+            other => panic!("{plan} allowed one too many: {other:?}"),
+        }
+        assert_eq!(e.rec.launches(), allowed, "{plan} spawned a process for a refused start");
+        e.mgr.shutdown();
+    }
 }

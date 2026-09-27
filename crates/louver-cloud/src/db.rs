@@ -179,29 +179,64 @@ CREATE TABLE IF NOT EXISTS broadcast_events (
 CREATE INDEX IF NOT EXISTS idx_event_broadcast ON broadcast_events(broadcast_id, id DESC);
 "#;
 
+/// The plan an account with no subscription is on.
+///
+/// A real row rather than a null `plan_id`, for two reasons. `users.plan_id` is
+/// `NOT NULL` with a foreign key, and making it nullable would mean rewriting a
+/// table that has production rows in it. And a plan whose every limit is zero
+/// fails closed everywhere by itself: code that forgets to ask about the
+/// subscription still cannot start a broadcast, because the limit it reads is 0.
+pub const UNSUBSCRIBED_PLAN: &str = "none";
+
+/// `subscriptions.status`, spelt once.
+pub const SUBSCRIPTION_ACTIVE: &str = "active";
+pub const SUBSCRIPTION_UNSUBSCRIBED: &str = "unsubscribed";
+
 /// The plans the service ships with.
 ///
 /// Rows, not constants in the code. `entitlement` reads limits by name, so a
 /// fourth plan is an INSERT and never an `if`.
-type SeedPlan = (&'static str, &'static str, &'static [(&'static str, i64)]);
+///
+/// Prices are whole won. Money is never a float.
+struct SeedPlan {
+    id: &'static str,
+    label: &'static str,
+    monthly_price_krw: i64,
+    description: &'static str,
+    /// Offered on the pricing page. The unsubscribed plan is not.
+    active: bool,
+    sort_order: i64,
+    limits: &'static [(&'static str, i64)],
+}
 
 const SEED_PLANS: &[SeedPlan] = &[
-    (
-        "basic",
-        "Basic",
-        &[
+    SeedPlan {
+        id: "basic",
+        label: "Basic",
+        monthly_price_krw: 19_900,
+        description: "개인 크리에이터 / 테스트",
+        active: true,
+        sort_order: 1,
+        limits: &[
             ("max_concurrent_streams", 1),
             ("max_broadcasts", 3),
             ("max_storage_bytes", 20 * 1024 * 1024 * 1024),
             ("max_upload_bytes", 8 * 1024 * 1024 * 1024),
-            ("scheduling_enabled", 0),
+            // Scheduling is a common feature of every paid plan now: a
+            // broadcaster who cannot schedule cannot run 24/7 unattended, which
+            // is the thing being sold.
+            ("scheduling_enabled", 1),
             ("priority_recovery", 0),
         ],
-    ),
-    (
-        "pro",
-        "Pro",
-        &[
+    },
+    SeedPlan {
+        id: "pro",
+        label: "Pro",
+        monthly_price_krw: 39_900,
+        description: "여러 채널 운영자",
+        active: true,
+        sort_order: 2,
+        limits: &[
             ("max_concurrent_streams", 2),
             ("max_broadcasts", 10),
             ("max_storage_bytes", 100 * 1024 * 1024 * 1024),
@@ -209,11 +244,15 @@ const SEED_PLANS: &[SeedPlan] = &[
             ("scheduling_enabled", 1),
             ("priority_recovery", 0),
         ],
-    ),
-    (
-        "business",
-        "Business",
-        &[
+    },
+    SeedPlan {
+        id: "business",
+        label: "Business",
+        monthly_price_krw: 59_900,
+        description: "전문 채널 / 다중 라이브 운영",
+        active: true,
+        sort_order: 3,
+        limits: &[
             ("max_concurrent_streams", 3),
             ("max_broadcasts", 30),
             ("max_storage_bytes", 400 * 1024 * 1024 * 1024),
@@ -221,7 +260,27 @@ const SEED_PLANS: &[SeedPlan] = &[
             ("scheduling_enabled", 1),
             ("priority_recovery", 1),
         ],
-    ),
+    },
+    SeedPlan {
+        id: UNSUBSCRIBED_PLAN,
+        label: "요금제 없음",
+        monthly_price_krw: 0,
+        description: "요금제를 선택하면 방송을 시작할 수 있습니다.",
+        // Never on the pricing page: it is a state, not something to buy.
+        active: false,
+        sort_order: 99,
+        limits: &[
+            // Every one of these is zero on purpose. An account here can sign
+            // in, look around and choose a plan, and can do nothing that costs
+            // the server anything.
+            ("max_concurrent_streams", 0),
+            ("max_broadcasts", 0),
+            ("max_storage_bytes", 0),
+            ("max_upload_bytes", 0),
+            ("scheduling_enabled", 0),
+            ("priority_recovery", 0),
+        ],
+    },
 ];
 
 #[derive(Clone)]
@@ -363,6 +422,15 @@ impl CloudDb {
         ] {
             ensure_column(&conn, "broadcasts", column, decl)?;
         }
+        // Pricing. `plans` held a label and a bag of limits; a paid service also
+        // has to say what it costs and who it is for. Defaults on every column so
+        // that a production row reads as free-and-offered until `seed_plans`
+        // below writes the real figures over it.
+        ensure_column(&conn, "plans", "monthly_price_krw", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&conn, "plans", "description", "TEXT NOT NULL DEFAULT ''")?;
+        ensure_column(&conn, "plans", "active", "INTEGER NOT NULL DEFAULT 1")?;
+        ensure_column(&conn, "plans", "sort_order", "INTEGER NOT NULL DEFAULT 0")?;
+
         // Signup, which until now asked for an email and a password and nothing
         // else. All three are nullable and stay NULL on every account that
         // already exists: a display name is not an identifier, and nobody can
@@ -457,15 +525,34 @@ impl CloudDb {
 
     fn seed_plans(&self) -> Result<()> {
         let c = self.conn.lock().unwrap();
-        for (id, label, limits) in SEED_PLANS {
-            let map: BTreeMap<&str, i64> = limits.iter().copied().collect();
+        for p in SEED_PLANS {
+            let map: BTreeMap<&str, i64> = p.limits.iter().copied().collect();
             let json = serde_json::to_string(&map).unwrap_or_else(|_| "{}".into());
-            // Existing plans are left alone: an operator may have edited a
-            // limit, and a restart must not undo that.
+            // A plan's *limits* are still left alone on conflict: an operator may
+            // have raised one for a customer, and a restart must not undo that.
+            //
+            // Its price and its description are not, and must not be. They
+            // arrived after these rows existed, so a production database has a
+            // Basic row with no price in it; `DO NOTHING` would leave the pricing
+            // page showing ₩0 for ever. What the service charges is the
+            // service's to state, not a per-row edit to preserve.
             c.execute(
-                "INSERT INTO plans (id, label, limits) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(id) DO NOTHING",
-                params![id, label, json],
+                "INSERT INTO plans (id, label, limits, monthly_price_krw, description, active, sort_order)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                     monthly_price_krw = excluded.monthly_price_krw,
+                     description       = excluded.description,
+                     active            = excluded.active,
+                     sort_order        = excluded.sort_order",
+                params![
+                    p.id,
+                    p.label,
+                    json,
+                    p.monthly_price_krw,
+                    p.description,
+                    p.active as i64,
+                    p.sort_order
+                ],
             )?;
         }
         Ok(())
@@ -474,12 +561,24 @@ impl CloudDb {
     // --- plans ------------------------------------------------------------
 
     pub fn plan(&self, id: &str) -> Result<Plan> {
-        let c = self.conn.lock().unwrap();
-        let (label, json): (String, String) = c
-            .query_row("SELECT label, limits FROM plans WHERE id=?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(&format!("{PLAN_COLUMNS} WHERE id=?1"), [id], row_to_plan)
             .optional()?
-            .ok_or(CloudError::NotFound("plan"))?;
-        Ok(Plan { id: id.to_string(), label, limits: serde_json::from_str(&json).unwrap_or_default() })
+            .ok_or(CloudError::NotFound("plan"))
+    }
+
+    /// The plans a visitor may buy, in the order the pricing page shows them.
+    ///
+    /// Filtered on `active` rather than on a list of names, so the unsubscribed
+    /// plan — and any internal one an operator adds later — stays off the public
+    /// page without this function knowing they exist.
+    pub fn plans_for_sale(&self) -> Result<Vec<Plan>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(&format!("{PLAN_COLUMNS} WHERE active = 1 ORDER BY sort_order, id"))?;
+        let rows = st.query_map([], row_to_plan)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     // --- users ------------------------------------------------------------
@@ -491,15 +590,24 @@ impl CloudDb {
     /// need a name it has no way to ask for, and consent is something a person
     /// gives, not something a shell script can give on their behalf.
     pub fn create_user(&self, email: &str, password_hash: &str, plan_id: &str) -> Result<User> {
-        self.insert_user(None, email, password_hash, plan_id, None)
+        self.insert_user(None, email, password_hash, plan_id, None, SUBSCRIPTION_ACTIVE)
     }
 
     /// An account made by somebody filling in the signup form.
     ///
-    /// The one thing worth noticing: [`Signup`] has no plan field. The plan is
-    /// the server's to decide, so a request body cannot ask for Business.
-    pub fn register_user(&self, s: &Signup<'_>, plan_id: &str) -> Result<User> {
-        self.insert_user(Some(s.name), s.email, s.password_hash, plan_id, Some(s.terms_version))
+    /// Lands on the unsubscribed plan, always. There is no plan argument at all,
+    /// which is a stronger guarantee than validating one: signing up cannot grant
+    /// an entitlement because there is no parameter through which it could.
+    /// Paying for a plan goes through [`CloudDb::activate_subscription`].
+    pub fn register_user(&self, s: &Signup<'_>) -> Result<User> {
+        self.insert_user(
+            Some(s.name),
+            s.email,
+            s.password_hash,
+            UNSUBSCRIBED_PLAN,
+            Some(s.terms_version),
+            SUBSCRIPTION_UNSUBSCRIBED,
+        )
     }
 
     /// The user row and its subscription, in one transaction.
@@ -518,6 +626,7 @@ impl CloudDb {
         password_hash: &str,
         plan_id: &str,
         consented_to: Option<&str>,
+        status: &str,
     ) -> Result<User> {
         let id = crate::new_id();
         let conn = self.conn.clone();
@@ -541,7 +650,10 @@ impl CloudDb {
             }
             other => CloudError::Db(other),
         })?;
-        tx.execute("INSERT INTO subscriptions (user_id, plan_id) VALUES (?1, ?2)", params![id, plan_id])?;
+        tx.execute(
+            "INSERT INTO subscriptions (user_id, plan_id, status) VALUES (?1, ?2, ?3)",
+            params![id, plan_id, status],
+        )?;
         tx.commit()?;
         drop(guard);
         self.user(&id)
@@ -587,6 +699,18 @@ impl CloudDb {
             .ok_or(CloudError::BadCredentials)
     }
 
+    /// What this user is entitled to, and why. Also `GET /api/me/subscription`.
+    ///
+    /// Two conditions, and both have to hold: the status says active, **and** the
+    /// plan grants something. Either one alone would be a hole — an account
+    /// parked on the unsubscribed plan must not become entitled because a status
+    /// column says `active`, and a Business plan must not keep working after the
+    /// subscription behind it is cancelled.
+    ///
+    /// A missing `subscriptions` row reads as active, which is what keeps every
+    /// account made before this existed working exactly as it did. That is safe
+    /// precisely because of the second condition: the unsubscribed plan grants
+    /// nothing, so "active with no row" cannot conjure an entitlement.
     pub fn subscription(&self, user_id: &str) -> Result<Subscription> {
         let u = self.user(user_id)?;
         let plan = self.plan(&u.plan_id)?;
@@ -596,25 +720,98 @@ impl CloudDb {
             .unwrap()
             .query_row("SELECT status FROM subscriptions WHERE user_id=?1", [user_id], |r| r.get(0))
             .optional()?
-            .unwrap_or_else(|| "active".into());
+            .unwrap_or_else(|| SUBSCRIPTION_ACTIVE.into());
+
+        let active = status == SUBSCRIPTION_ACTIVE && plan.can_broadcast();
         Ok(Subscription {
             user_id: u.id,
-            plan_id: plan.id,
-            plan_label: plan.label,
-            status,
-            limits: plan.limits,
+            plan_id: plan.id.clone(),
+            plan_label: plan.label.clone(),
+            // Whatever the column says, an account on the unsubscribed plan is
+            // unsubscribed. Reporting `active` there would make the dashboard
+            // offer a broadcast the server would then refuse.
+            status: if active { status } else { SUBSCRIPTION_UNSUBSCRIBED.to_string() },
+            limits: plan.limits.clone(),
+            active,
+            // `None` is what lets a client tell "no plan" from "Basic" without
+            // comparing against a plan id it would have to hard-code.
+            plan: active.then_some(plan),
         })
     }
 
+    /// Refuse anything that costs the server money when there is no subscription.
+    ///
+    /// The one gate, called from the places that spend resources. Its error names
+    /// nothing internal and tells the user what to do about it.
+    pub fn require_active_subscription(&self, user_id: &str) -> Result<Subscription> {
+        let sub = self.subscription(user_id)?;
+        if !sub.active {
+            return Err(CloudError::NoSubscription);
+        }
+        Ok(sub)
+    }
+
+    /// Put a user on a plan, and mark the subscription active. §13.
+    ///
+    /// **Not reachable from a browser, by design.** There is no route that calls
+    /// this; the only callers are the bootstrap CLI and, when it exists, a
+    /// payment webhook that has already verified a payment. That is the whole
+    /// reason it is a function here rather than a handler: adding the webhook
+    /// means calling this, and never means opening a door.
+    pub fn activate_subscription(&self, user_id: &str, plan_id: &str) -> Result<Subscription> {
+        // Both checked before anything is written: an unknown plan id, or the
+        // unsubscribed plan, would otherwise leave an account "active" on
+        // something that grants nothing.
+        let plan = self.plan(plan_id)?;
+        if !plan.can_broadcast() {
+            return Err(CloudError::Invalid(format!("'{plan_id}' 요금제로는 구독을 활성화할 수 없습니다")));
+        }
+        self.user(user_id)?;
+        self.write_plan(user_id, plan_id, SUBSCRIPTION_ACTIVE)?;
+        self.subscription(user_id)
+    }
+
+    /// End a subscription, leaving everything the user owns in place. §13.
+    ///
+    /// The account goes to the unsubscribed plan, so nothing can be started and
+    /// nothing is deleted: the videos, the destinations, the connected YouTube
+    /// account and the broadcast rows are all still there for when they come
+    /// back. Running broadcasts are not killed here — stopping somebody
+    /// mid-stream is a decision for the caller that knows why.
+    pub fn cancel_subscription(&self, user_id: &str) -> Result<Subscription> {
+        self.user(user_id)?;
+        self.write_plan(user_id, UNSUBSCRIBED_PLAN, SUBSCRIPTION_UNSUBSCRIBED)?;
+        self.subscription(user_id)
+    }
+
+    /// The plan a user is on, as the CLI sets it.
+    ///
+    /// Kept at this signature because `--create-user` and the deploy script use
+    /// it to put the operator's account on Business. It marks the subscription
+    /// active, which is what it always did.
     pub fn set_plan(&self, user_id: &str, plan_id: &str) -> Result<()> {
-        let c = self.conn.lock().unwrap();
-        c.execute("UPDATE users SET plan_id=?2 WHERE id=?1", params![user_id, plan_id])?;
-        c.execute(
-            "INSERT INTO subscriptions (user_id, plan_id) VALUES (?1, ?2)
+        self.write_plan(user_id, plan_id, SUBSCRIPTION_ACTIVE)
+    }
+
+    /// Both halves of "what plan is this account on", in one transaction.
+    ///
+    /// `users.plan_id` is what `entitlement` reads and `subscriptions` is what
+    /// the status comes from. Half of this landing would leave an account whose
+    /// plan and status disagree, which is the one state nothing else here knows
+    /// how to interpret.
+    fn write_plan(&self, user_id: &str, plan_id: &str, status: &str) -> Result<()> {
+        let conn = self.conn.clone();
+        let mut guard = conn.lock().unwrap();
+        let tx = guard.transaction()?;
+        tx.execute("UPDATE users SET plan_id=?2 WHERE id=?1", params![user_id, plan_id])?;
+        tx.execute(
+            "INSERT INTO subscriptions (user_id, plan_id, status) VALUES (?1, ?2, ?3)
              ON CONFLICT(user_id) DO UPDATE SET plan_id=excluded.plan_id,
+                                                status=excluded.status,
                                                 updated_at=datetime('now')",
-            params![user_id, plan_id],
+            params![user_id, plan_id, status],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1693,6 +1890,24 @@ fn row_to_youtube_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::yout
 }
 
 const BROADCAST_COLUMNS: &str = "SELECT * FROM broadcasts";
+
+const PLAN_COLUMNS: &str = "SELECT id, label, limits, monthly_price_krw, description, active, sort_order
+     FROM plans";
+
+fn row_to_plan(r: &rusqlite::Row<'_>) -> rusqlite::Result<Plan> {
+    let json: String = r.get("limits")?;
+    Ok(Plan {
+        id: r.get("id")?,
+        label: r.get("label")?,
+        // A plan whose limits will not parse grants nothing, rather than
+        // everything. The only way this happens is a hand-edited row.
+        limits: serde_json::from_str(&json).unwrap_or_default(),
+        monthly_price_krw: r.get("monthly_price_krw")?,
+        description: r.get("description")?,
+        active: r.get::<_, i64>("active")? != 0,
+        sort_order: r.get("sort_order")?,
+    })
+}
 
 fn row_to_media(r: &rusqlite::Row<'_>) -> rusqlite::Result<CloudMedia> {
     let state: String = r.get(4)?;

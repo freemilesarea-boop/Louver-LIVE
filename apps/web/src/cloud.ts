@@ -45,13 +45,66 @@ export const MIN_PASSWORD_CHARS = 10;
 /** Matches `louver_cloud::db::MAX_NAME_CHARS`, counted in characters. */
 export const MAX_NAME_CHARS = 60;
 
+/**
+ * A plan, exactly as the server describes it.
+ *
+ * The price and the concurrency figure are **not** duplicated anywhere in this
+ * app. They arrive from `GET /api/plans`, so what the pricing page shows and
+ * what the server charges cannot drift apart.
+ */
+export interface Plan {
+  id: string;
+  label: string;
+  limits: Record<string, number>;
+  monthly_price_krw: number;
+  description: string;
+  active: boolean;
+  sort_order: number;
+}
+
 export interface Subscription {
   user_id: string;
   plan_id: string;
   plan_label: string;
+  /** `active` or `unsubscribed`. */
   status: string;
   limits: Record<string, number>;
+  /** The one question to ask. True only when a paid plan is active. */
+  active?: boolean;
+  /** `null` when there is no subscription — which is how "no plan" is told from
+   * "Basic" without comparing plan ids here. */
+  plan?: Plan | null;
 }
+
+/** Limit keys, matching `louver_cloud::entitlement`. */
+export const MAX_CONCURRENT_STREAMS = "max_concurrent_streams";
+
+/** How many broadcasts a plan may run at once. */
+export function concurrentStreams(plan: Plan): number {
+  return plan.limits[MAX_CONCURRENT_STREAMS] ?? 0;
+}
+
+/** ₩19,900 — whole won, grouped, never a decimal. */
+export function formatWon(krw: number): string {
+  return `₩${krw.toLocaleString("ko-KR")}`;
+}
+
+/**
+ * What every paid plan includes.
+ *
+ * Marketing copy, not entitlements — which is why it lives here and the numbers
+ * do not. Nothing branches on this list; it is only ever rendered.
+ */
+export const PLAN_FEATURES = [
+  "24/7 클라우드 송출",
+  "YouTube 계정 연결",
+  "플레이리스트 방송",
+  "예약 송출",
+  "PC를 종료해도 계속 송출",
+] as const;
+
+/** The plan singled out on the pricing page. A presentation choice, nothing more. */
+export const RECOMMENDED_PLAN = "pro";
 
 export interface CloudMedia {
   id: string;
@@ -240,6 +293,16 @@ export interface Dashboard {
   /** How many the plan allows. The server decides this; the UI only shows it. */
   allowed: number;
   broadcasts: Broadcast[];
+  /** Is there an active subscription? Optional so a payload from an older
+   * server still parses; absent is read as subscribed, which is what every
+   * account on such a server is. */
+  subscribed?: boolean;
+  plan_id?: string;
+}
+
+/** Does this dashboard belong to an account that may broadcast? */
+export function isSubscribed(d: Dashboard): boolean {
+  return d.subscribed ?? true;
 }
 
 export interface BroadcastEvent {

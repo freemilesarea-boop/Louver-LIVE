@@ -30,9 +30,8 @@ fn basic_allows_one_stream_and_refuses_the_second() {
     db.claim_stream_slot(&uid, &b[0]).expect("the first must be allowed");
     let second = db.claim_stream_slot(&uid, &b[1]);
     match second {
-        Err(CloudError::LimitReached { limit, used, allowed }) => {
-            assert_eq!(limit, MAX_CONCURRENT_STREAMS);
-            assert_eq!((used, allowed), (1, 1));
+        Err(CloudError::ConcurrencyReached { ref plan_label, used, allowed }) => {
+            assert_eq!((plan_label.as_str(), used, allowed), ("Basic", 1, 1));
         }
         other => panic!("a Basic user's second stream must be refused, got {other:?}"),
     }
@@ -50,7 +49,7 @@ fn business_allows_three_and_refuses_the_fourth() {
     assert_eq!(db.active_stream_count(&uid).unwrap(), 3);
 
     assert!(
-        matches!(db.claim_stream_slot(&uid, &b[3]), Err(CloudError::LimitReached { .. })),
+        matches!(db.claim_stream_slot(&uid, &b[3]), Err(CloudError::ConcurrencyReached { .. })),
         "the fourth stream must be refused",
     );
 }
@@ -61,7 +60,7 @@ fn pro_sits_between_them() {
     let (uid, b) = user_with_broadcasts(&db, "pro@x.com", "pro", 3);
     db.claim_stream_slot(&uid, &b[0]).unwrap();
     db.claim_stream_slot(&uid, &b[1]).unwrap();
-    assert!(matches!(db.claim_stream_slot(&uid, &b[2]), Err(CloudError::LimitReached { .. })));
+    assert!(matches!(db.claim_stream_slot(&uid, &b[2]), Err(CloudError::ConcurrencyReached { .. })));
 }
 
 #[test]
@@ -243,4 +242,185 @@ fn a_broadcast_that_failed_for_good_is_not_retried_after_a_restart() {
     assert_eq!(got.desired_state, DesiredState::Stopped);
     assert!(db.broadcasts_wanting_to_run().unwrap().is_empty());
     assert_eq!(db.active_stream_count(&uid).unwrap(), 0, "a failed stream must free its slot");
+}
+
+// --- subscriptions ---------------------------------------------------------
+//
+// An entitlement has two halves: is there a subscription, and how much does it
+// allow. These are about the first, and about the places that would otherwise
+// spend server resources without asking.
+
+use louver_cloud::db::{Signup, SUBSCRIPTION_UNSUBSCRIBED, UNSUBSCRIBED_PLAN};
+
+fn signed_up(db: &CloudDb, email: &str) -> String {
+    db.register_user(&Signup {
+        name: "홍길동",
+        email,
+        password_hash: "salt:hash",
+        terms_version: "2026-09-27",
+    })
+    .unwrap()
+    .id
+}
+
+#[test]
+fn a_new_public_account_is_unsubscribed_and_can_do_nothing_that_costs_anything() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let uid = signed_up(&db, "new@example.com");
+
+    let sub = db.subscription(&uid).unwrap();
+    assert_eq!(sub.plan_id, UNSUBSCRIBED_PLAN);
+    assert_eq!(sub.status, SUBSCRIPTION_UNSUBSCRIBED);
+    assert!(!sub.active);
+    assert!(sub.plan.is_none(), "there is no plan to report");
+
+    // Every limit is zero, so even a path that forgot to ask about the
+    // subscription would refuse.
+    assert_eq!(db.limit(&uid, MAX_CONCURRENT_STREAMS).unwrap(), 0);
+    assert_eq!(db.limit(&uid, louver_cloud::entitlement::MAX_BROADCASTS).unwrap(), 0);
+    assert_eq!(db.limit(&uid, MAX_UPLOAD_BYTES).unwrap(), 0);
+
+    // And the gate answers with something a person can act on.
+    assert!(matches!(db.require_active_subscription(&uid), Err(CloudError::NoSubscription)));
+    assert!(matches!(db.check_can_create_broadcast(&uid), Err(CloudError::NoSubscription)));
+    assert_eq!(
+        db.require_active_subscription(&uid).unwrap_err().to_string(),
+        "방송을 시작하려면 활성화된 요금제가 필요합니다"
+    );
+}
+
+#[test]
+fn an_unsubscribed_account_cannot_claim_a_stream_slot() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let uid = signed_up(&db, "new@example.com");
+    // A broadcast row put in place directly: what is under test is the slot, and
+    // creating one through the API is refused for the same reason.
+    let media = db.create_media(&uid, "a.mp4", 10, "k").unwrap();
+    db.record_media_prepared(&media.id, "k", 10.0, 10).unwrap();
+    let dest = db.create_destination(&uid, "d", "rtmps://a/live2", "••••").unwrap();
+    db.raw()
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO broadcasts (id, user_id, name, media_id, destination_id, desired_state, runtime_state)
+             VALUES ('b1', ?1, 'n', ?2, ?3, 'stopped', 'CREATED')",
+            rusqlite::params![uid, media.id, dest.id],
+        )
+        .unwrap();
+
+    assert!(matches!(db.claim_stream_slot(&uid, "b1"), Err(CloudError::NoSubscription)));
+    // Refused means refused: the row must not have been marked running on the
+    // way out.
+    assert_eq!(db.active_stream_count(&uid).unwrap(), 0);
+}
+
+#[test]
+fn paying_for_a_plan_is_the_only_thing_that_grants_one() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let uid = signed_up(&db, "new@example.com");
+
+    // What a verified payment will call. Nothing a browser can reach.
+    let sub = db.activate_subscription(&uid, "pro").unwrap();
+    assert!(sub.active);
+    assert_eq!(sub.plan_id, "pro");
+    assert_eq!(sub.status, "active");
+    assert_eq!(sub.plan.as_ref().map(|p| p.max_concurrent_streams()), Some(2));
+    assert_eq!(sub.plan.as_ref().map(|p| p.monthly_price_krw), Some(39_900));
+    assert_eq!(db.limit(&uid, MAX_CONCURRENT_STREAMS).unwrap(), 2);
+
+    // Cancelling takes the entitlement away and leaves everything they own.
+    let media = db.create_media(&uid, "a.mp4", 10, "k").unwrap();
+    let after = db.cancel_subscription(&uid).unwrap();
+    assert!(!after.active);
+    assert_eq!(after.plan_id, UNSUBSCRIBED_PLAN);
+    assert!(db.media_owned(&uid, &media.id).is_ok(), "cancelling must not delete anything");
+}
+
+#[test]
+fn a_plan_that_grants_nothing_cannot_be_activated() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let uid = signed_up(&db, "new@example.com");
+
+    // An unknown id, and the unsubscribed plan — both would leave an account
+    // "active" on something that allows no broadcasts.
+    assert!(db.activate_subscription(&uid, "enterprise-unlimited").is_err());
+    assert!(db.activate_subscription(&uid, UNSUBSCRIBED_PLAN).is_err());
+    assert!(db.activate_subscription(&uid, "").is_err());
+    assert!(!db.subscription(&uid).unwrap().active, "a failed activation must grant nothing");
+}
+
+#[test]
+fn an_account_the_bootstrap_cli_made_keeps_its_plan_and_its_entitlement() {
+    let db = CloudDb::open_in_memory().unwrap();
+    // Exactly what `--create-user ... --plan business` does, which is what the
+    // deploy script runs for the operator's account.
+    let ops = db.create_user("freemilesarea@example.com", "salt:hash", "business").unwrap();
+    let sub = db.subscription(&ops.id).unwrap();
+    assert!(sub.active, "the operator's account must not be unsubscribed by any of this");
+    assert_eq!(sub.plan_id, "business");
+    assert_eq!(db.limit(&ops.id, MAX_CONCURRENT_STREAMS).unwrap(), 3);
+
+    // Re-running the deploy script keeps it there.
+    db.set_plan(&ops.id, "business").unwrap();
+    assert!(db.subscription(&ops.id).unwrap().active);
+    assert_eq!(db.limit(&ops.id, MAX_CONCURRENT_STREAMS).unwrap(), 3);
+}
+
+#[test]
+fn the_three_paid_plans_carry_the_prices_and_the_concurrency_the_service_sells() {
+    let db = CloudDb::open_in_memory().unwrap();
+    for (id, label, price, streams) in
+        [("basic", "Basic", 19_900, 1), ("pro", "Pro", 39_900, 2), ("business", "Business", 59_900, 3)]
+    {
+        let p = db.plan(id).unwrap();
+        assert_eq!(p.label, label);
+        assert_eq!(p.monthly_price_krw, price, "{id}");
+        assert_eq!(p.max_concurrent_streams(), streams, "{id}");
+        assert!(p.active, "{id} must be on the pricing page");
+        assert!(!p.description.is_empty(), "{id} needs a line saying who it is for");
+        assert!(p.can_broadcast());
+        // Every paid plan includes scheduling: 24/7 unattended is the thing
+        // being sold, and it cannot be done without it.
+        assert_eq!(p.limits.get("scheduling_enabled").copied(), Some(1), "{id}");
+    }
+}
+
+#[test]
+fn the_price_list_is_the_three_paid_plans_in_order_and_nothing_else() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let ids: Vec<String> = db.plans_for_sale().unwrap().into_iter().map(|p| p.id).collect();
+    assert_eq!(ids, ["basic", "pro", "business"], "sorted by sort_order, not by name");
+
+    // The unsubscribed plan is a state, not something to buy.
+    assert!(!ids.iter().any(|i| i == UNSUBSCRIBED_PLAN));
+    assert!(!db.plan(UNSUBSCRIBED_PLAN).unwrap().active);
+
+    // And a plan an operator marks inactive drops off the page without this
+    // function knowing it existed.
+    db.raw().lock().unwrap().execute("UPDATE plans SET active = 0 WHERE id = 'pro'", []).unwrap();
+    let after: Vec<String> = db.plans_for_sale().unwrap().into_iter().map(|p| p.id).collect();
+    assert_eq!(after, ["basic", "business"]);
+}
+
+#[test]
+fn a_price_is_whole_won_in_an_integer_column() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let conn = db.raw();
+    let guard = conn.lock().unwrap();
+    // The declared type, not just the value: a REAL column would round ₩19,900
+    // correctly today and surprise somebody the first time a price is not a
+    // round number.
+    let mut st = guard.prepare("PRAGMA table_info(plans)").unwrap();
+    let decl: Vec<(String, String)> = st
+        .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let price = decl.iter().find(|(name, _)| name == "monthly_price_krw").expect("the column exists");
+    assert_eq!(price.1.to_uppercase(), "INTEGER", "money is never a float");
+
+    // And it reads back exactly, with no fractional part anywhere.
+    let raw: i64 =
+        guard.query_row("SELECT monthly_price_krw FROM plans WHERE id='basic'", [], |r| r.get(0)).unwrap();
+    assert_eq!(raw, 19_900);
 }

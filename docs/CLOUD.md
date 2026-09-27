@@ -95,14 +95,15 @@ a request does not have to come from the form.
 point — every account that existed before signup asked for a name has none, and
 nobody can retroactively have agreed to anything. Readers fall back to the email.
 
-Two entry points, deliberately not one:
+Two entry points, deliberately not one (see **Plans, subscriptions and
+entitlements** below for what each one grants):
 
 | | `CloudDb::create_user` | `CloudDb::register_user` |
 | --- | --- | --- |
 | used by | `louver-server --create-user`, tests | `POST /api/auth/register` |
 | name | none | required, trimmed, ≤ 60 characters |
 | consent | none recorded | timestamps from SQLite's clock |
-| plan | the caller's argument | `LOUVER_DEFAULT_PLAN`, never the request body |
+| plan | the caller's argument | always the unsubscribed plan; no argument exists |
 
 The user row and its subscription are written in one transaction: an account with
 no subscription row is one whose limits come from a fallback, which is
@@ -122,6 +123,75 @@ say on the page that they are drafts and not reviewed documents, because a 404
 under a required checkbox is worse and a fake agreement is worse still. Replace
 both before charging anybody money, and bump `TERMS_VERSION` in
 `apps/server/src/auth.rs` so existing accounts can be asked again.
+
+## Plans, subscriptions and entitlements
+
+Three paid plans, and the entitlement that separates them is how many broadcasts
+may run at once.
+
+| plan | ₩ / month | concurrent streams |
+| --- | --- | --- |
+| Basic | 19,900 | 1 |
+| Pro | 39,900 | 2 |
+| Business | 59,900 | 3 |
+
+Prices are whole won in an `INTEGER` column. Money is never a float.
+
+### Where the numbers live
+
+`plans` rows, and nowhere else. `GET /api/plans` serves them, the pricing page
+renders what it is given, and no price or ceiling is written into the front end —
+so there is no second copy to disagree with what the server charges. Marketing
+copy (the shared feature list) *is* in the UI, because nothing branches on it.
+
+### No subscription
+
+An account with no subscription sits on a real plan, `none`, whose every limit is
+zero. A row rather than a null `plan_id`, for two reasons: `users.plan_id` is
+`NOT NULL` with a foreign key, and rewriting that table on a production database
+is not worth it; and a plan that grants nothing fails closed by itself, so code
+that forgets to ask about the subscription still cannot start anything.
+
+`CloudDb::subscription` reports `active` only when **both** hold: the status says
+active, and the plan grants something. Either alone would be a hole — an account
+parked on `none` must not become entitled by a status column, and a Business plan
+must not keep working after the subscription behind it is cancelled. A missing
+`subscriptions` row still reads as active, which is what keeps every account made
+before this existed working; that is safe because of the second condition.
+
+`register_user` takes **no plan argument**, so a public signup cannot grant an
+entitlement — there is no parameter through which it could. `create_user`, the
+bootstrap CLI's path, is unchanged and still puts the operator's account on
+whatever `--plan` says.
+
+### Where it is enforced
+
+| path | gate |
+| --- | --- |
+| `POST /api/broadcasts` | `check_can_create_broadcast` → `require_active_subscription` |
+| `POST …/start`, `…/restart` | `BroadcastManager::start`, then `claim_stream_slot` |
+| the scheduler | `run_schedules` → `start` (same gate), logged as its own case |
+| recovery after a restart | `recover_all`, per broadcast, before any worker is spawned |
+
+Recovery is the one that would be missed, because nobody is watching a boot: it
+spawns workers directly rather than through `start`, so the gate is repeated
+there. It leaves `desired_state` alone — subscribing again is meant to bring the
+broadcast back, and rewriting it to stopped would silently discard that.
+
+The concurrency refusal is its own error, `ConcurrencyReached`, so the sentence
+names the user's plan and their number instead of a database key.
+
+### Changing a plan
+
+`activate_subscription(user_id, plan_id)` and `cancel_subscription(user_id)`.
+**No route calls either.** Their only callers are the bootstrap CLI and, when it
+exists, a payment webhook that has already verified a payment — which is the whole
+reason they are functions here rather than handlers. `POST /api/plans` and
+`POST /api/me/subscription` do not exist, and a test asserts they answer 404.
+
+**TODO(billing): there is no payment yet.** The pricing page's buttons say
+"결제 시스템을 준비 중입니다." and send nothing. No PG, no billing key, no
+recurring charge, no webhook, no refunds.
 
 ## Media pipeline
 

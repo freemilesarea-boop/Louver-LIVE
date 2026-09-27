@@ -56,6 +56,10 @@ pub fn router(app: App) -> Router {
         .route("/api/auth/logout", post(auth::logout))
         .route("/api/me", get(auth::me))
         .route("/api/me/subscription", get(auth::subscription))
+        // Public on purpose: a price list nobody can read before signing up is
+        // not a price list. There is deliberately **no** route that writes a
+        // plan — see `CloudDb::activate_subscription`.
+        .route("/api/plans", get(auth::plans))
         .merge(media)
         .route("/api/stream-destinations", get(api::list_destinations).post(api::create_destination))
         .route("/api/stream-destinations/{id}", delete(api::delete_destination))
