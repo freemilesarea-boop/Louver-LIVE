@@ -244,19 +244,20 @@ impl Privacy {
 
 /// How a destination is driven.
 ///
-/// Today there is one kind. The reason this enum exists before the second one
-/// does is §5: a YouTube-connected destination can set a title and a privacy,
-/// and a manual key cannot, so every feature that depends on that has to ask
-/// which it is rather than assume.
+/// The distinction is §5's: a YouTube-connected destination can set a title and
+/// a privacy, and a pasted key cannot, so every feature that depends on that
+/// asks which it is rather than assuming. Both kinds send video through exactly
+/// the same worker — the difference is only in what else can be done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DestinationKind {
     /// A stream key pasted from YouTube Studio. Sends video; changes nothing
     /// about the broadcast on YouTube's side.
     ManualRtmps,
-    /// An account connected through OAuth, able to create and title a live
-    /// broadcast. Not implemented yet; the column exists so that the day it is,
-    /// old rows do not have to be guessed at.
+    /// An account connected through OAuth. 247streams creates the live
+    /// broadcast itself, titles it, sets its privacy and asks YouTube for an
+    /// ingestion address of its own, so the user pastes nothing. The row is
+    /// written by [`crate::youtube::Youtube::provision`].
     YoutubeAccount,
 }
 
@@ -466,6 +467,11 @@ pub struct Broadcast {
     pub current_duration_secs: f64,
     /// One pass through the playlist, in seconds.
     pub cycle_duration_secs: f64,
+
+    /// Where this broadcast's YouTube resources are, when an account is
+    /// connected. Every field is `None` for a pasted stream key, which is how
+    /// the two providers coexist without a branch in the sending path. §7.
+    pub youtube: crate::youtube::YoutubeLink,
 }
 
 /// A broadcast plus its playlist, for the screen that edits one.

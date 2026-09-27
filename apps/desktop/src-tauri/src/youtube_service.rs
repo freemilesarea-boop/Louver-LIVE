@@ -518,7 +518,13 @@ impl YoutubeService {
         );
 
         let outcome = (|| -> Result<MetadataOutcome> {
-            api.update_broadcast(&token, &broadcast.id, &meta, broadcast.scheduled_start_time.as_deref())?;
+            api.update_broadcast(
+                &token,
+                &broadcast.id,
+                &meta,
+                broadcast.scheduled_start_time.as_deref(),
+                None,
+            )?;
             self.logger.info(
                 LogTarget::App,
                 &format!("YOUTUBE_METADATA_UPDATED: {} ({})", broadcast.id, meta.privacy.as_api()),

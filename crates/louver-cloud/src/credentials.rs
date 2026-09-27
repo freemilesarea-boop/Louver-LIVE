@@ -214,6 +214,46 @@ pub fn destination_account(destination_id: &str) -> String {
     format!("destination:{destination_id}")
 }
 
+/// How long a stored secret is, and a fingerprint of it. Never the secret. §15.
+///
+/// The fingerprint is the first four bytes of its SHA-256. That is enough to
+/// answer the only question a log or a diagnosis ever needs to answer — "is
+/// this the same key that worked yesterday?" — by comparing two lines, and it
+/// discloses nothing about the key itself.
+pub fn fingerprint(keys: &Arc<dyn SecretStore>, account: &str) -> KeyFingerprint {
+    match keys.get(account) {
+        Ok(Some(secret)) => {
+            let secret = secret.trim();
+            let digest = ring::digest::digest(&ring::digest::SHA256, secret.as_bytes());
+            let hex: String = digest.as_ref().iter().take(4).map(|b| format!("{b:02x}")).collect();
+            KeyFingerprint { len: secret.chars().count(), sha256: hex }
+        }
+        Ok(None) => KeyFingerprint { len: 0, sha256: "none".into() },
+        Err(_) => KeyFingerprint { len: 0, sha256: "unreadable".into() },
+    }
+}
+
+/// A secret described rather than shown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyFingerprint {
+    pub len: usize,
+    pub sha256: String,
+}
+
+impl KeyFingerprint {
+    /// Is there a secret at all? A missing one is why a broadcast would never
+    /// have started, so it is worth asking about separately.
+    pub fn present(&self) -> bool {
+        self.len > 0
+    }
+}
+
+impl std::fmt::Display for KeyFingerprint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[REDACTED len={} sha256:{}]", self.len, self.sha256)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -228,3 +228,78 @@ fn an_edited_playlist_is_not_re_adopted() {
     // And `media_id` follows the first item, for anything still reading it.
     assert_eq!(reopened.broadcast(&broadcast_id).unwrap().media_id, "m-2");
 }
+
+/// §17: the YouTube schema is added to a production database, not built beside it.
+///
+/// No DROP, no recreate, no row lost. The check is deliberately structural — the
+/// tables and columns are read out of `sqlite_master` and `PRAGMA table_info`
+/// rather than inferred from a query succeeding — because a migration that
+/// recreated `broadcasts` would pass every behavioural test and still have
+/// destroyed the production table on the way.
+#[test]
+fn the_youtube_schema_is_added_without_disturbing_what_was_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.db");
+    let (broadcast_id, sealed) = yesterdays_database(&path);
+
+    // What the old file's `broadcasts` table looked like, before.
+    let before: Vec<String> = {
+        let c = Connection::open(&path).unwrap();
+        columns(&c, "broadcasts")
+    };
+
+    let db = CloudDb::open(&path).unwrap();
+    let conn = db.raw();
+    let guard = conn.lock().unwrap();
+
+    // The new tables exist.
+    for table in ["youtube_accounts", "oauth_states"] {
+        let n: i64 = guard
+            .query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1", [table], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(n, 1, "{table} was not created");
+    }
+
+    // Every column the old table had is still there, in the same order, and the
+    // new ones were appended.
+    let after = columns(&guard, "broadcasts");
+    assert_eq!(&after[..before.len()], &before[..], "an existing column was moved or dropped");
+    for added in ["youtube_account_id", "youtube_broadcast_id", "youtube_stream_id", "youtube_status"] {
+        assert!(after.contains(&added.to_string()), "{added} is missing");
+    }
+    for added in ["kind", "youtube_account_id", "youtube_stream_id"] {
+        assert!(columns(&guard, "stream_destinations").contains(&added.to_string()), "{added} is missing");
+    }
+
+    // The old rows are where they were.
+    let rows: i64 = guard.query_row("SELECT count(*) FROM broadcasts", [], |r| r.get(0)).unwrap();
+    assert_eq!(rows, 1, "a migration deleted a broadcast");
+    let still: Vec<u8> = guard
+        .query_row("SELECT sealed FROM credentials WHERE account='destination:d-old'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(still, sealed, "a migration must never touch an encrypted value");
+    drop(guard);
+
+    // And the broadcast that was on air reads as a manual RTMPS one, which is
+    // what it is: every YouTube field is absent rather than guessed at.
+    let b = db.broadcast_owned("u-old", &broadcast_id).unwrap();
+    assert!(b.youtube.account_id.is_none());
+    assert!(b.youtube.broadcast_id.is_none());
+    assert!(b.youtube.status.is_none());
+    assert_eq!(
+        db.destination_owned("u-old", "d-old").unwrap().kind,
+        louver_cloud::DestinationKind::ManualRtmps,
+        "a destination written before the column existed is a pasted key, because that is all it could be"
+    );
+
+    // Nothing to connect, and asking is not an error.
+    assert!(db.youtube_accounts_for("u-old").unwrap().is_empty());
+}
+
+fn columns(c: &Connection, table: &str) -> Vec<String> {
+    let mut st = c.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+    let rows = st.query_map([], |r| r.get::<_, String>(1)).unwrap();
+    rows.map(|r| r.unwrap()).collect()
+}

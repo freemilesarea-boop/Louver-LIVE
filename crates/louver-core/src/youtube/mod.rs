@@ -16,7 +16,7 @@ pub mod provision;
 pub mod quota;
 pub mod steps;
 
-pub use api::{ChannelInfo, HttpClient, LiveBroadcast, LiveStream, YoutubeApi};
+pub use api::{ChannelInfo, HttpClient, LiveBroadcast, LiveStream, NewLiveStream, YoutubeApi};
 pub use chat::{ChatMessage, ChatOrder, ChatSettings, ChatState, ChatStatus, MIN_INTERVAL_SECS};
 pub use metadata::{BroadcastMetadata, Privacy, CATEGORIES};
 pub use oauth::{ClientCredentials, TokenStore};

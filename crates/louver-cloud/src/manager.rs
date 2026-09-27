@@ -190,6 +190,9 @@ pub struct BroadcastManager {
     keys: Arc<dyn louver_core::security::SecretStore>,
     launchers: Arc<dyn LauncherFactory>,
     workers: Arc<Mutex<HashMap<String, Worker>>>,
+    /// Set only when this server has YouTube connecting configured. `None`
+    /// means every broadcast is a pasted stream key, exactly as before.
+    youtube: Option<Arc<crate::youtube::Youtube>>,
 }
 
 impl std::fmt::Debug for BroadcastManager {
@@ -217,7 +220,22 @@ impl BroadcastManager {
             keys,
             launchers,
             workers: Arc::new(Mutex::new(HashMap::new())),
+            youtube: None,
         }
+    }
+
+    /// Give this manager a YouTube provider.
+    ///
+    /// Optional on purpose: without one, every broadcast is a pasted stream key
+    /// and not one line of the sending path behaves differently. With one, only
+    /// the broadcasts that have an account attached take the extra steps.
+    pub fn with_youtube(mut self, yt: crate::youtube::Youtube) -> Self {
+        self.youtube = Some(Arc::new(yt));
+        self
+    }
+
+    pub fn youtube(&self) -> Option<Arc<crate::youtube::Youtube>> {
+        self.youtube.clone()
     }
 
     /// The store broadcasts read their stream keys from.
@@ -243,6 +261,13 @@ impl BroadcastManager {
     /// decision is made before any process is spawned. A start that then fails
     /// releases the slot rather than leaving it held by nothing.
     pub fn start(&self, user_id: &str, broadcast_id: &str) -> Result<()> {
+        // §8: a connected account's broadcast is checked with YouTube before
+        // anything is claimed or spawned — a token that will not refresh or a
+        // broadcast YouTube has already completed is a reason not to start, not
+        // something to discover once FFmpeg is running.
+        if let Some(yt) = &self.youtube {
+            yt.before_start(broadcast_id)?;
+        }
         self.db.claim_stream_slot(user_id, broadcast_id)?;
         match self.spawn_worker(broadcast_id) {
             Ok(()) => Ok(()),
@@ -262,6 +287,12 @@ impl BroadcastManager {
         self.db.release_stream_slot(user_id, broadcast_id)?;
         self.halt_worker(broadcast_id);
         self.db.record_runtime_only(broadcast_id, RuntimeState::Stopped)?;
+        // §9: end YouTube's side too, after the sender is down. Tolerant by
+        // design — `enableAutoStop` may already have completed it — and never
+        // able to leave 247streams thinking the broadcast is still running.
+        if let Some(yt) = &self.youtube {
+            yt.after_stop(broadcast_id);
+        }
         Ok(())
     }
 
@@ -279,6 +310,27 @@ impl BroadcastManager {
         let wanted = self.db.broadcasts_wanting_to_run()?;
         let mut started = 0;
         for b in wanted {
+            // §14: a YouTube-connected broadcast has to be checked before its
+            // worker is spawned — the access token has almost certainly expired
+            // while the server was down, and the broadcast itself may have been
+            // ended on YouTube's side in the meantime.
+            if let (Some(yt), Some(_)) = (&self.youtube, &b.youtube.broadcast_id) {
+                if let Err(e) = yt.before_start(&b.id) {
+                    let _ = self.db.record_failure(&b.id, &format!("복구 실패: {e}"));
+                    // Ended on YouTube is final. Left wanting to run, this
+                    // broadcast would be restarted by every boot for ever,
+                    // which is the one thing §14 forbids.
+                    if self
+                        .db
+                        .broadcast(&b.id)
+                        .map(|x| x.youtube.status.as_deref() == Some(crate::youtube::COMPLETE))
+                        .unwrap_or(false)
+                    {
+                        let _ = self.db.give_up(&b.id);
+                    }
+                    continue;
+                }
+            }
             match self.spawn_worker(&b.id) {
                 Ok(()) => started += 1,
                 Err(e) => {
@@ -467,8 +519,9 @@ impl BroadcastManager {
             let workers = Arc::clone(&self.workers);
             let loop_forever = b.loop_forever;
             let user_id = b.user_id.clone();
+            let youtube = self.youtube.clone();
             std::thread::spawn(move || {
-                run_until_stopped(rt, &db, &id, &stop, loop_forever, user_id);
+                run_until_stopped(rt, &db, &id, &stop, loop_forever, user_id, youtube);
                 // The thread is finishing; drop its own entry so a later start
                 // is not refused by a worker that no longer exists.
                 workers.lock().unwrap().remove(&id);
@@ -491,8 +544,10 @@ fn run_until_stopped(
     stop: &AtomicBool,
     loop_forever: bool,
     user_id: String,
+    youtube: Option<Arc<crate::youtube::Youtube>>,
 ) {
     let mut stderr_cursor = StderrCursor::default();
+    let mut watcher = YoutubeWatch::default();
     loop {
         if stop.load(Ordering::SeqCst) {
             let _ = rt.stop(true);
@@ -548,6 +603,14 @@ fn run_until_stopped(
                 let _ = db.record_runtime_only(broadcast_id, RuntimeState::Stopped);
                 return;
             }
+        }
+
+        // §8: YouTube's own view of the stream, asked for on a schedule and a
+        // bounded number of times. FFmpeg being alive says nothing about whether
+        // YouTube has accepted the ingest, so the two are tracked separately and
+        // this is the only thing that writes the YouTube one.
+        if let Some(yt) = &youtube {
+            watcher.maybe_poll(yt, db, broadcast_id);
         }
 
         if rt.status().supervisor.restart_count as i64 > MAX_RESTARTS {
@@ -698,6 +761,56 @@ mod meter_tests {
     }
 }
 
+/// Asks YouTube how the ingest is going, on a schedule and not for ever.
+///
+/// Every poll costs API quota, and a broadcast that has gone live has nothing
+/// left to report, so this stops as soon as it has an answer and gives up after
+/// a few minutes of not getting one. §8 forbids an unbounded loop and this is
+/// where that rule lives.
+#[derive(Debug)]
+struct YoutubeWatch {
+    next: std::time::Instant,
+    polls: u32,
+    settled: bool,
+}
+
+impl Default for YoutubeWatch {
+    fn default() -> Self {
+        Self { next: std::time::Instant::now(), polls: 0, settled: false }
+    }
+}
+
+impl YoutubeWatch {
+    /// Every ten seconds, at most thirty times: five minutes for YouTube to
+    /// notice an ingest it usually notices in twenty seconds.
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+    const LIMIT: u32 = 30;
+
+    fn maybe_poll(&mut self, yt: &Arc<crate::youtube::Youtube>, db: &CloudDb, broadcast_id: &str) {
+        if self.settled || self.polls >= Self::LIMIT || std::time::Instant::now() < self.next {
+            return;
+        }
+        self.next = std::time::Instant::now() + Self::EVERY;
+        self.polls += 1;
+        match yt.poll_status(broadcast_id) {
+            // Not a YouTube broadcast at all: never ask again.
+            Ok(None) => self.settled = true,
+            Ok(Some(status)) => {
+                if status == crate::youtube::LIVE || status == crate::youtube::COMPLETE {
+                    self.settled = true;
+                }
+            }
+            Err(e) => {
+                let _ =
+                    db.append_event(broadcast_id, EventLevel::Warn, &format!("YouTube 상태 확인 실패: {e}"));
+                if self.polls >= Self::LIMIT {
+                    self.settled = true;
+                }
+            }
+        }
+    }
+}
+
 /// Reads a rotating tail without repeating itself and without losing a line.
 ///
 /// The core keeps the last twenty stderr lines and drops the oldest, so a count
@@ -750,25 +863,14 @@ fn describe_destination(
     let host = rest.split('/').next().unwrap_or("").to_string();
     let path = rest.strip_prefix(&host).unwrap_or("").to_string();
 
-    let account = crate::credentials::destination_account(&dest.id);
-    let (len, fingerprint) = match keys.get(&account) {
-        Ok(Some(key)) => {
-            let digest = ring::digest::digest(&ring::digest::SHA256, key.trim().as_bytes());
-            let hex: String = digest.as_ref().iter().take(4).map(|b| format!("{b:02x}")).collect();
-            (key.trim().chars().count(), hex)
-        }
-        // No key at all is why FFmpeg would never have started; say so rather
-        // than leaving an empty URL to be guessed at.
-        Ok(None) => (0, "none".to_string()),
-        Err(_) => (0, "unreadable".to_string()),
-    };
+    // No key at all is why FFmpeg would never have started, so the fingerprint
+    // says so rather than leaving an empty URL to be guessed at.
+    let key = crate::credentials::fingerprint(keys, &crate::credentials::destination_account(&dest.id));
 
     say(
         broadcast_id,
         "info",
-        &format!(
-            "송출 대상: scheme={scheme} host={host} path={path} key=[REDACTED len={len} sha256:{fingerprint}] 영상={items}개"
-        ),
+        &format!("송출 대상: scheme={scheme} host={host} path={path} key={key} 영상={items}개"),
     );
     if !matches!(scheme.as_str(), "rtmp" | "rtmps") {
         say(
@@ -777,7 +879,7 @@ fn describe_destination(
             &format!("송출 대상이 RTMP(S)가 아닙니다 (scheme={scheme}). YouTube에는 도달하지 않습니다."),
         );
     }
-    if len == 0 {
+    if !key.present() {
         say(broadcast_id, "error", "스트림 키를 읽을 수 없습니다. 대상을 다시 저장해 주세요.");
     }
     // The limit of what a pasted key can do, said at the moment it matters.

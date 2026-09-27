@@ -17,6 +17,7 @@ pub mod manager;
 pub mod models;
 pub mod schedule;
 pub mod storage;
+pub mod youtube;
 
 pub use db::CloudDb;
 pub use models::*;

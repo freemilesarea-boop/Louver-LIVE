@@ -129,6 +129,34 @@ CREATE TABLE IF NOT EXISTS broadcasts (
 CREATE INDEX IF NOT EXISTS idx_broadcast_user ON broadcasts(user_id);
 CREATE INDEX IF NOT EXISTS idx_broadcast_desired ON broadcasts(desired_state);
 
+-- A connected YouTube channel. §3. No token here: the refresh and access
+-- tokens are sealed in `credentials`, under this row's id.
+CREATE TABLE IF NOT EXISTS youtube_accounts (
+    id               TEXT PRIMARY KEY,
+    user_id          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    provider         TEXT NOT NULL DEFAULT 'youtube',
+    channel_id       TEXT NOT NULL,
+    channel_title    TEXT NOT NULL DEFAULT '',
+    thumbnail_url    TEXT,
+    token_expiry     TEXT,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    last_verified_at TEXT,
+    -- One row per channel per user: reconnecting the same channel updates it
+    -- rather than leaving two accounts that disagree about the tokens.
+    UNIQUE (user_id, channel_id)
+);
+CREATE INDEX IF NOT EXISTS idx_yt_account_user ON youtube_accounts(user_id);
+
+-- A consent attempt in flight. §15: single use, and it expires.
+CREATE TABLE IF NOT EXISTS oauth_states (
+    state      TEXT PRIMARY KEY,
+    user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    verifier   TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    used_at    TEXT
+);
+
 -- One video in one broadcast's playlist. §1.
 CREATE TABLE IF NOT EXISTS broadcast_items (
     id           TEXT PRIMARY KEY,
@@ -279,6 +307,14 @@ impl CloudDb {
             // playlist was rotated to when it was last started (§9's resume).
             ("play_count", "INTEGER NOT NULL DEFAULT 0"),
             ("playlist_offset", "INTEGER NOT NULL DEFAULT 0"),
+            // §7: where this broadcast's YouTube resources are. Null on every
+            // row that was ever created with a pasted stream key, which is what
+            // keeps those broadcasts behaving exactly as they do now.
+            ("youtube_account_id", "TEXT"),
+            ("youtube_broadcast_id", "TEXT"),
+            ("youtube_stream_id", "TEXT"),
+            ("youtube_status", "TEXT"),
+            ("youtube_error", "TEXT"),
             ("current_index", "INTEGER NOT NULL DEFAULT 0"),
             ("current_item", "TEXT"),
             ("next_item", "TEXT"),
@@ -291,6 +327,9 @@ impl CloudDb {
         // §5: which kind of destination this is. Every existing row is a stream
         // key someone pasted, which is exactly what the default says.
         ensure_column(&conn, "stream_destinations", "kind", "TEXT NOT NULL DEFAULT 'manual_rtmps'")?;
+        // A destination YouTube gave us, rather than one somebody pasted.
+        ensure_column(&conn, "stream_destinations", "youtube_account_id", "TEXT")?;
+        ensure_column(&conn, "stream_destinations", "youtube_stream_id", "TEXT")?;
 
         let db = Self { conn: Arc::new(Mutex::new(conn)) };
         db.seed_plans()?;
@@ -750,6 +789,279 @@ impl CloudDb {
         Ok(())
     }
 
+    // --- YouTube accounts and OAuth (§2, §3) -------------------------------
+
+    /// Start a consent attempt and return its state parameter.
+    ///
+    /// The state is the row's key, so an unknown state is an unknown row and
+    /// there is nothing to compare by hand.
+    pub fn create_oauth_state(&self, user_id: &str, verifier: &str) -> Result<String> {
+        let state = crate::new_id();
+        self.raw().lock().unwrap().execute(
+            "INSERT INTO oauth_states (state, user_id, verifier) VALUES (?1, ?2, ?3)",
+            params![state, user_id, verifier],
+        )?;
+        Ok(state)
+    }
+
+    /// Spend a consent attempt. Once, and only while it is fresh.
+    ///
+    /// The update is the check: a second callback with the same state changes no
+    /// rows and is refused, which is what makes a replayed redirect useless.
+    pub fn claim_oauth_state(&self, state: &str, ttl_minutes: i64) -> Result<OauthClaim> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let changed = guard.execute(
+            &format!(
+                "UPDATE oauth_states SET used_at = datetime('now')
+                 WHERE state = ?1 AND used_at IS NULL
+                   AND created_at > datetime('now', '-{ttl_minutes} minutes')"
+            ),
+            [state],
+        )?;
+        if changed == 0 {
+            return Err(CloudError::Invalid(
+                "연결 요청이 만료되었거나 이미 사용되었습니다. 다시 시도해 주세요.".into(),
+            ));
+        }
+        let (user_id, verifier) =
+            guard.query_row("SELECT user_id, verifier FROM oauth_states WHERE state = ?1", [state], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
+        // Housekeeping, while we are here: spent and stale attempts are of no
+        // further use to anyone.
+        let _ = guard.execute(
+            "DELETE FROM oauth_states
+             WHERE used_at IS NOT NULL AND used_at < datetime('now', '-1 hours')
+                OR created_at < datetime('now', '-1 days')",
+            [],
+        );
+        Ok(OauthClaim { user_id, verifier })
+    }
+
+    /// Create or update the row for a channel. Reconnecting the same channel
+    /// keeps its id, so the sealed tokens stay where the account expects them.
+    pub fn upsert_youtube_account(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        channel_title: &str,
+        thumbnail_url: Option<&str>,
+    ) -> Result<crate::youtube::YoutubeAccount> {
+        let existing: Option<String> = self
+            .raw()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT id FROM youtube_accounts WHERE user_id = ?1 AND channel_id = ?2",
+                params![user_id, channel_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = existing.unwrap_or_else(crate::new_id);
+        self.raw().lock().unwrap().execute(
+            "INSERT INTO youtube_accounts (id, user_id, channel_id, channel_title, thumbnail_url)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                 channel_title = excluded.channel_title,
+                 thumbnail_url = COALESCE(excluded.thumbnail_url, youtube_accounts.thumbnail_url),
+                 updated_at = datetime('now')",
+            params![id, user_id, channel_id, channel_title, thumbnail_url],
+        )?;
+        self.youtube_account_owned(user_id, &id)
+    }
+
+    pub fn youtube_account_owned(&self, user_id: &str, id: &str) -> Result<crate::youtube::YoutubeAccount> {
+        self.raw()
+            .lock()
+            .unwrap()
+            .query_row(
+                &format!("{YOUTUBE_ACCOUNT_COLUMNS} WHERE id = ?1 AND user_id = ?2"),
+                params![id, user_id],
+                row_to_youtube_account,
+            )
+            .optional()?
+            .ok_or(CloudError::NotFound("youtube account"))
+    }
+
+    pub fn youtube_accounts_for(&self, user_id: &str) -> Result<Vec<crate::youtube::YoutubeAccount>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st =
+            guard.prepare(&format!("{YOUTUBE_ACCOUNT_COLUMNS} WHERE user_id = ?1 ORDER BY created_at"))?;
+        let rows = st.query_map([user_id], row_to_youtube_account)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn delete_youtube_account(&self, user_id: &str, id: &str) -> Result<()> {
+        self.raw()
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM youtube_accounts WHERE id = ?1 AND user_id = ?2", params![id, user_id])?;
+        Ok(())
+    }
+
+    pub fn touch_youtube_account(&self, id: &str) -> Result<()> {
+        self.raw().lock().unwrap().execute(
+            "UPDATE youtube_accounts SET last_verified_at = datetime('now'),
+                    updated_at = datetime('now') WHERE id = ?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// When the cached access token stops being usable. Seconds from now.
+    pub fn set_youtube_token_expiry(&self, id: &str, seconds: i64) -> Result<()> {
+        let modifier = format!("{}{} seconds", if seconds < 0 { "-" } else { "+" }, seconds.abs());
+        self.raw().lock().unwrap().execute(
+            "UPDATE youtube_accounts SET token_expiry = datetime('now', ?2),
+                    updated_at = datetime('now') WHERE id = ?1",
+            params![id, modifier],
+        )?;
+        Ok(())
+    }
+
+    /// True when there is no usable cached token — including when there never
+    /// was one, which is the state a fresh server restart is in.
+    pub fn youtube_token_expired(&self, id: &str) -> Result<bool> {
+        let expiry: Option<String> = self
+            .raw()
+            .lock()
+            .unwrap()
+            .query_row("SELECT token_expiry FROM youtube_accounts WHERE id = ?1", [id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        let Some(expiry) = expiry else { return Ok(true) };
+        let still_good: i64 = self.raw().lock().unwrap().query_row(
+            "SELECT CASE WHEN ?1 > datetime('now') THEN 1 ELSE 0 END",
+            [expiry],
+            |r| r.get(0),
+        )?;
+        Ok(still_good == 0)
+    }
+
+    // --- a broadcast's YouTube resources (§7) ------------------------------
+
+    /// A destination that YouTube gave us, for one broadcast.
+    ///
+    /// An ordinary `stream_destinations` row on purpose: from here on the
+    /// sending path is the one that is already on air, and the stream key is
+    /// sealed by the same store as a pasted one.
+    pub fn upsert_youtube_destination(
+        &self,
+        user_id: &str,
+        broadcast_id: &str,
+        ingestion_address: &str,
+        account_id: &str,
+        stream_id: &str,
+    ) -> Result<StreamDestination> {
+        let title: String = self
+            .raw()
+            .lock()
+            .unwrap()
+            .query_row("SELECT channel_title FROM youtube_accounts WHERE id = ?1", [account_id], |r| r.get(0))
+            .optional()?
+            .unwrap_or_else(|| "YouTube".to_string());
+        let existing: Option<String> = self
+            .raw()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT d.id FROM stream_destinations d JOIN broadcasts b ON b.destination_id = d.id
+                 WHERE b.id = ?1 AND d.kind = 'youtube_account'",
+                [broadcast_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let id = existing.unwrap_or_else(crate::new_id);
+        self.raw().lock().unwrap().execute(
+            "INSERT INTO stream_destinations
+                 (id, user_id, label, rtmps_url, key_masked, kind, youtube_account_id, youtube_stream_id)
+             VALUES (?1, ?2, ?3, ?4, '••••••••••••', 'youtube_account', ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                 label = excluded.label,
+                 rtmps_url = excluded.rtmps_url,
+                 youtube_account_id = excluded.youtube_account_id,
+                 youtube_stream_id = excluded.youtube_stream_id",
+            params![id, user_id, title, ingestion_address, account_id, stream_id],
+        )?;
+        self.destination_owned(user_id, &id)
+    }
+
+    /// A destination for a YouTube-connected broadcast that does not exist yet.
+    ///
+    /// `create_broadcast` insists on a destination the caller owns, and YouTube
+    /// cannot be asked for an ingestion address until there is a broadcast to
+    /// title. This breaks the circle: an empty row of the right kind, which
+    /// `upsert_youtube_destination` then fills in place once Google has
+    /// answered. It carries no key, so a broadcast pointed at it and never
+    /// provisioned refuses to start rather than sending somewhere wrong.
+    pub fn reserve_youtube_destination(&self, user_id: &str, account_id: &str) -> Result<StreamDestination> {
+        let title: String = self
+            .raw()
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT channel_title FROM youtube_accounts WHERE id = ?1 AND user_id = ?2",
+                params![account_id, user_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or(CloudError::NotFound("youtube account"))?;
+        let id = crate::new_id();
+        self.raw().lock().unwrap().execute(
+            "INSERT INTO stream_destinations
+                 (id, user_id, label, rtmps_url, key_masked, kind, youtube_account_id)
+             VALUES (?1, ?2, ?3, '', '••••••••••••', 'youtube_account', ?4)",
+            params![id, user_id, title, account_id],
+        )?;
+        self.destination_owned(user_id, &id)
+    }
+
+    /// Point a broadcast at a destination we just made for it.
+    pub fn point_broadcast_at(&self, user_id: &str, broadcast_id: &str, destination_id: &str) -> Result<()> {
+        self.destination_owned(user_id, destination_id)?;
+        self.raw().lock().unwrap().execute(
+            "UPDATE broadcasts SET destination_id = ?2 WHERE id = ?1 AND user_id = ?3",
+            params![broadcast_id, destination_id, user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn attach_youtube(
+        &self,
+        broadcast_id: &str,
+        account_id: &str,
+        youtube_broadcast_id: &str,
+        youtube_stream_id: &str,
+        status: &str,
+    ) -> Result<()> {
+        self.raw().lock().unwrap().execute(
+            "UPDATE broadcasts SET youtube_account_id = ?2, youtube_broadcast_id = ?3,
+                    youtube_stream_id = ?4, youtube_status = ?5, youtube_error = NULL
+             WHERE id = ?1",
+            params![broadcast_id, account_id, youtube_broadcast_id, youtube_stream_id, status],
+        )?;
+        Ok(())
+    }
+
+    /// YouTube's own view of the broadcast, which is not FFmpeg's. §8.
+    pub fn set_youtube_status(&self, broadcast_id: &str, status: &str) -> Result<()> {
+        self.raw().lock().unwrap().execute(
+            "UPDATE broadcasts SET youtube_status = ?2 WHERE id = ?1",
+            params![broadcast_id, status],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_youtube_error(&self, broadcast_id: &str, message: &str) -> Result<()> {
+        self.raw().lock().unwrap().execute(
+            "UPDATE broadcasts SET youtube_status = 'error', youtube_error = ?2 WHERE id = ?1",
+            params![broadcast_id, message],
+        )?;
+        Ok(())
+    }
+
     // --- playlists (§1, §2) -----------------------------------------------
 
     /// One broadcast's playlist, in order, with what the UI needs to draw it.
@@ -1092,6 +1404,16 @@ impl CloudDb {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// Every user id, for the same diagnostic command. Same reason: the caller
+    /// is a shell on the server, not a request.
+    pub fn all_user_ids(&self) -> Result<Vec<String>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare("SELECT id FROM users ORDER BY created_at")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// One broadcast's events, without an owner check. Same reason.
     pub fn events_for(&self, broadcast_id: &str, limit: i64) -> Result<Vec<BroadcastEvent>> {
         let conn = self.raw();
@@ -1232,6 +1554,32 @@ impl CloudDb {
 
 // `SELECT *` would break the moment a migration adds a column in a different
 // order, and reading by name means adding one here is the only edit needed.
+/// What a consent attempt was for, once it is spent.
+#[derive(Debug, Clone)]
+pub struct OauthClaim {
+    pub user_id: String,
+    pub verifier: String,
+}
+
+const YOUTUBE_ACCOUNT_COLUMNS: &str = "SELECT id, user_id, provider, channel_id, channel_title,
+        thumbnail_url, token_expiry, created_at, updated_at, last_verified_at
+        FROM youtube_accounts";
+
+fn row_to_youtube_account(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::youtube::YoutubeAccount> {
+    Ok(crate::youtube::YoutubeAccount {
+        id: r.get("id")?,
+        user_id: r.get("user_id")?,
+        provider: r.get("provider")?,
+        channel_id: r.get("channel_id")?,
+        channel_title: r.get("channel_title")?,
+        thumbnail_url: r.get("thumbnail_url")?,
+        token_expiry: r.get("token_expiry")?,
+        created_at: r.get("created_at")?,
+        updated_at: r.get("updated_at")?,
+        last_verified_at: r.get("last_verified_at")?,
+    })
+}
+
 const BROADCAST_COLUMNS: &str = "SELECT * FROM broadcasts";
 
 fn row_to_media(r: &rusqlite::Row<'_>) -> rusqlite::Result<CloudMedia> {
@@ -1325,6 +1673,16 @@ fn row_to_broadcast(r: &rusqlite::Row<'_>) -> rusqlite::Result<Broadcast> {
         current_position_secs: r.get("current_position_secs")?,
         current_duration_secs: r.get("current_duration_secs")?,
         cycle_duration_secs: r.get("cycle_duration_secs")?,
+        youtube: crate::youtube::YoutubeLink {
+            account_id: r.get("youtube_account_id")?,
+            broadcast_id: r.get("youtube_broadcast_id")?,
+            stream_id: r.get("youtube_stream_id")?,
+            status: r.get("youtube_status")?,
+            watch_url: r
+                .get::<_, Option<String>>("youtube_broadcast_id")?
+                .map(|id| format!("https://www.youtube.com/watch?v={id}")),
+            last_error: r.get("youtube_error")?,
+        },
     })
 }
 

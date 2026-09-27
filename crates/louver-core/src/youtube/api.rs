@@ -57,6 +57,31 @@ pub struct LiveBroadcast {
     pub enable_auto_stop: bool,
 }
 
+/// An ingestion endpoint this service just created.
+///
+/// `stream_name` is the stream key. It exists in this struct for exactly as long
+/// as it takes the caller to seal it, which is why `Debug` will not print it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct NewLiveStream {
+    pub id: String,
+    /// `rtmps://a.rtmps.youtube.com/live2` or the plain RTMP address.
+    pub ingestion_address: String,
+    pub stream_name: String,
+    /// True when YouTube offered an RTMPS address and it is the one above.
+    pub is_rtmps: bool,
+}
+
+impl std::fmt::Debug for NewLiveStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NewLiveStream")
+            .field("id", &self.id)
+            .field("ingestion_address", &self.ingestion_address)
+            .field("stream_name", &"<redacted>")
+            .field("is_rtmps", &self.is_rtmps)
+            .finish()
+    }
+}
+
 /// One of the channel's ingestion endpoints.
 ///
 /// The stream key lives in `ingestion_key`, which is why this type never
@@ -295,6 +320,46 @@ impl<'a> YoutubeApi<'a> {
         Ok(parse_broadcast(&v))
     }
 
+    /// Create an ingestion endpoint of our own. `liveStreams.insert`.
+    ///
+    /// One stream per broadcast rather than reusing the channel's default, so
+    /// that three concurrent broadcasts cannot publish to the same key — which
+    /// would make them fight over one live stream.
+    ///
+    /// `cdn.resolution` and `cdn.frameRate` are `variable`, which is what
+    /// YouTube documents for an `rtmp` ingestion whose format the sender
+    /// decides. The response carries the RTMPS address as well as the RTMP one;
+    /// the caller prefers RTMPS.
+    pub fn create_stream(&self, token: &str, title: &str) -> Result<NewLiveStream> {
+        let body = serde_json::json!({
+            "snippet": { "title": title },
+            "cdn": {
+                "frameRate": "variable",
+                "resolution": "variable",
+                "ingestionType": "rtmp",
+            },
+        });
+        let v = self.call("POST", "/liveStreams?part=id,snippet,cdn,status", token, Some(body))?;
+        let info = &v["cdn"]["ingestionInfo"];
+        let rtmps = info["rtmpsIngestionAddress"].as_str().unwrap_or_default().to_string();
+        let rtmp = info["ingestionAddress"].as_str().unwrap_or_default().to_string();
+        let stream_name = info["streamName"].as_str().unwrap_or_default().to_string();
+        let id = v["id"].as_str().unwrap_or_default().to_string();
+        if id.is_empty() || stream_name.is_empty() || (rtmps.is_empty() && rtmp.is_empty()) {
+            return Err(LouverError::with_detail(
+                ErrorCode::YoutubeApiFailed,
+                "liveStreams.insert 응답에 ingestion 정보가 없습니다",
+            ));
+        }
+        let is_rtmps = !rtmps.is_empty();
+        Ok(NewLiveStream {
+            id,
+            ingestion_address: if is_rtmps { rtmps } else { rtmp },
+            stream_name,
+            is_rtmps,
+        })
+    }
+
     /// The channel's ingestion endpoints, with their keys.
     ///
     /// The keys are in the response, which is why the result is matched in
@@ -357,6 +422,7 @@ impl<'a> YoutubeApi<'a> {
         broadcast_id: &str,
         meta: &BroadcastMetadata,
         scheduled_start_time: Option<&str>,
+        scheduled_end_time: Option<&str>,
     ) -> Result<()> {
         let mut snippet = serde_json::json!({
             "title": meta.title,
@@ -364,6 +430,9 @@ impl<'a> YoutubeApi<'a> {
         });
         if let Some(t) = scheduled_start_time {
             snippet["scheduledStartTime"] = serde_json::Value::String(t.to_string());
+        }
+        if let Some(t) = scheduled_end_time {
+            snippet["scheduledEndTime"] = serde_json::Value::String(t.to_string());
         }
         let body = serde_json::json!({
             "id": broadcast_id,

@@ -313,7 +313,7 @@ fn the_broadcast_update_carries_title_description_and_privacy() {
     let api = YoutubeApi::with_base(&http, fake.base.clone());
 
     let b = api.active_broadcast("tok").unwrap();
-    api.update_broadcast("tok", &b.id, &meta(), None).unwrap();
+    api.update_broadcast("tok", &b.id, &meta(), None, None).unwrap();
 
     let put = fake.requests().into_iter().find(|r| r.method == "PUT").unwrap();
     assert_eq!(put.body["id"], "bcast-1");
