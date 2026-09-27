@@ -9,40 +9,57 @@
  * accounts, plans, uploading a file to somewhere else — rejects with a message
  * that says so, rather than pretending.
  */
-import { api, listen } from '@/services/ipc'
-import type { Media, RuntimeStatus, StreamState } from '@/types'
-import { AUTO_SETTINGS, emptySchedule } from './cloud'
+import { api, listen } from "@/services/ipc";
+import type { Media, RuntimeStatus, StreamState } from "@/types";
+import { AUTO_SETTINGS, emptySchedule } from "./cloud";
 import type {
-  Broadcast, BroadcastDetail, BroadcastEvent, BroadcastItem, BroadcastPatch, CloudMedia, Dashboard,
-  DesiredState, Health, Me, MediaState, Metrics, NewBroadcast, NewDestination, NewItem, RuntimeState,
-  StreamDestination, Subscription,
-} from './cloud'
-import type { Transport } from './transport'
+  Broadcast,
+  BroadcastDetail,
+  BroadcastEvent,
+  BroadcastItem,
+  BroadcastPatch,
+  CloudMedia,
+  Dashboard,
+  DesiredState,
+  Health,
+  Me,
+  MediaState,
+  Metrics,
+  NewBroadcast,
+  NewDestination,
+  NewItem,
+  RuntimeState,
+  StreamDestination,
+  Subscription,
+  YoutubeAccount,
+  YoutubeAvailability,
+} from "./cloud";
+import type { Transport } from "./transport";
 
 const ONLY_ON_THE_WEB = (what: string) => {
-  const e = new Error(`${what}은(는) 웹 버전에서만 사용할 수 있습니다.`)
-  return Object.assign(e, { code_str: 'LL-DESKTOP', message: e.message })
-}
+  const e = new Error(`${what}은(는) 웹 버전에서만 사용할 수 있습니다.`);
+  return Object.assign(e, { code_str: "LL-DESKTOP", message: e.message });
+};
 
 /** The desktop is one machine with one stream key: one destination, always. */
 export const LOCAL_DESTINATION: StreamDestination = {
-  id: 'local',
-  user_id: 'local',
-  label: '이 컴퓨터의 스트림 키',
-  rtmps_url: 'rtmps://a.rtmps.youtube.com/live2',
-  key_masked: '••••••••••••',
-  created_at: '',
-}
+  id: "local",
+  user_id: "local",
+  label: "이 컴퓨터의 스트림 키",
+  rtmps_url: "rtmps://a.rtmps.youtube.com/live2",
+  key_masked: "••••••••••••",
+  created_at: "",
+};
 
 export class DesktopTransport implements Transport {
-  readonly kind = 'desktop' as const
+  readonly kind = "desktop" as const;
 
   async register(): Promise<Me> {
-    throw ONLY_ON_THE_WEB('계정 만들기')
+    throw ONLY_ON_THE_WEB("계정 만들기");
   }
 
   async login(): Promise<Me> {
-    throw ONLY_ON_THE_WEB('로그인')
+    throw ONLY_ON_THE_WEB("로그인");
   }
 
   async logout(): Promise<void> {
@@ -50,42 +67,42 @@ export class DesktopTransport implements Transport {
   }
 
   async me(): Promise<Me> {
-    return { id: 'local', email: '', plan_id: 'desktop' }
+    return { id: "local", email: "", plan_id: "desktop" };
   }
 
   async subscription(): Promise<Subscription> {
     return {
-      user_id: 'local',
-      plan_id: 'desktop',
-      plan_label: '데스크톱',
-      status: 'active',
+      user_id: "local",
+      plan_id: "desktop",
+      plan_label: "데스크톱",
+      status: "active",
       // One machine sends one stream. The number is the truth here, not a plan.
       limits: { max_concurrent_streams: 1 },
-    }
+    };
   }
 
   async listMedia(): Promise<CloudMedia[]> {
-    return (await api.listMedia()).map(fromDesktopMedia)
+    return (await api.listMedia()).map(fromDesktopMedia);
   }
 
   async uploadMedia(): Promise<CloudMedia> {
-    throw ONLY_ON_THE_WEB('영상 업로드')
+    throw ONLY_ON_THE_WEB("영상 업로드");
   }
 
   async deleteMedia(id: string): Promise<void> {
-    await api.deleteMedia(Number(id))
+    await api.deleteMedia(Number(id));
   }
 
   async listDestinations(): Promise<StreamDestination[]> {
-    return [LOCAL_DESTINATION]
+    return [LOCAL_DESTINATION];
   }
 
   async createDestination(_input: NewDestination): Promise<StreamDestination> {
-    throw ONLY_ON_THE_WEB('송출 대상 추가')
+    throw ONLY_ON_THE_WEB("송출 대상 추가");
   }
 
   async deleteDestination(): Promise<void> {
-    throw ONLY_ON_THE_WEB('송출 대상 삭제')
+    throw ONLY_ON_THE_WEB("송출 대상 삭제");
   }
 
   /**
@@ -93,82 +110,118 @@ export class DesktopTransport implements Transport {
    * state. The desktop runs one at a time, so `active` is 0 or 1.
    */
   async dashboard(): Promise<Dashboard> {
-    const [playlists, status] = await Promise.all([api.listPlaylists(), api.getStatus()])
-    const broadcasts = playlists.map((p) => toBroadcast(p.id, p.name, status))
+    const [playlists, status] = await Promise.all([
+      api.listPlaylists(),
+      api.getStatus(),
+    ]);
+    const broadcasts = playlists.map((p) => toBroadcast(p.id, p.name, status));
     return {
-      plan_label: '데스크톱',
-      active: broadcasts.filter((b) => b.desired_state === 'running').length,
+      plan_label: "데스크톱",
+      active: broadcasts.filter((b) => b.desired_state === "running").length,
       allowed: 1,
       broadcasts,
-    }
+    };
   }
 
   async createBroadcast(_input: NewBroadcast): Promise<BroadcastDetail> {
-    throw ONLY_ON_THE_WEB('방송 만들기')
+    throw ONLY_ON_THE_WEB("방송 만들기");
   }
 
   async getBroadcast(id: string): Promise<BroadcastDetail> {
-    const d = await this.dashboard()
-    const b = d.broadcasts.find((x) => x.id === id)
-    if (!b) throw new Error('방송을 찾을 수 없습니다')
+    const d = await this.dashboard();
+    const b = d.broadcasts.find((x) => x.id === id);
+    if (!b) throw new Error("방송을 찾을 수 없습니다");
     // The desktop's playlists are edited on its own screens, not through this.
-    return { ...b, items: [] }
+    return { ...b, items: [] };
   }
 
-  async updateBroadcast(_id: string, _patch: BroadcastPatch): Promise<Broadcast> {
-    throw ONLY_ON_THE_WEB('방송 정보 수정')
+  async updateBroadcast(
+    _id: string,
+    _patch: BroadcastPatch,
+  ): Promise<Broadcast> {
+    throw ONLY_ON_THE_WEB("방송 정보 수정");
   }
 
   async replaceItems(_id: string, _items: NewItem[]): Promise<BroadcastItem[]> {
-    throw ONLY_ON_THE_WEB('플레이리스트 편집')
+    throw ONLY_ON_THE_WEB("플레이리스트 편집");
   }
 
   async startBroadcast(id: string): Promise<Broadcast> {
-    const status = await api.startBroadcast(Number(id))
-    return toBroadcast(Number(id), status.playlist_name ?? '', status)
+    const status = await api.startBroadcast(Number(id));
+    return toBroadcast(Number(id), status.playlist_name ?? "", status);
   }
 
   async stopBroadcast(id: string): Promise<Broadcast> {
-    const status = await api.stopBroadcast()
-    return toBroadcast(Number(id), status.playlist_name ?? '', status)
+    const status = await api.stopBroadcast();
+    return toBroadcast(Number(id), status.playlist_name ?? "", status);
   }
 
   async restartBroadcast(id: string): Promise<Broadcast> {
-    await api.stopBroadcast()
-    return this.startBroadcast(id)
+    await api.stopBroadcast();
+    return this.startBroadcast(id);
   }
 
   async deleteBroadcast(id: string): Promise<void> {
-    await api.deletePlaylist(Number(id))
+    await api.deletePlaylist(Number(id));
   }
 
   async logs(_id: string, limit = 100): Promise<BroadcastEvent[]> {
-    const events = await api.recentEvents(limit)
+    const events = await api.recentEvents(limit);
     return events.map((e, i) => ({
       id: i,
       broadcast_id: _id,
       at: e.at,
       level: e.level,
       message: e.message,
-    }))
+    }));
+  }
+
+  /**
+   * The desktop connects YouTube through its own settings screen, not through
+   * this transport: it holds one account, in its own database, with its own
+   * OAuth loopback. Answering "not configured" is therefore the truth rather
+   * than a stub — there is nothing here for the cloud's connect button to do.
+   */
+  async youtubeAvailability(): Promise<YoutubeAvailability> {
+    return { configured: false, redirect_uri: "" };
+  }
+
+  async listYoutubeAccounts(): Promise<YoutubeAccount[]> {
+    return [];
+  }
+
+  async youtubeConsentUrl(): Promise<string> {
+    throw new Error("데스크톱 앱에서는 설정 화면에서 YouTube를 연결합니다");
+  }
+
+  async disconnectYoutubeAccount(_id: string): Promise<void> {
+    throw new Error(
+      "데스크톱 앱에서는 설정 화면에서 YouTube 연결을 해제합니다",
+    );
   }
 
   /** The desktop is the machine in front of you. That is the whole point. */
   async health(): Promise<Health> {
     return {
-      status: 'ok',
-      version: '',
-      deployment: 'local',
-      checks: { api: true, database: true, ffmpeg: true, ffmpeg_rtmps: true, storage: true },
-    }
+      status: "ok",
+      version: "",
+      deployment: "local",
+      checks: {
+        api: true,
+        database: true,
+        ffmpeg: true,
+        ffmpeg_rtmps: true,
+        storage: true,
+      },
+    };
   }
 
   async metrics(): Promise<Metrics> {
-    const status = await api.getStatus()
-    const m = await api.getMetrics()
-    const d = await this.dashboard()
+    const status = await api.getStatus();
+    const m = await api.getMetrics();
+    const d = await this.dashboard();
     return {
-      deployment: 'local',
+      deployment: "local",
       server: {
         cpu_percent: m.system_cpu_percent,
         memory_total_bytes: m.total_memory_bytes,
@@ -192,88 +245,98 @@ export class DesktopTransport implements Transport {
         ffmpeg_pid: status.supervisor.pid ?? null,
         last_heartbeat: null,
       })),
-    }
+    };
   }
 
   /** The desktop already pushes a status event; a snapshot follows each one. */
   watchDashboard(onSnapshot: (d: Dashboard) => void): () => void {
-    let live = true
+    let live = true;
     const push = () => {
-      if (!live) return
+      if (!live) return;
       this.dashboard()
         .then((d) => live && onSnapshot(d))
-        .catch(() => undefined)
-    }
-    const unlisten = listen('status', push)
-    const timer = setInterval(push, 3000)
+        .catch(() => undefined);
+    };
+    const unlisten = listen("status", push);
+    const timer = setInterval(push, 3000);
     return () => {
-      live = false
-      clearInterval(timer)
-      unlisten.then((un) => un()).catch(() => undefined)
-    }
+      live = false;
+      clearInterval(timer);
+      unlisten.then((un) => un()).catch(() => undefined);
+    };
   }
 }
 
 const MEDIA_STATE: Record<string, MediaState> = {
-  imported: 'analysing',
-  compatible: 'preparing',
-  optimization_required: 'preparing',
-  normalized: 'ready',
-  missing: 'failed',
-  failed: 'failed',
-}
+  imported: "analysing",
+  compatible: "preparing",
+  optimization_required: "preparing",
+  normalized: "ready",
+  missing: "failed",
+  failed: "failed",
+};
 
 function fromDesktopMedia(m: Media): CloudMedia {
   return {
     id: String(m.id),
-    user_id: 'local',
+    user_id: "local",
     filename: m.display_name,
     size_bytes: m.file_size,
-    state: MEDIA_STATE[m.status] ?? 'uploaded',
+    state: MEDIA_STATE[m.status] ?? "uploaded",
     duration_secs: m.duration_secs,
     width: m.width,
     height: m.height,
     fps: m.fps,
     video_codec: m.video_codec,
     audio_codec: m.audio_codec ?? null,
-    container: '',
+    container: "",
     bitrate_bps: 0,
     prepared_duration_secs: m.normalized_duration_secs ?? null,
     last_error: m.last_error ?? null,
     created_at: m.added_at,
-  }
+  };
 }
 
 const RUNTIME: Record<StreamState, RuntimeState> = {
-  IDLE: 'CREATED',
-  PREPARING: 'PREPARING',
-  CONNECTING: 'STARTING',
-  LIVE: 'RUNNING',
-  RECONNECTING: 'RECONNECTING',
-  STOPPING: 'STOPPING',
-  STOPPED: 'STOPPED',
-  ERROR: 'FAILED',
-}
+  IDLE: "CREATED",
+  PREPARING: "PREPARING",
+  CONNECTING: "STARTING",
+  LIVE: "RUNNING",
+  RECONNECTING: "RECONNECTING",
+  STOPPING: "STOPPING",
+  STOPPED: "STOPPED",
+  ERROR: "FAILED",
+};
 
-function toBroadcast(playlistId: number, name: string, status: RuntimeStatus): Broadcast {
-  const isThisOne = status.playlist_id === playlistId
-  const runtime: RuntimeState = isThisOne ? RUNTIME[status.supervisor.state] : 'CREATED'
+function toBroadcast(
+  playlistId: number,
+  name: string,
+  status: RuntimeStatus,
+): Broadcast {
+  const isThisOne = status.playlist_id === playlistId;
+  const runtime: RuntimeState = isThisOne
+    ? RUNTIME[status.supervisor.state]
+    : "CREATED";
   const desired: DesiredState =
-    isThisOne && ['PREPARING', 'STARTING', 'RUNNING', 'RECONNECTING'].includes(runtime)
-      ? 'running'
-      : 'stopped'
+    isThisOne &&
+    ["PREPARING", "STARTING", "RUNNING", "RECONNECTING"].includes(runtime)
+      ? "running"
+      : "stopped";
   return {
     id: String(playlistId),
-    user_id: 'local',
+    user_id: "local",
     name,
-    media_id: '',
+    media_id: "",
+    // The desktop connects YouTube through its own settings screen, so a
+    // broadcast here has no cloud-side YouTube resources to report.
+    youtube: {},
     destination_id: LOCAL_DESTINATION.id,
     loop_forever: true,
     desired_state: desired,
     runtime_state: runtime,
     restart_count: isThisOne ? status.supervisor.restart_count : 0,
     last_error: isThisOne ? (status.last_start_error?.message ?? null) : null,
-    created_at: '',
+    created_at: "",
     started_at: null,
     stopped_at: null,
     last_heartbeat: null,
@@ -282,10 +345,10 @@ function toBroadcast(playlistId: number, name: string, status: RuntimeStatus): B
     ffmpeg_exit_code: null,
     ffmpeg_pid: isThisOne ? (status.supervisor.pid ?? null) : null,
     title: name,
-    description: '',
-    tags: '',
-    category: '',
-    privacy: 'private',
+    description: "",
+    tags: "",
+    category: "",
+    privacy: "private",
     settings: AUTO_SETTINGS,
     schedule: emptySchedule(),
     item_count: status.item_count,
@@ -296,5 +359,5 @@ function toBroadcast(playlistId: number, name: string, status: RuntimeStatus): B
     current_position_secs: 0,
     current_duration_secs: 0,
     cycle_duration_secs: status.cycle_duration_secs,
-  }
+  };
 }

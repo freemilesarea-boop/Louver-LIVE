@@ -7,54 +7,89 @@
  * in a browser against a server" lives in exactly two classes in this file.
  */
 import type {
-  Broadcast, BroadcastDetail, BroadcastEvent, BroadcastItem, BroadcastPatch, CloudMedia, Dashboard,
-  Health, Me, Metrics, NewBroadcast, NewDestination, NewItem, StreamDestination, Subscription,
-} from './cloud'
-import type { LouverError } from '@/types'
+  Broadcast,
+  BroadcastDetail,
+  BroadcastEvent,
+  BroadcastItem,
+  BroadcastPatch,
+  CloudMedia,
+  Dashboard,
+  Health,
+  Me,
+  Metrics,
+  NewBroadcast,
+  NewDestination,
+  NewItem,
+  StreamDestination,
+  Subscription,
+  YoutubeAccount,
+  YoutubeAvailability,
+} from "./cloud";
+import type { LouverError } from "@/types";
 
 export interface Transport {
   /** Which kind of backend this is, for the few places that must say so. */
-  readonly kind: 'web' | 'desktop'
+  readonly kind: "web" | "desktop";
 
-  register(email: string, password: string): Promise<Me>
-  login(email: string, password: string): Promise<Me>
-  logout(): Promise<void>
-  me(): Promise<Me>
-  subscription(): Promise<Subscription>
+  register(email: string, password: string): Promise<Me>;
+  login(email: string, password: string): Promise<Me>;
+  logout(): Promise<void>;
+  me(): Promise<Me>;
+  subscription(): Promise<Subscription>;
 
-  listMedia(): Promise<CloudMedia[]>
-  uploadMedia(file: File, onProgress?: (fraction: number) => void): Promise<CloudMedia>
-  deleteMedia(id: string): Promise<void>
+  listMedia(): Promise<CloudMedia[]>;
+  uploadMedia(
+    file: File,
+    onProgress?: (fraction: number) => void,
+  ): Promise<CloudMedia>;
+  deleteMedia(id: string): Promise<void>;
 
-  listDestinations(): Promise<StreamDestination[]>
-  createDestination(input: NewDestination): Promise<StreamDestination>
-  deleteDestination(id: string): Promise<void>
+  listDestinations(): Promise<StreamDestination[]>;
+  createDestination(input: NewDestination): Promise<StreamDestination>;
+  deleteDestination(id: string): Promise<void>;
 
-  dashboard(): Promise<Dashboard>
-  createBroadcast(input: NewBroadcast): Promise<BroadcastDetail>
+  dashboard(): Promise<Dashboard>;
+  createBroadcast(input: NewBroadcast): Promise<BroadcastDetail>;
   /** One broadcast with its playlist. */
-  getBroadcast(id: string): Promise<BroadcastDetail>
-  updateBroadcast(id: string, patch: BroadcastPatch): Promise<Broadcast>
+  getBroadcast(id: string): Promise<BroadcastDetail>;
+  updateBroadcast(id: string, patch: BroadcastPatch): Promise<Broadcast>;
   /** Replace the playlist with this list, in this order. */
-  replaceItems(id: string, items: NewItem[]): Promise<BroadcastItem[]>
-  startBroadcast(id: string): Promise<Broadcast>
-  stopBroadcast(id: string): Promise<Broadcast>
-  restartBroadcast(id: string): Promise<Broadcast>
-  deleteBroadcast(id: string): Promise<void>
-  logs(id: string, limit?: number): Promise<BroadcastEvent[]>
+  replaceItems(id: string, items: NewItem[]): Promise<BroadcastItem[]>;
+  startBroadcast(id: string): Promise<Broadcast>;
+  stopBroadcast(id: string): Promise<Broadcast>;
+  restartBroadcast(id: string): Promise<Broadcast>;
+  deleteBroadcast(id: string): Promise<void>;
+  logs(id: string, limit?: number): Promise<BroadcastEvent[]>;
 
   /** Live dashboard updates. Returns an unsubscribe function. */
-  watchDashboard(onSnapshot: (d: Dashboard) => void): () => void
+  watchDashboard(onSnapshot: (d: Dashboard) => void): () => void;
+
+  /** Can this deployment offer YouTube connecting, and with which redirect URI? */
+  youtubeAvailability(): Promise<YoutubeAvailability>;
+  /** The connected channels. Never carries a token. */
+  listYoutubeAccounts(): Promise<YoutubeAccount[]>;
+  /**
+   * Where the browser has to be sent to connect a channel.
+   *
+   * Two steps rather than a link, so that a server without Google credentials
+   * produces an error in the page instead of a raw JSON body in a new tab.
+   */
+  youtubeConsentUrl(): Promise<string>;
+  disconnectYoutubeAccount(id: string): Promise<void>;
 
   /** Where this is running and whether every part of it works. No session. */
-  health(): Promise<Health>
+  health(): Promise<Health>;
   /** Per-broadcast and machine numbers, for a long test and for costing. */
-  metrics(): Promise<Metrics>
+  metrics(): Promise<Metrics>;
 }
 
 /** Every rejection reaches the UI in the shape its error banner already knows. */
-function asLouverError(code: string, message: string, detail?: string): LouverError {
-  return { code_str: code, message, detail }
+function asLouverError(
+  code: string,
+  message: string,
+  detail?: string,
+): LouverError {
+  return { code_str: code, message, detail };
 }
 
 export class HttpError extends Error {
@@ -62,7 +97,7 @@ export class HttpError extends Error {
     readonly status: number,
     readonly louver: LouverError,
   ) {
-    super(louver.message)
+    super(louver.message);
   }
 }
 
@@ -75,114 +110,139 @@ export class HttpError extends Error {
  * injected script could read too.
  */
 export class WebTransport implements Transport {
-  readonly kind = 'web' as const
+  readonly kind = "web" as const;
 
-  constructor(private readonly base = '') {}
+  constructor(private readonly base = "") {}
 
   private async json<T>(path: string, init: RequestInit = {}): Promise<T> {
-    let res: Response
+    let res: Response;
     try {
       res = await fetch(`${this.base}${path}`, {
-        credentials: 'include',
+        credentials: "include",
         ...init,
-        headers: { ...(init.body ? { 'Content-Type': 'application/json' } : {}), ...init.headers },
-      })
+        headers: {
+          ...(init.body ? { "Content-Type": "application/json" } : {}),
+          ...init.headers,
+        },
+      });
     } catch (e) {
       throw new HttpError(
         0,
-        asLouverError('LL-NET', '서버에 연결할 수 없습니다.', e instanceof Error ? e.message : undefined),
-      )
+        asLouverError(
+          "LL-NET",
+          "서버에 연결할 수 없습니다.",
+          e instanceof Error ? e.message : undefined,
+        ),
+      );
     }
-    return this.unwrap<T>(res)
+    return this.unwrap<T>(res);
   }
 
   private async unwrap<T>(res: Response): Promise<T> {
-    const text = await res.text()
+    const text = await res.text();
     if (!res.ok) {
-      let message = '요청을 처리할 수 없습니다.'
+      let message = "요청을 처리할 수 없습니다.";
       try {
-        const body = JSON.parse(text) as { error?: string }
-        if (body.error) message = body.error
+        const body = JSON.parse(text) as { error?: string };
+        if (body.error) message = body.error;
       } catch {
         /* a proxy's HTML error page; the status is what matters */
       }
-      throw new HttpError(res.status, asLouverError(codeFor(res.status), message))
+      throw new HttpError(
+        res.status,
+        asLouverError(codeFor(res.status), message),
+      );
     }
-    return (text ? JSON.parse(text) : undefined) as T
+    return (text ? JSON.parse(text) : undefined) as T;
   }
 
   register(email: string, password: string) {
-    return this.json<Me>('/api/auth/register', {
-      method: 'POST',
+    return this.json<Me>("/api/auth/register", {
+      method: "POST",
       body: JSON.stringify({ email, password }),
-    })
+    });
   }
 
   login(email: string, password: string) {
-    return this.json<Me>('/api/auth/login', {
-      method: 'POST',
+    return this.json<Me>("/api/auth/login", {
+      method: "POST",
       body: JSON.stringify({ email, password }),
-    })
+    });
   }
 
   async logout() {
-    await this.json<void>('/api/auth/logout', { method: 'POST' })
+    await this.json<void>("/api/auth/logout", { method: "POST" });
   }
 
   me() {
-    return this.json<Me>('/api/me')
+    return this.json<Me>("/api/me");
   }
 
   subscription() {
-    return this.json<Subscription>('/api/me/subscription')
+    return this.json<Subscription>("/api/me/subscription");
   }
 
   listMedia() {
-    return this.json<CloudMedia[]>('/api/media')
+    return this.json<CloudMedia[]>("/api/media");
   }
 
   /**
    * Uploads with `XMLHttpRequest`, not `fetch`, for one reason: a progress
    * event. A 4 GB video with no visible progress looks broken.
    */
-  uploadMedia(file: File, onProgress?: (fraction: number) => void): Promise<CloudMedia> {
+  uploadMedia(
+    file: File,
+    onProgress?: (fraction: number) => void,
+  ): Promise<CloudMedia> {
     return new Promise((resolve, reject) => {
-      const form = new FormData()
-      form.append('file', file, file.name)
-      const xhr = new XMLHttpRequest()
-      xhr.open('POST', `${this.base}/api/media/upload`)
-      xhr.withCredentials = true
+      const form = new FormData();
+      form.append("file", file, file.name);
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${this.base}/api/media/upload`);
+      xhr.withCredentials = true;
       if (onProgress && xhr.upload) {
         xhr.upload.onprogress = (e) => {
-          if (e.lengthComputable && e.total > 0) onProgress(e.loaded / e.total)
-        }
+          if (e.lengthComputable && e.total > 0) onProgress(e.loaded / e.total);
+        };
       }
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
-          resolve(JSON.parse(xhr.responseText) as CloudMedia)
-          return
+          resolve(JSON.parse(xhr.responseText) as CloudMedia);
+          return;
         }
-        let message = '업로드에 실패했습니다.'
+        let message = "업로드에 실패했습니다.";
         try {
-          const body = JSON.parse(xhr.responseText) as { error?: string }
-          if (body.error) message = body.error
+          const body = JSON.parse(xhr.responseText) as { error?: string };
+          if (body.error) message = body.error;
         } catch {
           /* no JSON body */
         }
-        reject(new HttpError(xhr.status, asLouverError(codeFor(xhr.status), message)))
-      }
+        reject(
+          new HttpError(
+            xhr.status,
+            asLouverError(codeFor(xhr.status), message),
+          ),
+        );
+      };
       xhr.onerror = () =>
-        reject(new HttpError(0, asLouverError('LL-NET', '업로드 중 연결이 끊겼습니다.')))
-      xhr.send(form)
-    })
+        reject(
+          new HttpError(
+            0,
+            asLouverError("LL-NET", "업로드 중 연결이 끊겼습니다."),
+          ),
+        );
+      xhr.send(form);
+    });
   }
 
   async deleteMedia(id: string) {
-    await this.json<void>(`/api/media/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    await this.json<void>(`/api/media/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
   }
 
   listDestinations() {
-    return this.json<StreamDestination[]>('/api/stream-destinations')
+    return this.json<StreamDestination[]>("/api/stream-destinations");
   }
 
   /**
@@ -193,77 +253,117 @@ export class WebTransport implements Transport {
    * no code that could break it.
    */
   createDestination(input: NewDestination) {
-    return this.json<StreamDestination>('/api/stream-destinations', {
-      method: 'POST',
+    return this.json<StreamDestination>("/api/stream-destinations", {
+      method: "POST",
       body: JSON.stringify(input),
-    })
+    });
   }
 
   async deleteDestination(id: string) {
-    await this.json<void>(`/api/stream-destinations/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    })
+    await this.json<void>(
+      `/api/stream-destinations/${encodeURIComponent(id)}`,
+      {
+        method: "DELETE",
+      },
+    );
   }
 
   dashboard() {
-    return this.json<Dashboard>('/api/broadcasts')
+    return this.json<Dashboard>("/api/broadcasts");
   }
 
   createBroadcast(input: NewBroadcast) {
-    return this.json<BroadcastDetail>('/api/broadcasts', {
-      method: 'POST',
+    return this.json<BroadcastDetail>("/api/broadcasts", {
+      method: "POST",
       body: JSON.stringify(input),
-    })
+    });
   }
 
   getBroadcast(id: string) {
-    return this.json<BroadcastDetail>(`/api/broadcasts/${encodeURIComponent(id)}`)
+    return this.json<BroadcastDetail>(
+      `/api/broadcasts/${encodeURIComponent(id)}`,
+    );
   }
 
   updateBroadcast(id: string, patch: BroadcastPatch) {
     return this.json<Broadcast>(`/api/broadcasts/${encodeURIComponent(id)}`, {
-      method: 'PATCH',
+      method: "PATCH",
       body: JSON.stringify(patch),
-    })
+    });
   }
 
   replaceItems(id: string, items: NewItem[]) {
-    return this.json<BroadcastItem[]>(`/api/broadcasts/${encodeURIComponent(id)}/items`, {
-      method: 'PUT',
-      body: JSON.stringify(items),
-    })
+    return this.json<BroadcastItem[]>(
+      `/api/broadcasts/${encodeURIComponent(id)}/items`,
+      {
+        method: "PUT",
+        body: JSON.stringify(items),
+      },
+    );
   }
 
   startBroadcast(id: string) {
-    return this.json<Broadcast>(`/api/broadcasts/${encodeURIComponent(id)}/start`, { method: 'POST' })
+    return this.json<Broadcast>(
+      `/api/broadcasts/${encodeURIComponent(id)}/start`,
+      { method: "POST" },
+    );
   }
 
   stopBroadcast(id: string) {
-    return this.json<Broadcast>(`/api/broadcasts/${encodeURIComponent(id)}/stop`, { method: 'POST' })
+    return this.json<Broadcast>(
+      `/api/broadcasts/${encodeURIComponent(id)}/stop`,
+      { method: "POST" },
+    );
   }
 
   restartBroadcast(id: string) {
-    return this.json<Broadcast>(`/api/broadcasts/${encodeURIComponent(id)}/restart`, {
-      method: 'POST',
-    })
+    return this.json<Broadcast>(
+      `/api/broadcasts/${encodeURIComponent(id)}/restart`,
+      {
+        method: "POST",
+      },
+    );
   }
 
   async deleteBroadcast(id: string) {
-    await this.json<void>(`/api/broadcasts/${encodeURIComponent(id)}`, { method: 'DELETE' })
+    await this.json<void>(`/api/broadcasts/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
   }
 
   logs(id: string, limit = 100) {
     return this.json<BroadcastEvent[]>(
       `/api/broadcasts/${encodeURIComponent(id)}/logs?limit=${limit}`,
-    )
+    );
+  }
+
+  youtubeAvailability() {
+    return this.json<YoutubeAvailability>("/api/youtube");
+  }
+
+  listYoutubeAccounts() {
+    return this.json<YoutubeAccount[]>("/api/youtube/accounts");
+  }
+
+  async youtubeConsentUrl() {
+    const { url } = await this.json<{ url: string }>(
+      "/api/youtube/oauth/start",
+    );
+    return url;
+  }
+
+  async disconnectYoutubeAccount(id: string) {
+    await this.json<void>(`/api/youtube/accounts/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
   }
 
   health() {
-    return this.json<Health>('/health')
+    return this.json<Health>("/health");
   }
 
   metrics() {
-    return this.json<Metrics>('/api/metrics')
+    return this.json<Metrics>("/api/metrics");
   }
 
   /**
@@ -274,27 +374,31 @@ export class WebTransport implements Transport {
    * thing being watched is expected to run for weeks.
    */
   watchDashboard(onSnapshot: (d: Dashboard) => void): () => void {
-    if (typeof EventSource === 'undefined') {
+    if (typeof EventSource === "undefined") {
       const timer = setInterval(() => {
-        this.dashboard().then(onSnapshot).catch(() => undefined)
-      }, 3000)
-      return () => clearInterval(timer)
+        this.dashboard()
+          .then(onSnapshot)
+          .catch(() => undefined);
+      }, 3000);
+      return () => clearInterval(timer);
     }
-    const source = new EventSource(`${this.base}/api/events`, { withCredentials: true })
-    source.addEventListener('dashboard', (e) => {
+    const source = new EventSource(`${this.base}/api/events`, {
+      withCredentials: true,
+    });
+    source.addEventListener("dashboard", (e) => {
       try {
-        onSnapshot(JSON.parse((e as MessageEvent<string>).data) as Dashboard)
+        onSnapshot(JSON.parse((e as MessageEvent<string>).data) as Dashboard);
       } catch {
         /* a half-written frame; the next one is two seconds away */
       }
-    })
-    return () => source.close()
+    });
+    return () => source.close();
   }
 }
 
 function codeFor(status: number): string {
-  if (status === 401) return 'LL-AUTH'
-  if (status === 402) return 'LL-PLAN'
-  if (status === 404) return 'LL-NOTFOUND'
-  return `LL-HTTP-${status}`
+  if (status === 401) return "LL-AUTH";
+  if (status === 402) return "LL-PLAN";
+  if (status === 404) return "LL-NOTFOUND";
+  return `LL-HTTP-${status}`;
 }
