@@ -35,6 +35,51 @@ pub fn plan_for(
     plan_transcode(info, profile, measured_gop(builder, source, info, profile))
 }
 
+/// The plan that keeps the source's own geometry and frame rate.
+///
+/// The fast path. Video is copied whenever a copy can produce a broadcastable
+/// stream at all — see [`video_native_copy_reasons`] — and audio is still
+/// brought to the profile's 48 kHz stereo AAC, because that is cheap and it
+/// takes audio out of the question of whether two prepared files can be joined.
+///
+/// The one thing measured rather than read: the gap between keyframes. A copied
+/// video keeps whatever spacing it arrived with, and YouTube needs a keyframe
+/// every few seconds to let a viewer join and to cut between qualities. Past
+/// [`OutputProfile::max_copy_gop_secs`] the video is re-encoded to restore a
+/// regular one — which is the *only* reason a low frame rate can still end up
+/// encoded, and it is a reason about seconds, not about frames.
+pub fn plan_native(
+    builder: &FfmpegCommandBuilder,
+    source: &Path,
+    info: &MediaInfo,
+    profile: OutputProfile,
+) -> TranscodePlan {
+    let mut video_reasons = crate::media::probe::video_native_copy_reasons(info, profile);
+    if video_reasons.is_empty() {
+        if let Some(gop) = probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS) {
+            let limit = profile.max_copy_gop_secs();
+            if gop > limit {
+                video_reasons.push(format!("키프레임 간격이 너무 깁니다 ({gop:.1}초 > {limit:.1}초)"));
+            }
+        }
+    }
+    let audio_reasons = crate::media::probe::audio_encode_reasons(info, profile);
+    TranscodePlan {
+        video: if video_reasons.is_empty() {
+            crate::media::probe::StreamPlan::Copy
+        } else {
+            crate::media::probe::StreamPlan::Encode
+        },
+        audio: if audio_reasons.is_empty() {
+            crate::media::probe::StreamPlan::Copy
+        } else {
+            crate::media::probe::StreamPlan::Encode
+        },
+        video_reasons,
+        audio_reasons,
+    }
+}
+
 /// What adding this file costs: nothing if it is already cached, else a plan.
 ///
 /// The question the library asks the moment a file is added (§2), and the same
@@ -209,6 +254,27 @@ pub fn normalize_one(
     info: &MediaInfo,
     profile: OutputProfile,
     cancel: &CancelToken,
+    on_progress: impl FnMut(f64),
+) -> Result<NormalizeOutcome> {
+    normalize_one_with(builder, cache, source, media_hash, info, profile, None, cancel, on_progress)
+}
+
+/// [`normalize_one`], with the plan decided by the caller.
+///
+/// The server decides between the canonical profile and the source's own
+/// geometry, and that decision depends on things this function cannot see — a
+/// playlist's other items, and whether an operator has forced a canonical
+/// re-preparation. `None` keeps the original behaviour: plan it here.
+#[allow(clippy::too_many_arguments)]
+pub fn normalize_one_with(
+    builder: &FfmpegCommandBuilder,
+    cache: &MediaCache,
+    source: &Path,
+    media_hash: &str,
+    info: &MediaInfo,
+    profile: OutputProfile,
+    plan: Option<TranscodePlan>,
+    cancel: &CancelToken,
     mut on_progress: impl FnMut(f64),
 ) -> Result<NormalizeOutcome> {
     let started = std::time::Instant::now();
@@ -249,7 +315,10 @@ pub fn normalize_one(
     // What actually has to be re-encoded (§2, §7, §8). The keyframe spacing is
     // only measured when the video would otherwise be copied, so a file headed
     // for a full encode does not pay for the extra probe.
-    let plan = plan_for(builder, source, info, profile);
+    let plan = match plan {
+        Some(p) => p,
+        None => plan_for(builder, source, info, profile),
+    };
     let args = builder.build_normalize_args(source, &tmp_path, target, info.has_audio, &plan);
 
     let mut child = builder

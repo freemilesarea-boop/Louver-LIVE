@@ -507,6 +507,22 @@ impl CloudDb {
         // was recorded", which is the truth for every existing row.
         ensure_column(&conn, "users", "terms_version", "TEXT")?;
 
+        // What the prepared file actually is, and what to aim for next time.
+        //
+        // `prepared_signature` is the exact shape of the prepared file — codec,
+        // geometry, frame rate, time base, SPS checksum, audio layout — because
+        // a playlist is concatenated and stream-copied and every item has to
+        // agree. NULL means a file prepared before this release: those all came
+        // out of the one canonical encode, so a NULL reads as "canonical".
+        //
+        // `prepare_target` is how the *next* preparation should run: `auto`
+        // keeps the source's own geometry when that is safe, `canonical` forces
+        // the 1080p30 re-encode. It moves to `canonical` only when a playlist
+        // mixes formats and the items have to be made to match.
+        ensure_column(&conn, "media", "prepared_signature", "TEXT")?;
+        ensure_column(&conn, "media", "prepared_mode", "TEXT")?;
+        ensure_column(&conn, "media", "prepare_target", "TEXT NOT NULL DEFAULT 'auto'")?;
+
         // §5: which kind of destination this is. Every existing row is a stream
         // key someone pasted, which is exactly what the default says.
         ensure_column(&conn, "stream_destinations", "kind", "TEXT NOT NULL DEFAULT 'manual_rtmps'")?;
@@ -1491,6 +1507,97 @@ impl CloudDb {
             params![id, MediaState::Ready.id(), prepared_path, duration_secs, total_bytes],
         )?;
         Ok(())
+    }
+
+    /// Record what the prepared file turned out to be.
+    ///
+    /// Written from a probe of the *output*, not from what was asked for: the
+    /// only signature worth comparing is the one the file actually has.
+    pub fn record_prepared_signature(&self, id: &str, mode: &str, signature: &str) -> Result<()> {
+        self.raw().lock().unwrap().execute(
+            "UPDATE media SET prepared_mode=?2, prepared_signature=?3 WHERE id=?1",
+            params![id, mode, signature],
+        )?;
+        Ok(())
+    }
+
+    /// How the next preparation of this media should run: `auto` or `canonical`.
+    pub fn prepare_target(&self, id: &str) -> Result<String> {
+        Ok(self
+            .raw()
+            .lock()
+            .unwrap()
+            .query_row("SELECT COALESCE(prepare_target, 'auto') FROM media WHERE id=?1", [id], |r| r.get(0))
+            .optional()?
+            .unwrap_or_else(|| "auto".to_string()))
+    }
+
+    /// Aim the next preparation of this media at the canonical profile.
+    ///
+    /// One direction only. Nothing moves a media back to `auto`, because the
+    /// reason it was pinned — a playlist that mixes formats — does not go away
+    /// when the playlist is edited again, and flapping between the two would
+    /// mean re-encoding hours of video twice.
+    pub fn pin_to_canonical(&self, id: &str) -> Result<()> {
+        self.raw()
+            .lock()
+            .unwrap()
+            .execute("UPDATE media SET prepare_target='canonical' WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    /// The prepared shape of every enabled item in a playlist, in order.
+    ///
+    /// `(media_id, mode, signature)`. A legacy row — prepared before signatures
+    /// were recorded — reads as `("canonical", None)`, which is what it is.
+    pub fn playlist_shapes(&self, broadcast_id: &str) -> Result<Vec<(String, String, Option<String>)>> {
+        let mut ids: Vec<String> =
+            self.items_for(broadcast_id)?.into_iter().filter(|i| i.enabled).map(|i| i.media_id).collect();
+        if ids.is_empty() {
+            ids.push(self.broadcast(broadcast_id)?.media_id);
+        }
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut out = Vec::new();
+        for id in ids {
+            let row: Option<(Option<String>, Option<String>)> = guard
+                .query_row("SELECT prepared_mode, prepared_signature FROM media WHERE id=?1", [&id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            let (mode, sig) = row.unwrap_or((None, None));
+            out.push((id, mode.unwrap_or_else(|| "canonical".into()), sig));
+        }
+        Ok(out)
+    }
+
+    /// Refuse to broadcast a playlist whose items cannot be joined.
+    ///
+    /// The last line of defence, checked on every start and every recovery
+    /// rather than only when the playlist is edited. Concatenating packets from
+    /// files that disagree on geometry or SPS produces a stream that decodes as
+    /// garbage from the seam onwards, and it would do so *live*, an hour in,
+    /// with nobody watching the server.
+    ///
+    /// Safe when every item is canonical (legacy files included — they all came
+    /// out of the one canonical encode) or when every item is native with the
+    /// same signature.
+    pub fn check_playlist_joinable(&self, broadcast_id: &str) -> Result<()> {
+        let shapes = self.playlist_shapes(broadcast_id)?;
+        if shapes.len() < 2 {
+            return Ok(());
+        }
+        let all_canonical = shapes.iter().all(|(_, mode, _)| mode == "canonical");
+        let first = shapes[0].2.clone();
+        let all_same_native =
+            first.is_some() && shapes.iter().all(|(_, mode, sig)| mode == "native" && *sig == first);
+        if all_canonical || all_same_native {
+            return Ok(());
+        }
+        Err(CloudError::Invalid(
+            "플레이리스트의 영상 형식이 서로 달라 아직 방송할 수 없습니다.              영상을 방송 형식으로 맞추는 중이며, 끝나면 시작할 수 있습니다."
+                .into(),
+        ))
     }
 
     pub fn record_media_failed(&self, id: &str, why: &str) -> Result<()> {

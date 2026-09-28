@@ -582,6 +582,11 @@ impl BroadcastManager {
         }
 
         let b = self.db.broadcast(broadcast_id)?;
+        // Every item has to be joinable with every other before a single packet
+        // is sent: the concat demuxer copies packets, it does not reconcile
+        // them. Checked here rather than in `start` so a boot recovery is held
+        // to the same rule.
+        self.db.check_playlist_joinable(broadcast_id)?;
         let playlist = self.db.prepared_items_for(broadcast_id)?;
         let dest = self.db.destination(&b.destination_id)?;
 

@@ -19,6 +19,7 @@ YouTube 는 [YOUTUBE_OAUTH.md](YOUTUBE_OAUTH.md) 를 보세요.
 | 누가 어떤 요금제인지 | `docker compose exec louver louver-server --audit-plans` |
 | 해지했는데 권한이 남은 계정 | `docker compose exec louver louver-server --audit-billing` |
 | 요금제 저장 한도와 계정별 사용량 | `docker compose exec louver louver-server --audit-storage` |
+| 이 영상이 왜 이렇게 준비됐는지 | `docker compose exec louver louver-server --media-check <파일>` |
 
 `/health` 의 `checks` 는 전부 `true` 여야 합니다. 하나라도 `false` 면 HTTP 503 이
 나오고, `status` 는 `degraded` 입니다.
@@ -210,6 +211,8 @@ docker compose exec louver louver-server --audit-plans --revoke-unpaid-grants --
 | YouTube 연결이 끊김 | refresh token 이 철회됨 | 수강생이 다시 연결 |
 | 업로드가 507 | 서버 디스크 여유 5GB 미만 | **3번** |
 | 업로드가 402 "저장 공간이 부족합니다" | 그 계정이 요금제 한도를 넘음 | 영상 삭제 안내. 파일은 지워지지 않았습니다 |
+| 업로드 준비가 오래 걸린다 | 그 파일이 재인코딩 대상 | `--media-check <파일>` 가 이유를 한 줄로 알려줍니다. 서버 로그에도 `media <id>: mode=... reason=...` 가 남습니다 |
+| 방송이 "영상 형식이 서로 달라" 로 거부된다 | 플레이리스트에 형식이 다른 영상이 섞임 | 그 영상들을 표준 형식으로 다시 준비하는 중입니다. 미디어 목록에서 준비가 끝나면 시작됩니다 |
 | 해지했는데 방송이 계속 나간다 | 해지가 실패했을 가능성 | `--audit-billing` 과 로그. 해지 성공 시에는 방송도 즉시 종료됩니다 |
 | 로그인이 429 | 한 IP 에서 1분에 10회 초과 | 1분 기다리면 풀립니다 |
 
@@ -222,6 +225,9 @@ npm run verify                 # 11단계 전체
 node scripts/release-smoke.mjs # 가입→결제→YouTube→송출→해지 17단계 (가짜 PayApp/Google)
 node scripts/mobile-smoke.mjs  # 휴대폰 4개 화면 폭에서 레이아웃
 node scripts/capacity-check.mjs # 동시 1·2·3 송출의 CPU/RAM
+
+# 업로드 준비 성능 (Node 없이, production 에서도 그대로)
+docker compose exec louver louver-server --media-check /경로/영상.mp4 --compare --run
 ```
 
 전부 로컬에서 돌고, 실제 PayApp·YouTube 에는 아무 요청도 보내지 않습니다.

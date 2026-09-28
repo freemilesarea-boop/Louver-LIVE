@@ -270,6 +270,70 @@ No card details reach this server: they are typed on PayApp's page.
 
 ## Media pipeline
 
+### Preparation: copy what can be copied
+
+Every upload used to be re-encoded to 1920x1080 at 30fps, because the question
+being asked was "does this already match the one canonical format?" and the
+answer for almost every real file is no. A production upload of 4h36m of 720p at
+**two frames a second** — a slideshow — was therefore scaled up, frame-doubled
+fifteen times over and re-encoded end to end on a two-core server, for a result
+no viewer could tell apart from the original.
+
+The question is now "can this file be sent as it is?", which is a question about
+what a stream copy cannot fix:
+
+| | |
+| --- | --- |
+| codec | H.264 only |
+| pixel format | yuv420p only |
+| colour | no HDR |
+| rotation | none |
+| H.264 | profile in baseline/main/high, level within the profile's ceiling |
+| size | no larger than 1920x1080, even, at least 128px |
+| frame rate | **no higher** than 30fps — lower is fine and stays as it is |
+| keyframes | measured; no further apart than `max_copy_gop_secs` (4s) |
+
+Each stream is judged on its own. Audio is always brought to 48 kHz stereo AAC,
+because that is cheap and it takes audio out of the question of whether two
+prepared files can be joined — so a 44.1 kHz source costs an audio encode, not a
+video one. Anything the table refuses goes through the canonical 1080p30 encode
+exactly as before.
+
+Measured on a four-core machine, 10 minutes of 720p at 2fps:
+
+| | wall clock | speed | output |
+| --- | --- | --- | --- |
+| before (always 1080p30) | 113.5s | 5.3x | 236 MB |
+| now, 44.1 kHz source (audio encoded) | 19.9s | 30x | 53 MB |
+| now, 48 kHz source (pure remux) | 0.7s | 899x | 48 MB |
+
+`louver-server --media-check <file> [--run] [--compare]` prints the decision and
+the reasons for any file, and with `--run` measures it. It is in the server
+binary rather than a script because the production image has no Node.
+
+### Playlists are concatenated, so their items have to agree
+
+A broadcast is one FFmpeg reading a concat manifest and copying packets into one
+RTMP stream. The demuxer joins them; it does not reconcile them, and the FLV
+muxer writes one `AVCDecoderConfigurationRecord` at the head of the stream and
+never again. Two files that disagree — on geometry, frame rate, time base, or
+the SPS itself — produce a stream that decodes as garbage from the seam onwards,
+*live*, an hour in.
+
+So each prepared file records a `prepared_signature`: codec, geometry, frame
+rate, time base, a CRC of the codec extradata, and the audio layout, all read
+back from the produced file rather than from what was asked for. A playlist may
+go on air when **either** every item is canonical (legacy rows included — they
+all came out of the one canonical encode) **or** every item is native with the
+same signature.
+
+Anything else is made to agree: editing the playlist pins the native items to
+the canonical profile and re-prepares them in the background, and the media go
+back to 준비 중 until that is done. The expensive path still exists — it is now
+the price of mixing formats in one playlist rather than the price of every
+upload. `CloudDb::check_playlist_joinable` is checked again at every start and
+every boot recovery, where nobody is watching.
+
 `media/probe.rs` decides compatibility; `media/normalize.rs` prepares a cache
 entry; `streaming/ffmpeg.rs` builds every argv. §8's "UPLOAD → FFPROBE →
 COMPATIBLE? → NORMALIZE → READY" is `plan_for` + `normalize_one`, already

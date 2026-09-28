@@ -853,3 +853,116 @@ fn a_paying_accounts_plan_decides_how_many_streams_it_gets() {
         e.mgr.shutdown();
     }
 }
+
+// --- fast-path media keeps every part of the lifecycle --------------------
+//
+// Preparation now leaves most uploads at their own size and frame rate, so the
+// broadcasts built on them must behave exactly as the canonical ones did:
+// start, crash, recover, stop, loop, single pass. These drive the real manager
+// over media marked the way the fast path marks them.
+
+/// Mark this media the way a fast-path preparation does.
+fn mark_native(e: &Env, media_id: &str, signature: &str) {
+    e.db.record_prepared_signature(media_id, "native", signature).unwrap();
+}
+
+#[test]
+fn a_broadcast_on_fast_path_media_starts_crashes_recovers_and_stops() {
+    // Test H. Nothing about the lifecycle knows or cares how the file was
+    // prepared — but that is a claim, and this is the check.
+    let e = env("business");
+    let a = e.video("one.mp4", 60.0);
+    let b = e.video("two.mp4", 60.0);
+    mark_native(&e, &a, "h264/1280x720/2/1");
+    mark_native(&e, &b, "h264/1280x720/2/1");
+    let id = e.broadcast("밤 라디오", &[a, b], true);
+
+    e.mgr.start(&e.user, &id).unwrap();
+    e.wait_for_launches(1);
+    // Both items are in the manifest, in order.
+    assert_eq!(played(&e.rec.last().files), ["one.mp4", "two.mp4"]);
+
+    // A crash is still the supervisor's business.
+    e.rec.crash();
+    e.wait_for_launches(2);
+    assert_eq!(e.db.broadcast(&id).unwrap().desired_state, DesiredState::Running);
+
+    // A restart of the server still brings it back.
+    e.mgr.shutdown();
+    assert_eq!(e.mgr.recover_all().unwrap(), 1);
+    e.wait_for_launches(3);
+
+    e.mgr.stop(&e.user, &id).unwrap();
+    assert_eq!(e.db.broadcast(&id).unwrap().desired_state, DesiredState::Stopped);
+    e.mgr.shutdown();
+}
+
+#[test]
+fn a_playlist_whose_items_cannot_be_joined_never_reaches_ffmpeg() {
+    // The rule that makes the fast path safe, enforced where it counts: not at
+    // the edit, which a user can skip, but at the moment something would be
+    // sent. Both the start button and a boot recovery go through it.
+    let e = env("business");
+    let a = e.video("one.mp4", 60.0);
+    let b = e.video("two.mp4", 60.0);
+    mark_native(&e, &a, "h264/1280x720/2/1/aaaa");
+    mark_native(&e, &b, "h264/1920x1080/30/1/bbbb");
+    let id = e.broadcast("섞인 방송", &[a, b], true);
+
+    let refused = e.mgr.start(&e.user, &id).unwrap_err();
+    assert!(refused.to_string().contains("영상 형식이 서로 달라"), "{refused}");
+    assert_eq!(e.rec.launches(), 0, "an unjoinable playlist reached FFmpeg");
+
+    // And recovery holds the same line, where nobody is watching.
+    e.db.update_broadcast_owned(
+        &e.user,
+        &id,
+        &louver_cloud::BroadcastPatch { loop_forever: Some(true), ..Default::default() },
+    )
+    .unwrap();
+    e.db.claim_stream_slot(&e.user, &id).unwrap();
+    assert_eq!(e.db.broadcast(&id).unwrap().desired_state, DesiredState::Running);
+    assert_eq!(e.mgr.recover_all().unwrap(), 0, "recovery started an unjoinable playlist");
+    assert_eq!(e.rec.launches(), 0);
+    e.mgr.shutdown();
+}
+
+#[test]
+fn loop_and_single_pass_are_unchanged_on_fast_path_media() {
+    // Test I. "전체 반복" keeps `-stream_loop -1` and never ends by itself;
+    // "한 바퀴만" still ends after one pass of the playlist's own length.
+    let e = env("business");
+    let a = e.video("short.mp4", 2.0);
+    mark_native(&e, &a, "h264/1280x720/2/1");
+    let looping = e.broadcast("반복", std::slice::from_ref(&a), true);
+
+    e.mgr.start(&e.user, &looping).unwrap();
+    e.wait_for_launches(1);
+    assert!(
+        e.rec.last().args.windows(2).any(|w| w == ["-stream_loop", "-1"]),
+        "the looping flag went missing",
+    );
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    assert_eq!(
+        e.db.broadcast(&looping).unwrap().desired_state,
+        DesiredState::Running,
+        "a looping broadcast ended itself",
+    );
+    e.mgr.stop(&e.user, &looping).unwrap();
+
+    let b = e.video("once.mp4", 2.0);
+    mark_native(&e, &b, "h264/1280x720/2/1");
+    let once = e.broadcast("한 바퀴", &[b], false);
+    e.mgr.start(&e.user, &once).unwrap();
+    e.wait_for_launches(2);
+    for _ in 0..200 {
+        if e.db.broadcast(&once).unwrap().desired_state == DesiredState::Stopped {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let row = e.db.broadcast(&once).unwrap();
+    assert_eq!(row.desired_state, DesiredState::Stopped, "a single pass never ended");
+    assert_eq!(row.runtime_state, RuntimeState::Stopped);
+    e.mgr.shutdown();
+}

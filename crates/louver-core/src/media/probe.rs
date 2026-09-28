@@ -191,6 +191,181 @@ pub fn probe_max_keyframe_gap(builder: &FfmpegCommandBuilder, path: &Path, windo
     max_keyframe_gap(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// What a prepared file actually *is*, in exactly the detail that decides
+/// whether two of them can be concatenated and stream-copied into one RTMP
+/// stream.
+///
+/// The concat demuxer joins packets; it does not reconcile them. The FLV muxer
+/// then writes one `AVCDecoderConfigurationRecord` at the head of the stream and
+/// never again. So every input has to agree on the codec, the geometry, the
+/// frame rate, the time base — and on the SPS/PPS themselves, which is what
+/// `video_extradata` carries. Two 1280x720 H.264 files from different encoders
+/// can have different SPS, and joining them produces a stream that decodes as
+/// garbage from the seam onwards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamSignature {
+    pub video_codec: String,
+    pub width: u32,
+    pub height: u32,
+    pub pix_fmt: String,
+    /// ffprobe's own rational, compared as text so 30000/1001 and 29.97 cannot
+    /// be mistaken for each other.
+    pub frame_rate: String,
+    pub time_base: String,
+    /// CRC32 of the codec extradata — the H.264 SPS/PPS.
+    pub video_extradata: String,
+    pub audio_codec: String,
+    pub audio_sample_rate: u32,
+    pub audio_channels: u32,
+}
+
+impl StreamSignature {
+    /// For a log line and for the DB. Not a hash: an operator has to be able to
+    /// read why two files were judged different.
+    pub fn as_key(&self) -> String {
+        format!(
+            "{}/{}x{}/{}/{}/{}/{}/{}/{}ch@{}",
+            self.video_codec,
+            self.width,
+            self.height,
+            self.pix_fmt,
+            self.frame_rate,
+            self.time_base,
+            self.video_extradata,
+            self.audio_codec,
+            self.audio_channels,
+            self.audio_sample_rate,
+        )
+    }
+}
+
+/// Read a file's [`StreamSignature`]. One ffprobe of the header.
+pub fn probe_signature(builder: &FfmpegCommandBuilder, path: &Path) -> Result<StreamSignature> {
+    let args = builder.build_signature_probe_args(path);
+    let out = builder
+        .probe_command(&args)
+        .output()
+        .map_err(|e| LouverError::with_detail(ErrorCode::MediaProbeFailed, e.to_string()))?;
+    if !out.status.success() {
+        return Err(LouverError::with_detail(
+            ErrorCode::MediaProbeFailed,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ));
+    }
+    parse_signature_json(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Split out so it can be tested against fixtures without running ffprobe.
+pub fn parse_signature_json(json: &str) -> Result<StreamSignature> {
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| LouverError::with_detail(ErrorCode::MediaProbeFailed, e.to_string()))?;
+    let streams = v["streams"].as_array().cloned().unwrap_or_default();
+    let video = streams
+        .iter()
+        .find(|s| s["codec_type"] == "video")
+        .ok_or_else(|| LouverError::new(ErrorCode::MediaNoVideoStream))?;
+    let audio = streams.iter().find(|s| s["codec_type"] == "audio");
+    let text = |v: &serde_json::Value, k: &str| v[k].as_str().unwrap_or_default().to_string();
+    Ok(StreamSignature {
+        video_codec: text(video, "codec_name"),
+        width: video["width"].as_u64().unwrap_or(0) as u32,
+        height: video["height"].as_u64().unwrap_or(0) as u32,
+        pix_fmt: text(video, "pix_fmt"),
+        // `avg_frame_rate` is 0/0 on a stream ffprobe could not average; the
+        // declared rate is the fallback, exactly as `parse_probe_json` does.
+        frame_rate: match text(video, "avg_frame_rate").as_str() {
+            "" | "0/0" => text(video, "r_frame_rate"),
+            other => other.to_string(),
+        },
+        time_base: text(video, "time_base"),
+        video_extradata: text(video, "extradata_hash"),
+        audio_codec: audio.map(|a| text(a, "codec_name")).unwrap_or_default(),
+        audio_sample_rate: audio
+            .and_then(|a| a["sample_rate"].as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0),
+        audio_channels: audio.and_then(|a| a["channels"].as_u64()).unwrap_or(0) as u32,
+    })
+}
+
+/// The smallest picture this service will send, in either direction.
+///
+/// Below this a stream is not a broadcast, and an odd dimension cannot be
+/// encoded as yuv420p at all.
+const MIN_DIMENSION: u32 = 128;
+
+/// Why this file's video cannot be sent **as it is**, at its own size and its
+/// own frame rate.
+///
+/// Deliberately not [`video_encode_reasons`], which asks a different question:
+/// whether the file already matches the one canonical 1080p30 format. That
+/// question forces a four-hour 720p slideshow through a full libx264 encode for
+/// no reason a viewer could ever see. This one asks only what a *stream copy*
+/// cannot fix:
+///
+/// * the codec, the pixel format, HDR and rotation — a copy changes none of them
+/// * an H.264 profile or level a player may refuse
+/// * a picture larger than the profile sells, which would push the bitrate past
+///   what the plan and the ingest expect
+/// * a frame rate above the profile's, for the same reason
+/// * an odd or absurd size
+///
+/// A *lower* frame rate is deliberately allowed. A 2fps source is a legitimate
+/// slideshow broadcast: FLV timestamps are milliseconds and carry any rate, and
+/// YouTube accepts it. What YouTube does not accept is a long gap between
+/// keyframes, and that is measured separately — see [`plan_native`].
+pub fn video_native_copy_reasons(info: &MediaInfo, profile: OutputProfile) -> Vec<String> {
+    let mut r = Vec::new();
+    if info.video_codec != "h264" {
+        r.push(format!("영상 코덱이 H.264가 아닙니다 ({})", info.video_codec));
+    }
+    if info.pixel_format != "yuv420p" {
+        r.push(format!("픽셀 포맷이 yuv420p가 아닙니다 ({})", info.pixel_format));
+    }
+    if info.is_hdr {
+        r.push("HDR 영상입니다. SDR로 변환이 필요합니다".into());
+    }
+    if info.rotation != 0 {
+        r.push(format!("회전 메타데이터가 있습니다 ({}도)", info.rotation));
+    }
+    if !profile.allows_h264_profile(&info.video_profile) {
+        r.push(format!("H.264 프로파일이 지원 범위 밖입니다 ({})", info.video_profile));
+    }
+    if let Some(level) = info.video_level {
+        if level > profile.max_h264_level() {
+            r.push(format!(
+                "H.264 레벨이 {}를 넘습니다 ({})",
+                fmt_level(profile.max_h264_level()),
+                fmt_level(level)
+            ));
+        }
+    }
+    if info.width > profile.width() || info.height > profile.height() {
+        r.push(format!(
+            "해상도가 {}x{}보다 큽니다 ({}x{})",
+            profile.width(),
+            profile.height(),
+            info.width,
+            info.height
+        ));
+    }
+    if info.width < MIN_DIMENSION
+        || info.height < MIN_DIMENSION
+        || info.width % 2 != 0
+        || info.height % 2 != 0
+    {
+        r.push(format!("해상도를 그대로 쓸 수 없습니다 ({}x{})", info.width, info.height));
+    }
+    // Above the profile's rate the encode is what keeps the bitrate inside what
+    // the plan sells. Below it, there is nothing to fix.
+    if info.fps > f64::from(profile.fps()) + 0.01 {
+        r.push(format!("프레임레이트가 {}fps를 넘습니다 ({:.2}fps)", profile.fps(), info.fps));
+    }
+    if info.fps <= 0.0 {
+        r.push("프레임레이트를 읽을 수 없습니다".into());
+    }
+    r
+}
+
 /// Result of checking a source against the broadcast profile (§7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Compatibility {

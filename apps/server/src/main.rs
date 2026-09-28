@@ -405,6 +405,135 @@ fn audit_storage(args: &[String]) -> std::process::ExitCode {
     }
 }
 
+/// `--media-check <file> [--run] [--compare]`
+///
+/// Why a file was prepared the way it was, and what that cost.
+///
+/// Written in Rust and shipped in the server binary on purpose: the production
+/// image has no Node, and the moment somebody needs this is the moment a user
+/// is asking why their upload took three hours. Without `--run` it only probes
+/// — safe on a live server, milliseconds, touches nothing.
+///
+/// `--run` prepares the file into a temporary directory and reports what it
+/// cost. `--compare` does it twice, once the way this release does it and once
+/// the way every upload used to be done, which is the measurement behind the
+/// change. Use `--compare` on a short clip: the old way is the slow way.
+fn media_check(args: &[String]) -> std::process::ExitCode {
+    use louver_core::media::normalize::{normalize_one_with, plan_for, plan_native, CancelToken};
+    use louver_core::media::probe::probe;
+    use louver_core::streaming::ffmpeg::{FfmpegCommandBuilder, FfmpegTools};
+
+    let Some(path) = value_of(args, "--media-check") else {
+        eprintln!("사용법: louver-server --media-check <파일> [--run] [--compare]");
+        return std::process::ExitCode::FAILURE;
+    };
+    let path = std::path::PathBuf::from(path);
+    let tools = match FfmpegTools::discover(
+        std::env::var("LOUVER_FFMPEG_DIR").ok().map(std::path::PathBuf::from).as_deref(),
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("[louver] FFmpeg를 찾지 못했습니다: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let profile = louver_cloud::ingest::CLOUD_PROFILE;
+    let encoder = std::env::var("LOUVER_ENCODER").unwrap_or_else(|_| "libx264".into());
+    let builder = FfmpegCommandBuilder::new(tools, profile).with_encoder(encoder.clone());
+
+    let info = match probe(&builder, &path) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[louver] 파일을 읽을 수 없습니다: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    println!("=== 247streams 미디어 점검 ===");
+    println!("파일     : {}", path.display());
+    println!(
+        "영상     : {} {}x{} @{:.2}fps {} profile={} level={}",
+        info.video_codec,
+        info.width,
+        info.height,
+        info.fps,
+        info.pixel_format,
+        if info.video_profile.is_empty() { "?" } else { &info.video_profile },
+        info.video_level.map(|l| format!("{}.{}", l / 10, l % 10)).unwrap_or_else(|| "?".into()),
+    );
+    println!(
+        "소리     : {} {}Hz {}ch",
+        info.audio_codec.clone().unwrap_or_else(|| "없음".into()),
+        info.audio_sample_rate.unwrap_or(0),
+        info.audio_channels.unwrap_or(0),
+    );
+    println!("길이     : {:.1}초 ({:.2}시간)", info.duration_secs, info.duration_secs / 3600.0);
+
+    let native = plan_native(&builder, &path, &info, profile);
+    let canonical = plan_for(&builder, &path, &info, profile);
+    let say = |name: &str, plan: &louver_core::media::probe::TranscodePlan| {
+        println!(
+            "\n{name}: mode={} video={} audio={}",
+            if plan.video.is_copy() { "native" } else { "canonical" },
+            if plan.video.is_copy() { "copy" } else { "encode" },
+            if plan.audio.is_copy() { "copy" } else { "encode" },
+        );
+        for r in plan.video_reasons.iter().chain(plan.audio_reasons.iter()) {
+            println!("    reason: {r}");
+        }
+    };
+    say("이 버전", &native);
+    if args.iter().any(|a| a == "--compare") {
+        say("이전 버전(항상 1080p30)", &canonical);
+    }
+
+    if !args.iter().any(|a| a == "--run") {
+        println!("\n실제로 준비해 보려면 --run 을 붙이세요 (임시 폴더에 만들고 지웁니다).");
+        return std::process::ExitCode::SUCCESS;
+    }
+
+    // A scratch directory of our own rather than a crate: this runs in the
+    // production image, and a diagnostic is not a reason to add a dependency.
+    let dir = std::env::temp_dir().join(format!("louver-media-check-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[louver] 임시 폴더를 만들 수 없습니다: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
+    let mut runs = vec![("이 버전", native)];
+    if args.iter().any(|a| a == "--compare") {
+        runs.push(("이전 버전", canonical));
+    }
+    println!("\n{:<12} {:>9} {:>9} {:>10} {:>8} {:>8}", "", "걸린시간", "배속", "출력크기", "영상", "소리");
+    for (name, plan) in runs {
+        let cache = louver_core::media::cache::MediaCache::new(dir.join(name));
+        let started = std::time::Instant::now();
+        let out = normalize_one_with(
+            &builder,
+            &cache,
+            &path,
+            "media-check",
+            &info,
+            profile,
+            Some(plan.clone()),
+            &CancelToken::new(),
+            |_| {},
+        );
+        match out {
+            Ok(o) => println!(
+                "{:<12} {:>8.1}s {:>8.1}x {:>10} {:>8} {:>8}",
+                name,
+                started.elapsed().as_secs_f64(),
+                o.speed_x,
+                louver_core::system::format_bytes(o.bytes),
+                if plan.video.is_copy() { "copy" } else { "encode" },
+                if plan.audio.is_copy() { "copy" } else { "encode" },
+            ),
+            Err(e) => println!("{name:<12} 실패: {e}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::process::ExitCode::SUCCESS
+}
+
 fn value_of(args: &[String], flag: &str) -> Option<String> {
     let i = args.iter().position(|a| a == flag)?;
     args.get(i + 1).filter(|v| !v.starts_with("--")).cloned()
@@ -441,6 +570,10 @@ async fn main() -> std::process::ExitCode {
     // Who is on which plan, and how they got there.
     if args.iter().any(|a| a == "--audit-plans") {
         return audit_plans(&args);
+    }
+    // Why one file was prepared the way it was, and what it cost.
+    if args.iter().any(|a| a == "--media-check") {
+        return media_check(&args);
     }
     // What the storage ceilings are, and what this build would set them to.
     if args.iter().any(|a| a == "--audit-storage") {

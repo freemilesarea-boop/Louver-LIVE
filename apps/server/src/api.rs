@@ -271,6 +271,7 @@ pub async fn create_broadcast(
     Caller(uid): Caller,
     Json(b): Json<NewBroadcast>,
 ) -> Out<louver_cloud::BroadcastDetail> {
+    let app2 = app.clone();
     let made = crate::blocking(move || {
         let playlist = b.playlist();
         let first = playlist
@@ -339,6 +340,19 @@ pub async fn create_broadcast(
         Ok(louver_cloud::BroadcastDetail { broadcast, items })
     })
     .await?;
+    // The same question the items endpoint asks, for a playlist that arrived
+    // with the broadcast.
+    {
+        let app = app2;
+        let id = made.broadcast.id.clone();
+        let _ = crate::blocking(move || {
+            if let Err(e) = app.ingest.ensure_playlist_compatible(&id) {
+                eprintln!("[louver] 플레이리스트 형식 확인 실패: {e}");
+            }
+            Ok(())
+        })
+        .await;
+    }
     Ok(Json(made))
 }
 
@@ -393,7 +407,20 @@ pub async fn replace_items(
     Path(id): Path<String>,
     Json(items): Json<Vec<louver_cloud::db::NewItem>>,
 ) -> Out<Vec<louver_cloud::BroadcastItem>> {
-    Ok(Json(crate::blocking(move || app.db.replace_items(&uid, &id, &items)).await?))
+    Ok(Json(
+        crate::blocking(move || {
+            let saved = app.db.replace_items(&uid, &id, &items)?;
+            // A playlist whose items cannot be joined is made joinable now,
+            // rather than at START — re-preparing hours of video is not
+            // something to discover with a finger on the button. Queued in the
+            // background; the media go back to 준비 중 until it is done.
+            if let Err(e) = app.ingest.ensure_playlist_compatible(&id) {
+                eprintln!("[louver] 플레이리스트 형식 확인 실패: {e}");
+            }
+            Ok(saved)
+        })
+        .await?,
+    ))
 }
 
 pub async fn get_broadcast(

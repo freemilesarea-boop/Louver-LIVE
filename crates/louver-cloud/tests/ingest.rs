@@ -165,7 +165,7 @@ fn a_conformant_upload_is_remuxed_and_becomes_broadcastable() {
 }
 
 #[test]
-fn a_non_conformant_upload_is_transcoded_and_still_becomes_broadcastable() {
+fn only_the_audio_is_converted_when_only_the_audio_is_wrong() {
     let Some(tools) = tools() else {
         eprintln!("SKIP: no FFmpeg sidecar");
         return;
@@ -178,22 +178,322 @@ fn a_non_conformant_upload_is_transcoded_and_still_becomes_broadcastable() {
 
     let done = settled(&e, &m.id);
     assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
-    // What was probed is the source's own shape, not the profile's.
+    // What was probed is the source's own shape.
     assert_eq!((done.width, done.height), (640, 480));
-    // What was produced conforms, which is what makes it broadcastable.
-    let prepared =
-        LocalStorage::new(e.root.join("media")).localize(&done.prepared_path.clone().unwrap()).unwrap();
+
+    // Test B. The video is H.264 yuv420p at a size and rate that can be sent as
+    // they are; only the audio (mono, 44.1 kHz) has to change. Re-encoding the
+    // picture to fix the sound is the waste this release exists to remove, so
+    // the geometry is kept and the audio alone is converted.
+    let prepared = probe_prepared(&e, &tools, &done);
+    assert_eq!((prepared.width, prepared.height), (640, 480), "the picture was re-encoded to fix the audio");
+    assert_eq!(prepared.audio_sample_rate, Some(48_000));
+    assert_eq!(prepared.audio_channels, Some(2));
+    assert_eq!(prepared.video_codec, "h264");
+}
+
+/// What the prepared file turned out to be.
+fn probe_prepared(
+    e: &Env,
+    tools: &FfmpegTools,
+    m: &louver_cloud::CloudMedia,
+) -> louver_core::media::probe::MediaInfo {
+    let path = LocalStorage::new(e.root.join("media")).localize(&m.prepared_path.clone().unwrap()).unwrap();
     let builder = louver_core::streaming::ffmpeg::FfmpegCommandBuilder::new(
         tools.clone(),
         louver_cloud::ingest::CLOUD_PROFILE,
     );
-    let info = louver_core::media::probe::probe(&builder, &prepared).unwrap();
-    assert_eq!((info.width, info.height), (1920, 1080));
-    assert!(
-        louver_core::media::probe::check_compatibility(&info, louver_cloud::ingest::CLOUD_PROFILE)
-            .is_compatible(),
-        "the prepared file does not match the broadcast profile",
+    louver_core::media::probe::probe(&builder, &path).unwrap()
+}
+
+/// A fixture with exactly the shape a test needs.
+///
+/// Written out rather than parameterised over `make` because the interesting
+/// cases differ in one parameter each, and the point of every test below is
+/// *which* parameter.
+fn fixture(tools: &FfmpegTools, at: &std::path::Path, args: &[&str]) {
+    let mut all: Vec<String> = vec!["-y".into(), "-loglevel".into(), "error".into()];
+    all.extend(args.iter().map(|s| s.to_string()));
+    all.push(at.to_string_lossy().into_owned());
+    let out = std::process::Command::new(&tools.ffmpeg).args(&all).output().expect("ffmpeg");
+    assert!(out.status.success(), "fixture: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// The 4.5-hour production file in miniature: 720p, two frames a second,
+/// H.264 and AAC, keyframes every two seconds.
+fn low_fps_source(tools: &FfmpegTools, at: &std::path::Path) {
+    fixture(
+        tools,
+        at,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=2:duration=6",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=6",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            // Two seconds of keyframe spacing at 2fps is four frames.
+            "-g",
+            "4",
+            "-keyint_min",
+            "4",
+            "-sc_threshold",
+            "0",
+            "-r",
+            "2",
+            "-fps_mode",
+            "cfr",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-shortest",
+        ],
     );
+}
+
+#[test]
+fn a_long_low_frame_rate_source_is_not_re_encoded_to_thirty_frames_a_second() {
+    // Test G, and the reason this release exists. The production upload was
+    // 4h36m of 720p at two frames a second — a slideshow — and the old rule
+    // ("does this already match 1920x1080 at 30fps?") sent it through a full
+    // libx264 encode of every one of those hours. Nothing a viewer sees is
+    // different for it.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let src = e.root.join("slideshow.mp4");
+    low_fps_source(&tools, &src);
+
+    let m = e.ingest.accept_upload(&e.user, "slideshow.mp4", &src).unwrap();
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
+
+    let prepared = probe_prepared(&e, &tools, &done);
+    assert_eq!((prepared.width, prepared.height), (1280, 720), "the picture was scaled up to 1080p");
+    assert!(prepared.fps < 5.0, "the frame rate was multiplied up to {}fps", prepared.fps);
+    assert_eq!(prepared.video_codec, "h264");
+    // 48 kHz stereo AAC already, so nothing at all was encoded.
+    assert_eq!(prepared.audio_sample_rate, Some(48_000));
+}
+
+#[test]
+fn a_file_that_already_matches_the_profile_is_not_encoded_either() {
+    // Test A. The conformant fixture: nothing about it needs changing, so
+    // neither stream is encoded and the result is a remux.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let src = e.root.join("ok.mp4");
+    make(&tools, &src, true);
+    let m = e.ingest.accept_upload(&e.user, "ok.mp4", &src).unwrap();
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
+    let prepared = probe_prepared(&e, &tools, &done);
+    assert_eq!((prepared.width, prepared.height), (1920, 1080));
+    assert!((prepared.fps - 30.0).abs() < 0.1);
+}
+
+#[test]
+fn an_unsupported_codec_still_goes_through_the_full_encode() {
+    // Test C. MPEG-4 part 2 cannot be copied into an H.264 stream at all.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let src = e.root.join("mpeg4.mp4");
+    fixture(
+        &tools,
+        &src,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x480:rate=25:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-c:v",
+            "mpeg4",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-shortest",
+        ],
+    );
+
+    let m = e.ingest.accept_upload(&e.user, "mpeg4.mp4", &src).unwrap();
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
+    let prepared = probe_prepared(&e, &tools, &done);
+    assert_eq!(prepared.video_codec, "h264", "an unsupported codec was passed through");
+    assert_eq!((prepared.width, prepared.height), (1920, 1080), "a transcode must land on the profile");
+}
+
+#[test]
+fn an_unsupported_pixel_format_still_goes_through_the_full_encode() {
+    // Test D. 4:4:4 is H.264, and no player on an ingest will take it.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let src = e.root.join("yuv444.mp4");
+    fixture(
+        &tools,
+        &src,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x480:rate=25:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv444p",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-shortest",
+        ],
+    );
+
+    let m = e.ingest.accept_upload(&e.user, "yuv444.mp4", &src).unwrap();
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
+    let prepared = probe_prepared(&e, &tools, &done);
+    assert_eq!(prepared.pixel_format, "yuv420p", "4:4:4 was sent to an ingest that cannot take it");
+    assert_eq!((prepared.width, prepared.height), (1920, 1080));
+}
+
+#[test]
+fn a_picture_larger_than_the_plan_sells_is_scaled_down() {
+    // A copy cannot resize, and 1440p at the profile's bitrate would be both
+    // worse than the plan promises and more than the ingest expects.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let src = e.root.join("big.mp4");
+    fixture(
+        &tools,
+        &src,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=2560x1440:rate=25:duration=2",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=2",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-shortest",
+        ],
+    );
+
+    let m = e.ingest.accept_upload(&e.user, "big.mp4", &src).unwrap();
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
+    let prepared = probe_prepared(&e, &tools, &done);
+    assert_eq!((prepared.width, prepared.height), (1920, 1080));
+}
+
+#[test]
+fn keyframes_too_far_apart_are_rebuilt_even_when_everything_else_fits() {
+    // The one reason alow frame rate can still cost an encode, and it is a
+    // reason about seconds rather than frames: a viewer joining a live stream
+    // waits for the next keyframe, and YouTube cuts between qualities on them.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let src = e.root.join("sparse.mp4");
+    fixture(
+        &tools,
+        &src,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=30:duration=25",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=25",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            // One keyframe every 10 seconds, far past the 4-second limit.
+            "-g",
+            "300",
+            "-keyint_min",
+            "300",
+            "-sc_threshold",
+            "0",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-shortest",
+        ],
+    );
+
+    let m = e.ingest.accept_upload(&e.user, "sparse.mp4", &src).unwrap();
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
+    let prepared = probe_prepared(&e, &tools, &done);
+    assert_eq!((prepared.width, prepared.height), (1920, 1080), "a sparse-keyframe file was copied");
 }
 
 #[test]
@@ -302,4 +602,156 @@ fn an_upload_that_would_fill_the_server_is_refused_before_it_is_stored() {
     let said = louver_cloud::CloudError::OutOfSpace.to_string();
     assert!(said.contains("저장 공간"), "{said}");
     assert!(!said.contains('/'), "a user-facing message must not carry a path: {said}");
+}
+
+// --- playlists are concatenated, so their items have to agree -------------
+
+/// A broadcast over the given media, in order.
+fn broadcast_over(e: &Env, media: &[&str]) -> String {
+    let dest = e.db.create_destination(&e.user, "채널", "rtmps://a/live2", "••••").unwrap();
+    let b = e.db.create_broadcast(&e.user, "플레이리스트", media[0], &dest.id, true).unwrap();
+    let items: Vec<louver_cloud::db::NewItem> = media
+        .iter()
+        .map(|m| louver_cloud::db::NewItem { media_id: (*m).to_string(), enabled: true, repeat_count: 1 })
+        .collect();
+    e.db.replace_items(&e.user, &b.id, &items).unwrap();
+    b.id
+}
+
+#[test]
+fn a_playlist_of_identical_uploads_needs_nothing_doing_to_it() {
+    // Test E. Two exports of the same shape — the ordinary case, and the one
+    // that must not cost anything. Both take the fast path, both come out with
+    // the same signature, and the playlist is joinable as it stands.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let mut ids = Vec::new();
+    for name in ["one.mp4", "two.mp4"] {
+        let src = e.root.join(name);
+        low_fps_source(&tools, &src);
+        let m = e.ingest.accept_upload(&e.user, name, &src).unwrap();
+        assert_eq!(settled(&e, &m.id).state, MediaState::Ready);
+        ids.push(m.id);
+    }
+    let b = broadcast_over(&e, &[&ids[0], &ids[1]]);
+
+    e.db.check_playlist_joinable(&b).expect("two identical uploads were judged unjoinable");
+    assert_eq!(e.ingest.ensure_playlist_compatible(&b).unwrap(), 0, "something was re-prepared for nothing");
+    // Both kept their own shape rather than being pushed to 1080p30.
+    for id in &ids {
+        let m = e.db.media_owned(&e.user, id).unwrap();
+        assert_eq!(probe_prepared(&e, &tools, &m).width, 1280);
+    }
+    assert_eq!(e.db.prepared_items_for(&b).unwrap().len(), 2);
+}
+
+#[test]
+fn a_playlist_that_mixes_formats_is_made_to_agree_before_it_can_start() {
+    // Test F. Two files that are each individually fine to send, and cannot be
+    // joined to each other: different geometry, different frame rate, different
+    // SPS. Concatenating them and copying packets would produce a stream that
+    // decodes as garbage from the seam onwards — live, with nobody watching.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+
+    let a = e.root.join("slideshow.mp4");
+    low_fps_source(&tools, &a);
+    let first = e.ingest.accept_upload(&e.user, "slideshow.mp4", &a).unwrap().id;
+    assert_eq!(settled(&e, &first).state, MediaState::Ready);
+
+    let b_src = e.root.join("normal.mp4");
+    fixture(
+        &tools,
+        &b_src,
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=854x480:rate=25:duration=3",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=330:sample_rate=48000:duration=3",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "50",
+            "-keyint_min",
+            "50",
+            "-sc_threshold",
+            "0",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-shortest",
+        ],
+    );
+    let second = e.ingest.accept_upload(&e.user, "normal.mp4", &b_src).unwrap().id;
+    assert_eq!(settled(&e, &second).state, MediaState::Ready);
+
+    let b = broadcast_over(&e, &[&first, &second]);
+    // As they stand, this playlist may not go on air.
+    assert!(e.db.check_playlist_joinable(&b).is_err(), "a mixed playlist was judged joinable");
+
+    // Putting them in one playlist is what triggers the expensive path — and it
+    // is the only thing that does.
+    assert_eq!(e.ingest.ensure_playlist_compatible(&b).unwrap(), 2);
+    for id in [&first, &second] {
+        assert_eq!(settled(&e, id).state, MediaState::Ready, "re-preparation failed");
+    }
+
+    e.db.check_playlist_joinable(&b).expect("the playlist was not made joinable");
+    for id in [&first, &second] {
+        let m = e.db.media_owned(&e.user, id).unwrap();
+        let prepared = probe_prepared(&e, &tools, &m);
+        assert_eq!((prepared.width, prepared.height), (1920, 1080));
+        assert!((prepared.fps - 30.0).abs() < 0.1);
+    }
+    // And it stays that way: a second pass has nothing left to do.
+    assert_eq!(e.ingest.ensure_playlist_compatible(&b).unwrap(), 0);
+}
+
+#[test]
+fn media_prepared_before_this_release_is_still_broadcastable() {
+    // Test J. Every file prepared before signatures existed came out of the one
+    // canonical encode, so a row with no signature reads as canonical — and two
+    // of them are joinable, which is exactly what production has today.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let mut ids = Vec::new();
+    for name in ["legacy-a.mp4", "legacy-b.mp4"] {
+        let src = e.root.join(name);
+        make(&tools, &src, true);
+        let m = e.ingest.accept_upload(&e.user, name, &src).unwrap();
+        assert_eq!(settled(&e, &m.id).state, MediaState::Ready);
+        ids.push(m.id);
+    }
+    // Exactly what a production row looks like: prepared, with nothing recorded
+    // about its shape.
+    e.db.raw()
+        .lock()
+        .unwrap()
+        .execute("UPDATE media SET prepared_mode=NULL, prepared_signature=NULL", [])
+        .unwrap();
+
+    let b = broadcast_over(&e, &[&ids[0], &ids[1]]);
+    e.db.check_playlist_joinable(&b).expect("legacy media was judged unjoinable");
+    assert_eq!(e.ingest.ensure_playlist_compatible(&b).unwrap(), 0, "legacy media was re-prepared");
+    assert_eq!(e.db.prepared_items_for(&b).unwrap().len(), 2);
 }

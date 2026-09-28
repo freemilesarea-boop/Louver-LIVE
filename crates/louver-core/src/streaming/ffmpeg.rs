@@ -458,6 +458,30 @@ impl FfmpegCommandBuilder {
         ]
     }
 
+    /// Ask ffprobe for exactly the stream parameters that decide whether two
+    /// files can be concatenated and stream-copied into one RTMP stream.
+    ///
+    /// `extradata_hash` is the point of it: for H.264 that is a checksum of the
+    /// SPS/PPS, which is what an FLV muxer writes **once** at the head of the
+    /// stream. Two files whose geometry matches but whose SPS differ will make
+    /// a decoder — YouTube's included — misread everything after the join, and
+    /// nothing short of comparing the extradata catches that.
+    pub fn build_signature_probe_args(&self, input: &Path) -> Vec<String> {
+        vec![
+            "-v".into(),
+            "error".into(),
+            "-print_format".into(),
+            "json".into(),
+            "-show_entries".into(),
+            "stream=codec_type,codec_name,width,height,pix_fmt,avg_frame_rate,r_frame_rate,\
+             time_base,profile,level,sample_rate,channels,extradata_hash"
+                .replace(char::is_whitespace, ""),
+            "-show_data_hash".into(),
+            "CRC32".into(),
+            input.to_string_lossy().into_owned(),
+        ]
+    }
+
     /// Ask ffprobe where the keyframes are, over the first `window_secs`.
     ///
     /// Only the packet flags are requested, so ffprobe reads the index rather

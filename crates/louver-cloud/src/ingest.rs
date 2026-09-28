@@ -16,8 +16,8 @@ use crate::storage::Storage;
 use crate::{CloudError, Result};
 use louver_core::config::OutputProfile;
 use louver_core::media::cache::MediaCache;
-use louver_core::media::normalize::{normalize_one, CancelToken};
-use louver_core::media::probe::probe;
+use louver_core::media::normalize::{normalize_one_with, plan_for, plan_native, CancelToken};
+use louver_core::media::probe::{probe, probe_signature, StreamSignature, TranscodePlan};
 use louver_core::streaming::ffmpeg::{FfmpegCommandBuilder, FfmpegTools};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -187,19 +187,50 @@ impl Ingest {
         let info = probe(&builder, &local)?;
         self.db.record_media_analysis(media_id, &info)?;
 
+        // Two questions, and only one of them used to be asked. "Does this file
+        // already match the one canonical 1080p30 format?" sends a four-hour
+        // 720p slideshow through a full libx264 encode. "Can this file be sent
+        // as it is?" is the question that matters, and it is the one `auto`
+        // asks. `canonical` is the pinned answer for media that has to match
+        // other items in a playlist — see `ensure_playlist_compatible`.
+        let pinned = self.db.prepare_target(media_id).unwrap_or_else(|_| "auto".into()) == "canonical";
+        let plan = if pinned {
+            plan_for(&builder, &local, &info, CLOUD_PROFILE)
+        } else {
+            plan_native(&builder, &local, &info, CLOUD_PROFILE)
+        };
+        let mode = if plan.video.is_copy() { "native" } else { "canonical" };
+        // §8: why, in a line an operator can read when a user says it was slow.
+        // Nothing here is user content and nothing is a secret.
+        println!(
+            "[louver] media {}: mode={} video={} audio={} in={}x{}@{:.2}fps/{} audio={}/{}Hz{}",
+            &media_id[..8.min(media_id.len())],
+            mode,
+            if plan.video.is_copy() { "copy" } else { "encode" },
+            if plan.audio.is_copy() { "copy" } else { "encode" },
+            info.width,
+            info.height,
+            info.fps,
+            if info.video_codec.is_empty() { "?" } else { &info.video_codec },
+            info.audio_codec.clone().unwrap_or_else(|| "none".into()),
+            info.audio_sample_rate.unwrap_or(0),
+            reasons_suffix(&plan),
+        );
+
         // Prepared output goes beside the store, then gets filed like any other
         // object, so an S3 backend uploads it rather than leaving it on a disk.
         let scratch = self.storage.scratch_dir().join(media_id);
         std::fs::create_dir_all(&scratch)?;
         let cache = MediaCache::new(&scratch);
 
-        let out = normalize_one(
+        let out = normalize_one_with(
             &builder,
             &cache,
             &local,
             media_id,
             &info,
             CLOUD_PROFILE,
+            Some(plan),
             &CancelToken::new(),
             |_| {},
         )?;
@@ -224,8 +255,101 @@ impl Ingest {
 
         let original = self.storage.size_bytes(&key).unwrap_or(0) as i64;
         let prepared = self.storage.size_bytes(&prepared_key).unwrap_or(0) as i64;
+
+        // What the file turned out to be, read from the file rather than from
+        // what was asked for. This is what a playlist compares — and it is
+        // written *before* the media is marked ready, because the moment it is
+        // ready a broadcast may be built on it, and a row that is ready with no
+        // signature reads as canonical when it is not.
+        match self.signature_of(&prepared_key) {
+            Ok(sig) => {
+                println!(
+                    "[louver] media {}: prepared mode={} {} ({:.1}s, {:.0}x realtime)",
+                    &media_id[..8.min(media_id.len())],
+                    mode,
+                    sig.as_key(),
+                    out.duration_secs,
+                    out.speed_x,
+                );
+                self.db.record_prepared_signature(media_id, mode, &sig.as_key())?;
+            }
+            // A file we cannot read the shape of cannot be judged compatible
+            // with anything, so it is recorded as canonical-unknown and the
+            // playlist check will send it down the canonical path if it is ever
+            // mixed with something else.
+            Err(e) => eprintln!("[louver] media {media_id}: 준비된 파일을 읽지 못했습니다: {e}"),
+        }
         self.db.record_media_prepared(media_id, &prepared_key, out.duration_secs, original + prepared)?;
         Ok(())
+    }
+
+    /// The exact shape of a prepared file, for the playlist compatibility check.
+    fn signature_of(&self, prepared_key: &crate::storage::ObjectKey) -> Result<StreamSignature> {
+        let builder =
+            FfmpegCommandBuilder::new(self.tools.clone(), CLOUD_PROFILE).with_encoder(self.encoder.clone());
+        let local = self.storage.localize(prepared_key)?;
+        Ok(probe_signature(&builder, &local)?)
+    }
+
+    /// Make every item of a playlist safe to concatenate, re-preparing only what
+    /// has to change.
+    ///
+    /// A playlist is one FFmpeg reading a concat manifest and copying packets
+    /// into one RTMP stream. The demuxer joins them; it does not reconcile them.
+    /// So the items have to agree on codec, geometry, frame rate, time base and
+    /// SPS — and two files that merely look alike are not enough, which is why
+    /// the comparison is a probe of the produced files rather than of intent.
+    ///
+    /// Safe without doing anything when **either**:
+    ///
+    /// * every item is canonical (including legacy files, which all came out of
+    ///   the one canonical encode), or
+    /// * every item is native and their signatures are identical — the common
+    ///   case of one file, or several exports from the same source.
+    ///
+    /// Otherwise the native items are pinned to the canonical profile and
+    /// re-prepared. That is the expensive path, and it now happens only when a
+    /// user actually mixes formats in one playlist rather than for every upload.
+    ///
+    /// Returns how many media were queued for re-preparation.
+    pub fn ensure_playlist_compatible(&self, broadcast_id: &str) -> Result<usize> {
+        let shapes = self.db.playlist_shapes(broadcast_id)?;
+        if shapes.len() < 2 {
+            return Ok(0);
+        }
+        let all_canonical = shapes.iter().all(|(_, mode, _)| mode == "canonical");
+        let first = shapes[0].2.clone();
+        let all_same_native =
+            shapes.iter().all(|(_, mode, sig)| mode == "native" && *sig == first) && first.is_some();
+        if all_canonical || all_same_native {
+            return Ok(0);
+        }
+
+        let mut queued = 0;
+        for (media_id, mode, _) in shapes.iter() {
+            if mode == "canonical" {
+                continue;
+            }
+            println!(
+                "[louver] playlist {}: media {} 를 표준 형식으로 다시 준비합니다 (형식이 섞여 있습니다)",
+                &broadcast_id[..8.min(broadcast_id.len())],
+                &media_id[..8.min(media_id.len())],
+            );
+            self.db.pin_to_canonical(media_id)?;
+            // Back to preparing, so nothing starts a broadcast on a file that is
+            // about to be replaced. `prepared_media_for` refuses anything that
+            // is not ready, which is the gate that already exists.
+            self.db.set_media_state(media_id, crate::MediaState::Preparing)?;
+            let this = self.clone();
+            let id = media_id.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = this.prepare(&id) {
+                    let _ = this.db.record_media_failed(&id, &e.to_string());
+                }
+            });
+            queued += 1;
+        }
+        Ok(queued)
     }
 
     /// What was done, for the log and for §22's costing.
@@ -238,6 +362,16 @@ impl Ingest {
             .query_row("SELECT state FROM media WHERE id=?1", [media_id], |r| r.get::<_, String>(0))
             .map_err(|_| CloudError::NotFound("media"))?;
         Ok(m)
+    }
+}
+
+/// The first reason a stream is being encoded, for the log line. Reasons are
+/// generated by this crate and contain no user content.
+fn reasons_suffix(plan: &TranscodePlan) -> String {
+    let first = plan.video_reasons.first().or_else(|| plan.audio_reasons.first());
+    match first {
+        Some(r) => format!(" reason={r}"),
+        None => String::new(),
     }
 }
 
