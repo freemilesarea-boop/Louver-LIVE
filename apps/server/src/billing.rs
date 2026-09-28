@@ -86,14 +86,27 @@ pub async fn status(State(app): State<App>, Caller(uid): Caller) -> Out<BillingS
     ))
 }
 
-/// Cancel the subscription, and the entitlement with it.
+/// Cancel the subscription, the entitlement, and whatever is on air.
 ///
-/// The provider is asked first and the local writes happen only after it agrees,
-/// so a refused `rebillCancel` leaves the user paying *and* able to broadcast —
-/// the safe way round. See `Payapp::cancel`.
+/// One order, and every part of it matters:
+///
+/// 1. PayApp is asked first. A refused `rebillCancel` returns an error and
+///    nothing local has changed — the account is still paying and still
+///    broadcasting, which is the safe way round. The one state that must never
+///    exist is "PayApp keeps charging and 247streams took everything away".
+/// 2. Only then the entitlement, in one transaction, and only the plan this
+///    record paid for.
+/// 3. Only if that actually revoked something, the account's running broadcasts
+///    are stopped — all of them, and nobody else's. An account on a plan an
+///    operator granted by hand keeps both its plan and its broadcasts.
+/// 4. All of it before the answer, so the browser's next question already sees
+///    미구독, no live broadcasts and a concurrency of zero.
 pub async fn cancel(State(app): State<App>, Caller(uid): Caller) -> Out<louver_cloud::BillingSubscription> {
     let payapp = provider(&app)?;
-    Ok(Json(crate::blocking(move || payapp.cancel(&uid)).await?))
+    // All four steps live in `Payapp::cancel_and_take_off_air`, so this route and
+    // any other caller cannot get the order different from each other.
+    let record = crate::blocking(move || payapp.cancel_and_take_off_air(&uid, &app.mgr)).await?;
+    Ok(Json(record))
 }
 
 /// PayApp's payment notification. §6.

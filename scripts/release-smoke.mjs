@@ -281,7 +281,17 @@ try {
     }
   }
   if (plans.some((p) => p.id === 'none')) fail('미구독 상태가 요금제로 판매되고 있습니다')
-  log('요금제 3종 가격/동시송출 일치 ✓')
+  // The storage ceilings a fresh database seeds, and the invariant that a
+  // per-file limit can never exceed the whole allowance.
+  for (const [id, storage] of Object.entries({ basic: 5, pro: 10, business: 20 })) {
+    const p = plans.find((x) => x.id === id)
+    const gb = p.limits.max_storage_bytes / 1024 ** 3
+    if (gb !== storage) fail(`${id} 저장 한도 ${gb}GB, 기대 ${storage}GB`)
+    if (p.limits.max_upload_bytes > p.limits.max_storage_bytes) {
+      fail(`${id} 한 파일 한도가 전체 한도보다 큽니다`)
+    }
+  }
+  log('요금제 3종 가격/동시송출/저장한도 일치 ✓')
 
   step(5, 'checkout (fake PayApp)')
   const checkout = await post('/api/billing/checkout', { plan_id: 'pro', recvphone: '010-1234-5678' })
@@ -452,11 +462,34 @@ try {
   }
   log('서버를 죽였다 살려도 방송이 돌아옴 ✓, YouTube 는 건드리지 않음 ✓')
 
-  step(14, 'cancel the subscription')
+  step(14, 'cancel the subscription — while a broadcast is on air')
+  // Deliberately not stopped first: the policy is that confirming a
+  // cancellation ends whatever is running.
+  const onAir = (await get(`/api/broadcasts/${bId}`)).json
+  if (onAir.desired_state !== 'running') fail('취소 전에 방송이 돌고 있지 않습니다')
+  google.lifecycle = 'live'
+  const completesBeforeCancel = google.transitions.filter((t) => t === 'complete').length
   const cancelled = await post('/api/billing/cancel')
   if (cancelled.status !== 200) fail(`cancel ${cancelled.status}: ${cancelled.text}`)
   if (cancelled.json.status !== 'cancelled') fail(`상태 ${cancelled.json.status}`)
-  log('해지 ✓')
+
+  // Before the answer came back, everything had to be consistent already.
+  const afterCancel = (await get(`/api/broadcasts/${bId}`)).json
+  if (afterCancel.desired_state !== 'stopped') fail('해지 후에도 방송이 running 입니다')
+  if (afterCancel.runtime_state !== 'STOPPED') fail(`해지 후 runtime=${afterCancel.runtime_state}`)
+  if (google.transitions.filter((t) => t === 'complete').length !== completesBeforeCancel + 1) {
+    fail('해지가 YouTube 방송을 종료하지 않았습니다')
+  }
+  if ((await get('/api/broadcasts')).json.active !== 0) fail('해지 후에도 슬롯이 잡혀 있습니다')
+  log('해지 ✓, 송출 중이던 방송 종료 ✓, YouTube complete ✓')
+
+  // And nothing brings it back.
+  await new Promise((r) => setTimeout(r, 2000))
+  const later = (await get(`/api/broadcasts/${bId}`)).json
+  if (later.desired_state !== 'stopped' || later.runtime_state === 'RUNNING') {
+    fail('해지된 방송이 되살아났습니다')
+  }
+  log('watchdog 이 되살리지 않음 ✓')
 
   step(15, 'entitlement is gone immediately')
   const gone = (await get('/api/me/subscription')).json
@@ -465,7 +498,6 @@ try {
   log('즉시 미구독 ✓')
 
   step(16, 'a cancelled account cannot get back on air')
-  await post(`/api/broadcasts/${bId}/stop`)
   for (const [what, path] of [
     ['start', `/api/broadcasts/${bId}/start`],
     ['restart', `/api/broadcasts/${bId}/restart`],

@@ -549,3 +549,125 @@ fn a_revoked_account_can_be_put_back_on_a_plan() {
     assert_eq!(back.plan_id, "basic");
     assert_eq!(db.limit("u-legacy", MAX_CONCURRENT_STREAMS).unwrap(), 1);
 }
+
+// --- storage ceilings for one 80 GB server --------------------------------
+
+const GB: i64 = 1024 * 1024 * 1024;
+
+#[test]
+fn the_storage_ceilings_fit_the_server_they_run_on() {
+    // One 80 GB disk holds the database, the container's logs, the working
+    // directories and every account's originals *and* prepared copies. The
+    // ceilings have to be numbers that fit that, and the prices and the
+    // concurrency that actually distinguish the plans must not have moved.
+    let db = CloudDb::open_in_memory().unwrap();
+    for (id, storage, upload, price, streams) in [
+        ("basic", 5 * GB, 2 * GB, 19_900, 1),
+        ("pro", 10 * GB, 4 * GB, 39_900, 2),
+        ("business", 20 * GB, 8 * GB, 59_900, 3),
+    ] {
+        let p = db.plan(id).unwrap();
+        assert_eq!(p.limits.get(MAX_STORAGE_BYTES).copied(), Some(storage), "{id} 저장 한도");
+        assert_eq!(p.limits.get(MAX_UPLOAD_BYTES).copied(), Some(upload), "{id} 한 파일 한도");
+        assert_eq!(p.monthly_price_krw, price, "{id} 가격이 바뀌었습니다");
+        assert_eq!(p.max_concurrent_streams(), streams, "{id} 동시 송출이 바뀌었습니다");
+        // A per-file ceiling above the account's whole allowance would be a
+        // limit that can never be the one that fires.
+        assert!(upload <= storage, "{id}: 한 파일 한도가 전체 한도보다 큽니다");
+    }
+    // And the three of them together still fit a single server with room for
+    // the database, the logs and the working directories.
+    let all: i64 = ["basic", "pro", "business"]
+        .iter()
+        .map(|id| db.plan(id).unwrap().limits.get(MAX_STORAGE_BYTES).copied().unwrap_or(0))
+        .sum();
+    assert!(all <= 40 * GB, "세 요금제 합계가 {}GB 입니다", all / GB);
+}
+
+#[test]
+fn a_production_row_keeps_its_old_limits_until_an_operator_applies_the_new_ones() {
+    // The thing the audit found: `seed_plans` leaves `limits` alone on conflict,
+    // because an operator may have raised one for a customer. So changing the
+    // numbers in code changes nothing for a database that already has the rows,
+    // and lowering a ceiling is an explicit operator action.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.db");
+    {
+        let db = CloudDb::open(&path).unwrap();
+        // A row as the previous release left it: 400 GB, and a limit an operator
+        // raised by hand that must survive.
+        db.raw()
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE plans SET limits='{\"max_concurrent_streams\":3,\"max_broadcasts\":99,\
+                  \"max_storage_bytes\":429496729600,\"max_upload_bytes\":34359738368,\
+                  \"scheduling_enabled\":1,\"priority_recovery\":1}' WHERE id='business'",
+                [],
+            )
+            .unwrap();
+    }
+
+    // Re-opening runs the migrations and the seed. Neither may touch it.
+    let db = CloudDb::open(&path).unwrap();
+    let before = db.plan("business").unwrap();
+    assert_eq!(before.limits.get(MAX_STORAGE_BYTES).copied(), Some(400 * GB), "부팅이 한도를 바꿨습니다");
+
+    // The read-only audit says what would change, and nothing else.
+    let audit = db.storage_audit().unwrap();
+    let business = audit.iter().find(|a| a.plan_id == "business").unwrap();
+    assert_eq!(business.storage_now, 400 * GB);
+    assert_eq!(business.storage_target, 20 * GB);
+    assert_eq!(business.monthly_price_krw, 59_900);
+    assert_eq!(business.concurrent_streams, 3);
+    assert_eq!(db.plan("business").unwrap().limits.get(MAX_STORAGE_BYTES).copied(), Some(400 * GB));
+
+    // Applying changes exactly the two storage keys.
+    let changed = db.apply_seed_storage_limits().unwrap();
+    assert!(changed.contains(&"business".to_string()), "{changed:?}");
+    let after = db.plan("business").unwrap();
+    assert_eq!(after.limits.get(MAX_STORAGE_BYTES).copied(), Some(20 * GB));
+    assert_eq!(after.limits.get(MAX_UPLOAD_BYTES).copied(), Some(8 * GB));
+    assert_eq!(after.monthly_price_krw, 59_900, "가격이 바뀌었습니다");
+    assert_eq!(after.max_concurrent_streams(), 3, "동시 송출이 바뀌었습니다");
+    assert_eq!(
+        after.limits.get(MAX_BROADCASTS).copied(),
+        Some(99),
+        "운영자가 올려 둔 다른 한도가 사라졌습니다",
+    );
+    assert_eq!(after.limits.get("priority_recovery").copied(), Some(1));
+
+    // Idempotent: running it again changes nothing.
+    assert!(db.apply_seed_storage_limits().unwrap().is_empty());
+}
+
+#[test]
+fn an_account_over_the_new_ceiling_keeps_everything_and_can_still_broadcast() {
+    // Lowering a ceiling must not delete a file or take anybody off air. The
+    // only thing it does is refuse the next upload.
+    let db = CloudDb::open_in_memory().unwrap();
+    let (uid, b) = user_with_broadcasts(&db, "full@x.com", "basic", 1);
+    // 6 GB stored on a plan that now allows 5.
+    let m = db.create_media(&uid, "big.mp4", 6 * GB, "key/big.mp4").unwrap();
+    db.record_media_prepared(&m.id, "key/big-prepared.mp4", 3600.0, 6 * GB).unwrap();
+    assert!(db.storage_used(&uid).unwrap() > 5 * GB);
+
+    // The next upload is refused, in words that say what to do.
+    match db.check_upload_allowed(&uid, 1024) {
+        Err(CloudError::LimitReached { limit, .. }) => {
+            assert_eq!(limit, MAX_STORAGE_BYTES);
+            let said = CloudError::LimitReached { limit, used: 6 * GB, allowed: 5 * GB }.to_string();
+            assert!(said.contains("저장 공간이 부족합니다"), "{said}");
+            assert!(said.contains("삭제"), "{said}");
+            assert!(!said.contains("max_storage_bytes"), "데이터베이스 키가 사용자에게 보입니다: {said}");
+        }
+        other => panic!("an over-quota upload was allowed: {other:?}"),
+    }
+
+    // Everything they have is still there, and still playable.
+    assert_eq!(db.media_for(&uid).unwrap().len(), 2);
+    assert!(!db.prepared_items_for(&b[0]).unwrap().is_empty());
+    // And they can still go on air: storage has nothing to do with broadcasting.
+    db.claim_stream_slot(&uid, &b[0]).expect("an over-quota account was refused a broadcast");
+    assert_eq!(db.active_stream_count(&uid).unwrap(), 1);
+}

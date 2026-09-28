@@ -441,7 +441,9 @@ describe("the media library", () => {
       uploadMedia: vi
         .fn()
         .mockRejectedValue(
-          new Error("max_upload_bytes 한도를 초과했습니다 (4096/64)"),
+          // Exactly what the server sends for this refusal, so the test breaks
+          // if the wording there changes.
+          new Error("파일이 너무 큽니다 (4.0GB / 한 파일 최대 2.0GB)."),
         ),
     });
 
@@ -452,7 +454,7 @@ describe("the media library", () => {
     );
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
-      "max_upload_bytes 한도를 초과했습니다",
+      "파일이 너무 큽니다",
     );
   });
 });

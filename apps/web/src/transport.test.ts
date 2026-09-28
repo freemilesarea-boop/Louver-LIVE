@@ -107,7 +107,7 @@ describe('WebTransport', () => {
       send() {
         this.upload.onprogress?.({ lengthComputable: true, loaded: 5, total: 10 } as ProgressEvent)
         this.status = 402
-        this.responseText = JSON.stringify({ error: 'max_upload_bytes 한도를 초과했습니다 (4096/64)' })
+        this.responseText = JSON.stringify({ error: '파일이 너무 큽니다 (4.0GB / 한 파일 최대 2.0GB).' })
         this.onload?.()
       }
     }

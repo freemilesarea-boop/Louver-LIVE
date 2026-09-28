@@ -18,6 +18,7 @@ YouTube 는 [YOUTUBE_OAUTH.md](YOUTUBE_OAUTH.md) 를 보세요.
 | 최근 로그 | `docker compose logs --tail 200 louver` |
 | 누가 어떤 요금제인지 | `docker compose exec louver louver-server --audit-plans` |
 | 해지했는데 권한이 남은 계정 | `docker compose exec louver louver-server --audit-billing` |
+| 요금제 저장 한도와 계정별 사용량 | `docker compose exec louver louver-server --audit-storage` |
 
 `/health` 의 `checks` 는 전부 `true` 여야 합니다. 하나라도 `false` 면 HTTP 503 이
 나오고, `status` 는 `degraded` 입니다.
@@ -172,7 +173,23 @@ docker compose exec louver louver-server --audit-billing --fix --yes  # 회수
 `--fix` 는 위에 출력된 계정만 건드립니다. 부팅 migration 이 요금제를 자동으로
 바꾸는 일은 없습니다.
 
-### 4-4. 새 계정이 Basic 으로 보인다
+### 4-4. 저장 한도를 새 값으로 맞춘다
+
+베타 한도는 Basic 5GB / Pro 10GB / Business 20GB 입니다. 기존 production 행은
+부팅으로 바뀌지 않으므로(운영자가 올려 둔 한도를 되돌리지 않기 위해) 직접
+적용해야 합니다.
+
+```bash
+docker compose exec louver louver-server --audit-storage               # 읽기만
+docker compose exec louver louver-server --audit-storage --apply --yes
+```
+
+`--apply` 는 `max_storage_bytes` 와 `max_upload_bytes` 만 씁니다. 월요금과 동시
+송출 수는 이 명령으로 바뀌지 않습니다. **파일은 하나도 지우지 않고 방송도 끊지
+않습니다.** 새 한도를 이미 넘은 계정은 가진 것을 그대로 유지하고 방송도 계속하며,
+영상을 지울 때까지 추가 업로드만 거부됩니다.
+
+### 4-5. 새 계정이 Basic 으로 보인다
 
 ```bash
 docker compose exec louver louver-server --audit-plans
@@ -191,7 +208,9 @@ docker compose exec louver louver-server --audit-plans --revoke-unpaid-grants --
 | 방송이 `재연결 중` 을 반복 | 스트림 키가 틀렸거나 YouTube 가 받지 않음 | `--diagnose` 의 FFmpeg 로그 줄 |
 | 결제했는데 요금제가 안 붙음 | `feedbackurl` 이 서버에 닿지 않음 | [PAYAPP.md](PAYAPP.md) 11번 |
 | YouTube 연결이 끊김 | refresh token 이 철회됨 | 수강생이 다시 연결 |
-| 업로드가 507 | 디스크 여유 5GB 미만 | **3번** |
+| 업로드가 507 | 서버 디스크 여유 5GB 미만 | **3번** |
+| 업로드가 402 "저장 공간이 부족합니다" | 그 계정이 요금제 한도를 넘음 | 영상 삭제 안내. 파일은 지워지지 않았습니다 |
+| 해지했는데 방송이 계속 나간다 | 해지가 실패했을 가능성 | `--audit-billing` 과 로그. 해지 성공 시에는 방송도 즉시 종료됩니다 |
 | 로그인이 429 | 한 IP 에서 1분에 10회 초과 | 1분 기다리면 풀립니다 |
 
 ---

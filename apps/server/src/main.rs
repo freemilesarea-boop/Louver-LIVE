@@ -292,6 +292,119 @@ fn audit_billing(args: &[String]) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// `--audit-storage [--apply --yes]`
+///
+/// The storage ceilings that ship in this build, against the ones the database
+/// is actually using, plus who is storing how much.
+///
+/// It exists because `seed_plans` leaves a plan's `limits` alone on conflict —
+/// an operator may have raised one for a customer and a restart must not undo
+/// that — so editing `SEED_PLANS` changes nothing for a database whose rows are
+/// already there. Lowering a ceiling can put an existing account over it, so
+/// somebody has to read the list first and then say so.
+///
+/// `--apply` writes only `max_storage_bytes` and `max_upload_bytes`. The price
+/// column is not in the statement; `max_concurrent_streams` and `max_broadcasts`
+/// are read back from the row and written unchanged. **No file is ever deleted**
+/// and no account is put off air: an account over the new ceiling keeps
+/// everything it has, keeps broadcasting, and is refused its next upload.
+fn audit_storage(args: &[String]) -> std::process::ExitCode {
+    let data = std::path::PathBuf::from(
+        std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()),
+    );
+    let db = match louver_cloud::CloudDb::open(&data.join("cloud.db")) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[louver] 데이터베이스를 열 수 없습니다 ({}): {e}", data.display());
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let plans = match db.storage_audit() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[louver] 요금제를 읽을 수 없습니다: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let gb = |b: i64| format!("{:.0}GB", b as f64 / 1_073_741_824.0);
+
+    println!(
+        "{:<10} {:>9} {:>6}  {:>16}  {:>16}",
+        "plan", "월요금", "동시", "저장(현재→변경)", "한파일(현재→변경)"
+    );
+    let mut pending = 0;
+    for p in &plans {
+        let moves = p.storage_now != p.storage_target || p.upload_now != p.upload_target;
+        if moves {
+            pending += 1;
+        }
+        println!(
+            "{:<10} {:>9} {:>6}  {:>7} → {:<6}  {:>7} → {:<6}{}",
+            p.plan_id,
+            p.monthly_price_krw,
+            p.concurrent_streams,
+            gb(p.storage_now),
+            gb(p.storage_target),
+            gb(p.upload_now),
+            gb(p.upload_target),
+            if moves { "  ← 변경됨" } else { "" }
+        );
+    }
+    println!("\n월요금과 동시 송출 수는 이 명령으로 바뀌지 않습니다.");
+
+    match db.storage_usage() {
+        Ok(rows) => {
+            let over: Vec<_> = rows.iter().filter(|r| r.over()).collect();
+            println!("\n계정 {}개, 변경 후 한도를 넘는 계정 {}개", rows.len(), over.len());
+            for r in rows.iter().filter(|r| r.used_bytes > 0) {
+                println!(
+                    "  {:<34} {:<10} 사용 {:>7} / 한도 {:<7}{}",
+                    r.email,
+                    r.plan_id,
+                    gb(r.used_bytes),
+                    gb(r.ceiling_after),
+                    if r.over() { "  ← 추가 업로드만 차단됨 (파일은 그대로)" } else { "" }
+                );
+            }
+            if !over.is_empty() {
+                println!("\n한도를 넘는 계정의 파일은 삭제되지 않습니다. 방송도 계속됩니다.");
+                println!("추가 업로드만 거부되며, 영상을 지우면 다시 올릴 수 있습니다.");
+            }
+        }
+        Err(e) => eprintln!("[louver] 사용량을 읽을 수 없습니다: {e}"),
+    }
+
+    if pending == 0 {
+        println!("\n요금제 한도는 이미 이 버전과 같습니다. 조치할 것이 없습니다.");
+        return std::process::ExitCode::SUCCESS;
+    }
+    let apply = args.iter().any(|a| a == "--apply");
+    let confirmed = args.iter().any(|a| a == "--yes");
+    if !apply {
+        println!("\n위 한도를 적용하려면:");
+        println!("  louver-server --audit-storage --apply --yes");
+        return std::process::ExitCode::SUCCESS;
+    }
+    if !confirmed {
+        eprintln!("[louver] 요금제 {pending}개의 저장 한도를 변경합니다. 확인했다면 --yes 를 함께 주세요.");
+        return std::process::ExitCode::FAILURE;
+    }
+    match db.apply_seed_storage_limits() {
+        Ok(changed) => {
+            println!(
+                "[louver] 요금제 {}개의 저장 한도를 적용했습니다: {}",
+                changed.len(),
+                changed.join(", ")
+            );
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[louver] 한도를 적용하지 못했습니다: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 fn value_of(args: &[String], flag: &str) -> Option<String> {
     let i = args.iter().position(|a| a == flag)?;
     args.get(i + 1).filter(|v| !v.starts_with("--")).cloned()
@@ -328,6 +441,10 @@ async fn main() -> std::process::ExitCode {
     // Who is on which plan, and how they got there.
     if args.iter().any(|a| a == "--audit-plans") {
         return audit_plans(&args);
+    }
+    // What the storage ceilings are, and what this build would set them to.
+    if args.iter().any(|a| a == "--audit-storage") {
+        return audit_storage(&args);
     }
     // Cancelled at the provider, but still holding the plan here.
     if args.iter().any(|a| a == "--audit-billing") {

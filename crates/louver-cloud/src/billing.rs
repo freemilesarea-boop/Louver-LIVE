@@ -311,6 +311,20 @@ impl Clone for Payapp {
     }
 }
 
+/// What a cancellation did.
+///
+/// `entitlement_revoked` is the difference between "this account is no longer
+/// paying" and "this account no longer has a paid plan". They come apart when
+/// the account is on a plan an operator granted by hand: the recurring payment
+/// still stops, and the plan is not PayApp's to take away. Everything that
+/// follows a cancellation — taking broadcasts off air, above all — hangs off
+/// this flag rather than off the fact that the provider said yes.
+#[derive(Debug, Clone)]
+pub struct Cancellation {
+    pub record: BillingSubscription,
+    pub entitlement_revoked: bool,
+}
+
 impl Payapp {
     pub fn new(db: CloudDb, http: Arc<dyn FormPost>, config: Config) -> Self {
         Self { db, http, config }
@@ -422,7 +436,7 @@ impl Payapp {
     /// period is not honoured past the cancellation, which is the service policy.
     /// `current_period_end` is still written by the payment notification, but no
     /// entitlement decision reads it.
-    pub fn cancel(&self, user_id: &str) -> Result<BillingSubscription> {
+    pub fn cancel(&self, user_id: &str) -> Result<Cancellation> {
         // 1. The record has to be this user's own; `live_billing_subscription`
         //    only ever looks inside one account, so another user's billing id
         //    cannot be reached from here at all.
@@ -450,7 +464,46 @@ impl Payapp {
         if revoked {
             eprintln!("[louver] payapp: 정기결제를 해지하고 유료 권한을 회수했습니다");
         }
-        Ok(updated)
+        // 6. The caller finishes the job: a revoked entitlement means the
+        //    account's running broadcasts have to come off air too, and the
+        //    workers belong to the manager rather than here. `entitlement_revoked`
+        //    is what says whether there is anything to take off air — a
+        //    cancellation that revoked nothing must not stop anything.
+        Ok(Cancellation { record: updated, entitlement_revoked: revoked })
+    }
+
+    /// The whole of a cancellation, including taking the account off air.
+    ///
+    /// One function because the order is the policy, and an order that lives in
+    /// two callers is an order that will differ in one of them:
+    ///
+    /// 1. `rebillCancel`. A refusal returns here and **nothing local has
+    ///    changed** — still paying, still broadcasting.
+    /// 2. The record and the entitlement, in one transaction, for the plan this
+    ///    record paid for and no other.
+    /// 3. Only if step 2 actually revoked something, every broadcast that
+    ///    account has running is stopped as a deliberate final stop: intent to
+    ///    `stopped` so no watchdog and no boot revives it, and YouTube told the
+    ///    broadcast is over. An account whose plan an operator granted by hand
+    ///    keeps both the plan and the broadcast.
+    ///
+    /// Stopping is best effort per broadcast and cannot fail the cancellation:
+    /// the money side is already settled at the provider, and a broadcast that
+    /// resists stopping has `desired_state = stopped` written before the worker
+    /// is asked, so its own next tick ends it.
+    pub fn cancel_and_take_off_air(
+        &self,
+        user_id: &str,
+        mgr: &crate::manager::BroadcastManager,
+    ) -> Result<BillingSubscription> {
+        let done = self.cancel(user_id)?;
+        if done.entitlement_revoked {
+            let stopped = mgr.stop_all_for(user_id, crate::manager::StopReason::SubscriptionCancelled);
+            if !stopped.is_empty() {
+                println!("[louver] 해지: 실행 중이던 방송 {}개를 종료했습니다", stopped.len());
+            }
+        }
+        Ok(done.record)
     }
 
     /// One PayApp request, with the reply turned into something safe.

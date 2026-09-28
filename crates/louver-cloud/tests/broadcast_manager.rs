@@ -461,9 +461,53 @@ struct YtHarness {
     fleet: Arc<Fleet>,
     api: Arc<FakeGoogle>,
     keys: Arc<dyn SecretStore>,
+    pay: louver_cloud::billing::Payapp,
+    payapi: Arc<FakePayapp>,
     user: String,
     id: String,
+    account: String,
 }
+
+/// A PayApp that agrees unless a test scripts a refusal.
+#[derive(Debug, Default)]
+struct FakePayapp {
+    calls: Mutex<Vec<String>>,
+    replies: Mutex<Vec<String>>,
+}
+
+impl FakePayapp {
+    fn refuse_next(&self) {
+        self.replies.lock().unwrap().push("state=0&errno=00009".into());
+    }
+    fn cancels(&self) -> usize {
+        self.calls.lock().unwrap().iter().filter(|c| c.contains("rebillCancel")).count()
+    }
+}
+
+impl louver_cloud::billing::FormPost for FakePayapp {
+    fn post_form(&self, _url: &str, fields: &[(&str, &str)]) -> louver_cloud::Result<String> {
+        let cmd = fields.iter().find(|(k, _)| *k == "cmd").map(|(_, v)| *v).unwrap_or("");
+        self.calls.lock().unwrap().push(cmd.to_string());
+        let scripted = {
+            let mut r = self.replies.lock().unwrap();
+            if r.is_empty() {
+                None
+            } else {
+                Some(r.remove(0))
+            }
+        };
+        Ok(scripted.unwrap_or_else(|| match cmd {
+            "rebillRegist" => {
+                "state=1&errno=00000&rebill_no=CAN1&payurl=https%3A%2F%2Fpayapp.kr%2Fp%2F1".into()
+            }
+            _ => "state=1&errno=00000".to_string(),
+        }))
+    }
+}
+
+const PAY_USERID: &str = "247streams";
+const PAY_LINKKEY: &str = "cancel-test-link-key";
+const PAY_LINKVAL: &str = "cancel-test-link-val";
 
 /// A connected account with a provisioned, YouTube-backed broadcast: exactly
 /// what a user who pressed "YouTube로 방송 만들기" ends up with.
@@ -518,10 +562,61 @@ fn youtube_harness() -> YtHarness {
     let b = db.create_broadcast(&user, "밤 라디오", &m.id, &dest.id, true).unwrap();
     yt.provision(&user, &b.id, &account).unwrap();
 
-    YtHarness { dir, db, mgr, fleet, api, keys, user, id: b.id }
+    let payapi = Arc::new(FakePayapp::default());
+    let pay = louver_cloud::billing::Payapp::new(
+        db.clone(),
+        Arc::clone(&payapi) as Arc<dyn louver_cloud::billing::FormPost>,
+        louver_cloud::billing::Config {
+            userid: PAY_USERID.into(),
+            linkkey: PAY_LINKKEY.into(),
+            linkval: PAY_LINKVAL.into(),
+            api_url: "https://fake.payapp.test/oapi/apiLoad.html".into(),
+            public_url: "https://247streams.kr".into(),
+        },
+    );
+
+    YtHarness { dir, db, mgr, fleet, api, keys, pay, payapi, user, id: b.id, account }
 }
 
 impl YtHarness {
+    /// Pay for a plan the way an account does: register the recurring payment,
+    /// then a verified notification. Nothing else grants an entitlement.
+    fn subscribe(&self, plan: &str, price: &str) {
+        let order = self.pay.checkout(&self.user, plan, "01012345678").unwrap();
+        let feedback: std::collections::BTreeMap<String, String> = [
+            ("userid", PAY_USERID),
+            ("linkkey", PAY_LINKKEY),
+            ("linkval", PAY_LINKVAL),
+            ("price", price),
+            ("pay_state", "4"),
+            ("pay_date", "2026-09-28 12:00:05"),
+            ("pay_type", "card"),
+            ("mul_no", "880001"),
+            ("rebill_no", "CAN1"),
+            ("var1", &order.billing_id),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        assert!(self.pay.handle_feedback(&feedback).is_accepted(), "the payment was not accepted");
+        assert!(self.db.subscription(&self.user).unwrap().active);
+    }
+
+    /// A second broadcast on the same channel, so "all of them" can be tested.
+    fn another(&self, name: &str) -> String {
+        use louver_cloud::storage::Storage;
+        let store = LocalStorage::new(self.dir.path().join("media"));
+        let src = self.dir.path().join(format!("{name}.mp4"));
+        std::fs::write(&src, b"prepared video bytes").unwrap();
+        let key = store.put_file(&self.user, &format!("{name}.mp4"), &src).unwrap();
+        let m = self.db.create_media(&self.user, &format!("{name}.mp4"), 20, &key).unwrap();
+        self.db.record_media_prepared(&m.id, &key, 2.0, 20).unwrap();
+        let dest = self.db.reserve_youtube_destination(&self.user, &self.account).unwrap();
+        let b = self.db.create_broadcast(&self.user, name, &m.id, &dest.id, true).unwrap();
+        self.mgr.youtube().unwrap().provision(&self.user, &b.id, &self.account).unwrap();
+        b.id
+    }
+
     fn link(&self) -> louver_cloud::youtube::YoutubeLink {
         self.db.broadcast_owned(&self.user, &self.id).unwrap().youtube
     }
@@ -679,5 +774,193 @@ fn a_single_pass_playlist_ends_on_youtube_too() {
     assert_eq!(row.youtube.status.as_deref(), Some("complete"));
     assert_eq!(h.db.active_stream_count(&h.user).unwrap(), 0, "the slot was not given back");
     let _ = &h.dir;
+    h.mgr.shutdown();
+}
+
+// --- cancelling a subscription takes the account off air -------------------
+//
+// The policy: confirming a cancellation revokes the paid features *and* ends
+// whatever is on air. The order is what makes it safe — PayApp first, so a
+// refusal leaves the account paying and broadcasting rather than paying for
+// nothing.
+
+#[test]
+fn cancelling_stops_the_stream_that_was_on_air() {
+    // A, B, C, H together: the worker is gone, the intent is stopped, YouTube
+    // is complete, and the plan is back to nothing.
+    let h = youtube_harness();
+    h.subscribe("pro", "39900");
+    h.mgr.start(&h.user, &h.id).unwrap();
+    eventually("launched", || h.fleet.launches(&h.id) == 1);
+    h.go_live();
+
+    let record = h.pay.cancel_and_take_off_air(&h.user, &h.mgr).unwrap();
+    assert_eq!(record.status, louver_cloud::BillingStatus::Cancelled);
+    assert_eq!(h.payapi.cancels(), 1, "PayApp was not asked, or was asked twice");
+
+    // A: no worker left, and the process was asked to go.
+    assert!(!h.mgr.running_ids().contains(&h.id), "a worker outlived the cancellation");
+    assert!(!h.fleet.is_alive(&h.id), "FFmpeg is still publishing");
+    // B: the stored intent.
+    let row = h.db.broadcast_owned(&h.user, &h.id).unwrap();
+    assert_eq!(row.desired_state, louver_cloud::DesiredState::Stopped);
+    assert_eq!(row.runtime_state, RuntimeState::Stopped);
+    // C: YouTube's side is finished.
+    assert_eq!(h.api.completions(), 1, "YouTube was left holding a live broadcast");
+    assert_eq!(h.link().status.as_deref(), Some("complete"));
+    // H: nothing left to run on.
+    let sub = h.db.subscription(&h.user).unwrap();
+    assert!(!sub.active);
+    assert_eq!(h.db.limit(&h.user, louver_cloud::entitlement::MAX_CONCURRENT_STREAMS).unwrap(), 0);
+    assert_eq!(h.db.active_stream_count(&h.user).unwrap(), 0, "a slot is still held");
+    // And the log says why, where the user reads it.
+    let events = h.db.events_for(&h.id, 50).unwrap();
+    assert!(
+        events.iter().any(|e| e.message.contains("구독이 해지되어 방송을 종료했습니다")),
+        "{:?}",
+        events.iter().map(|e| &e.message).collect::<Vec<_>>()
+    );
+    h.mgr.shutdown();
+}
+
+#[test]
+fn nothing_revives_a_broadcast_the_cancellation_stopped() {
+    // D. Two layers have to hold: the supervisor inside the worker (which is
+    // gone, and its `desired_state` says stopped anyway) and the boot recovery
+    // (which reads that intent *and* asks about the subscription).
+    let h = youtube_harness();
+    h.subscribe("pro", "39900");
+    h.mgr.start(&h.user, &h.id).unwrap();
+    eventually("launched", || h.fleet.launches(&h.id) == 1);
+    h.go_live();
+    h.pay.cancel_and_take_off_air(&h.user, &h.mgr).unwrap();
+    let launches = h.fleet.launches(&h.id);
+
+    // Give every watchdog its chance.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    assert_eq!(h.fleet.launches(&h.id), launches, "something relaunched a cancelled broadcast");
+    // And a boot does not either.
+    assert_eq!(h.mgr.recover_all().unwrap(), 0);
+    assert_eq!(h.fleet.launches(&h.id), launches);
+    h.mgr.shutdown();
+}
+
+#[test]
+fn cancelling_stops_every_one_of_that_accounts_streams() {
+    // E. Pro allows two; both have to come off.
+    let h = youtube_harness();
+    h.subscribe("pro", "39900");
+    let second = h.another("두 번째");
+    h.mgr.start(&h.user, &h.id).unwrap();
+    h.mgr.start(&h.user, &second).unwrap();
+    eventually("both launched", || h.fleet.launches(&h.id) == 1 && h.fleet.launches(&second) == 1);
+    h.go_live();
+
+    h.pay.cancel_and_take_off_air(&h.user, &h.mgr).unwrap();
+
+    for id in [&h.id, &second] {
+        assert!(!h.mgr.running_ids().contains(id), "{id} is still running");
+        assert_eq!(
+            h.db.broadcast_owned(&h.user, id).unwrap().desired_state,
+            louver_cloud::DesiredState::Stopped,
+            "{id} still wants to run",
+        );
+    }
+    assert_eq!(h.db.active_stream_count(&h.user).unwrap(), 0);
+    h.mgr.shutdown();
+}
+
+#[test]
+fn one_accounts_cancellation_leaves_another_accounts_stream_alone() {
+    // F. The query is scoped to one user id, so there is no argument that
+    // reaches somebody else's broadcast — but that is exactly the kind of claim
+    // that has to be checked rather than asserted in a comment.
+    let h = youtube_harness();
+    h.subscribe("pro", "39900");
+
+    let other = h.db.create_user("other@example.com", "hash", "business").unwrap().id;
+    let store = LocalStorage::new(h.dir.path().join("media"));
+    let src = h.dir.path().join("other.mp4");
+    std::fs::write(&src, b"prepared video bytes").unwrap();
+    let key = {
+        use louver_cloud::storage::Storage;
+        store.put_file(&other, "other.mp4", &src).unwrap()
+    };
+    let m = h.db.create_media(&other, "other.mp4", 20, &key).unwrap();
+    h.db.record_media_prepared(&m.id, &key, 2.0, 20).unwrap();
+    let dest = h.db.create_destination(&other, "남의 채널", "rtmps://a/live2", "••••").unwrap();
+    h.keys.set(&louver_cloud::credentials::destination_account(&dest.id), "aaaa-bbbb-cccc-dddd").unwrap();
+    let theirs = h.db.create_broadcast(&other, "남의 방송", &m.id, &dest.id, true).unwrap().id;
+
+    h.mgr.start(&h.user, &h.id).unwrap();
+    h.mgr.start(&other, &theirs).unwrap();
+    eventually("both launched", || h.fleet.launches(&h.id) == 1 && h.fleet.launches(&theirs) == 1);
+    h.go_live();
+
+    h.pay.cancel_and_take_off_air(&h.user, &h.mgr).unwrap();
+
+    assert!(h.mgr.running_ids().contains(&theirs), "another account's broadcast was stopped");
+    assert!(h.fleet.is_alive(&theirs), "another account's FFmpeg was killed");
+    assert_eq!(
+        h.db.broadcast_owned(&other, &theirs).unwrap().desired_state,
+        louver_cloud::DesiredState::Running,
+    );
+    assert!(h.db.subscription(&other).unwrap().active, "another account lost its plan");
+    h.mgr.shutdown();
+}
+
+#[test]
+fn a_refused_cancellation_leaves_the_stream_running() {
+    // G, and the reason for the order. If the broadcast were stopped first and
+    // PayApp then refused, the account would keep being charged with nothing on
+    // air — the one outcome this whole design exists to prevent.
+    let h = youtube_harness();
+    h.subscribe("pro", "39900");
+    h.mgr.start(&h.user, &h.id).unwrap();
+    eventually("launched", || h.fleet.launches(&h.id) == 1);
+    h.go_live();
+
+    h.payapi.refuse_next();
+    let refused = h.pay.cancel_and_take_off_air(&h.user, &h.mgr).expect_err("a refusal reported success");
+    let said = refused.to_string();
+    assert!(!said.contains(PAY_LINKKEY) && !said.contains(PAY_LINKVAL), "{said}");
+
+    assert!(h.mgr.running_ids().contains(&h.id), "a refused cancellation took the broadcast off air");
+    assert!(h.fleet.is_alive(&h.id));
+    assert_eq!(
+        h.db.broadcast_owned(&h.user, &h.id).unwrap().desired_state,
+        louver_cloud::DesiredState::Running,
+    );
+    assert!(h.db.subscription(&h.user).unwrap().active, "the entitlement was taken on a refusal");
+    assert_eq!(h.api.completions(), 0, "YouTube was ended on a refused cancellation");
+
+    // Retryable, and the retry does everything.
+    h.pay.cancel_and_take_off_air(&h.user, &h.mgr).unwrap();
+    assert!(!h.mgr.running_ids().contains(&h.id));
+    assert_eq!(h.api.completions(), 1);
+    h.mgr.shutdown();
+}
+
+#[test]
+fn a_hand_granted_plan_keeps_both_the_plan_and_the_broadcast() {
+    // The operator's Business account, which has no billing record of its own.
+    // A cancellation that revokes nothing must take nothing off air — otherwise
+    // cancelling a leftover Basic registration would end an operator's stream.
+    let h = youtube_harness();
+    h.subscribe("basic", "19900");
+    // An operator lifts this account to Business by hand, outside PayApp.
+    h.db.activate_subscription(&h.user, "business").unwrap();
+    h.mgr.start(&h.user, &h.id).unwrap();
+    eventually("launched", || h.fleet.launches(&h.id) == 1);
+    h.go_live();
+
+    h.pay.cancel_and_take_off_air(&h.user, &h.mgr).unwrap();
+
+    assert_eq!(h.payapi.cancels(), 1, "the recurring payment must still stop");
+    let sub = h.db.subscription(&h.user).unwrap();
+    assert!(sub.active, "a hand-granted plan is not PayApp's to take away");
+    assert_eq!(sub.plan_id, "business");
+    assert!(h.mgr.running_ids().contains(&h.id), "a broadcast was stopped for a plan nobody revoked");
+    assert_eq!(h.api.completions(), 0);
     h.mgr.shutdown();
 }

@@ -24,6 +24,30 @@ pub use db::CloudDb;
 pub use models::*;
 pub use storage::Storage;
 
+/// A limit, in words a user can act on.
+///
+/// The default used to be `max_storage_bytes 한도를 초과했습니다
+/// (5368709120/5368709120)` — a database key and two byte counts. Storage is
+/// the limit a beta student is most likely to meet, so it says what to do about
+/// it instead.
+fn limit_message(limit: &str, used: i64, allowed: i64) -> String {
+    let gb = |b: i64| format!("{:.1}GB", b as f64 / 1_073_741_824.0);
+    match limit {
+        entitlement::MAX_STORAGE_BYTES => format!(
+            "저장 공간이 부족합니다 (사용 {} / 한도 {}). 사용하지 않는 영상을 삭제한 뒤 다시 올려주세요.",
+            gb(used),
+            gb(allowed)
+        ),
+        entitlement::MAX_UPLOAD_BYTES => {
+            format!("파일이 너무 큽니다 ({} / 한 파일 최대 {}).", gb(used), gb(allowed))
+        }
+        entitlement::MAX_BROADCASTS => {
+            format!("이 요금제에서는 방송을 {allowed}개까지 만들 수 있습니다.")
+        }
+        other => format!("{other} 한도를 초과했습니다 ({used}/{allowed})"),
+    }
+}
+
 /// Anything that can go wrong at the cloud layer.
 ///
 /// Deliberately separate from [`louver_core::error::LouverError`]: that enum is
@@ -37,7 +61,7 @@ pub enum CloudError {
     Forbidden,
     #[error("{0}")]
     Invalid(String),
-    #[error("{limit} 한도를 초과했습니다 ({used}/{allowed})")]
+    #[error("{}", limit_message(limit, *used, *allowed))]
     LimitReached { limit: &'static str, used: i64, allowed: i64 },
     /// The concurrency ceiling, which is the entitlement that distinguishes the
     /// paid plans and therefore the one a user meets most often. Separate from

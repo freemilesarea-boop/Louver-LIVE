@@ -540,8 +540,9 @@ fn cancelling_stops_the_next_charge_and_takes_the_entitlement_back_at_once() {
     assert!(e.db.subscription(&e.user).unwrap().active);
 
     let after = e.pay.cancel(&e.user).unwrap();
-    assert_eq!(after.status, BillingStatus::Cancelled);
-    assert!(after.cancelled_at.is_some());
+    assert_eq!(after.record.status, BillingStatus::Cancelled);
+    assert!(after.record.cancelled_at.is_some());
+    assert!(after.entitlement_revoked, "the cancellation did not report taking the plan back");
 
     // The request is exactly the four fields the documentation lists, and no
     // linkval.
@@ -649,7 +650,7 @@ fn cancelling_twice_leaves_one_cancellation() {
     assert_eq!(cancels, 1, "PayApp is not asked twice");
     let record = e.billing();
     assert_eq!(record.status, BillingStatus::Cancelled);
-    assert_eq!(record.cancelled_at, first.cancelled_at, "the cancellation time is not rewritten");
+    assert_eq!(record.cancelled_at, first.record.cancelled_at, "the cancellation time is not rewritten");
     assert_eq!(e.db.billing_subscriptions_for(&e.user).unwrap().len(), 1);
     assert!(!e.db.subscription(&e.user).unwrap().active);
 }
@@ -774,7 +775,8 @@ fn cancelling_a_registration_that_was_never_paid_ends_it_outright() {
     e.pay.checkout(&e.user, "pro", "01012345678").unwrap();
 
     let after = e.pay.cancel(&e.user).unwrap();
-    assert_eq!(after.status, BillingStatus::Cancelled, "there is no paid period to keep");
+    assert_eq!(after.record.status, BillingStatus::Cancelled, "there is no paid period to keep");
+    assert!(!after.entitlement_revoked, "a registration that never paid had nothing to revoke");
     assert!(!e.db.subscription(&e.user).unwrap().active);
     // And the user may start again.
     assert!(e.pay.checkout(&e.user, "basic", "01012345678").is_ok());

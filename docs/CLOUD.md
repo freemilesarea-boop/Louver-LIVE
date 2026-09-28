@@ -137,6 +137,28 @@ may run at once.
 
 Prices are whole won in an `INTEGER` column. Money is never a float.
 
+### Storage ceilings and the one server
+
+Basic 5GB / Pro 10GB / Business 20GB, against a single 80 GB disk that also holds
+the database, the container's logs and every broadcast's working directory. The
+per-file ceilings (2/4/8GB) are deliberately below the account's whole allowance.
+
+`seed_plans` does **not** overwrite a plan's `limits` on conflict — an operator
+may have raised one for a customer — so changing these numbers in code changes
+nothing for a database whose rows already exist. Lowering a ceiling is an
+explicit operator action:
+
+```bash
+louver-server --audit-storage              # read-only: now → target, and who is over
+louver-server --audit-storage --apply --yes
+```
+
+`--apply` writes only `max_storage_bytes` and `max_upload_bytes`, reading the
+row's other limits back and writing them unchanged; the price column is not in
+the statement. **No file is deleted and nobody is taken off air.** An account
+already over the new ceiling keeps everything it has, keeps broadcasting, and is
+refused its next upload until it deletes something.
+
 ### Where the numbers live
 
 `plans` rows, and nowhere else. `GET /api/plans` serves them, the pricing page
@@ -229,8 +251,13 @@ order id, amount and `rebill_no` against what we stored, and only for
 the return URL grants nothing; there is still no route a browser can reach that
 changes a plan.
 
-Cancelling stops the next charge **and takes the paid features back at once** —
-the remainder of the paid month is not honoured, which is the service policy. The
+Cancelling stops the next charge, **takes the paid features back at once and ends
+whatever that account has on air** — the remainder of the paid month is not
+honoured, which is the service policy. Every running broadcast of that account
+is stopped as a final stop (intent to `stopped`, so no watchdog and no boot
+revives it, and YouTube's broadcast is completed); nobody else's is touched, and
+an account whose plan an operator granted by hand keeps both the plan and the
+broadcast. The
 provider is asked first and the local writes happen only after it agrees, so a
 refused `rebillCancel` leaves the account paying and still able to broadcast
 rather than the other way round. Only the plan that cancelled record paid for is

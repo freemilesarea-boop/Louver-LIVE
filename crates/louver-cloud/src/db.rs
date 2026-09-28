@@ -283,8 +283,8 @@ const SEED_PLANS: &[SeedPlan] = &[
         limits: &[
             ("max_concurrent_streams", 1),
             ("max_broadcasts", 3),
-            ("max_storage_bytes", 20 * 1024 * 1024 * 1024),
-            ("max_upload_bytes", 8 * 1024 * 1024 * 1024),
+            ("max_storage_bytes", 5 * 1024 * 1024 * 1024),
+            ("max_upload_bytes", 2 * 1024 * 1024 * 1024),
             // Scheduling is a common feature of every paid plan now: a
             // broadcaster who cannot schedule cannot run 24/7 unattended, which
             // is the thing being sold.
@@ -302,8 +302,8 @@ const SEED_PLANS: &[SeedPlan] = &[
         limits: &[
             ("max_concurrent_streams", 2),
             ("max_broadcasts", 10),
-            ("max_storage_bytes", 100 * 1024 * 1024 * 1024),
-            ("max_upload_bytes", 16 * 1024 * 1024 * 1024),
+            ("max_storage_bytes", 10 * 1024 * 1024 * 1024),
+            ("max_upload_bytes", 4 * 1024 * 1024 * 1024),
             ("scheduling_enabled", 1),
             ("priority_recovery", 0),
         ],
@@ -318,8 +318,8 @@ const SEED_PLANS: &[SeedPlan] = &[
         limits: &[
             ("max_concurrent_streams", 3),
             ("max_broadcasts", 30),
-            ("max_storage_bytes", 400 * 1024 * 1024 * 1024),
-            ("max_upload_bytes", 32 * 1024 * 1024 * 1024),
+            ("max_storage_bytes", 20 * 1024 * 1024 * 1024),
+            ("max_upload_bytes", 8 * 1024 * 1024 * 1024),
             ("scheduling_enabled", 1),
             ("priority_recovery", 1),
         ],
@@ -622,6 +622,100 @@ impl CloudDb {
     }
 
     // --- plans ------------------------------------------------------------
+
+    /// What each plan's storage limits are now, against what this build seeds.
+    ///
+    /// Exists because `seed_plans` deliberately does **not** overwrite a plan's
+    /// limits: an operator may have raised one for a customer and a restart must
+    /// not undo that. The consequence is that changing a number in `SEED_PLANS`
+    /// changes nothing for a database that already has these rows — so lowering
+    /// the storage ceilings to fit an 80 GB server needs somebody to look at the
+    /// difference and say yes. This is the looking.
+    pub fn storage_audit(&self) -> Result<Vec<StorageAudit>> {
+        let mut out = Vec::new();
+        for p in SEED_PLANS {
+            let target: BTreeMap<&str, i64> = p.limits.iter().copied().collect();
+            let Ok(current) = self.plan(p.id) else { continue };
+            out.push(StorageAudit {
+                plan_id: p.id.to_string(),
+                label: current.label.clone(),
+                monthly_price_krw: current.monthly_price_krw,
+                concurrent_streams: current.max_concurrent_streams(),
+                storage_now: current.limits.get(crate::entitlement::MAX_STORAGE_BYTES).copied().unwrap_or(0),
+                storage_target: target.get(crate::entitlement::MAX_STORAGE_BYTES).copied().unwrap_or(0),
+                upload_now: current.limits.get(crate::entitlement::MAX_UPLOAD_BYTES).copied().unwrap_or(0),
+                upload_target: target.get(crate::entitlement::MAX_UPLOAD_BYTES).copied().unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Who is storing how much, against what the new ceiling would be.
+    ///
+    /// The question an operator has to answer before lowering a limit: whose
+    /// account is already over it. Nobody's files are touched by the answer —
+    /// over the ceiling only blocks the *next* upload.
+    pub fn storage_usage(&self) -> Result<Vec<UsageRow>> {
+        let targets: BTreeMap<&str, i64> = SEED_PLANS
+            .iter()
+            .map(|p| {
+                let m: BTreeMap<&str, i64> = p.limits.iter().copied().collect();
+                (p.id, m.get(crate::entitlement::MAX_STORAGE_BYTES).copied().unwrap_or(0))
+            })
+            .collect();
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(
+            "SELECT u.email, u.plan_id, COALESCE(SUM(m.size_bytes), 0)
+             FROM users u LEFT JOIN media m ON m.user_id = u.id
+             GROUP BY u.id ORDER BY 3 DESC",
+        )?;
+        let rows =
+            st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (email, plan_id, used) = row?;
+            let ceiling_after = targets.get(plan_id.as_str()).copied().unwrap_or(0);
+            out.push(UsageRow { email, plan_id, used_bytes: used, ceiling_after });
+        }
+        Ok(out)
+    }
+
+    /// Write this build's storage limits into `plans`, and nothing else.
+    ///
+    /// Reads each row's own `limits`, replaces exactly the two storage keys and
+    /// writes it back, so `max_concurrent_streams`, `max_broadcasts` and
+    /// anything an operator added survive untouched. The `monthly_price_krw`
+    /// column is not in the statement at all: there is no arrangement of this
+    /// call that can change a price.
+    ///
+    /// Deliberately not called at boot. See `storage_audit`.
+    pub fn apply_seed_storage_limits(&self) -> Result<Vec<String>> {
+        let mut changed = Vec::new();
+        for p in SEED_PLANS {
+            let target: BTreeMap<&str, i64> = p.limits.iter().copied().collect();
+            let Ok(current) = self.plan(p.id) else { continue };
+            let mut limits = current.limits.clone();
+            let mut moved = false;
+            for key in [crate::entitlement::MAX_STORAGE_BYTES, crate::entitlement::MAX_UPLOAD_BYTES] {
+                let want = target.get(key).copied().unwrap_or(0);
+                if limits.get(key).copied() != Some(want) {
+                    limits.insert(key.to_string(), want);
+                    moved = true;
+                }
+            }
+            if !moved {
+                continue;
+            }
+            let json = serde_json::to_string(&limits)
+                .map_err(|e| CloudError::Invalid(format!("한도를 저장할 수 없습니다: {e}")))?;
+            self.conn
+                .lock()
+                .unwrap()
+                .execute("UPDATE plans SET limits = ?2 WHERE id = ?1", params![p.id, json])?;
+            changed.push(p.id.to_string());
+        }
+        Ok(changed)
+    }
 
     pub fn plan(&self, id: &str) -> Result<Plan> {
         self.conn
@@ -2398,6 +2492,37 @@ pub struct BillingPayment<'a> {
     pub status: Option<BillingStatus>,
     pub paid_at: Option<&'a str>,
     pub period_end: Option<&'a str>,
+}
+
+/// One plan's storage limits, now and as this build would set them.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StorageAudit {
+    pub plan_id: String,
+    pub label: String,
+    /// Printed so an operator can see for themselves that this does not move.
+    pub monthly_price_krw: i64,
+    /// The same.
+    pub concurrent_streams: i64,
+    pub storage_now: i64,
+    pub storage_target: i64,
+    pub upload_now: i64,
+    pub upload_target: i64,
+}
+
+/// One account's stored bytes, against the ceiling it would have.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UsageRow {
+    pub email: String,
+    pub plan_id: String,
+    pub used_bytes: i64,
+    pub ceiling_after: i64,
+}
+
+impl UsageRow {
+    /// Would this account be over the new ceiling? Only blocks new uploads.
+    pub fn over(&self) -> bool {
+        self.ceiling_after > 0 && self.used_bytes > self.ceiling_after
+    }
 }
 
 /// A billing record whose provider subscription is over while the entitlement it

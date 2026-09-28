@@ -193,6 +193,9 @@ impl RuntimeEvents for DbEvents {
 pub enum StopReason {
     /// The user pressed STOP.
     UserFinalStop,
+    /// The subscription was cancelled. Every one of that account's running
+    /// broadcasts ends, because the entitlement they were running on is gone.
+    SubscriptionCancelled,
     /// A scheduled window reached its end time.
     ScheduledWindowEnd,
     /// "반복 재생" is off and the playlist has played once.
@@ -512,6 +515,42 @@ impl BroadcastManager {
                 eprintln!("[louver] 작업 디렉터리를 지우지 못했습니다: {e}");
             }
         }
+    }
+
+    /// Stop every broadcast this account has running, and say which they were.
+    ///
+    /// The cancellation path's second half. Called only after the provider has
+    /// agreed and the entitlement has actually been taken away — a cancellation
+    /// that revoked nothing (an account an operator moved to another plan by
+    /// hand) must not take that account off air.
+    ///
+    /// Scoped to one user id in the query itself, so there is no arrangement of
+    /// arguments that reaches somebody else's broadcast. Best effort per
+    /// broadcast: one that cannot be stopped is logged and the rest still stop,
+    /// and its own worker sees `desired_state = stopped` on its next tick and
+    /// leaves anyway.
+    pub fn stop_all_for(&self, user_id: &str, reason: StopReason) -> Vec<String> {
+        let mut stopped = Vec::new();
+        let Ok(mine) = self.db.broadcasts_for(user_id) else { return stopped };
+        let live = self.running_ids();
+        for b in mine {
+            let running = b.desired_state == DesiredState::Running || live.contains(&b.id);
+            if !running {
+                continue;
+            }
+            match self.stop_with(user_id, &b.id, reason) {
+                Ok(()) => {
+                    let _ =
+                        self.db.append_event(&b.id, EventLevel::Warn, "구독이 해지되어 방송을 종료했습니다");
+                    stopped.push(b.id);
+                }
+                Err(e) => {
+                    say(&b.id, "warn", &format!("해지 후 방송을 종료하지 못했습니다: {e}"));
+                    let _ = self.db.record_failure(&b.id, &format!("해지 후 종료 실패: {e}"));
+                }
+            }
+        }
+        stopped
     }
 
     /// Ask every worker to finish, and wait. For a clean shutdown.

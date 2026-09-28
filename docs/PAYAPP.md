@@ -200,17 +200,28 @@ ledger 삽입과 상태 변경은 **한 트랜잭션**이라, 그 사이에 서�
 기간의 남은 일수는 유지하지 않습니다. 해지된 구독은 `cancelled`이 되고 계정은
 `none`(동시 송출 0)으로 내려갑니다.
 
-**순서가 정책보다 중요합니다.** `Payapp::cancel`은:
+**순서가 정책보다 중요합니다.** `Payapp::cancel_and_take_off_air`는:
 
 1. 호출자 본인의 billing record를 찾습니다 (billing id는 API 표면에 없습니다)
 2. `cmd=rebillCancel` — `cmd` / `userid` / `rebill_no` / `linkkey` 네 개뿐
 3. `state=1`을 확인합니다
 4. 그 다음에야 한 트랜잭션으로 `status=cancelled` + `cancelled_at` + entitlement 회수
+5. **회수가 실제로 일어났을 때에만**, 그 계정의 실행 중 방송을 전부 종료합니다
+   (deliberate stop: `desired_state=stopped` + worker 종료 + YouTube complete)
+6. 응답
 
 PayApp이 거부하면 **로컬은 아무것도 바뀌지 않습니다.** 오류를 반환하고, 계정은
-그대로 구독 중이며 재시도할 수 있습니다. 반대 순서였다면 *PayApp은 매달 계속
-청구하는데 247streams 권한만 없어진* 계정이 생길 수 있습니다 — 이 순서는 그 상태를
-불가능하게 만들기 위해 존재합니다.
+그대로 구독 중이고 방송도 계속 나가며 재시도할 수 있습니다. 반대 순서였다면
+*PayApp은 매달 계속 청구하는데 247streams 권한만 없어진* 계정이 생길 수 있습니다 —
+이 순서는 그 상태를 불가능하게 만들기 위해 존재합니다.
+
+5번이 `entitlement_revoked` 에 걸려 있는 이유: 운영자가 CLI로 Business를 부여한
+계정의 낡은 Basic 등록을 해지하면 정기결제는 멈추지만 요금제는 그대로입니다. 그때
+방송을 끄면 운영자의 송출이 끊깁니다. 회수한 것이 없으면 끌 것도 없습니다.
+
+종료는 방송별 best effort이고 해지 자체를 실패시키지 않습니다. 돈 쪽은 이미
+provider에서 확정됐고, 종료가 안 된 방송도 `desired_state=stopped`가 먼저 쓰이므로
+그 worker가 다음 tick에 스스로 끝냅니다.
 
 **운영자가 직접 부여한 요금제는 건드리지 않습니다.** 회수는
 `UPDATE users SET plan_id='none' WHERE id=? AND plan_id=?`로, *그 billing record가
