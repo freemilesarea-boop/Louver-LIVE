@@ -863,7 +863,7 @@ fn a_paying_accounts_plan_decides_how_many_streams_it_gets() {
 
 /// Mark this media the way a fast-path preparation does.
 fn mark_native(e: &Env, media_id: &str, signature: &str) {
-    e.db.record_prepared_signature(media_id, "native", signature).unwrap();
+    e.db.record_prepared_signature(media_id, "direct", signature).unwrap();
 }
 
 #[test]

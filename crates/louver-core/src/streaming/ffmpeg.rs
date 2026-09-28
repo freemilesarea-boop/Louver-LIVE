@@ -247,6 +247,16 @@ pub fn preferred_sw_encoders() -> &'static [&'static str] {
     }
 }
 
+/// How to re-encode a video without changing what is already right about it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LiveVideoSpec {
+    /// Longest gap between keyframes, in seconds. The ingest's requirement.
+    pub keyframe_secs: f64,
+    /// The same interval in frames, for the encoder's own GOP ceiling.
+    pub gop_frames: u32,
+    pub kbps: u32,
+}
+
 /// What the bundled FFmpeg can actually do (§15).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FfmpegCapabilities {
@@ -617,6 +627,125 @@ impl FfmpegCommandBuilder {
             a.extend(["-c:a".into(), "copy".into()]);
         }
 
+        a.extend([
+            "-movflags".into(),
+            "+faststart".into(),
+            "-map_metadata".into(),
+            "-1".into(),
+            "-avoid_negative_ts".into(),
+            "make_zero".into(),
+            output.to_string_lossy().into_owned(),
+        ]);
+        a
+    }
+
+    /// Re-encode the video and change **nothing else**.
+    ///
+    /// For a file whose only quarrel with a live ingest is its keyframe spacing.
+    /// A keyframe cannot be added to an H.264 bitstream by copying it — an IDR
+    /// is an intra-coded picture, and the frames around it reference each other
+    /// — so the pictures have to be produced again. What does *not* have to
+    /// change is everything else: the size stays, the frame rate stays, the
+    /// pixel format stays, the audio is untouched.
+    ///
+    /// That is the difference between re-encoding 33,000 frames of 1280x720 and
+    /// 497,000 frames of 1920x1080 for the same four-and-a-half hours.
+    ///
+    /// Keyframes are forced **by time** rather than by frame count
+    /// (`force_key_frames` on an expression), because the requirement is stated
+    /// in seconds and the frame rate may be anything from 1fps upwards. `-g`
+    /// carries the same interval in frames as a ceiling for the encoder's own
+    /// decisions.
+    pub fn build_live_normalize_args(
+        &self,
+        input: &Path,
+        output: &Path,
+        target_duration_secs: f64,
+        has_audio: bool,
+        encode_audio: bool,
+        spec: &LiveVideoSpec,
+    ) -> Vec<String> {
+        let p = self.profile;
+        let mut a: Vec<String> = vec![
+            "-hide_banner".into(),
+            "-nostdin".into(),
+            "-loglevel".into(),
+            "error".into(),
+            "-progress".into(),
+            "pipe:1".into(),
+            "-y".into(),
+            "-i".into(),
+            input.to_string_lossy().into_owned(),
+        ];
+        if !has_audio {
+            a.extend([
+                "-f".into(),
+                "lavfi".into(),
+                "-i".into(),
+                format!("anullsrc=channel_layout=stereo:sample_rate={}", p.audio_sample_rate()),
+            ]);
+        }
+        if has_audio && encode_audio {
+            a.extend([
+                "-filter_complex".into(),
+                format!(
+                    "[0:a]aformat=sample_fmts=fltp:sample_rates={}:channel_layouts=stereo,\
+                     aresample={}:first_pts=0[a]",
+                    p.audio_sample_rate(),
+                    p.audio_sample_rate()
+                ),
+            ]);
+        }
+        a.extend(["-map".into(), "0:v:0".into(), "-map".into()]);
+        a.push(match (has_audio, encode_audio) {
+            (false, _) => "1:a".to_string(),
+            (true, true) => "[a]".to_string(),
+            (true, false) => "0:a:0".to_string(),
+        });
+        a.extend(["-t".into(), format!("{target_duration_secs:.6}")]);
+
+        a.extend(["-c:v".into(), self.encoder.clone()]);
+        if self.encoder == "libx264" {
+            a.extend(["-preset".into(), "veryfast".into(), "-profile:v".into(), "high".into()]);
+        }
+        a.extend([
+            // No scale and no fps filter: this is the whole point.
+            "-pix_fmt".into(),
+            "yuv420p".into(),
+            "-force_key_frames".into(),
+            format!("expr:gte(t,n_forced*{:.3})", spec.keyframe_secs),
+            "-g".into(),
+            spec.gop_frames.to_string(),
+            "-keyint_min".into(),
+            spec.gop_frames.to_string(),
+            "-sc_threshold".into(),
+            "0".into(),
+            "-b:v".into(),
+            format!("{}k", spec.kbps),
+            "-maxrate".into(),
+            format!("{}k", spec.kbps),
+            "-bufsize".into(),
+            format!("{}k", spec.kbps * 2),
+            // The source's own timing, kept exactly. A rate filter here would
+            // invent frames, which is the cost this path exists to avoid.
+            "-fps_mode".into(),
+            "passthrough".into(),
+        ]);
+        a.extend(["-video_track_timescale".into(), p.video_timescale().to_string()]);
+        if encode_audio {
+            a.extend([
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                format!("{}k", p.audio_kbps()),
+                "-ar".into(),
+                p.audio_sample_rate().to_string(),
+                "-ac".into(),
+                p.audio_channels().to_string(),
+            ]);
+        } else {
+            a.extend(["-c:a".into(), "copy".into()]);
+        }
         a.extend([
             "-movflags".into(),
             "+faststart".into(),

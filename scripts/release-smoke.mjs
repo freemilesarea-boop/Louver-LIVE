@@ -387,10 +387,10 @@ try {
   // H.264 yuv420p 48kHz stereo, so nothing about it needs re-encoding, and the
   // whole point of this release is that nothing is.
   const prep = serverLog.join('')
-  if (!/media [0-9a-f]{8}: mode=native video=copy/.test(prep)) {
+  if (!/media [0-9a-f]{8}: mode=direct video=copy audio=copy/.test(prep)) {
     fail(`호환되는 업로드가 빠른 경로를 타지 않았습니다:\n${prep.split('\n').filter((l) => l.includes('media ')).join('\n')}`)
   }
-  log('업로드와 준비 ✓ (mode=native, 영상 재인코딩 없음)')
+  log('업로드와 준비 ✓ (mode=direct, 아무것도 재인코딩하지 않음)')
 
   step(10, 'create a YouTube-backed playlist broadcast')
   const created = await post('/api/broadcasts', {

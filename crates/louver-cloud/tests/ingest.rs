@@ -222,6 +222,13 @@ fn fixture(tools: &FfmpegTools, at: &std::path::Path, args: &[&str]) {
 /// The 4.5-hour production file in miniature: 720p, two frames a second,
 /// H.264 and AAC, keyframes every two seconds.
 fn low_fps_source(tools: &FfmpegTools, at: &std::path::Path) {
+    low_fps_source_at(tools, at, "48000")
+}
+
+/// The same, at whichever sample rate a test needs. YouTube's encoder guide
+/// lists both 44.1 kHz and 48 kHz for stereo RTMP, so both arrive in practice.
+fn low_fps_source_at(tools: &FfmpegTools, at: &std::path::Path, sample_rate: &str) {
+    let audio = format!("sine=frequency=440:sample_rate={sample_rate}:duration=6");
     fixture(
         tools,
         at,
@@ -233,13 +240,17 @@ fn low_fps_source(tools: &FfmpegTools, at: &std::path::Path) {
             "-f",
             "lavfi",
             "-i",
-            "sine=frequency=440:sample_rate=48000:duration=6",
+            &audio,
             "-c:v",
             "libx264",
             "-preset",
             "ultrafast",
             "-pix_fmt",
             "yuv420p",
+            "-profile:v",
+            "high",
+            "-level",
+            "3.1",
             // Two seconds of keyframe spacing at 2fps is four frames.
             "-g",
             "4",
@@ -256,7 +267,7 @@ fn low_fps_source(tools: &FfmpegTools, at: &std::path::Path) {
             "-b:a",
             "128k",
             "-ar",
-            "48000",
+            sample_rate,
             "-ac",
             "2",
             "-shortest",
@@ -443,57 +454,185 @@ fn a_picture_larger_than_the_plan_sells_is_scaled_down() {
     assert_eq!((prepared.width, prepared.height), (1920, 1080));
 }
 
-#[test]
-fn keyframes_too_far_apart_are_rebuilt_even_when_everything_else_fits() {
-    // The one reason alow frame rate can still cost an encode, and it is a
-    // reason about seconds rather than frames: a viewer joining a live stream
-    // waits for the next keyframe, and YouTube cuts between qualities on them.
-    let Some(tools) = tools() else {
-        eprintln!("SKIP: no FFmpeg sidecar");
-        return;
-    };
-    let e = env(&tools);
-    let src = e.root.join("sparse.mp4");
+/// The longest gap between keyframes in a prepared file.
+fn keyframe_gap(e: &Env, tools: &FfmpegTools, m: &louver_cloud::CloudMedia) -> f64 {
+    let path = LocalStorage::new(e.root.join("media")).localize(&m.prepared_path.clone().unwrap()).unwrap();
+    let builder = louver_core::streaming::ffmpeg::FfmpegCommandBuilder::new(
+        tools.clone(),
+        louver_cloud::ingest::CLOUD_PROFILE,
+    );
+    louver_core::media::probe::probe_max_keyframe_gap(&builder, &path, 60).expect("keyframes")
+}
+
+/// The production file in miniature: everything is right except the keyframes.
+fn sparse_keyframe_source(tools: &FfmpegTools, at: &std::path::Path, sample_rate: &str) {
+    let audio = format!("sine=frequency=440:sample_rate={sample_rate}:duration=30");
     fixture(
-        &tools,
-        &src,
+        tools,
+        at,
         &[
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=size=1280x720:rate=30:duration=25",
+            "testsrc2=size=1280x720:rate=2:duration=30",
             "-f",
             "lavfi",
             "-i",
-            "sine=frequency=440:sample_rate=48000:duration=25",
+            &audio,
             "-c:v",
             "libx264",
             "-preset",
             "ultrafast",
             "-pix_fmt",
             "yuv420p",
-            // One keyframe every 10 seconds, far past the 4-second limit.
+            "-profile:v",
+            "high",
+            "-level",
+            "3.1",
+            // One keyframe every ten seconds — YouTube's limit is four.
             "-g",
-            "300",
+            "20",
             "-keyint_min",
-            "300",
+            "20",
             "-sc_threshold",
             "0",
+            "-r",
+            "2",
+            "-fps_mode",
+            "cfr",
             "-c:a",
             "aac",
+            "-b:a",
+            "128k",
             "-ar",
-            "48000",
+            sample_rate,
             "-ac",
             "2",
             "-shortest",
         ],
     );
+}
+
+#[test]
+fn keyframes_too_far_apart_are_never_copied() {
+    // Test D. YouTube's own encoder guide asks for a keyframe every two seconds
+    // and forbids more than four. A ten-second gap means a viewer joining the
+    // stream waits ten seconds for a picture, and the ingest may buffer. No
+    // amount of "everything else is fine" makes that copyable — and what is
+    // checked is the *produced* file, not what the encoder was asked for.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let src = e.root.join("sparse.mp4");
+    sparse_keyframe_source(&tools, &src, "48000");
 
     let m = e.ingest.accept_upload(&e.user, "sparse.mp4", &src).unwrap();
     let done = settled(&e, &m.id);
     assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
+
+    // Test F: the produced file is inside the limit.
+    let gap = keyframe_gap(&e, &tools, &done);
+    assert!(gap <= 4.0, "a prepared file went out with {gap:.1}s between keyframes");
+}
+
+#[test]
+fn fixing_the_keyframes_does_not_also_change_the_size_or_the_frame_rate() {
+    // Test E, and the whole point of this release. The production upload is
+    // 720p at two frames a second with ten-second keyframes: everything about
+    // it is broadcastable except the keyframes. Adding an IDR needs an encode —
+    // there is no way to copy one in — but nothing about that encode requires
+    // scaling to 1080p or inventing twenty-eight frames a second.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let src = e.root.join("prod-like.mp4");
+    sparse_keyframe_source(&tools, &src, "44100");
+
+    let m = e.ingest.accept_upload(&e.user, "prod-like.mp4", &src).unwrap();
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
+
     let prepared = probe_prepared(&e, &tools, &done);
-    assert_eq!((prepared.width, prepared.height), (1920, 1080), "a sparse-keyframe file was copied");
+    assert_eq!((prepared.width, prepared.height), (1280, 720), "the picture was scaled for no reason");
+    assert!(prepared.fps < 5.0, "the frame rate was raised to {:.2}fps for no reason", prepared.fps);
+    assert_eq!(prepared.pixel_format, "yuv420p");
+    // Test A: 44.1 kHz stereo AAC is what YouTube's guide lists for RTMP, so
+    // the sound is not touched either.
+    assert_eq!(prepared.audio_sample_rate, Some(44_100), "44.1kHz audio was re-encoded for nothing");
+    assert_eq!(prepared.audio_channels, Some(2));
+    // And the one thing that did have to change, changed.
+    let gap = keyframe_gap(&e, &tools, &done);
+    assert!(gap <= 4.0, "{gap:.1}s between keyframes");
+
+    // Test G: the result is measured and recorded like any other preparation.
+    let shapes = e.db.playlist_shapes(&broadcast_over(&e, &[&m.id])).unwrap();
+    let (_, mode, signature) = shapes[0].clone();
+    assert_eq!(mode, "live_normalize");
+    let sig = signature.expect("no signature was recorded");
+    assert!(sig.contains("1280x720"), "{sig}");
+    assert!(sig.contains("44100"), "{sig}");
+}
+
+#[test]
+fn keyframes_already_close_enough_are_left_alone() {
+    // Test C. The same file with two-second keyframes is copied outright.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+    let src = e.root.join("dense.mp4");
+    low_fps_source(&tools, &src);
+
+    let m = e.ingest.accept_upload(&e.user, "dense.mp4", &src).unwrap();
+    let done = settled(&e, &m.id);
+    assert_eq!(done.state, MediaState::Ready, "{:?}", done.last_error);
+    let prepared = probe_prepared(&e, &tools, &done);
+    assert_eq!((prepared.width, prepared.height), (1280, 720));
+    assert!(keyframe_gap(&e, &tools, &done) <= 4.0);
+}
+
+#[test]
+fn two_sample_rates_in_one_playlist_are_converged_rather_than_joined() {
+    // Test B. 44.1 kHz and 48 kHz are both fine to send; they are not fine to
+    // concatenate. The FLV muxer writes one audio configuration at the head of
+    // the stream, so the second file's sound would be decoded at the first
+    // file's rate.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+
+    let a = e.root.join("at-44.mp4");
+    low_fps_source_at(&tools, &a, "44100");
+    let first = e.ingest.accept_upload(&e.user, "at-44.mp4", &a).unwrap().id;
+    assert_eq!(settled(&e, &first).state, MediaState::Ready);
+
+    let b_src = e.root.join("at-48.mp4");
+    low_fps_source_at(&tools, &b_src, "48000");
+    let second = e.ingest.accept_upload(&e.user, "at-48.mp4", &b_src).unwrap().id;
+    assert_eq!(settled(&e, &second).state, MediaState::Ready);
+
+    // Each on its own kept its own rate.
+    assert_eq!(
+        probe_prepared(&e, &tools, &e.db.media_owned(&e.user, &first).unwrap()).audio_sample_rate,
+        Some(44_100),
+    );
+
+    let b = broadcast_over(&e, &[&first, &second]);
+    assert!(e.db.check_playlist_joinable(&b).is_err(), "two sample rates were judged joinable");
+    assert_eq!(e.ingest.ensure_playlist_compatible(&b).unwrap(), 2);
+    for id in [&first, &second] {
+        assert_eq!(settled(&e, id).state, MediaState::Ready);
+        let prepared = probe_prepared(&e, &tools, &e.db.media_owned(&e.user, id).unwrap());
+        assert_eq!(prepared.audio_sample_rate, Some(48_000), "convergence must land on one rate");
+    }
+    e.db.check_playlist_joinable(&b).expect("the playlist was not made joinable");
 }
 
 #[test]

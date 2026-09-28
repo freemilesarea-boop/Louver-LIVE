@@ -419,7 +419,7 @@ fn audit_storage(args: &[String]) -> std::process::ExitCode {
 /// the way every upload used to be done, which is the measurement behind the
 /// change. Use `--compare` on a short clip: the old way is the slow way.
 fn media_check(args: &[String]) -> std::process::ExitCode {
-    use louver_core::media::normalize::{normalize_one_with, plan_for, plan_native, CancelToken};
+    use louver_core::media::normalize::{normalize_one_with, plan_preparation, CancelToken};
     use louver_core::media::probe::probe;
     use louver_core::streaming::ffmpeg::{FfmpegCommandBuilder, FfmpegTools};
 
@@ -468,16 +468,20 @@ fn media_check(args: &[String]) -> std::process::ExitCode {
     );
     println!("길이     : {:.1}초 ({:.2}시간)", info.duration_secs, info.duration_secs / 3600.0);
 
-    let native = plan_native(&builder, &path, &info, profile);
-    let canonical = plan_for(&builder, &path, &info, profile);
-    let say = |name: &str, plan: &louver_core::media::probe::TranscodePlan| {
-        println!(
-            "\n{name}: mode={} video={} audio={}",
-            if plan.video.is_copy() { "native" } else { "canonical" },
-            if plan.video.is_copy() { "copy" } else { "encode" },
-            if plan.audio.is_copy() { "copy" } else { "encode" },
-        );
-        for r in plan.video_reasons.iter().chain(plan.audio_reasons.iter()) {
+    let native = plan_preparation(&builder, &path, &info, profile, false);
+    let canonical = plan_preparation(&builder, &path, &info, profile, true);
+    let say = |name: &str, prep: &louver_core::media::normalize::Preparation| {
+        println!("\n{name}: {}", prep.summary());
+        if let Some(g) = prep.measured_gop_secs {
+            println!("    키프레임 간격: {g:.1}초 (한계 {:.1}초)", profile.max_copy_gop_secs());
+        }
+        if let Some(v) = &prep.video {
+            println!(
+                "    영상 재인코딩: {}x{} @{:.2}fps 유지, 키프레임 {:.1}초마다, {}kbps",
+                info.width, info.height, info.fps, v.keyframe_secs, v.kbps,
+            );
+        }
+        for r in prep.plan.video_reasons.iter().chain(prep.plan.audio_reasons.iter()) {
             println!("    reason: {r}");
         }
     };
@@ -502,8 +506,17 @@ fn media_check(args: &[String]) -> std::process::ExitCode {
     if args.iter().any(|a| a == "--compare") {
         runs.push(("이전 버전", canonical));
     }
-    println!("\n{:<12} {:>9} {:>9} {:>10} {:>8} {:>8}", "", "걸린시간", "배속", "출력크기", "영상", "소리");
-    for (name, plan) in runs {
+    let summarise = |prep: &louver_core::media::normalize::Preparation| {
+        (
+            if prep.plan.video.is_copy() { "copy" } else { "encode" },
+            if prep.plan.audio.is_copy() { "copy" } else { "encode" },
+        )
+    };
+    println!(
+        "\n{:<12} {:>9} {:>9} {:>10} {:>8} {:>8}  결과",
+        "", "걸린시간", "배속", "출력크기", "영상", "소리"
+    );
+    for (name, prep) in runs {
         let cache = louver_core::media::cache::MediaCache::new(dir.join(name));
         let started = std::time::Instant::now();
         let out = normalize_one_with(
@@ -513,20 +526,36 @@ fn media_check(args: &[String]) -> std::process::ExitCode {
             "media-check",
             &info,
             profile,
-            Some(plan.clone()),
+            Some(&prep),
             &CancelToken::new(),
             |_| {},
         );
+        let (v, au) = summarise(&prep);
         match out {
-            Ok(o) => println!(
-                "{:<12} {:>8.1}s {:>8.1}x {:>10} {:>8} {:>8}",
-                name,
-                started.elapsed().as_secs_f64(),
-                o.speed_x,
-                louver_core::system::format_bytes(o.bytes),
-                if plan.video.is_copy() { "copy" } else { "encode" },
-                if plan.audio.is_copy() { "copy" } else { "encode" },
-            ),
+            Ok(o) => {
+                let shape = louver_core::media::probe::probe(&builder, &o.output_path).ok();
+                let gop = louver_core::media::probe::probe_max_keyframe_gap(&builder, &o.output_path, 60);
+                println!(
+                    "{:<12} {:>8.1}s {:>8.1}x {:>10} {:>8} {:>8}  {}",
+                    name,
+                    started.elapsed().as_secs_f64(),
+                    o.speed_x,
+                    louver_core::system::format_bytes(o.bytes),
+                    v,
+                    au,
+                    match shape {
+                        Some(s) => format!(
+                            "{}x{}@{:.2}fps gop={} {}Hz",
+                            s.width,
+                            s.height,
+                            s.fps,
+                            gop.map(|g| format!("{g:.1}s")).unwrap_or_else(|| "?".into()),
+                            s.audio_sample_rate.unwrap_or(0),
+                        ),
+                        None => String::new(),
+                    },
+                );
+            }
             Err(e) => println!("{name:<12} 실패: {e}"),
         }
     }

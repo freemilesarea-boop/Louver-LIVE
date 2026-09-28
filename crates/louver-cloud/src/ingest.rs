@@ -16,8 +16,8 @@ use crate::storage::Storage;
 use crate::{CloudError, Result};
 use louver_core::config::OutputProfile;
 use louver_core::media::cache::MediaCache;
-use louver_core::media::normalize::{normalize_one_with, plan_for, plan_native, CancelToken};
-use louver_core::media::probe::{probe, probe_signature, StreamSignature, TranscodePlan};
+use louver_core::media::normalize::{normalize_one_with, plan_preparation, CancelToken, PrepareMode};
+use louver_core::media::probe::{probe, probe_max_keyframe_gap, probe_signature, StreamSignature};
 use louver_core::streaming::ffmpeg::{FfmpegCommandBuilder, FfmpegTools};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -45,6 +45,13 @@ pub const DISK_FLOOR_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// a core free; the queue is the price, and it is paid at upload rather than on
 /// air.
 pub const MAX_PREPARING_AT_ONCE: usize = 1;
+
+/// How much of a live-normalized file to read back when checking its keyframes.
+///
+/// The encoder was told to force one every two seconds, so a minute is thirty
+/// chances to catch it not having done so — and it is an index read rather than
+/// a scan of hours of video.
+const KEYFRAME_CHECK_SECS: u32 = 60;
 
 /// Turns an uploaded file into a broadcastable one.
 #[derive(Clone)]
@@ -187,53 +194,81 @@ impl Ingest {
         let info = probe(&builder, &local)?;
         self.db.record_media_analysis(media_id, &info)?;
 
-        // Two questions, and only one of them used to be asked. "Does this file
-        // already match the one canonical 1080p30 format?" sends a four-hour
-        // 720p slideshow through a full libx264 encode. "Can this file be sent
-        // as it is?" is the question that matters, and it is the one `auto`
-        // asks. `canonical` is the pinned answer for media that has to match
-        // other items in a playlist — see `ensure_playlist_compatible`.
+        // The whole policy is in `plan_preparation`. `canonical` is the pinned
+        // answer for media that has to match other items in a playlist — see
+        // `ensure_playlist_compatible`.
         let pinned = self.db.prepare_target(media_id).unwrap_or_else(|_| "auto".into()) == "canonical";
-        let plan = if pinned {
-            plan_for(&builder, &local, &info, CLOUD_PROFILE)
-        } else {
-            plan_native(&builder, &local, &info, CLOUD_PROFILE)
-        };
-        let mode = if plan.video.is_copy() { "native" } else { "canonical" };
+        let mut prep = plan_preparation(&builder, &local, &info, CLOUD_PROFILE, pinned);
         // §8: why, in a line an operator can read when a user says it was slow.
         // Nothing here is user content and nothing is a secret.
         println!(
-            "[louver] media {}: mode={} video={} audio={} in={}x{}@{:.2}fps/{} audio={}/{}Hz{}",
+            "[louver] media {}: {} in={}x{}@{:.2}fps/{} audio={}/{}Hz gop={}",
             &media_id[..8.min(media_id.len())],
-            mode,
-            if plan.video.is_copy() { "copy" } else { "encode" },
-            if plan.audio.is_copy() { "copy" } else { "encode" },
+            prep.summary(),
             info.width,
             info.height,
             info.fps,
             if info.video_codec.is_empty() { "?" } else { &info.video_codec },
             info.audio_codec.clone().unwrap_or_else(|| "none".into()),
             info.audio_sample_rate.unwrap_or(0),
-            reasons_suffix(&plan),
+            prep.measured_gop_secs.map(|g| format!("{g:.1}s")).unwrap_or_else(|| "?".into()),
         );
 
         // Prepared output goes beside the store, then gets filed like any other
         // object, so an S3 backend uploads it rather than leaving it on a disk.
+        //
+        // Emptied first: a previous run that failed after writing its cache
+        // entry would otherwise be *reused*, and a re-preparation asked for
+        // because the playlist needs a different format would quietly return
+        // the old one.
         let scratch = self.storage.scratch_dir().join(media_id);
+        let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch)?;
         let cache = MediaCache::new(&scratch);
 
-        let out = normalize_one_with(
+        let mut out = normalize_one_with(
             &builder,
             &cache,
             &local,
             media_id,
             &info,
             CLOUD_PROFILE,
-            Some(plan),
+            Some(&prep),
             &CancelToken::new(),
             |_| {},
         )?;
+
+        // A live-normalized file exists for one reason: to have keyframes close
+        // enough together for a live ingest. Asking the encoder for them is not
+        // the same as having them, so the result is measured, and a file that
+        // still falls short is redone the canonical way rather than sent.
+        if prep.mode == PrepareMode::LiveNormalize {
+            let limit = CLOUD_PROFILE.max_copy_gop_secs();
+            let got = probe_max_keyframe_gap(&builder, &out.output_path, KEYFRAME_CHECK_SECS);
+            if got.is_some_and(|g| g > limit) {
+                eprintln!(
+                    "[louver] media {}: 키프레임 간격이 여전히 {:.1}초입니다. 표준 변환으로 다시 만듭니다",
+                    &media_id[..8.min(media_id.len())],
+                    got.unwrap_or_default(),
+                );
+                let _ = std::fs::remove_dir_all(&scratch);
+                std::fs::create_dir_all(&scratch)?;
+                let cache = MediaCache::new(&scratch);
+                prep = plan_preparation(&builder, &local, &info, CLOUD_PROFILE, true);
+                out = normalize_one_with(
+                    &builder,
+                    &cache,
+                    &local,
+                    media_id,
+                    &info,
+                    CLOUD_PROFILE,
+                    Some(&prep),
+                    &CancelToken::new(),
+                    |_| {},
+                )?;
+            }
+        }
+        let mode = prep.mode.id();
 
         // `normalize_one` makes the plan itself — copy what is already right,
         // encode only what is not — and `out.plan` says which it chose, for
@@ -319,8 +354,12 @@ impl Ingest {
         }
         let all_canonical = shapes.iter().all(|(_, mode, _)| mode == "canonical");
         let first = shapes[0].2.clone();
+        // Only the canonical conversion produces files that are interchangeable
+        // with each other; `direct`, `hybrid` and `live_normalize` each keep
+        // something of the source, so two of those agree only when their
+        // signatures do.
         let all_same_native =
-            shapes.iter().all(|(_, mode, sig)| mode == "native" && *sig == first) && first.is_some();
+            shapes.iter().all(|(_, mode, sig)| mode != "canonical" && *sig == first) && first.is_some();
         if all_canonical || all_same_native {
             return Ok(0);
         }
@@ -362,16 +401,6 @@ impl Ingest {
             .query_row("SELECT state FROM media WHERE id=?1", [media_id], |r| r.get::<_, String>(0))
             .map_err(|_| CloudError::NotFound("media"))?;
         Ok(m)
-    }
-}
-
-/// The first reason a stream is being encoded, for the log line. Reasons are
-/// generated by this crate and contain no user content.
-fn reasons_suffix(plan: &TranscodePlan) -> String {
-    let first = plan.video_reasons.first().or_else(|| plan.audio_reasons.first());
-    match first {
-        Some(r) => format!(" reason={r}"),
-        None => String::new(),
     }
 }
 

@@ -80,6 +80,166 @@ pub fn plan_native(
     }
 }
 
+/// Which of the four ways a file can be prepared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareMode {
+    /// Nothing is encoded. The container is rewritten and that is all.
+    Direct,
+    /// The picture is copied; only the sound is converted.
+    Hybrid,
+    /// The picture is encoded again **at its own size and frame rate**, because
+    /// something a copy cannot fix — in practice the keyframe spacing — makes it
+    /// unusable on a live ingest as it stands.
+    LiveNormalize,
+    /// The full canonical conversion to the profile's format. What a file needs
+    /// when the codec, the pixel format or the geometry is out of range, and
+    /// what every item of a mixed playlist is converged onto.
+    Canonical,
+}
+
+impl PrepareMode {
+    /// The word the log and the database use.
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Hybrid => "hybrid",
+            Self::LiveNormalize => "live_normalize",
+            Self::Canonical => "canonical",
+        }
+    }
+
+    /// Is this the one format everything can be converged onto?
+    ///
+    /// Only the canonical conversion produces a file that is interchangeable
+    /// with every other canonical file. The other three keep something of the
+    /// source, so two of them agree only when their signatures do.
+    pub fn is_canonical(self) -> bool {
+        matches!(self, Self::Canonical)
+    }
+}
+
+/// How one file will be prepared, and why.
+#[derive(Debug, Clone)]
+pub struct Preparation {
+    pub mode: PrepareMode,
+    pub plan: TranscodePlan,
+    /// Set for [`PrepareMode::LiveNormalize`] only.
+    pub video: Option<crate::streaming::ffmpeg::LiveVideoSpec>,
+    /// The measured gap between keyframes, when it was measured.
+    pub measured_gop_secs: Option<f64>,
+}
+
+impl Preparation {
+    /// One line for the log: what is being done and why. No user content.
+    pub fn summary(&self) -> String {
+        let reason = self
+            .plan
+            .video_reasons
+            .first()
+            .or_else(|| self.plan.audio_reasons.first())
+            .map(|r| format!(" reason={r}"))
+            .unwrap_or_default();
+        format!(
+            "mode={} video={} audio={}{}",
+            self.mode.id(),
+            if self.plan.video.is_copy() { "copy" } else { "encode" },
+            if self.plan.audio.is_copy() { "copy" } else { "encode" },
+            reason,
+        )
+    }
+}
+
+/// Bitrate for a re-encode that is only fixing the keyframes.
+///
+/// The source is already a file somebody was happy to publish, so the target is
+/// its own bitrate with a little room, not the profile's 1080p figure — which
+/// on a 720p slideshow would be six times what the picture needs. Bounded below
+/// so a badly-made source does not produce a worse copy, and above by what the
+/// plan sells.
+pub fn live_normalize_kbps(info: &MediaInfo, profile: OutputProfile) -> u32 {
+    let ceiling = profile.video_kbps();
+    let by_pixels = (u64::from(profile.video_kbps()) * u64::from(info.width) * u64::from(info.height)
+        / (u64::from(profile.width()) * u64::from(profile.height())).max(1)) as u32;
+    let target = match info.video_bitrate {
+        Some(bps) => ((bps / 1000) as u32).saturating_mul(5) / 4,
+        None => by_pixels,
+    };
+    target.clamp(1_000, ceiling)
+}
+
+/// Decide how to prepare one file: the whole of the policy, in one place.
+///
+/// In order, because the order is the policy:
+///
+/// 1. `canonical_only` — the caller has already decided (a playlist that mixes
+///    formats converges on the canonical format, and nothing else will do).
+/// 2. Anything a stream copy cannot fix — codec, pixel format, HDR, rotation,
+///    profile/level, a picture larger than the profile, a frame rate above it —
+///    is the canonical conversion.
+/// 3. Otherwise the keyframe spacing is measured. Inside the limit, the picture
+///    is copied and only the sound may need converting. Outside it, the picture
+///    is encoded again *at its own size and rate* — the smallest encode that
+///    makes the file usable live.
+pub fn plan_preparation(
+    builder: &FfmpegCommandBuilder,
+    source: &Path,
+    info: &MediaInfo,
+    profile: OutputProfile,
+    canonical_only: bool,
+) -> Preparation {
+    use crate::media::probe::{audio_native_copy_reasons, video_native_copy_reasons, StreamPlan};
+
+    if canonical_only {
+        let plan = plan_for(builder, source, info, profile);
+        return Preparation { mode: PrepareMode::Canonical, plan, video: None, measured_gop_secs: None };
+    }
+
+    let blocking = video_native_copy_reasons(info, profile);
+    if !blocking.is_empty() {
+        let mut plan = plan_for(builder, source, info, profile);
+        // The canonical path decides for itself what to encode; the reasons a
+        // copy was impossible are what the log should show.
+        plan.video_reasons = blocking;
+        return Preparation { mode: PrepareMode::Canonical, plan, video: None, measured_gop_secs: None };
+    }
+
+    let audio_reasons = audio_native_copy_reasons(info, profile);
+    let audio = if audio_reasons.is_empty() { StreamPlan::Copy } else { StreamPlan::Encode };
+
+    let limit = profile.max_copy_gop_secs();
+    let measured = probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS);
+    if let Some(gop) = measured {
+        if gop > limit {
+            // The one thing a copy cannot fix that is not about the format: an
+            // IDR has to be encoded. Everything else about the file stays.
+            let keyframe_secs = limit / 2.0;
+            let gop_frames = ((info.fps * keyframe_secs).round() as u32).max(1);
+            return Preparation {
+                mode: PrepareMode::LiveNormalize,
+                plan: TranscodePlan {
+                    video: StreamPlan::Encode,
+                    audio,
+                    video_reasons: vec![format!("키프레임 간격이 너무 깁니다 ({gop:.1}초 > {limit:.1}초)")],
+                    audio_reasons,
+                },
+                video: Some(crate::streaming::ffmpeg::LiveVideoSpec {
+                    keyframe_secs,
+                    gop_frames,
+                    kbps: live_normalize_kbps(info, profile),
+                }),
+                measured_gop_secs: measured,
+            };
+        }
+    }
+
+    Preparation {
+        mode: if audio.is_copy() { PrepareMode::Direct } else { PrepareMode::Hybrid },
+        plan: TranscodePlan { video: StreamPlan::Copy, audio, video_reasons: Vec::new(), audio_reasons },
+        video: None,
+        measured_gop_secs: measured,
+    }
+}
+
 /// What adding this file costs: nothing if it is already cached, else a plan.
 ///
 /// The question the library asks the moment a file is added (§2), and the same
@@ -273,7 +433,7 @@ pub fn normalize_one_with(
     media_hash: &str,
     info: &MediaInfo,
     profile: OutputProfile,
-    plan: Option<TranscodePlan>,
+    prepared: Option<&Preparation>,
     cancel: &CancelToken,
     mut on_progress: impl FnMut(f64),
 ) -> Result<NormalizeOutcome> {
@@ -315,11 +475,22 @@ pub fn normalize_one_with(
     // What actually has to be re-encoded (§2, §7, §8). The keyframe spacing is
     // only measured when the video would otherwise be copied, so a file headed
     // for a full encode does not pay for the extra probe.
-    let plan = match plan {
-        Some(p) => p,
+    let plan = match prepared {
+        Some(p) => p.plan.clone(),
         None => plan_for(builder, source, info, profile),
     };
-    let args = builder.build_normalize_args(source, &tmp_path, target, info.has_audio, &plan);
+    let args = match prepared.and_then(|p| p.video.as_ref()) {
+        // The picture is being encoded, but only to fix what a copy cannot.
+        Some(spec) => builder.build_live_normalize_args(
+            source,
+            &tmp_path,
+            target,
+            info.has_audio,
+            !plan.audio.is_copy(),
+            spec,
+        ),
+        None => builder.build_normalize_args(source, &tmp_path, target, info.has_audio, &plan),
+    };
 
     let mut child = builder
         .command(&args)

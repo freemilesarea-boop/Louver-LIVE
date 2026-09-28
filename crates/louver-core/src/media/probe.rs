@@ -569,6 +569,40 @@ pub fn audio_encode_reasons(info: &MediaInfo, profile: OutputProfile) -> Vec<Str
     r
 }
 
+/// Sample rates a live ingest takes as they are.
+///
+/// YouTube's own encoder guide lists 44.1 kHz and 48 kHz stereo AAC for RTMP,
+/// so converting one to the other buys nothing a listener could hear and costs
+/// an audio encode of every hour of the file. The canonical profile still
+/// produces 48 kHz — it is the one format everything converges on — but a file
+/// that arrives at 44.1 kHz and is going out on its own does not have to move.
+pub const LIVE_AUDIO_RATES: [u32; 2] = [44_100, 48_000];
+
+/// Why this file's audio cannot be sent **as it is**.
+///
+/// Deliberately not [`audio_encode_reasons`], which asks whether the audio
+/// already matches the canonical profile exactly. That question is the right
+/// one for a file being converged onto the canonical format, and the wrong one
+/// for a file going out on its own or beside others that share its rate.
+pub fn audio_native_copy_reasons(info: &MediaInfo, profile: OutputProfile) -> Vec<String> {
+    let mut r = Vec::new();
+    match (&info.audio_codec, info.audio_sample_rate, info.audio_channels) {
+        (Some(c), Some(sr), Some(ch))
+            if c == "aac" && LIVE_AUDIO_RATES.contains(&sr) && ch == profile.audio_channels() => {}
+        (None, _, _) => r.push("오디오 트랙이 없습니다".into()),
+        _ => r.push("오디오가 44.1kHz 또는 48kHz 스테레오 AAC가 아닙니다".into()),
+    }
+    if r.is_empty() {
+        if let Some(bps) = info.audio_bitrate {
+            let ceiling = u64::from(profile.audio_kbps()) * 1000 * 2;
+            if bps > ceiling {
+                r.push(format!("오디오 비트레이트가 너무 높습니다 ({} kbps)", bps / 1000));
+            }
+        }
+    }
+    r
+}
+
 /// Decide what has to be re-encoded, and what can simply be copied (§7, §8).
 ///
 /// `max_gop_secs` is the longest gap between keyframes measured in the source,

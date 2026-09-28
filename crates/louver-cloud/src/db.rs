@@ -1587,10 +1587,14 @@ impl CloudDb {
         if shapes.len() < 2 {
             return Ok(());
         }
+        // Only the canonical conversion makes files that are interchangeable
+        // with each other. `direct`, `hybrid` and `live_normalize` all keep
+        // something of the source, so two of those agree only when their
+        // signatures do — exactly, extradata included.
         let all_canonical = shapes.iter().all(|(_, mode, _)| mode == "canonical");
         let first = shapes[0].2.clone();
         let all_same_native =
-            first.is_some() && shapes.iter().all(|(_, mode, sig)| mode == "native" && *sig == first);
+            first.is_some() && shapes.iter().all(|(_, mode, sig)| mode != "canonical" && *sig == first);
         if all_canonical || all_same_native {
             return Ok(());
         }
