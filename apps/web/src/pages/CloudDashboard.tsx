@@ -263,6 +263,11 @@ function BroadcastCard({
   onAct: (what: "start" | "stop" | "restart" | "delete") => void;
   onEdit: () => void;
 }) {
+  // Deleting a broadcast takes its playlist, its schedule and its YouTube link
+  // with it and cannot be undone, and 삭제 sits one button away from 시작. A
+  // second click is the whole guard — a modal for this would be heavier than
+  // the decision.
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const live = holdsASlot(b);
   const scheduled = !live && b.schedule.enabled;
   const status = scheduled ? "예약됨" : RUNTIME_LABELS[b.runtime_state];
@@ -324,9 +329,33 @@ function BroadcastCard({
               <Button size="sm" onClick={onEdit} disabled={busy}>
                 수정
               </Button>
-              <Button size="sm" onClick={() => onAct("delete")} disabled={busy}>
-                삭제
-              </Button>
+              {confirmingDelete ? (
+                <>
+                  <Button
+                    size="sm"
+                    variant="danger"
+                    onClick={() => onAct("delete")}
+                    disabled={busy}
+                  >
+                    정말 삭제
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => setConfirmingDelete(false)}
+                    disabled={busy}
+                  >
+                    취소
+                  </Button>
+                </>
+              ) : (
+                <Button
+                  size="sm"
+                  onClick={() => setConfirmingDelete(true)}
+                  disabled={busy}
+                >
+                  삭제
+                </Button>
+              )}
             </>
           )}
         </div>

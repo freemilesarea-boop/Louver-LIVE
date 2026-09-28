@@ -231,7 +231,13 @@ type Answer = std::result::Result<(HeaderMap, Json<Me>), ApiError>;
 /// Every check here is also made in the browser. That is not duplication to be
 /// removed: the browser's copy is there to answer quickly, and this copy is the
 /// one that decides, because a request does not have to come from the form.
-pub async fn register(State(app): State<App>, headers: HeaderMap, Json(body): Json<Registration>) -> Answer {
+pub async fn register(
+    State(app): State<App>,
+    peer: crate::throttle::Peer,
+    headers: HeaderMap,
+    Json(body): Json<Registration>,
+) -> Answer {
+    guard("register", &headers, peer)?;
     let (me, token) = crate::blocking(move || {
         let name = clean_name(&body.name)?;
         let email = normalize_email(&body.email)?;
@@ -262,7 +268,14 @@ pub async fn register(State(app): State<App>, headers: HeaderMap, Json(body): Js
     Ok((with_cookie(session_cookie(&token, &headers)), Json(me)))
 }
 
-pub async fn login(State(app): State<App>, headers: HeaderMap, Json(body): Json<Credentials>) -> Answer {
+pub async fn login(
+    State(app): State<App>,
+    peer: crate::throttle::Peer,
+    headers: HeaderMap,
+    Json(body): Json<Credentials>,
+) -> Answer {
+    // Before the hash, not after: the point is to not spend the CPU.
+    guard("login", &headers, peer)?;
     let (me, token) = crate::blocking(move || {
         let email = normalize_email(&body.email)?;
         // The same error for an unknown address as for a wrong password, so the
@@ -278,6 +291,29 @@ pub async fn login(State(app): State<App>, headers: HeaderMap, Json(body): Json<
     })
     .await?;
     Ok((with_cookie(session_cookie(&token, &headers)), Json(me)))
+}
+
+/// Refuse a caller who is hammering this route.
+///
+/// Placed in front of the password hash rather than behind it, because the cost
+/// being defended is the hash itself. A request with no socket behind it — the
+/// tests, driving the router in process — is not counted; see `throttle`.
+fn guard(
+    route: &'static str,
+    headers: &HeaderMap,
+    peer: crate::throttle::Peer,
+) -> std::result::Result<(), ApiError> {
+    let Some(who) = crate::throttle::caller_key(headers, peer.0) else {
+        return Ok(());
+    };
+    match crate::throttle::shared().check(route, &who) {
+        Ok(()) => Ok(()),
+        Err(wait) => {
+            // The address is in the server's log, not in the answer.
+            eprintln!("[louver] {route}: 시도가 너무 잦아 거부했습니다 ({}초 후 재시도)", wait.as_secs());
+            Err(CloudError::TooManyAttempts.into())
+        }
+    }
 }
 
 /// Ends this session server-side, not only in the browser.

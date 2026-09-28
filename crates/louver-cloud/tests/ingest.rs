@@ -276,3 +276,30 @@ fn preparing_the_same_upload_twice_at_once_does_not_destroy_it() {
     // And a retry afterwards is still allowed — the claim was released.
     e.ingest.prepare(&m.id).expect("a retry after the work finished");
 }
+
+#[test]
+fn an_upload_that_would_fill_the_server_is_refused_before_it_is_stored() {
+    // Not the plan's ceiling — the machine's. A disk with no room left cannot
+    // write the database, the prepared file or the container's log, so every
+    // broadcast on the server dies with it. This is the one lever a user has on
+    // that, so it is the one place the floor is enforced.
+    let Some(tools) = tools() else {
+        eprintln!("SKIP: no FFmpeg sidecar");
+        return;
+    };
+    let e = env(&tools);
+
+    // A byte is always fine, whatever disk this test runs on.
+    e.ingest.check_disk_has_room(1).unwrap();
+
+    // Eight exabytes is not, on any disk, and the arithmetic must saturate
+    // rather than wrap into "plenty of room".
+    match e.ingest.check_disk_has_room(i64::MAX) {
+        Err(louver_cloud::CloudError::OutOfSpace) => {}
+        other => panic!("an impossible upload was accepted: {other:?}"),
+    }
+    // And the message a user sees says what to do, with no path in it.
+    let said = louver_cloud::CloudError::OutOfSpace.to_string();
+    assert!(said.contains("저장 공간"), "{said}");
+    assert!(!said.contains('/'), "a user-facing message must not carry a path: {said}");
+}

@@ -48,6 +48,7 @@ impl App {
         let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(data.join("media")));
         let upload_tmp = data.join("uploads");
         std::fs::create_dir_all(&upload_tmp)?;
+        sweep_abandoned_uploads(&upload_tmp);
 
         let tools =
             FfmpegTools::discover(std::env::var("LOUVER_FFMPEG_DIR").ok().map(PathBuf::from).as_deref())
@@ -89,6 +90,33 @@ impl App {
         };
 
         Ok(Self { db, mgr, ingest, storage, keys, upload_tmp, tools, youtube, payapp })
+    }
+}
+
+/// Throw away `.part` files from uploads that never finished.
+///
+/// The handler deletes its own temp file on both the success and the failure
+/// path, so these only exist when the process died mid-upload — a deploy, a
+/// crash, an OOM. Each one is as large as the video that was being sent, and
+/// nothing would ever look at them again. Boot is the one moment when no upload
+/// is in flight and deleting them is unambiguously safe.
+fn sweep_abandoned_uploads(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut freed: u64 = 0;
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("part") {
+            continue;
+        }
+        let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(&path).is_ok() {
+            freed += size;
+            count += 1;
+        }
+    }
+    if count > 0 {
+        println!("[louver] 중단된 업로드 {count}개를 정리했습니다 ({}MB)", freed / 1_048_576);
     }
 }
 

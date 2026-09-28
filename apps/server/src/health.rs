@@ -35,6 +35,14 @@ pub struct Checks {
     /// is the worst time to find out. Checked here so a deploy says it up front.
     pub ffmpeg_rtmps: bool,
     pub storage: bool,
+    /// Is there still room on the disk to work in?
+    ///
+    /// A boolean rather than a number, because this answer is public: an
+    /// uptime monitor needs to know that the server is about to be unable to
+    /// write, and does not need to know how much of the disk a customer's
+    /// videos are using. False here is the warning that arrives *before* the
+    /// database, the logs and every broadcast stop at once.
+    pub disk: bool,
 }
 
 /// Where this is running, as the operator declared it.
@@ -58,6 +66,7 @@ pub async fn health(State(app): State<App>) -> (StatusCode, Json<Health>) {
             ffmpeg,
             ffmpeg_rtmps: rtmps,
             storage: storage_writable(&app),
+            disk: disk_has_room(&app),
         }
     })
     .await
@@ -67,9 +76,15 @@ pub async fn health(State(app): State<App>) -> (StatusCode, Json<Health>) {
         ffmpeg: false,
         ffmpeg_rtmps: false,
         storage: false,
+        disk: false,
     });
 
-    let ok = checks.api && checks.database && checks.ffmpeg && checks.ffmpeg_rtmps && checks.storage;
+    let ok = checks.api
+        && checks.database
+        && checks.ffmpeg
+        && checks.ffmpeg_rtmps
+        && checks.storage
+        && checks.disk;
     let body = Health {
         status: if ok { "ok" } else { "degraded" },
         version: env!("CARGO_PKG_VERSION"),
@@ -79,6 +94,14 @@ pub async fn health(State(app): State<App>) -> (StatusCode, Json<Health>) {
     };
     // 503 when degraded, so an orchestrator does not have to parse the body.
     (if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(body))
+}
+
+/// Is there more than the reserved floor left on the data volume?
+fn disk_has_room(app: &App) -> bool {
+    let free = louver_core::system::available_disk_bytes(&app.upload_tmp);
+    // Zero means the mount could not be identified — no information, so no
+    // alarm. Anything else is measured against the same floor uploads use.
+    free == 0 || free >= louver_cloud::ingest::DISK_FLOOR_BYTES
 }
 
 /// Does FFmpeg run, and can it reach an RTMPS ingest?

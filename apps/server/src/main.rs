@@ -375,7 +375,10 @@ async fn main() -> std::process::ExitCode {
         app.storage.backend_name()
     );
 
-    let service = with_web_ui(router(app.clone()));
+    // `with_connect_info` so the login throttle can tell one caller from
+    // another when there is no proxy in front to say.
+    let service =
+        with_web_ui(router(app.clone())).into_make_service_with_connect_info::<std::net::SocketAddr>();
     let shutdown = async move {
         let _ = tokio::signal::ctrl_c().await;
         println!("[louver] 종료 신호를 받았습니다. 방송을 정리합니다");

@@ -44,6 +44,15 @@ pub fn run() -> std::process::ExitCode {
     println!("data dir : {}", data.display());
     println!("ffmpeg   : {}", std::env::var("LOUVER_FFMPEG_DIR").unwrap_or_else(|_| "(PATH)".into()));
     println!("방송     : {}개", broadcasts.len());
+    // The number an operator wants first when anything is behaving oddly: a
+    // server that cannot write cannot broadcast, and the symptoms look like
+    // everything else.
+    let free = louver_core::system::available_disk_bytes(&data) / 1_048_576;
+    let floor = louver_cloud::ingest::DISK_FLOOR_BYTES / 1_048_576;
+    println!(
+        "디스크   : 여유 {free}MB (업로드 차단 기준 {floor}MB){}",
+        if free != 0 && free < floor { "  ← 업로드가 거부됩니다" } else { "" }
+    );
     youtube_configuration();
     accounts(&db, keys.as_ref());
     println!();

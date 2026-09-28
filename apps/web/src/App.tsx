@@ -158,10 +158,14 @@ export function App() {
   return (
     <div className="min-h-screen bg-ink-950 text-ink-100">
       <DeploymentBanner />
-      <header className="flex items-center justify-between border-b border-ink-700 px-6 py-3">
-        <div className="flex items-center gap-6">
+      {/* Wraps rather than overflows: at 375px the tabs and the sign-out button
+          do not fit on one line, and a header that overflows takes the whole
+          page with it — the document becomes wider than the screen and every
+          page scrolls sideways. */}
+      <header className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 border-b border-ink-700 px-4 py-3 sm:px-6">
+        <div className="flex min-w-0 flex-wrap items-center gap-x-4 gap-y-2 sm:gap-6">
           <Wordmark />
-          <nav className="flex gap-1">
+          <nav className="flex flex-wrap gap-1">
             {TABS.map((x) => (
               <button
                 key={x.id}
@@ -178,11 +182,13 @@ export function App() {
             ))}
           </nav>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex shrink-0 items-center gap-3">
           {/* The name when there is one, the email for every account made
               before signup asked for one. Rendered as text by React, so a name
               containing markup is shown, never run. */}
-          <span className="text-xs text-ink-500">{displayName(me)}</span>
+          <span className="max-w-[40vw] truncate text-xs text-ink-500">
+            {displayName(me)}
+          </span>
           <Button
             size="sm"
             onClick={async () => {
@@ -194,7 +200,7 @@ export function App() {
           </Button>
         </div>
       </header>
-      <main className="mx-auto max-w-4xl p-6">
+      <main className="mx-auto max-w-4xl p-4 sm:p-6">
         {notice && (
           <div
             role="status"

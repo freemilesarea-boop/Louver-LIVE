@@ -48,6 +48,16 @@ pub enum CloudError {
     /// No subscription, or one that is no longer active.
     #[error("방송을 시작하려면 활성화된 요금제가 필요합니다")]
     NoSubscription,
+    /// The server's own disk, not the user's plan. Separate from
+    /// `LimitReached` because paying more would not help and the operator is
+    /// the one who has to act.
+    #[error("서버 저장 공간이 부족합니다. 잠시 후 다시 시도해 주세요.")]
+    OutOfSpace,
+    /// Too many attempts from one caller in a short time. Not about this
+    /// account — about the machine, which has two cores and a password hash
+    /// that costs a third of one.
+    #[error("시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.")]
+    TooManyAttempts,
     #[error("이미 사용 중인 이메일입니다")]
     EmailTaken,
     #[error("이메일 또는 비밀번호가 올바르지 않습니다")]

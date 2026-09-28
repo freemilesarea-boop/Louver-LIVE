@@ -402,6 +402,40 @@ impl Youtube {
         Ok(())
     }
 
+    /// A new YouTube broadcast for a broadcast whose last one has ended.
+    ///
+    /// The point of doing this rather than provisioning from scratch: a
+    /// `liveStream` is reusable and a `liveBroadcast` is not. Keeping the stream
+    /// means the ingestion address and the stream key stay exactly as they were,
+    /// so the `stream_destinations` row, the sealed key and every line of the
+    /// sending path are untouched — a recurring schedule gets a new YouTube
+    /// broadcast without the user's connection being rebuilt underneath them.
+    ///
+    /// Only when there is no usable stream does this fall back to full
+    /// provisioning, which does replace the key.
+    fn renew(&self, b: &crate::models::Broadcast, account_id: &str) -> Result<()> {
+        let meta = metadata_of(b);
+        let start = scheduled_start_for(b);
+        let end = b.schedule.stop_at.clone().filter(|_| b.schedule.enabled);
+        let fresh = self.call_api(&b.id, account_id, ApiMethod::LiveBroadcastsInsert, |api, token| {
+            api.create_broadcast(token, &meta, &start, end.as_deref(), true)
+        })?;
+
+        if let Some(stream_id) = b.youtube.stream_id.clone() {
+            let bound = self.call_api(&b.id, account_id, ApiMethod::LiveBroadcastsBind, |api, token| {
+                api.bind_broadcast(token, &fresh.id, &stream_id)
+            })?;
+            if bound.bound_stream_id.as_deref() == Some(stream_id.as_str()) {
+                self.db.attach_youtube(&b.id, account_id, &fresh.id, &stream_id, WAITING)?;
+                return Ok(());
+            }
+        }
+        // No stream to reuse: make one, which also rewrites the destination and
+        // its key. Correct, and the more disruptive of the two paths, which is
+        // why it is the fallback.
+        self.provision(&b.user_id, &b.id, account_id)
+    }
+
     /// Bring YouTube's side in line with what 247streams says. §10.
     pub fn sync_metadata(&self, user_id: &str, broadcast_id: &str) -> Result<()> {
         let b = self.db.broadcast_owned(user_id, broadcast_id)?;
@@ -435,10 +469,19 @@ impl Youtube {
             })?;
 
         if broadcast.life_cycle_status == "complete" {
+            // A completed YouTube broadcast can never go live again — and this
+            // is the *ordinary* state of a broadcast that ran yesterday, or one
+            // whose window ended this morning. Refusing here is what used to
+            // make a daily schedule work exactly once.
+            //
+            // So the record is marked complete (it is), and a fresh YouTube
+            // broadcast is made for this occurrence. `renew` keeps the existing
+            // ingestion stream, so the destination row and its sealed key — the
+            // things FFmpeg actually sends to — do not change.
             self.db.set_youtube_status(broadcast_id, COMPLETE)?;
-            return Err(CloudError::Invalid(
-                "이 YouTube 방송은 이미 종료되었습니다. 새 방송을 만들어 주세요.".into(),
-            ));
+            self.note(broadcast_id, "이전 YouTube 방송이 종료되어 새 방송을 만듭니다");
+            self.renew(&b, &account_id)?;
+            return Ok(());
         }
         // Recovery's case: the resources are still there but the binding is
         // not, which YouTube answers with a broadcast that has no stream.
@@ -594,10 +637,22 @@ fn metadata_of(b: &crate::models::Broadcast) -> BroadcastMetadata {
 }
 
 /// A `scheduledStartTime` YouTube will accept. §5: required even for "start now".
+///
+/// Always in the future. A repeating schedule keeps its *original* start instant
+/// for ever — that is what "every weekday at 21:00" is stored as — so using it
+/// verbatim would hand YouTube a start time from last month on every occurrence
+/// after the first.
 fn scheduled_start_for(b: &crate::models::Broadcast) -> String {
-    b.schedule
+    let soon = chrono::Utc::now() + chrono::Duration::minutes(1);
+    let stored = b
+        .schedule
         .start_at
-        .clone()
+        .as_deref()
         .filter(|_| b.schedule.enabled)
-        .unwrap_or_else(|| (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    match stored {
+        Some(t) if t > soon => t.to_rfc3339(),
+        _ => soon.to_rfc3339(),
+    }
 }

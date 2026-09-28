@@ -763,18 +763,60 @@ fn n2_a_pasted_key_broadcast_causes_no_api_call_at_all() {
     let _ = account;
 }
 
-// --- O: a broadcast YouTube has ended is not started again ----------------
+// --- O: a broadcast YouTube has ended gets a new one ----------------------
 
 #[test]
-fn o_a_completed_youtube_broadcast_refuses_to_start() {
+fn o_a_completed_youtube_broadcast_is_replaced_rather_than_reused() {
+    // A completed YouTube broadcast can never go live again. That used to be an
+    // error the user could only escape by building a new broadcast, which made a
+    // daily schedule work exactly once. Now the next start makes a fresh YouTube
+    // broadcast — and keeps the ingestion stream, so the destination row and the
+    // sealed key the sender uses do not move.
     let e = env();
     let account = e.connect();
     let id = e.broadcast(&account, "밤의 플레이리스트");
     e.yt.provision(&e.user, &id, &account).unwrap();
+    let before = e.db.broadcast_owned(&e.user, &id).unwrap();
+    let key_account = louver_cloud::credentials::destination_account(&before.destination_id);
+    let key_before = e.keys.get(&key_account).unwrap();
+    *e.api.lifecycle.lock().unwrap() = "complete".into();
+    let inserts_before = e.api.matching("/liveBroadcasts?").iter().filter(|c| c.method == "POST").count();
+
+    e.yt.before_start(&id).unwrap();
+
+    let after = e.db.broadcast_owned(&e.user, &id).unwrap();
+    assert_eq!(
+        e.api.matching("/liveBroadcasts?").iter().filter(|c| c.method == "POST").count(),
+        inserts_before + 1,
+        "no new YouTube broadcast was created",
+    );
+    assert_eq!(after.youtube.status.as_deref(), Some("waiting_for_ingest"));
+    assert_eq!(
+        after.youtube.stream_id, before.youtube.stream_id,
+        "the ingestion stream was replaced along with the broadcast",
+    );
+    assert_eq!(after.destination_id, before.destination_id, "the destination row moved");
+    assert_eq!(e.keys.get(&key_account).unwrap(), key_before, "the stream key changed");
+}
+
+#[test]
+fn o3_a_renewal_with_no_usable_stream_provisions_from_scratch() {
+    // The fallback. If the stream is gone too, the only way back is a full
+    // provisioning — which does replace the key, and is why it is not the
+    // ordinary path.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    // A record with no stream: what a half-finished provisioning leaves.
+    e.db.attach_youtube(&id, &account, "bcast-1", "", "complete").unwrap();
     *e.api.lifecycle.lock().unwrap() = "complete".into();
 
-    assert!(e.yt.before_start(&id).is_err(), "§14: this must not be restarted for ever");
-    assert_eq!(e.db.broadcast_owned(&e.user, &id).unwrap().youtube.status.as_deref(), Some("complete"));
+    e.yt.before_start(&id).unwrap();
+
+    let after = e.db.broadcast_owned(&e.user, &id).unwrap();
+    assert_eq!(after.youtube.status.as_deref(), Some("waiting_for_ingest"));
+    assert!(after.youtube.stream_id.is_some(), "a new stream was not created");
 }
 
 #[test]

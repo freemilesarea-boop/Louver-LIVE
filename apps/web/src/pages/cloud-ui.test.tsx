@@ -316,6 +316,34 @@ describe("the broadcast dashboard", () => {
     expect(stop).toHaveBeenCalledWith("b1");
   });
 
+  it("asks twice before deleting a broadcast", async () => {
+    // 삭제 sits next to 시작 and cannot be undone: it takes the playlist, the
+    // schedule and the YouTube link with it.
+    const remove = vi.fn().mockResolvedValue(undefined);
+    const t = fake({
+      deleteBroadcast: remove,
+      dashboard: vi.fn().mockResolvedValue({
+        plan_label: "Basic",
+        active: 0,
+        allowed: 1,
+        broadcasts: [broadcast({ desired_state: "stopped" })],
+      } satisfies Dashboard),
+    });
+
+    show(<CloudDashboard />, t);
+
+    await userEvent.click(await screen.findByRole("button", { name: "삭제" }));
+    expect(remove).not.toHaveBeenCalled();
+
+    // And it can be backed out of.
+    await userEvent.click(screen.getByRole("button", { name: "취소" }));
+    expect(remove).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: "삭제" }));
+    await userEvent.click(screen.getByRole("button", { name: "정말 삭제" }));
+    expect(remove).toHaveBeenCalledWith("b1");
+  });
+
   it("repeats the server's refusal instead of deciding for itself", async () => {
     // The browser is not the authority here: it asks, and shows the answer.
     const t = fake({

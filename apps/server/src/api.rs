@@ -461,9 +461,13 @@ pub async fn delete_broadcast(
 ) -> std::result::Result<Json<Gone>, ApiError> {
     crate::blocking(move || {
         // Stopping first is what makes the delete safe: the row cannot vanish
-        // while a worker still holds its slot.
-        let _ = app.mgr.stop(&uid, &id);
-        app.db.delete_broadcast_owned(&uid, &id)
+        // while a worker still holds its slot. A delete ends the YouTube
+        // broadcast too — there will be no next start for this row.
+        let _ = app.mgr.stop_with(&uid, &id, louver_cloud::manager::StopReason::Delete);
+        app.db.delete_broadcast_owned(&uid, &id)?;
+        // Only once the row is gone, and only then: this removes files.
+        app.mgr.forget(&id);
+        Ok(())
     })
     .await?;
     Ok(Json(Gone { deleted: true }))

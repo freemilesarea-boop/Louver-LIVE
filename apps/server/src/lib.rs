@@ -12,6 +12,7 @@ pub mod diagnose;
 pub mod error;
 pub mod health;
 pub mod state;
+pub mod throttle;
 pub mod youtube;
 
 use crate::state::App;

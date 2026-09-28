@@ -179,6 +179,46 @@ impl RuntimeEvents for DbEvents {
     }
 }
 
+/// Why a broadcast is being stopped.
+///
+/// Two questions have one answer each per reason, and getting either wrong is a
+/// production fault rather than a tidiness problem:
+///
+/// * **Does the user still want this running?** A restart or a server shutdown
+///   must leave `desired_state = running`, or recovery will not bring the
+///   broadcast back. Everything else clears it, so no watchdog resumes it.
+/// * **Is YouTube's broadcast over?** A completed YouTube broadcast can never go
+///   live again, so completing one on a restart bricks that broadcast for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The user pressed STOP.
+    UserFinalStop,
+    /// A scheduled window reached its end time.
+    ScheduledWindowEnd,
+    /// "반복 재생" is off and the playlist has played once.
+    PlaylistFinished,
+    /// The broadcast is being deleted.
+    Delete,
+    /// The same broadcast is about to be started again.
+    Restart,
+    /// This process is going down. The broadcast is not.
+    Shutdown,
+    /// The engine failed too many times in a row and stopped trying.
+    GaveUp,
+}
+
+impl StopReason {
+    /// Does this end the YouTube broadcast?
+    pub fn ends_the_youtube_broadcast(self) -> bool {
+        !matches!(self, Self::Restart | Self::Shutdown)
+    }
+
+    /// Does the user's stored intent become "stopped"?
+    pub fn clears_the_intent(self) -> bool {
+        !matches!(self, Self::Restart | Self::Shutdown)
+    }
+}
+
 /// Owns every running broadcast.
 #[derive(Clone)]
 pub struct BroadcastManager {
@@ -284,25 +324,51 @@ impl BroadcastManager {
         }
     }
 
-    /// Stop a broadcast the caller owns.
+    /// Stop a broadcast the caller owns, for good. The STOP button.
+    pub fn stop(&self, user_id: &str, broadcast_id: &str) -> Result<()> {
+        self.stop_with(user_id, broadcast_id, StopReason::UserFinalStop)
+    }
+
+    /// Stop a broadcast, saying *why* — because the why decides two things that
+    /// used to be decided by neither.
     ///
     /// `desired_state` goes to `stopped` before the thread is asked to finish,
-    /// so a tick racing this sees the intent and does not restart.
-    pub fn stop(&self, user_id: &str, broadcast_id: &str) -> Result<()> {
-        self.db.release_stream_slot(user_id, broadcast_id)?;
+    /// so a tick racing this sees the intent and does not restart. For a restart
+    /// the intent is deliberately left alone: the broadcast is meant to be
+    /// running, it is only this process that is changing.
+    pub fn stop_with(&self, user_id: &str, broadcast_id: &str, reason: StopReason) -> Result<()> {
+        // The ownership check that `release_stream_slot` used to be. A reason
+        // that keeps the intent does not write through a `WHERE user_id`, so
+        // without this a restart would not check who was asking.
+        self.db.broadcast_owned(user_id, broadcast_id)?;
+
+        if reason.clears_the_intent() {
+            self.db.release_stream_slot(user_id, broadcast_id)?;
+        }
         self.halt_worker(broadcast_id);
         self.db.record_runtime_only(broadcast_id, RuntimeState::Stopped)?;
         // §9: end YouTube's side too, after the sender is down. Tolerant by
         // design — `enableAutoStop` may already have completed it — and never
         // able to leave 247streams thinking the broadcast is still running.
-        if let Some(yt) = &self.youtube {
-            yt.after_stop(broadcast_id);
+        //
+        // Only for a reason that really is the end of the broadcast. A restart
+        // that completed it would make the next start impossible: YouTube never
+        // reopens a completed broadcast.
+        if reason.ends_the_youtube_broadcast() {
+            if let Some(yt) = &self.youtube {
+                yt.after_stop(broadcast_id);
+            }
         }
         Ok(())
     }
 
+    /// Stop and start again, with nothing in between that ends the broadcast.
+    ///
+    /// The slot is kept across the two halves rather than released and
+    /// re-claimed, so a restart cannot lose its place to another broadcast
+    /// starting in the same instant.
     pub fn restart(&self, user_id: &str, broadcast_id: &str) -> Result<()> {
-        self.stop(user_id, broadcast_id)?;
+        self.stop_with(user_id, broadcast_id, StopReason::Restart)?;
         self.start(user_id, broadcast_id)
     }
 
@@ -416,7 +482,10 @@ impl BroadcastManager {
                     }
                 }
                 Some(crate::schedule::ScheduleAction::Stop) => {
-                    let _ = self.stop(&b.user_id, &b.id);
+                    // The window is over, so this occurrence's YouTube broadcast
+                    // is over with it. The next occurrence gets a new one —
+                    // see `Youtube::renew`.
+                    let _ = self.stop_with(&b.user_id, &b.id, StopReason::ScheduledWindowEnd);
                     let _ = self.db.append_event(
                         &b.id,
                         EventLevel::Info,
@@ -428,7 +497,28 @@ impl BroadcastManager {
         }
     }
 
+    /// Throw away a deleted broadcast's working directory.
+    ///
+    /// Each broadcast owns a directory holding a core database, a concat
+    /// manifest and a session file. Deleting the row used to leave all three
+    /// behind for ever — small individually, unbounded over a year of a class
+    /// making and deleting broadcasts, and on the same 80 GB disk as everything
+    /// else. Best effort: a directory that will not go is not a reason to fail
+    /// a delete the user has already been told succeeded.
+    pub fn forget(&self, broadcast_id: &str) {
+        let dir = self.work_dir(broadcast_id);
+        if dir.exists() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                eprintln!("[louver] 작업 디렉터리를 지우지 못했습니다: {e}");
+            }
+        }
+    }
+
     /// Ask every worker to finish, and wait. For a clean shutdown.
+    ///
+    /// [`StopReason::Shutdown`] in everything but name: `desired_state` is left
+    /// alone so recovery restarts these, and YouTube is not told anything —
+    /// the broadcast is not ending, this process is.
     pub fn shutdown(&self) {
         let ids: Vec<String> = self.running_ids();
         for id in ids {
@@ -580,6 +670,10 @@ fn run_until_stopped(
 ) {
     let mut stderr_cursor = StderrCursor::default();
     let mut watcher = YoutubeWatch::default();
+    // Only read when "전체 반복" is off: where the pass being played began, and
+    // how many relaunches had happened by then.
+    let mut pass_began_at: i64 = 0;
+    let mut seen_restarts: i64 = 0;
     loop {
         if stop.load(Ordering::SeqCst) {
             let _ = rt.stop(true);
@@ -623,8 +717,21 @@ fn run_until_stopped(
         // deliberate stop, so nothing brings it back.
         if !loop_forever {
             let status = rt.status();
-            if status.cycle_duration_secs > 0.5 && (status.elapsed_secs as f64) >= status.cycle_duration_secs
-            {
+            // A relaunched FFmpeg reads the manifest from the top, so the pass
+            // it is playing began then — not when the broadcast did. Measuring
+            // from the start would cut a reconnected single pass short by
+            // exactly the time the reconnect took, which is the one thing "한
+            // 바퀴만" promises not to do.
+            if status.supervisor.restart_count as i64 != seen_restarts {
+                seen_restarts = status.supervisor.restart_count as i64;
+                pass_began_at = status.elapsed_secs;
+                let _ = db.append_event(
+                    broadcast_id,
+                    EventLevel::Info,
+                    "재연결되어 플레이리스트를 처음부터 다시 재생합니다",
+                );
+            }
+            if pass_complete(status.cycle_duration_secs, status.elapsed_secs, pass_began_at) {
                 let _ = rt.stop(true);
                 let _ = db.append_event(
                     broadcast_id,
@@ -633,6 +740,12 @@ fn run_until_stopped(
                 );
                 let _ = db.release_stream_slot(&user_id, broadcast_id);
                 let _ = db.record_runtime_only(broadcast_id, RuntimeState::Stopped);
+                // A real ending, so YouTube is told. Without this the dashboard
+                // says stopped while the channel still shows a live broadcast
+                // with nothing arriving on it. `StopReason::PlaylistFinished`.
+                if let Some(yt) = &youtube {
+                    yt.after_stop(broadcast_id);
+                }
                 return;
             }
         }
@@ -652,11 +765,27 @@ fn run_until_stopped(
                 &format!("{MAX_RESTARTS}회 연속 재시작에도 방송이 유지되지 않았습니다"),
             );
             let _ = db.give_up(broadcast_id);
+            // Nothing is going to bring this back by itself, so it is an ending
+            // like any other: `StopReason::GaveUp`. Leaving YouTube live would
+            // leave a channel showing a broadcast that no longer has a sender.
+            if let Some(yt) = &youtube {
+                yt.after_stop(broadcast_id);
+            }
             return;
         }
 
         std::thread::sleep(TICK);
     }
+}
+
+/// Has this single pass played the whole playlist?
+///
+/// Separated out because it is the whole of "한 바퀴만" and it is the kind of
+/// arithmetic that is wrong in a way nobody notices for a month.
+fn pass_complete(cycle_secs: f64, elapsed_secs: i64, pass_began_at: i64) -> bool {
+    // A cycle of zero means the engine has not worked out how long the playlist
+    // is yet. Stopping then would end the broadcast the instant it started.
+    cycle_secs > 0.5 && (elapsed_secs - pass_began_at) as f64 >= cycle_secs
 }
 
 /// What a broadcast needs to know about its prepared file.
@@ -978,5 +1107,32 @@ mod stderr_cursor_tests {
         // FFmpeg repeats the same DTS warning; each occurrence is news.
         assert_eq!(c.fresh(&lines(&["dts"])), lines(&["dts"]));
         assert_eq!(c.fresh(&lines(&["dts", "dts"])), lines(&["dts"]));
+    }
+}
+
+#[cfg(test)]
+mod pass_tests {
+    use super::pass_complete;
+
+    #[test]
+    fn a_pass_ends_only_once_the_whole_playlist_has_played() {
+        assert!(!pass_complete(60.0, 0, 0));
+        assert!(!pass_complete(60.0, 59, 0));
+        assert!(pass_complete(60.0, 60, 0));
+    }
+
+    #[test]
+    fn a_relaunch_restarts_the_pass_rather_than_shortening_it() {
+        // FFmpeg died 50 seconds into a 60-second playlist and was relaunched,
+        // so the pass being played began at second 50. Ending at second 60 would
+        // give the user 50 seconds of one pass and 10 of another.
+        assert!(!pass_complete(60.0, 60, 50));
+        assert!(!pass_complete(60.0, 109, 50));
+        assert!(pass_complete(60.0, 110, 50));
+    }
+
+    #[test]
+    fn an_unknown_playlist_length_never_ends_the_broadcast() {
+        assert!(!pass_complete(0.0, 10_000, 0));
     }
 }

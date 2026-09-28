@@ -32,6 +32,17 @@ services:
     # start — and the server is one process whose work is FFmpeg, which there is
     # no reason to starve on a box dedicated to it. To cap it anyway:
     #   docker compose -f docker-compose.yml -f docker-compose.limits.yml up -d
+    # Every FFmpeg warning line and every provisioning step goes to stdout, so a
+    # server broadcasting around the clock writes to the container log all day.
+    # Docker's default json-file driver has no ceiling, which on an 80 GB server
+    # means the log eventually takes the disk the database and the media are on —
+    # and a full disk does not slow this service down, it stops it. Three files
+    # of 50 MB is a few days of history and a bound.
+    logging:
+      driver: json-file
+      options:
+        max-size: '50m'
+        max-file: '3'
     healthcheck:
       test: ['CMD', 'louver-server', '--health-check']
       interval: 30s
@@ -47,6 +58,11 @@ services:
     image: caddy:2-alpine
     profiles: ['https']
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: '20m'
+        max-file: '3'
     ports:
       - '80:80'
       - '443:443'

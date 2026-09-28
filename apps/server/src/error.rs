@@ -32,6 +32,11 @@ impl IntoResponse for ApiError {
             CloudError::LimitReached { .. }
             | CloudError::ConcurrencyReached { .. }
             | CloudError::NoSubscription => (StatusCode::PAYMENT_REQUIRED, self.0.to_string()),
+            // Nothing the caller did wrong and nothing paying would fix: the
+            // server has no room. 507 rather than 500 so it is distinguishable
+            // in a log without reading the message.
+            CloudError::TooManyAttempts => (StatusCode::TOO_MANY_REQUESTS, self.0.to_string()),
+            CloudError::OutOfSpace => (StatusCode::INSUFFICIENT_STORAGE, self.0.to_string()),
             // Anything internal keeps its detail in the log, not in the body.
             CloudError::Db(_) | CloudError::Io(_) | CloudError::Crypto => {
                 eprintln!("[louver] internal: {}", self.0);

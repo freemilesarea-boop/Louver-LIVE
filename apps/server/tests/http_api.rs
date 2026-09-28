@@ -1733,3 +1733,49 @@ async fn no_billing_response_carries_a_credential() {
         }
     }
 }
+
+#[tokio::test]
+async fn a_burst_of_password_guesses_is_refused_before_the_hash_is_computed() {
+    // The CPU, not the account. Verifying a password is 600,000 PBKDF2 rounds by
+    // design; on a two-core server a stream of guesses is a way to take the
+    // machine away from the broadcasts on it without guessing anything.
+    let s = server();
+    account(&s, "dj@example.com").await;
+    louver_server::throttle::shared().clear();
+
+    let attempt = |ip: &'static str, password: &'static str, app: louver_server::state::App| async move {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/api/auth/login")
+            .header("x-forwarded-for", ip)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "email": "dj@example.com", "password": password,
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        louver_server::router(app).oneshot(req).await.unwrap().status()
+    };
+
+    let limit = louver_server::throttle::MAX_ATTEMPTS;
+    for i in 0..limit {
+        let got = attempt("203.0.113.7", "not-the-password", s.app.clone()).await;
+        assert_eq!(got, StatusCode::UNAUTHORIZED, "attempt {i} answered {got}");
+    }
+    assert_eq!(
+        attempt("203.0.113.7", "not-the-password", s.app.clone()).await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the burst was never cut off",
+    );
+    // Even the right password waits its turn — the limit is on the caller, not
+    // on being wrong.
+    assert_eq!(
+        attempt("203.0.113.7", "correct-horse-battery", s.app.clone()).await,
+        StatusCode::TOO_MANY_REQUESTS,
+    );
+    // And somebody else signing in from another address is unaffected.
+    assert_eq!(attempt("198.51.100.4", "correct-horse-battery", s.app.clone()).await, StatusCode::OK,);
+    louver_server::throttle::shared().clear();
+}
