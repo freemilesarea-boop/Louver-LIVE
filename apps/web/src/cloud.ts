@@ -29,6 +29,9 @@ export type MediaState =
 export interface Me {
   id: string;
   email: string;
+  /** `user` or `admin`. Decides whether the operator console is offered; it
+   * never decides whether it works — every admin route re-checks the database. */
+  role?: string;
   plan_id: string;
   /** What this person is called. `null` on accounts made before signup asked
    * for a name — every reader falls back to the email. */

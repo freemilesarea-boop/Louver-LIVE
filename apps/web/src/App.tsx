@@ -18,6 +18,7 @@ import {
 import { LegalPage, legalPageFor } from "./pages/Legal";
 import { DeploymentBanner, ServerStatus } from "./pages/ServerStatus";
 import { SignIn } from "./pages/SignIn";
+import { AdminApp, AdminDenied, isAdminPath } from "./admin/AdminApp";
 import { useTransport } from "./TransportContext";
 import { displayName } from "./cloud";
 import type { Me } from "./cloud";
@@ -91,6 +92,12 @@ export function App() {
       typeof window !== "undefined" &&
       window.location.pathname.replace(/\/+$/, "") === "/pricing",
   );
+  // The operator console lives under `/admin`. Read once, like the paths above;
+  // what it gates on is `me.role`, and the server checks that again on every
+  // request the console makes.
+  const [wantsAdmin] = useState(
+    () => typeof window !== "undefined" && isAdminPath(window.location.pathname),
+  );
   const [me, setMe] = useState<Me | null>(null);
   const [checked, setChecked] = useState(false);
   const [consent] = useState(consentOutcome);
@@ -136,6 +143,13 @@ export function App() {
         <SignIn onSignedIn={setMe} />
       </>
     );
+  }
+
+  // Answered here rather than by hiding a menu item: `/admin` is a URL anyone
+  // can type. A member who types it is told no, and the console is not rendered
+  // for them at all — and even if it were, every route it calls is refused.
+  if (wantsAdmin) {
+    return me.role === "admin" ? <AdminApp email={me.email} /> : <AdminDenied />;
   }
 
   // After the sign-in gate, unlike the legal pages: knowing whether a payment
@@ -189,6 +203,16 @@ export function App() {
           <span className="max-w-[40vw] truncate text-xs text-ink-500">
             {displayName(me)}
           </span>
+          {/* Only offered to an account the server already called an admin.
+              Hiding it is not what keeps members out — refusing the requests is. */}
+          {me.role === "admin" && (
+            <a
+              href="/admin"
+              className="rounded-md border border-live-dim px-2.5 py-1 text-xs text-live hover:bg-ink-800"
+            >
+              관리자
+            </a>
+          )}
           <Button
             size="sm"
             onClick={async () => {

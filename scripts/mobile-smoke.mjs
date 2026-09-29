@@ -14,7 +14,7 @@
  * a supported deployment and the state the page has to handle anyway.
  */
 import { createServer } from 'node:http'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -50,24 +50,22 @@ const fake = createServer((req, res) => {
 await new Promise((r) => fake.listen(PAY_PORT, '127.0.0.1', r))
 
 const data = mkdtempSync(join(tmpdir(), 'mobile-smoke-'))
-const server = spawn('./target/debug/louver-server', [], {
-  env: {
-    ...process.env,
-    LOUVER_DATA_DIR: data,
-    LOUVER_MASTER_KEY: 'ef'.repeat(32),
-    LOUVER_WEB_DIR: 'apps/web/dist',
-    LOUVER_FFMPEG_DIR: 'apps/desktop/src-tauri/binaries',
-    LOUVER_BIND: `127.0.0.1:${PORT}`,
-    LOUVER_INSECURE_COOKIES: '1',
-    LOUVER_DEPLOYMENT: 'local',
-    LOUVER_PUBLIC_URL: BASE,
-    PAYAPP_USERID: 'mobile-merchant',
-    PAYAPP_LINKKEY: 'mobile-link-key',
-    PAYAPP_LINKVAL: 'mobile-link-val',
-    PAYAPP_API_URL: `http://127.0.0.1:${PAY_PORT}/oapi/apiLoad.html`,
-  },
-  stdio: ['ignore', 'pipe', 'pipe'],
-})
+const env = {
+  ...process.env,
+  LOUVER_DATA_DIR: data,
+  LOUVER_MASTER_KEY: 'ef'.repeat(32),
+  LOUVER_WEB_DIR: 'apps/web/dist',
+  LOUVER_FFMPEG_DIR: 'apps/desktop/src-tauri/binaries',
+  LOUVER_BIND: `127.0.0.1:${PORT}`,
+  LOUVER_INSECURE_COOKIES: '1',
+  LOUVER_DEPLOYMENT: 'local',
+  LOUVER_PUBLIC_URL: BASE,
+  PAYAPP_USERID: 'mobile-merchant',
+  PAYAPP_LINKKEY: 'mobile-link-key',
+  PAYAPP_LINKVAL: 'mobile-link-val',
+  PAYAPP_API_URL: `http://127.0.0.1:${PAY_PORT}/oapi/apiLoad.html`,
+}
+const server = spawn('./target/debug/louver-server', [], { env, stdio: ['ignore', 'pipe', 'pipe'] })
 const serverLog = []
 for (const s of [server.stdout, server.stderr]) s.on('data', (c) => serverLog.push(c.toString()))
 
@@ -162,6 +160,23 @@ try {
       await page.goto(BASE + path)
       await page.waitForTimeout(200)
       await measure(path)
+    }
+
+    // The operator console. Denser than anything a student sees, and the one
+    // screen somebody will open from a phone in the middle of an incident.
+    // The grant is the same shell command as in production.
+    const granted = spawnSync('./target/debug/louver-server', ['--set-admin', email], {
+      env,
+      encoding: 'utf8',
+    })
+    if (granted.status !== 0) fail(`--set-admin: ${granted.stderr}`)
+    await page.goto(`${BASE}/admin`)
+    await page.getByRole('button', { name: '대시보드', exact: true }).waitFor({ timeout: 15000 })
+    await measure('/admin')
+    for (const s of ['매출', '회원', '방송', '결제', '시스템', '감사 로그']) {
+      await page.getByRole('button', { name: s, exact: true }).first().click()
+      await page.waitForTimeout(350)
+      await measure(`/admin ${s}`)
     }
 
     await ctx.close()

@@ -207,13 +207,16 @@ pub struct Registration {
 pub struct Me {
     pub id: String,
     pub email: String,
+    /// `user` or `admin`. The browser reads it only to decide whether to offer
+    /// the console; every admin route checks the database for itself.
+    pub role: String,
     pub plan_id: String,
     pub name: Option<String>,
 }
 
 impl Me {
     fn of(u: louver_cloud::User) -> Self {
-        Self { id: u.id, email: u.email, plan_id: u.plan_id, name: u.name }
+        Self { id: u.id, email: u.email, role: u.role, plan_id: u.plan_id, name: u.name }
     }
 }
 
@@ -285,6 +288,11 @@ pub async fn login(
             return Err(CloudError::BadCredentials);
         }
         let user = app.db.user(&user_id)?;
+        // A switched-off account is refused *after* the password check, so this
+        // route still cannot be used to find out which addresses exist.
+        if user.is_disabled() {
+            return Err(CloudError::Disabled);
+        }
         let (token, token_hash) = new_token()?;
         app.db.create_auth_session(&user.id, &token_hash, SESSION_DAYS)?;
         Ok((Me::of(user), token))

@@ -2359,6 +2359,7 @@ dependencies = [
  "louver-core",
  "serde",
  "serde_json",
+ "sysinfo",
  "tempfile",
  "tokio",
  "tokio-stream",

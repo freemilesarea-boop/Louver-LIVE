@@ -36,6 +36,7 @@ const PAY_USERID = 'release-merchant'
 const LINKKEY = 'release-link-key'
 const LINKVAL = 'release-link-val'
 const EMAIL = `student-${Date.now()}@example.com`
+const ADMIN_EMAIL = `operator-${Date.now()}@example.com`
 const PASSWORD = 'correct-horse-battery'
 
 const log = (...a) => console.log('[release]', ...a)
@@ -468,6 +469,131 @@ try {
     fail('서버 재시작이 YouTube 방송을 종료시켰습니다')
   }
   log('서버를 죽였다 살려도 방송이 돌아옴 ✓, YouTube 는 건드리지 않음 ✓')
+
+  step(18, 'the admin console: shut to members, opened from the shell')
+  const meNow = (await get('/api/me')).json
+  if (meNow.role !== 'user') fail(`새 계정의 role 이 ${meNow.role} 입니다`)
+  const ADMIN_ROUTES = [
+    ['GET', '/api/admin/dashboard'],
+    ['GET', '/api/admin/revenue'],
+    ['GET', '/api/admin/users'],
+    ['GET', `/api/admin/users/${meNow.id}`],
+    ['GET', `/api/admin/users/${meNow.id}/payments`],
+    ['GET', '/api/admin/broadcasts'],
+    ['GET', '/api/admin/billing'],
+    ['GET', '/api/admin/system'],
+    ['GET', '/api/admin/audit'],
+    ['POST', `/api/admin/users/${meNow.id}/disabled`],
+    ['POST', `/api/admin/broadcasts/${bId}/stop`],
+  ]
+  // Nobody at all.
+  for (const [method, path] of ADMIN_ROUTES) {
+    const r = await fetch(`${BASE}${path}`, {
+      method,
+      headers: { 'content-type': 'application/json' },
+      body: method === 'POST' ? '{}' : undefined,
+    })
+    if (r.status !== 401) fail(`로그인 없이 ${method} ${path} 가 ${r.status}`)
+  }
+  // A paying member, who is not an operator.
+  for (const [method, path] of ADMIN_ROUTES) {
+    const r = await call(method, path, method === 'POST' ? {} : undefined)
+    if (r.status !== 403) fail(`일반 사용자가 ${method} ${path} 로 ${r.status} 를 받았습니다`)
+  }
+  log('비로그인 401 ✓, 일반 사용자 403 ✓ (11개 경로)')
+
+  const memberCookie = cookie
+  cookie = ''
+  const opReg = await post('/api/auth/register', {
+    name: '운영자',
+    email: ADMIN_EMAIL,
+    password: PASSWORD,
+  })
+  if (opReg.status !== 200) fail(`운영자 가입 ${opReg.status}`)
+  // Registering does not make an operator, and neither does any request.
+  if ((await get('/api/admin/dashboard')).status !== 403) fail('가입만으로 관리자가 됐습니다')
+  const granted = spawnSync('./target/debug/louver-server', ['--set-admin', ADMIN_EMAIL], {
+    env,
+    encoding: 'utf8',
+  })
+  if (granted.status !== 0) fail(`--set-admin 실패: ${granted.stderr}`)
+  const listed = spawnSync('./target/debug/louver-server', ['--list-admins'], { env, encoding: 'utf8' })
+  if (!listed.stdout.includes(ADMIN_EMAIL)) fail('--list-admins 에 관리자가 없습니다')
+  log('셸로만 관리자 지정 ✓')
+
+  step(19, 'the dashboard adds up to what actually happened')
+  const board = await get('/api/admin/dashboard')
+  if (board.status !== 200) fail(`dashboard ${board.status}: ${board.text}`)
+  const b0 = board.json
+  if (b0.users.total !== 2) fail(`회원 ${b0.users.total}명, 기대 2`)
+  // One verified payment of ₩39,900, notified twice on purpose in step 6.
+  if (b0.revenue.all_time !== 39900) fail(`누적 매출 ${b0.revenue.all_time}, 기대 39900`)
+  if (b0.revenue.today !== 39900) fail(`오늘 매출 ${b0.revenue.today}, 기대 39900`)
+  if (b0.mrr_krw !== 39900) fail(`MRR ${b0.mrr_krw}, 기대 39900`)
+  if (b0.subscriptions.paid_total !== 1) fail(`유료 ${b0.subscriptions.paid_total}명, 기대 1`)
+  if (b0.broadcasts.running !== 1) fail(`송출 중 ${b0.broadcasts.running}, 기대 1`)
+  if (b0.youtube_accounts !== 1) fail(`YouTube 연결 ${b0.youtube_accounts}, 기대 1`)
+  const report = await get('/api/admin/revenue?from=2020-01-01&to=2099-12-31&grain=month')
+  if (report.status !== 200) fail(`revenue ${report.status}`)
+  const buckets = report.json.buckets.reduce((n, x) => n + x.krw, 0)
+  if (buckets !== 39900) fail(`기간 합계 ${buckets}, 기대 39900`)
+  if (report.json.buckets.reduce((n, x) => n + x.new_krw, 0) !== 39900) {
+    fail('첫 결제가 신규로 계산되지 않았습니다')
+  }
+  log('대시보드 숫자 = 실제로 일어난 일 ✓, 중복 알림 1회만 ✓')
+
+  step(20, 'force stop is the ordinary stop, and it is written down')
+  const adminList = (await get('/api/admin/broadcasts?filter=running')).json
+  const mine = adminList.find((x) => x.id === bId)
+  if (!mine) fail('관리자 화면에 송출 중인 방송이 없습니다')
+  if (!mine.worker_alive) fail('워커가 살아 있는데 죽은 것으로 보입니다')
+  google.lifecycle = 'live'
+  const completesBeforeForce = google.transitions.filter((t) => t === 'complete').length
+  const forced = await post(`/api/admin/broadcasts/${bId}/stop`, { note: '고객 요청 (릴리스 점검)' })
+  if (forced.status !== 200) fail(`force stop ${forced.status}: ${forced.text}`)
+  if (forced.json.desired_state !== 'stopped') fail('강제 종료 후에도 의도가 running 입니다')
+  if (google.transitions.filter((t) => t === 'complete').length !== completesBeforeForce + 1) {
+    fail('강제 종료가 YouTube 방송을 종료하지 않았습니다')
+  }
+  await new Promise((r) => setTimeout(r, 2000))
+  const afterForce = (await get(`/api/admin/broadcasts`)).json.find((x) => x.id === bId)
+  if (afterForce.desired_state !== 'stopped' || afterForce.worker_alive) {
+    fail('강제 종료한 방송을 watchdog 이 되살렸습니다')
+  }
+  const audit = (await get('/api/admin/audit')).json
+  const line = audit.find((a) => a.action === 'admin.broadcast.force_stop' && a.target_id === bId)
+  if (!line) fail('감사 로그에 강제 종료가 없습니다')
+  if (line.admin_email !== ADMIN_EMAIL) fail(`감사 로그의 관리자가 ${line.admin_email}`)
+  if (line.note !== '고객 요청 (릴리스 점검)') fail('사유가 남지 않았습니다')
+  log('강제 종료 = 일반 종료 ✓, watchdog 안 살림 ✓, 감사 로그 ✓')
+
+  step('☑', '관리자에게도 비밀정보는 보이지 않는다')
+  const surfaces = [
+    '/api/admin/dashboard',
+    '/api/admin/users',
+    `/api/admin/users/${meNow.id}`,
+    '/api/admin/broadcasts',
+    '/api/admin/billing',
+    '/api/admin/system',
+    '/api/admin/audit',
+  ]
+  for (const path of surfaces) {
+    const body = (await get(path)).text
+    for (const secret of [LINKKEY, LINKVAL, env.YOUTUBE_CLIENT_SECRET, env.LOUVER_MASTER_KEY, 'refresh-1', PASSWORD]) {
+      if (body.includes(secret)) fail(`${path} 응답에 비밀정보가 있습니다`)
+    }
+  }
+  log('7개 관리자 응답에 비밀정보 없음 ✓')
+
+  // Back to the student, and back on air: the cancellation policy below is
+  // about what happens to a broadcast that is running when somebody cancels.
+  cookie = memberCookie
+  const backOn = await post(`/api/broadcasts/${bId}/start`)
+  if (backOn.status !== 200) fail(`다시 시작 ${backOn.status}: ${backOn.text}`)
+  await until('다시 송출', async () => {
+    const b = (await get(`/api/broadcasts/${bId}`)).json
+    return b.runtime_state === 'RUNNING'
+  })
 
   step(14, 'cancel the subscription — while a broadcast is on air')
   // Deliberately not stopped first: the policy is that confirming a

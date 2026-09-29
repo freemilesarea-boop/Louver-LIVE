@@ -4,7 +4,8 @@
 들어가 `~/louver-live` 에서 실행하는 것을 기준으로 합니다.
 
 배포 자체는 [CLOUD_TESTING.md](CLOUD_TESTING.md), 결제는 [PAYAPP.md](PAYAPP.md),
-YouTube 는 [YOUTUBE_OAUTH.md](YOUTUBE_OAUTH.md) 를 보세요.
+YouTube 는 [YOUTUBE_OAUTH.md](YOUTUBE_OAUTH.md), 매출·회원·방송을 화면으로 보는
+관리 콘솔은 [ADMIN.md](ADMIN.md) 를 보세요.
 
 ---
 
@@ -20,6 +21,8 @@ YouTube 는 [YOUTUBE_OAUTH.md](YOUTUBE_OAUTH.md) 를 보세요.
 | 해지했는데 권한이 남은 계정 | `docker compose exec louver louver-server --audit-billing` |
 | 요금제 저장 한도와 계정별 사용량 | `docker compose exec louver louver-server --audit-storage` |
 | 이 영상이 왜 이렇게 준비됐는지 | `docker compose exec louver louver-server --media-check <파일>` |
+| 매출·회원·방송을 화면으로 | `https://247streams.kr/admin` ([ADMIN.md](ADMIN.md)) |
+| 관리자 계정 목록 | `docker compose exec louver louver-server --list-admins` |
 
 `/health` 의 `checks` 는 전부 `true` 여야 합니다. 하나라도 `false` 면 HTTP 503 이
 나오고, `status` 는 `degraded` 입니다.
@@ -222,7 +225,7 @@ docker compose exec louver louver-server --audit-plans --revoke-unpaid-grants --
 
 ```bash
 npm run verify                 # 11단계 전체
-node scripts/release-smoke.mjs # 가입→결제→YouTube→송출→해지 17단계 (가짜 PayApp/Google)
+node scripts/release-smoke.mjs # 가입→결제→YouTube→송출→관리콘솔→해지 20단계 (가짜 PayApp/Google)
 node scripts/mobile-smoke.mjs  # 휴대폰 4개 화면 폭에서 레이아웃
 node scripts/capacity-check.mjs # 동시 1·2·3 송출의 CPU/RAM
 

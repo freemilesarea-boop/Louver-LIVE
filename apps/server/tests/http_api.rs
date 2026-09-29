@@ -87,7 +87,18 @@ fn server() -> Server {
     std::fs::create_dir_all(&upload_tmp).unwrap();
     Server {
         _dir: dir,
-        app: App { db, mgr, ingest, storage, keys, upload_tmp, tools, youtube: None, payapp: None },
+        app: App {
+            db,
+            mgr,
+            ingest,
+            storage,
+            keys,
+            upload_tmp,
+            tools,
+            youtube: None,
+            payapp: None,
+            machine: std::sync::Arc::new(louver_server::state::Machine::default()),
+        },
     }
 }
 

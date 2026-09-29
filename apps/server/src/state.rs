@@ -29,6 +29,37 @@ pub struct App {
     /// again a supported deployment: everything but paying works, and the
     /// checkout route is the only thing that has to say so.
     pub payapp: Option<louver_cloud::billing::Payapp>,
+    /// CPU and memory, sampled on demand for the admin console.
+    ///
+    /// One long-lived sampler rather than a fresh one per request: `sysinfo`
+    /// reports CPU as the change between two readings, so a sampler created for
+    /// a single request always answers zero. Behind a mutex because it is
+    /// stateful, and the admin page is the only caller.
+    pub machine: std::sync::Arc<Machine>,
+}
+
+/// What this container is using, without spawning anything.
+#[derive(Debug)]
+pub struct Machine(std::sync::Mutex<sysinfo::System>);
+
+impl Default for Machine {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new(sysinfo::System::new()))
+    }
+}
+
+impl Machine {
+    /// `(cpu percent of the whole machine, used MB, total MB)`.
+    pub fn sample(&self) -> (f32, u64, u64) {
+        let mut sys = match self.0.lock() {
+            Ok(s) => s,
+            Err(e) => e.into_inner(),
+        };
+        sys.refresh_cpu();
+        sys.refresh_memory();
+        let cpu = sys.global_cpu_info().cpu_usage();
+        (cpu, sys.used_memory() / 1_048_576, sys.total_memory() / 1_048_576)
+    }
 }
 
 impl App {
@@ -89,7 +120,18 @@ impl App {
             }
         };
 
-        Ok(Self { db, mgr, ingest, storage, keys, upload_tmp, tools, youtube, payapp })
+        Ok(Self {
+            db,
+            mgr,
+            ingest,
+            storage,
+            keys,
+            upload_tmp,
+            tools,
+            youtube,
+            payapp,
+            machine: std::sync::Arc::new(Machine::default()),
+        })
     }
 }
 

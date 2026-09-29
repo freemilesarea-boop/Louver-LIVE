@@ -507,6 +507,49 @@ impl CloudDb {
         // was recorded", which is the truth for every existing row.
         ensure_column(&conn, "users", "terms_version", "TEXT")?;
 
+        // Who may run the service, and whose account is switched off.
+        //
+        // Both additive and both defaulted to the status quo: every existing row
+        // becomes an ordinary, enabled user. There is no route that writes
+        // either column — `--set-admin` and the admin API do, and nothing a
+        // signup or a session can reach.
+        ensure_column(&conn, "users", "role", "TEXT NOT NULL DEFAULT 'user'")?;
+        ensure_column(&conn, "users", "disabled_at", "TEXT")?;
+
+        // What an operator did to somebody else's account, and when.
+        //
+        // Append-only in practice: nothing in this codebase updates or deletes a
+        // row. Deliberately holds *no* secret — not a password hash, not a
+        // provider key, not a token — because an audit log is the one table
+        // most likely to be read out loud in a support thread.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS admin_audit (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 at          TEXT NOT NULL DEFAULT (datetime('now')),
+                 admin_id    TEXT NOT NULL,
+                 admin_email TEXT NOT NULL,
+                 action      TEXT NOT NULL,
+                 target_type TEXT NOT NULL,
+                 target_id   TEXT NOT NULL,
+                 before      TEXT,
+                 after       TEXT,
+                 note        TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_audit_at ON admin_audit(id DESC);
+             CREATE INDEX IF NOT EXISTS idx_audit_target ON admin_audit(target_type, target_id, id DESC);",
+        )?;
+
+        // Indexes the admin console's aggregations need, and nothing else does.
+        // `CREATE INDEX IF NOT EXISTS` on a table with production rows is a
+        // one-off build of an index, not a rewrite.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_users_created ON users(created_at);
+             CREATE INDEX IF NOT EXISTS idx_billing_event_paid
+                 ON billing_events(pay_state, processed_at);
+             CREATE INDEX IF NOT EXISTS idx_billing_status ON billing_subscriptions(status);
+             CREATE INDEX IF NOT EXISTS idx_broadcast_runtime ON broadcasts(runtime_state);",
+        )?;
+
         // What the prepared file actually is, and what to aim for next time.
         //
         // `prepared_signature` is the exact shape of the prepared file — codec,
@@ -837,7 +880,8 @@ impl CloudDb {
             .lock()
             .unwrap()
             .query_row(
-                "SELECT id, email, plan_id, created_at, name, terms_accepted_at, privacy_accepted_at
+                "SELECT id, email, plan_id, created_at, name, terms_accepted_at, privacy_accepted_at,
+                        COALESCE(role, 'user'), disabled_at
                  FROM users WHERE id=?1",
                 [id],
                 |r| {
@@ -851,6 +895,8 @@ impl CloudDb {
                         name: r.get(4)?,
                         terms_accepted_at: r.get(5)?,
                         privacy_accepted_at: r.get(6)?,
+                        role: r.get(7)?,
+                        disabled_at: r.get(8)?,
                     })
                 },
             )
@@ -917,6 +963,12 @@ impl CloudDb {
     /// The one gate, called from the places that spend resources. Its error names
     /// nothing internal and tells the user what to do about it.
     pub fn require_active_subscription(&self, user_id: &str) -> Result<Subscription> {
+        // Belt as well as braces. Disabling an account already deletes its
+        // sessions and stops its broadcasts, but this is the gate every path
+        // that spends the server's resources goes through — START, the
+        // scheduler, boot recovery — and a switched-off account must not get
+        // past any of them.
+        self.require_enabled(user_id)?;
         let sub = self.subscription(user_id)?;
         if !sub.active {
             return Err(CloudError::NoSubscription);

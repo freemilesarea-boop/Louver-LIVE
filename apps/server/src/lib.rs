@@ -5,6 +5,7 @@
 //! nothing to a running stream; a restart of this process brings back whatever
 //! was still meant to be running.
 
+pub mod admin;
 pub mod api;
 pub mod auth;
 pub mod billing;
@@ -95,6 +96,21 @@ pub fn router(app: App) -> Router {
         .route("/api/youtube/oauth/callback", get(youtube::callback))
         .route("/api/youtube/accounts", get(youtube::list_accounts))
         .route("/api/youtube/accounts/{id}", delete(youtube::delete_account))
+        // Every one of these goes through the `Admin` extractor, which answers
+        // 401 without a session and 403 for an ordinary user. There is
+        // deliberately no admin route that writes `users.role`: an operator is
+        // made at the command line, on the server.
+        .route("/api/admin/dashboard", get(admin::dashboard))
+        .route("/api/admin/revenue", get(admin::revenue))
+        .route("/api/admin/users", get(admin::users))
+        .route("/api/admin/users/{id}", get(admin::user))
+        .route("/api/admin/users/{id}/payments", get(admin::user_payments))
+        .route("/api/admin/users/{id}/disabled", post(admin::set_disabled))
+        .route("/api/admin/broadcasts", get(admin::broadcasts))
+        .route("/api/admin/broadcasts/{id}/stop", post(admin::force_stop))
+        .route("/api/admin/billing", get(admin::billing))
+        .route("/api/admin/system", get(admin::system))
+        .route("/api/admin/audit", get(admin::audit))
         .route("/api/metrics", get(api::metrics))
         .route("/api/events", get(api::events))
         .with_state(app)

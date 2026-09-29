@@ -154,6 +154,26 @@ pub struct User {
     /// behalf.
     pub terms_accepted_at: Option<String>,
     pub privacy_accepted_at: Option<String>,
+    /// `user` or `admin`. Read from the database and nowhere else — never from
+    /// a request, never from an email address the code recognises.
+    pub role: String,
+    /// When an operator switched this account off. `None` is an ordinary,
+    /// working account. A disabled account keeps every row it owns.
+    pub disabled_at: Option<String>,
+}
+
+/// The one role that can reach `/api/admin/*`.
+pub const ROLE_ADMIN: &str = "admin";
+pub const ROLE_USER: &str = "user";
+
+impl User {
+    pub fn is_admin(&self) -> bool {
+        self.role == ROLE_ADMIN
+    }
+
+    pub fn is_disabled(&self) -> bool {
+        self.disabled_at.is_some()
+    }
 }
 
 /// A plan is a bag of named limits, never a name the code branches on.

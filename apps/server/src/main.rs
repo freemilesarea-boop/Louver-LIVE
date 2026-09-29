@@ -292,6 +292,67 @@ fn audit_billing(args: &[String]) -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
+/// `--set-admin <email>` / `--drop-admin <email>` / `--list-admins`
+///
+/// The only way an operator is made. There is deliberately no API for it: a
+/// route that can grant admin is a route that has to be perfect for ever, and
+/// this service does not need one. Somebody with a shell on the server is
+/// already the most privileged party there is.
+///
+/// Not run automatically by any deployment. The command exists; using it is a
+/// decision.
+fn set_admin(args: &[String]) -> std::process::ExitCode {
+    let data = std::path::PathBuf::from(
+        std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()),
+    );
+    let db = match louver_cloud::CloudDb::open(&data.join("cloud.db")) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[louver] 데이터베이스를 열 수 없습니다 ({}): {e}", data.display());
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    if args.iter().any(|a| a == "--list-admins") {
+        match db.admins() {
+            Ok(list) if list.is_empty() => println!("관리자 계정이 없습니다."),
+            Ok(list) => {
+                println!("관리자 {}명:", list.len());
+                for email in list {
+                    println!("  {email}");
+                }
+            }
+            Err(e) => {
+                eprintln!("[louver] 관리자 목록을 읽을 수 없습니다: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
+
+    let (flag, role) = match value_of(args, "--set-admin") {
+        Some(email) => (email, louver_cloud::ROLE_ADMIN),
+        None => match value_of(args, "--drop-admin") {
+            Some(email) => (email, louver_cloud::ROLE_USER),
+            None => {
+                eprintln!("사용법: louver-server --set-admin <email> | --drop-admin <email> | --list-admins");
+                return std::process::ExitCode::FAILURE;
+            }
+        },
+    };
+    match db.set_role(&flag, role) {
+        Ok(u) => {
+            println!("[louver] {} → {}", u.email, if u.is_admin() { "관리자" } else { "일반 사용자" });
+            println!("관리 콘솔: <서비스 주소>/admin");
+            std::process::ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("[louver] 권한을 바꾸지 못했습니다: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
 /// `--audit-storage [--apply --yes]`
 ///
 /// The storage ceilings that ship in this build, against the ones the database
@@ -599,6 +660,10 @@ async fn main() -> std::process::ExitCode {
     // Who is on which plan, and how they got there.
     if args.iter().any(|a| a == "--audit-plans") {
         return audit_plans(&args);
+    }
+    // Who may open the admin console.
+    if args.iter().any(|a| a == "--set-admin" || a == "--drop-admin" || a == "--list-admins") {
+        return set_admin(&args);
     }
     // Why one file was prepared the way it was, and what it cost.
     if args.iter().any(|a| a == "--media-check") {

@@ -9,6 +9,7 @@
 //! The rule this crate holds to: if `louver-core` already does something, call
 //! it. Replacing tested code with untested code is not a port.
 
+pub mod admin;
 pub mod billing;
 pub mod credentials;
 pub mod db;
@@ -82,6 +83,17 @@ pub enum CloudError {
     /// that costs a third of one.
     #[error("시도가 너무 많습니다. 잠시 후 다시 시도해 주세요.")]
     TooManyAttempts,
+    /// Signed in, and not an operator.
+    ///
+    /// Separate from [`CloudError::Forbidden`], which answers 404 on purpose so
+    /// that one user cannot probe another's ids. The admin surface is not a
+    /// resource somebody might own: a plain 403 is the honest answer, and it is
+    /// what an operator wants to see in a log.
+    #[error("관리자 권한이 필요합니다")]
+    NotAdmin,
+    /// The account has been switched off by an operator.
+    #[error("이 계정은 사용이 중지되었습니다. 관리자에게 문의해 주세요.")]
+    Disabled,
     #[error("이미 사용 중인 이메일입니다")]
     EmailTaken,
     #[error("이메일 또는 비밀번호가 올바르지 않습니다")]

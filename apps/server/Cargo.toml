@@ -26,6 +26,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tower-http = { version = "0.6", features = ["fs", "trace"] }
 # Only for the SSE endpoint's ticking stream; it pulls in nothing new.
 tokio-stream = "0.1"
+# Already in the tree via louver-core; the admin console samples CPU and RAM.
+sysinfo.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

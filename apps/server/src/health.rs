@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Health {
     /// "ok" when every check passed, "degraded" when one did not.
     pub status: &'static str,
@@ -25,7 +25,7 @@ pub struct Health {
     pub checks: Checks,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Checks {
     pub api: bool,
     pub database: bool,
@@ -58,6 +58,19 @@ pub fn deployment() -> String {
 }
 
 pub async fn health(State(app): State<App>) -> (StatusCode, Json<Health>) {
+    let body = snapshot(&app).await;
+    let ok = body.status == "ok";
+    // 503 when degraded, so an orchestrator does not have to parse the body.
+    (if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(body))
+}
+
+/// The same answer `/health` gives, for anything else that wants it.
+///
+/// Shared rather than duplicated: the admin console's system page shows exactly
+/// what the healthcheck sees, and two implementations of "is the database
+/// answering" would eventually disagree.
+pub async fn snapshot(app: &App) -> Health {
+    let app = app.clone();
     let checks = tokio::task::spawn_blocking(move || {
         let (ffmpeg, rtmps) = ffmpeg_state(&app.tools.ffmpeg);
         Checks {
@@ -85,15 +98,13 @@ pub async fn health(State(app): State<App>) -> (StatusCode, Json<Health>) {
         && checks.ffmpeg_rtmps
         && checks.storage
         && checks.disk;
-    let body = Health {
+    Health {
         status: if ok { "ok" } else { "degraded" },
         version: env!("CARGO_PKG_VERSION"),
         deployment: deployment(),
         cookies: crate::auth::CookiePolicy::from_env().name(),
         checks,
-    };
-    // 503 when degraded, so an orchestrator does not have to parse the body.
-    (if ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE }, Json(body))
+    }
 }
 
 /// Is there more than the reserved floor left on the data volume?
