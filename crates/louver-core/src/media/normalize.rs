@@ -189,6 +189,82 @@ pub fn direct_source_is_broadcastable(info: &MediaInfo, prep: &Preparation) -> b
         && is_mp4_family(&info.container)
 }
 
+/// An upper bound on the bytes a preparation will write to the disk.
+///
+/// Not a guess. Every encode this product performs is rate-capped in its own
+/// argv — `-b:v N -maxrate N -bufsize 2N` in both [`build_normalize_args`] and
+/// [`build_live_normalize_args`] — so the encoder cannot sustain more than `N`,
+/// and the VBV buffer bounds the short-term overshoot to two seconds' worth.
+/// Duration times the capped rate is therefore a real ceiling on the video, and
+/// the audio is a constant bitrate by construction.
+///
+/// [`build_normalize_args`]: crate::streaming::ffmpeg::FfmpegCommandBuilder::build_normalize_args
+/// [`build_live_normalize_args`]: crate::streaming::ffmpeg::FfmpegCommandBuilder::build_live_normalize_args
+///
+/// What this is for: knowing, *before* FFmpeg is started, whether the disk can
+/// hold what it is about to write. The old estimate was three times the source
+/// and was wrong in both directions — far too much for a 700MB source that
+/// becomes nothing, and no help at all for a 700MB source that becomes 11GB,
+/// which is a thing that happens when hours of 2fps video are encoded at
+/// 1080p30.
+///
+/// `source_bytes` is the upload's own size, needed for the paths that copy the
+/// picture rather than encode it.
+pub fn estimated_prepared_bytes(
+    info: &MediaInfo,
+    prep: &Preparation,
+    profile: OutputProfile,
+    source_bytes: u64,
+) -> u64 {
+    // Nothing is produced, so nothing is needed.
+    if direct_source_is_broadcastable(info, prep) {
+        return 0;
+    }
+    let secs = info.duration_secs.max(0.0);
+    let audio = if prep.plan.audio.is_copy() {
+        // Copied out of the source, so whatever it already was. Counted inside
+        // `source_bytes` below when the picture is copied too.
+        0
+    } else {
+        (f64::from(profile.audio_kbps()) * 125.0 * secs) as u64
+    };
+
+    let video = if prep.plan.video.is_copy() {
+        // The picture is copied, so it arrives at its own size. The whole
+        // source is the bound: the copied video cannot be larger than the file
+        // it came out of, audio and container included.
+        source_bytes
+    } else {
+        let kbps = match prep.video.as_ref() {
+            // Fixing the keyframes only: the encoder was given the source's own
+            // bitrate with a little room.
+            Some(spec) => spec.kbps,
+            // The canonical conversion, at the profile's figure.
+            None => profile.video_kbps(),
+        };
+        (f64::from(kbps) * 125.0 * secs) as u64
+    };
+
+    with_margin(video.saturating_add(audio))
+}
+
+/// Room for what the arithmetic above does not model.
+///
+/// The rate caps bound the streams; the file is a little more than its streams.
+/// An MP4 carries a moov atom that grows with the frame count, interleaving
+/// padding, and a VBV that may sit full at the last second. Ten percent plus a
+/// fixed 16MiB covers all of it with room to spare at both ends of the scale —
+/// the fixed part matters for a short clip, where ten percent of very little is
+/// very little, and the proportional part for a four-hour one.
+///
+/// Measured against real encodes in `storage_disk_guard.rs`, which asserts both
+/// directions: that the estimate is never under what FFmpeg actually wrote, and
+/// that it is not so far over as to refuse uploads a disk could have held.
+fn with_margin(bytes: u64) -> u64 {
+    const FIXED: u64 = 16 * 1024 * 1024;
+    bytes.saturating_add(bytes / 10).saturating_add(FIXED)
+}
+
 /// Bitrate for a re-encode that is only fixing the keyframes.
 ///
 /// The source is already a file somebody was happy to publish, so the target is

@@ -17,7 +17,8 @@ use crate::{CloudError, Result};
 use louver_core::config::OutputProfile;
 use louver_core::media::cache::MediaCache;
 use louver_core::media::normalize::{
-    direct_source_is_broadcastable, normalize_one_with, plan_preparation, CancelToken, PrepareMode,
+    direct_source_is_broadcastable, estimated_prepared_bytes, normalize_one_with, plan_preparation,
+    CancelToken, PrepareMode,
 };
 use louver_core::media::probe::{probe, probe_max_keyframe_gap, probe_signature, StreamSignature};
 use louver_core::streaming::ffmpeg::{FfmpegCommandBuilder, FfmpegTools};
@@ -54,6 +55,14 @@ pub const MAX_PREPARING_AT_ONCE: usize = 1;
 /// chances to catch it not having done so — and it is an index read rather than
 /// a scan of hours of video.
 const KEYFRAME_CHECK_SECS: u32 = 60;
+
+/// How often to look at the disk while a conversion is writing to it.
+///
+/// Often enough that the floor is still there when it trips, rarely enough that
+/// a four-hour encode does not stat the volume tens of thousands of times. At
+/// the profile's capped 6.2 Mbps an output grows about 4.6MB in this window,
+/// which is nothing against a 5GiB floor.
+const FLOOR_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Turns an uploaded file into a broadcastable one.
 #[derive(Clone)]
@@ -108,7 +117,7 @@ impl Ingest {
     ) -> Result<crate::CloudMedia> {
         let size = std::fs::metadata(temp_file)?.len() as i64;
         self.db.check_upload_allowed(user_id, size)?;
-        self.check_disk_has_room(size)?;
+        self.check_disk_has_room()?;
 
         let key = self.storage.put_file(user_id, filename, temp_file)?;
         let media = self.db.create_media(user_id, filename, size, &key)?;
@@ -123,35 +132,160 @@ impl Ingest {
         Ok(media)
     }
 
-    /// Is there room on the server's own disk for this, and for what it becomes?
+    /// Free bytes on the volume the store is on, or `None` when that cannot be
+    /// read.
     ///
-    /// An upload of N bytes costs N when it needs no conversion, and about 2N
-    /// when it does — the original is kept either way, so a future profile
-    /// change can re-prepare it — plus the scratch copy FFmpeg writes on the
-    /// way. Which of the two it will be is not known until the file has been
-    /// probed, and it is not worth probing before storing it, so the estimate
-    /// stays at three times the incoming size: it errs towards refusing an
-    /// upload rather than towards a server that cannot write.
-    pub fn check_disk_has_room(&self, incoming_bytes: i64) -> Result<()> {
+    /// `None` is not zero. An unrecognised mount, or a platform sysinfo has
+    /// nothing to say about, means the question was not answered — and refusing
+    /// every upload on that basis would be worse than the risk it guards
+    /// against. Every caller treats it as "allow".
+    fn free_bytes(&self) -> Option<u64> {
         let probe = self.storage.scratch_dir();
         let _ = std::fs::create_dir_all(&probe);
-        let free = louver_core::system::available_disk_bytes(&probe);
-        if free == 0 {
-            // Nothing to go on — an unrecognised mount, or a platform sysinfo
-            // has nothing to say about. Refusing every upload on that basis
-            // would be worse than the risk.
-            return Ok(());
+        match louver_core::system::available_disk_bytes(&probe) {
+            0 => None,
+            n => Some(n),
         }
-        let needed = (incoming_bytes.max(0) as u64).saturating_mul(3).saturating_add(DISK_FLOOR_BYTES);
-        if free < needed {
+    }
+
+    /// Is `free` enough to write `additional` bytes and still leave the floor?
+    ///
+    /// The whole of the policy, as arithmetic, so it can be checked against
+    /// numbers a test can choose rather than against whatever disk the test
+    /// happens to run on. Every caller below is this function plus a `statvfs`.
+    ///
+    /// `None` means the volume could not be read, and answers yes — see
+    /// [`Ingest::free_bytes`].
+    pub fn fits(free: Option<u64>, additional: u64) -> bool {
+        match free {
+            None => true,
+            Some(free) => free >= additional.saturating_add(DISK_FLOOR_BYTES),
+        }
+    }
+
+    /// Is the volume still above the floor right now?
+    ///
+    /// For the upload handler, which has to be able to ask this while a body is
+    /// still arriving. An unreadable volume answers `true`, for the same reason
+    /// [`Self::free_bytes`] returns `None`: a question that could not be asked
+    /// is not a refusal.
+    pub fn disk_above_floor(&self) -> bool {
+        Self::fits(self.free_bytes(), 0)
+    }
+
+    /// Is there room to take this upload into the store?
+    ///
+    /// **The incoming bytes are already on the disk when this runs.** The
+    /// handler streams the body to a temp file, and `free` is read after that,
+    /// so the N bytes have already been spent and counting them again reserves
+    /// them twice. What happens next is a `rename` within one filesystem —
+    /// `uploads/` and `media/` are both under the data directory — which moves
+    /// a directory entry and no bytes at all.
+    ///
+    /// So the only thing this stage has to protect is the floor itself.
+    ///
+    /// What the preparation will cost is a separate question, asked separately
+    /// once the file has been probed and there is a real answer to give. The
+    /// old formula asked it here, before anything was known, and answered three
+    /// times the source — which refused a 20GB upload unless 65GB were free,
+    /// on a server with an 80GB disk.
+    pub fn check_disk_has_room(&self) -> Result<()> {
+        let free = self.free_bytes();
+        if !Self::fits(free, 0) {
+            let free = free.unwrap_or(0);
             eprintln!(
-                "[louver] 업로드 거부: 디스크 여유 {}MB, 필요 {}MB",
+                "[louver] 업로드 거부: 디스크 여유 {}MB, 최소 확보 {}MB",
                 free / 1_048_576,
-                needed / 1_048_576
+                DISK_FLOOR_BYTES / 1_048_576,
             );
             return Err(CloudError::OutOfSpace);
         }
         Ok(())
+    }
+
+    /// Is there room for what this preparation is about to write?
+    ///
+    /// Asked after the probe and the plan, which is the first moment there is
+    /// anything true to say. `estimated_prepared_bytes` is an upper bound drawn
+    /// from the encoder's own rate caps, so a pass here means the output fits
+    /// with the floor still standing underneath it.
+    ///
+    /// Anything already on the disk — the source, and on a re-preparation the
+    /// prepared file that is about to be replaced — is inside `free` already
+    /// and is not counted again. The old prepared file in particular must not
+    /// be: it is not going anywhere, because a broadcast may be reading it.
+    fn check_room_to_prepare(&self, media_id: &str, need: u64) -> Result<()> {
+        let free = self.free_bytes();
+        if !Self::fits(free, need) {
+            let free = free.unwrap_or(0);
+            let needed = need.saturating_add(DISK_FLOOR_BYTES);
+            eprintln!(
+                "[louver] media {}: 변환 보류 — 디스크 여유 {}MB, 필요 {}MB (예상 결과물 {}MB + 최소 확보 {}MB)",
+                &media_id[..8.min(media_id.len())],
+                free / 1_048_576,
+                needed / 1_048_576,
+                need / 1_048_576,
+                DISK_FLOOR_BYTES / 1_048_576,
+            );
+            return Err(CloudError::OutOfSpace);
+        }
+        Ok(())
+    }
+
+    /// Stop this conversion if the disk falls to the floor while it runs.
+    ///
+    /// An estimate is an estimate. The one above is an upper bound on what
+    /// FFmpeg writes, but it cannot know what else lands on the volume in the
+    /// meantime — another upload, a log, a second preparation — so the floor is
+    /// watched again while the output grows.
+    ///
+    /// Cancelling is the whole mechanism: `normalize_one_with` checks the token
+    /// between progress lines, kills **its own child** and removes the partial
+    /// file. No signal is sent to anything else, so a broadcast's FFmpeg cannot
+    /// be touched by this — which is the one thing that must be true of any
+    /// code that reacts to a full disk.
+    fn floor_watch(&self, media_id: &str) -> (CancelToken, impl Fn(f64) + use<>) {
+        let token = CancelToken::new();
+        let watcher = token.clone();
+        let storage = Arc::clone(&self.storage);
+        let id = media_id.to_string();
+        let last = Mutex::new(std::time::Instant::now());
+        let on_progress = move |_percent: f64| {
+            // FFmpeg reports progress several times a second; stat the volume
+            // once every few seconds instead.
+            {
+                let mut last = last.lock().unwrap();
+                if last.elapsed() < FLOOR_CHECK_EVERY {
+                    return;
+                }
+                *last = std::time::Instant::now();
+            }
+            let free = louver_core::system::available_disk_bytes(&storage.scratch_dir());
+            if free != 0 && free < DISK_FLOOR_BYTES && !watcher.is_cancelled() {
+                eprintln!(
+                    "[louver] media {}: 디스크 여유가 {}MB까지 떨어져 변환을 중단합니다",
+                    &id[..8.min(id.len())],
+                    free / 1_048_576,
+                );
+                watcher.cancel();
+            }
+        };
+        (token, on_progress)
+    }
+
+    /// Report a conversion the floor watch stopped as what it was.
+    ///
+    /// `normalize_one_with` answers a cancellation with `MediaNormalizeCancelled`,
+    /// which is right — it does not know why it was cancelled. Here it is known,
+    /// and the user is owed the real reason: the server ran out of room, not
+    /// their file. `OutOfSpace` is the contract the rest of the product already
+    /// has for that, including the message the browser shows.
+    fn out_of_space_if_cancelled(&self, cancel: &CancelToken, e: louver_core::LouverError) -> CloudError {
+        if cancel.is_cancelled() {
+            CloudError::OutOfSpace
+        } else {
+            e.into()
+        }
     }
 
     /// Analyse, then remux or encode into the broadcast profile.
@@ -255,7 +389,15 @@ impl Ingest {
                 // path, which is what has always handled a file this odd.
                 Err(e) => {
                     eprintln!("[louver] media {media_id}: 원본을 읽지 못했습니다: {e}");
-                    return self.prepare_by_conversion(media_id, &user_id, &key, &local, &info, prep);
+                    return self.prepare_by_conversion(
+                        media_id,
+                        &user_id,
+                        &key,
+                        &local,
+                        &info,
+                        prep,
+                        self.storage.size_bytes(&key).unwrap_or(0),
+                    );
                 }
             }
             // The pointer is the source's own key. `prepared_media_for` needs
@@ -266,7 +408,16 @@ impl Ingest {
             return Ok(());
         }
 
-        self.prepare_by_conversion(media_id, &user_id, &key, &local, &info, prep)
+        // Everything below writes a file, so the disk is asked first — with a
+        // number drawn from the encoder's own rate caps rather than a multiple
+        // of the source. The source is already on the disk and is not counted;
+        // on a re-preparation neither is the prepared file being replaced,
+        // which stays where it is until something is reading it no longer.
+        let source_bytes = self.storage.size_bytes(&key).unwrap_or(0);
+        let need = estimated_prepared_bytes(&info, &prep, CLOUD_PROFILE, source_bytes);
+        self.check_room_to_prepare(media_id, need)?;
+
+        self.prepare_by_conversion(media_id, &user_id, &key, &local, &info, prep, source_bytes)
     }
 
     /// Produce a broadcastable file from a source that is not one yet.
@@ -283,6 +434,7 @@ impl Ingest {
         local: &std::path::Path,
         info: &louver_core::media::probe::MediaInfo,
         mut prep: louver_core::media::normalize::Preparation,
+        source_bytes: u64,
     ) -> Result<()> {
         let builder =
             FfmpegCommandBuilder::new(self.tools.clone(), CLOUD_PROFILE).with_encoder(self.encoder.clone());
@@ -299,6 +451,7 @@ impl Ingest {
         std::fs::create_dir_all(&scratch)?;
         let cache = MediaCache::new(&scratch);
 
+        let (cancel, on_progress) = self.floor_watch(media_id);
         let mut out = normalize_one_with(
             &builder,
             &cache,
@@ -307,9 +460,10 @@ impl Ingest {
             info,
             CLOUD_PROFILE,
             Some(&prep),
-            &CancelToken::new(),
-            |_| {},
-        )?;
+            &cancel,
+            &on_progress,
+        )
+        .map_err(|e| self.out_of_space_if_cancelled(&cancel, e))?;
 
         // A live-normalized file exists for one reason: to have keyframes close
         // enough together for a live ingest. Asking the encoder for them is not
@@ -328,6 +482,10 @@ impl Ingest {
                 std::fs::create_dir_all(&scratch)?;
                 let cache = MediaCache::new(&scratch);
                 prep = plan_preparation(&builder, local, info, CLOUD_PROFILE, true);
+                // A second output, at the canonical rate this time, so the
+                // disk is asked again before it is written.
+                let need = estimated_prepared_bytes(info, &prep, CLOUD_PROFILE, source_bytes);
+                self.check_room_to_prepare(media_id, need)?;
                 out = normalize_one_with(
                     &builder,
                     &cache,
@@ -336,9 +494,10 @@ impl Ingest {
                     info,
                     CLOUD_PROFILE,
                     Some(&prep),
-                    &CancelToken::new(),
-                    |_| {},
-                )?;
+                    &cancel,
+                    &on_progress,
+                )
+                .map_err(|e| self.out_of_space_if_cancelled(&cancel, e))?;
             }
         }
         let mode = prep.mode.id();

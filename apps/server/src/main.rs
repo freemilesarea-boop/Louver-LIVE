@@ -513,6 +513,22 @@ fn audit_media_storage(args: &[String]) -> std::process::ExitCode {
     }
 
     println!("미디어 저장소: {}", report.media_root);
+    let v = &report.volume;
+    if v.known {
+        println!();
+        println!("물리 디스크");
+        println!("  전체        {}", human(v.total_bytes));
+        println!("  사용 중     {}", human(v.used_bytes));
+        println!("  여유        {}", human(v.free_bytes));
+        println!("  최소 확보   {}  (이 아래로는 업로드와 변환을 거부합니다)", human(v.floor_bytes));
+        println!("  쓸 수 있음  {}", human(v.usable_bytes));
+        if v.usable_bytes == 0 {
+            println!("  ⚠ 여유가 최소 확보선 아래입니다. 새 업로드와 변환이 거부됩니다.");
+        }
+    } else {
+        println!();
+        println!("물리 디스크: 알 수 없음 (볼륨을 식별하지 못했습니다)");
+    }
     if !report.open_files_known {
         println!();
         println!("  ⚠ 열려 있는 파일 목록을 읽지 못했습니다. 어떤 파일도 삭제 가능으로 판정하지 않습니다.");

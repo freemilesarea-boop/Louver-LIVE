@@ -17,6 +17,13 @@ use std::convert::Infallible;
 use std::io::Write;
 use std::time::Duration;
 
+/// How much of an upload may be written between two looks at the disk.
+///
+/// The check costs a `statvfs`; 64MiB of body between them is under a second
+/// on any link fast enough to matter, and 64MiB is nothing against the 5GiB
+/// floor it is protecting.
+const FLOOR_CHECK_EVERY_BYTES: i64 = 64 * 1024 * 1024;
+
 type Out<T> = std::result::Result<Json<T>, ApiError>;
 
 // --- media ----------------------------------------------------------------
@@ -65,6 +72,7 @@ pub async fn upload_media(
         let temp = app.upload_tmp.join(format!("{}.part", louver_cloud::new_id()));
         let mut file = std::fs::File::create(&temp)?;
         let mut written: i64 = 0;
+        let mut floor_checked: i64 = 0;
         loop {
             let chunk = match field.chunk().await {
                 Ok(Some(c)) => c,
@@ -76,6 +84,19 @@ pub async fn upload_media(
                 }
             };
             written += chunk.len() as i64;
+            // The floor, while the body is still arriving. Without this the
+            // only disk check happens after the whole file has landed, which is
+            // exactly too late for the upload that fills the volume. Every few
+            // megabytes rather than every chunk: a chunk is tens of kilobytes
+            // and statting the volume that often would cost more than it saves.
+            if written - floor_checked >= FLOOR_CHECK_EVERY_BYTES {
+                floor_checked = written;
+                if !app.ingest.disk_above_floor() {
+                    drop(file);
+                    let _ = std::fs::remove_file(&temp);
+                    return Err(CloudError::OutOfSpace.into());
+                }
+            }
             if written > ceiling {
                 drop(file);
                 let _ = std::fs::remove_file(&temp);

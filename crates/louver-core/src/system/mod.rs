@@ -98,6 +98,20 @@ impl MetricsCollector {
     }
 }
 
+/// Total and free bytes on the volume containing `path`.
+///
+/// `(total, free)`, and `(0, 0)` when the volume cannot be identified — the
+/// same "not answered" that [`available_disk_bytes`] reports as zero.
+pub fn disk_capacity_bytes(path: &Path) -> (u64, u64) {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .filter(|d| path.starts_with(d.mount_point()))
+        .max_by_key(|d| d.mount_point().as_os_str().len())
+        .map(|d| (d.total_space(), d.available_space()))
+        .unwrap_or((0, 0))
+}
+
 /// Free bytes on the volume containing `path` (§10).
 pub fn available_disk_bytes(path: &Path) -> u64 {
     let disks = sysinfo::Disks::new_with_refreshed_list();

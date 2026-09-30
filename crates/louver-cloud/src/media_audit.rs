@@ -87,9 +87,30 @@ pub struct Totals {
     pub reclaimable_bytes: u64,
 }
 
+/// The volume itself, which is the thing the floor actually protects.
+///
+/// Separate from every quota on purpose. A plan's storage ceiling is what an
+/// account was sold; this is what the machine has. The two are allowed to
+/// disagree — several accounts may be sold more in total than the disk holds,
+/// which is ordinary — and the floor is what keeps that from becoming a server
+/// that cannot write.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct Volume {
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+    pub used_bytes: u64,
+    pub floor_bytes: u64,
+    /// Free space above the floor: what an upload or a conversion may use.
+    pub usable_bytes: u64,
+    /// `false` when the volume could not be identified, in which case every
+    /// figure above is zero and none of them means anything.
+    pub known: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MediaStorageAudit {
     pub media_root: String,
+    pub volume: Volume,
     pub objects: Vec<ObjectRow>,
     /// Scratch directories left behind by a preparation that died.
     pub scratch_bytes: u64,
@@ -354,8 +375,19 @@ pub fn audit(db: &CloudDb, data_dir: &Path) -> Result<MediaStorageAudit> {
         }
     }
 
+    let (total, free) = louver_core::system::disk_capacity_bytes(&media_root);
+    let volume = Volume {
+        total_bytes: total,
+        free_bytes: free,
+        used_bytes: total.saturating_sub(free),
+        floor_bytes: crate::ingest::DISK_FLOOR_BYTES,
+        usable_bytes: free.saturating_sub(crate::ingest::DISK_FLOOR_BYTES),
+        known: total > 0,
+    };
+
     Ok(MediaStorageAudit {
         media_root: media_root.to_string_lossy().into_owned(),
+        volume,
         objects,
         scratch_bytes: dir_bytes(&media_root.join(".scratch")),
         manifests,

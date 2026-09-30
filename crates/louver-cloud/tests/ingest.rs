@@ -738,18 +738,26 @@ fn an_upload_that_would_fill_the_server_is_refused_before_it_is_stored() {
     };
     let e = env(&tools);
 
-    // A byte is always fine, whatever disk this test runs on.
-    e.ingest.check_disk_has_room(1).unwrap();
+    // The gate a real upload passes through, on whatever disk this test runs
+    // on. It asks one thing — is the floor still there — because by the time it
+    // runs the upload is already written and the move into the store is a
+    // rename. What the *preparation* will cost is asked later, once the file
+    // has been probed and there is a real number to give; `Ingest::fits` is
+    // that arithmetic and `storage_disk_guard.rs` checks it against numbers a
+    // test can choose.
+    e.ingest.check_disk_has_room().expect("a machine running this test has 5GiB free");
+    assert!(e.ingest.disk_above_floor());
 
-    // Eight exabytes is not, on any disk, and the arithmetic must saturate
-    // rather than wrap into "plenty of room".
-    match e.ingest.check_disk_has_room(i64::MAX) {
-        Err(louver_cloud::CloudError::OutOfSpace) => {}
-        other => panic!("an impossible upload was accepted: {other:?}"),
-    }
-    // And the message a user sees says what to do, with no path in it.
+    // Nothing fits under a disk that has nothing left, and the arithmetic
+    // saturates rather than wrapping into "plenty of room".
+    assert!(!Ingest::fits(Some(0), 0));
+    assert!(!Ingest::fits(Some(u64::MAX - 1), u64::MAX));
+
+    // And the message a user sees says what to do, with no path in it. Written
+    // without assuming the spacing, so that rewording it — "저장 공간" or
+    // "저장공간" — is a copy change and not a broken test.
     let said = louver_cloud::CloudError::OutOfSpace.to_string();
-    assert!(said.contains("저장 공간"), "{said}");
+    assert!(said.replace(' ', "").contains("저장공간"), "{said}");
     assert!(!said.contains('/'), "a user-facing message must not carry a path: {said}");
 }
 
