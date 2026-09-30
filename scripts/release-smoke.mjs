@@ -282,17 +282,21 @@ try {
     }
   }
   if (plans.some((p) => p.id === 'none')) fail('미구독 상태가 요금제로 판매되고 있습니다')
-  // The storage ceilings a fresh database seeds, and the invariant that a
-  // per-file limit can never exceed the whole allowance.
-  for (const [id, storage] of Object.entries({ basic: 5, pro: 10, business: 20 })) {
+  // The storage ceilings a fresh database seeds — both of them, because the
+  // per-file limit is its own promise and not a fraction of the other — and the
+  // invariant that one file can never be allowed to exceed the whole allowance.
+  const CEILINGS = { basic: [15, 10], pro: [30, 15], business: [60, 20] }
+  for (const [id, [storage, perFile]] of Object.entries(CEILINGS)) {
     const p = plans.find((x) => x.id === id)
     const gb = p.limits.max_storage_bytes / 1024 ** 3
+    const file = p.limits.max_upload_bytes / 1024 ** 3
     if (gb !== storage) fail(`${id} 저장 한도 ${gb}GB, 기대 ${storage}GB`)
+    if (file !== perFile) fail(`${id} 파일당 한도 ${file}GB, 기대 ${perFile}GB`)
     if (p.limits.max_upload_bytes > p.limits.max_storage_bytes) {
       fail(`${id} 한 파일 한도가 전체 한도보다 큽니다`)
     }
   }
-  log('요금제 3종 가격/동시송출/저장한도 일치 ✓')
+  log('요금제 3종 가격/동시송출/저장한도/파일당 한도 일치 ✓')
 
   step(5, 'checkout (fake PayApp)')
   const checkout = await post('/api/billing/checkout', { plan_id: 'pro', recvphone: '010-1234-5678' })

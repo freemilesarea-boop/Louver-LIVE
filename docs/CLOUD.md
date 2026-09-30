@@ -150,12 +150,20 @@ figure is **per account**: two Basic accounts get 15GB each, not 15GB between
 them. The per-file ceilings are below the account's whole allowance.
 
 These are promises per account, not a division of the one 80 GB disk — the plans
-together can promise more than the server holds. What protects the disk is the
-free-space check every upload passes after its plan checks
-(`Ingest::check_disk_has_room`: free space must be at least three times the
-upload plus `DISK_FLOOR_BYTES`, 5GB). An upload is accepted only when all three
-hold — per-file ceiling, account ceiling, server disk — and each refusal says
-which it was (402 for the two plan limits, 507 for the disk).
+together can promise more than the server holds, and nothing reserves that
+theoretical sum. What protects the disk is a floor of `DISK_FLOOR_BYTES` (5 GiB)
+that real bytes are checked against at the moments they are about to be written:
+while an upload's body is arriving, once it has landed, before a conversion
+starts, and every few seconds while one runs. Only the third of those reserves
+anything beyond the floor, and what it reserves is an upper bound on the file
+the conversion will produce — drawn from the encoder's own rate caps, not from a
+multiple of the source, which said nothing about the output and refused a 20GB
+upload unless 65GB were free. A file that needs no conversion produces nothing
+and so reserves nothing. [STORAGE.md](STORAGE.md) has the whole of it.
+
+An upload is accepted only when all three hold — per-file ceiling, account
+ceiling, server disk — and each refusal says which it was (402 for the two plan
+limits, 507 for the disk).
 
 `seed_plans` does **not** overwrite a plan's `limits` on conflict — an operator
 may have raised one for a customer. Raising the ceilings (2026-09, from
