@@ -44,10 +44,10 @@ pub async fn upload_media(
     Caller(uid): Caller,
     mut form: Multipart,
 ) -> Out<CloudMedia> {
-    let ceiling = {
+    let (ceiling, plan_label) = {
         let db = app.db.clone();
         let uid = uid.clone();
-        crate::blocking(move || db.limit(&uid, MAX_UPLOAD_BYTES)).await?
+        crate::blocking(move || Ok((db.limit(&uid, MAX_UPLOAD_BYTES)?, db.plan_label_of(&uid)?))).await?
     };
 
     let mut saved: Option<(String, std::path::PathBuf)> = None;
@@ -81,6 +81,7 @@ pub async fn upload_media(
                 let _ = std::fs::remove_file(&temp);
                 return Err(CloudError::LimitReached {
                     limit: MAX_UPLOAD_BYTES,
+                    plan_label,
                     used: written,
                     allowed: ceiling,
                 }

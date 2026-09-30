@@ -18,7 +18,10 @@ import {
   RECOMMENDED_PLAN,
   billingIsLive,
   concurrentStreams,
+  formatPlanGb,
   formatWon,
+  storageLimit,
+  uploadLimit,
 } from "../cloud";
 import type { BillingSubscription, Plan } from "../cloud";
 
@@ -128,6 +131,8 @@ export function Pricing({ onClose }: { onClose?: () => void }) {
 function PlanCard({ plan, onChoose }: { plan: Plan; onChoose: () => void }) {
   const recommended = plan.id === RECOMMENDED_PLAN;
   const streams = concurrentStreams(plan);
+  const storage = storageLimit(plan);
+  const perFile = uploadLimit(plan);
 
   return (
     <div
@@ -166,6 +171,13 @@ function PlanCard({ plan, onChoose }: { plan: Plan; onChoose: () => void }) {
       >
         동시 송출 {streams}개
       </p>
+
+      {/* Also from the payload: what the server enforces is what is shown. */}
+      {storage > 0 && perFile > 0 && (
+        <p className="mt-2 text-xs text-ink-400" data-testid="storage">
+          저장공간 {formatPlanGb(storage)} · 파일당 최대 {formatPlanGb(perFile)}
+        </p>
+      )}
 
       <ul className="mt-4 space-y-1.5 text-sm text-ink-400">
         {PLAN_FEATURES.map((f) => (

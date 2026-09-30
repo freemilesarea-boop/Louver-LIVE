@@ -83,7 +83,11 @@ const PLANS = [
   {
     id: "basic",
     label: "Basic",
-    limits: { max_concurrent_streams: 1 },
+    limits: {
+      max_concurrent_streams: 1,
+      max_storage_bytes: 15 * 1024 ** 3,
+      max_upload_bytes: 10 * 1024 ** 3,
+    },
     monthly_price_krw: 19900,
     description: "개인 크리에이터 / 테스트",
     active: true,
@@ -92,7 +96,11 @@ const PLANS = [
   {
     id: "pro",
     label: "Pro",
-    limits: { max_concurrent_streams: 2 },
+    limits: {
+      max_concurrent_streams: 2,
+      max_storage_bytes: 30 * 1024 ** 3,
+      max_upload_bytes: 15 * 1024 ** 3,
+    },
     monthly_price_krw: 39900,
     description: "여러 채널 운영자",
     active: true,
@@ -101,7 +109,11 @@ const PLANS = [
   {
     id: "business",
     label: "Business",
-    limits: { max_concurrent_streams: 3 },
+    limits: {
+      max_concurrent_streams: 3,
+      max_storage_bytes: 60 * 1024 ** 3,
+      max_upload_bytes: 20 * 1024 ** 3,
+    },
     monthly_price_krw: 59900,
     description: "전문 채널 / 다중 라이브 운영",
     active: true,
@@ -1452,11 +1464,35 @@ describe("the price list", () => {
     expect(screen.getByText("동시 송출 1개")).toBeInTheDocument();
     expect(screen.getByText("동시 송출 2개")).toBeInTheDocument();
     expect(screen.getByText("동시 송출 3개")).toBeInTheDocument();
+    // Storage too: per account, and per file, as the server enforces them.
+    expect(screen.getByText("저장공간 15GB · 파일당 최대 10GB")).toBeInTheDocument();
+    expect(screen.getByText("저장공간 30GB · 파일당 최대 15GB")).toBeInTheDocument();
+    expect(screen.getByText("저장공간 60GB · 파일당 최대 20GB")).toBeInTheDocument();
 
     expect(screen.getByText("개인 크리에이터 / 테스트")).toBeInTheDocument();
     expect(screen.getByText("여러 채널 운영자")).toBeInTheDocument();
     expect(
       screen.getByText("전문 채널 / 다중 라이브 운영"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders storage limits the server changed, without this file knowing them", async () => {
+    const changed = PLANS.map((p) =>
+      p.id === "basic"
+        ? {
+            ...p,
+            limits: {
+              ...p.limits,
+              max_storage_bytes: 12.5 * 1024 ** 3,
+              max_upload_bytes: 7 * 1024 ** 3,
+            },
+          }
+        : p,
+    );
+    show(<Pricing />, fake({ plans: vi.fn().mockResolvedValue(changed) }));
+
+    expect(
+      await screen.findByText("저장공간 12.5GB · 파일당 최대 7GB"),
     ).toBeInTheDocument();
   });
 

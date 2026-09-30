@@ -87,6 +87,29 @@ export function concurrentStreams(plan: Plan): number {
   return plan.limits[MAX_CONCURRENT_STREAMS] ?? 0;
 }
 
+/** Per-account storage and per-file upload ceilings, in bytes. */
+export const MAX_STORAGE_BYTES = "max_storage_bytes";
+export const MAX_UPLOAD_BYTES = "max_upload_bytes";
+
+/** This account's storage allowance. Per account; plans do not share a pool. */
+export function storageLimit(plan: Plan): number {
+  return plan.limits[MAX_STORAGE_BYTES] ?? 0;
+}
+
+/** The largest single file this plan accepts. */
+export function uploadLimit(plan: Plan): number {
+  return plan.limits[MAX_UPLOAD_BYTES] ?? 0;
+}
+
+/**
+ * `15GB`, the way the server words it: GiB (1024³) called "GB", whole when
+ * it is whole, one decimal otherwise.
+ */
+export function formatPlanGb(bytes: number): string {
+  const gib = bytes / 1024 ** 3;
+  return Number.isInteger(gib) ? `${gib}GB` : `${gib.toFixed(1)}GB`;
+}
+
 /** ₩19,900 — whole won, grouped, never a decimal. */
 export function formatWon(krw: number): string {
   return `₩${krw.toLocaleString("ko-KR")}`;

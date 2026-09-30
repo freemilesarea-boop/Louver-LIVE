@@ -139,20 +139,40 @@ impl CloudDb {
         )?)
     }
 
-    /// Refuse an upload that would take the user over their storage ceiling.
+    /// The label of the plan this user's limits come from, for messages.
+    pub fn plan_label_of(&self, user_id: &str) -> Result<String> {
+        let u = self.user(user_id)?;
+        Ok(self.plan(&u.plan_id)?.label)
+    }
+
+    /// Refuse an upload that breaks either of the plan's two storage limits.
+    ///
+    /// Both are **per account**: `used` is this user's own media and nobody
+    /// else's. The physical disk is a third, separate check
+    /// (`Ingest::check_disk_has_room`) that runs after this one, so a plan with
+    /// room left can still be refused when the server has none.
+    ///
+    /// Both boundaries are inclusive: a file exactly at the per-file ceiling,
+    /// or one that fills the account exactly, is allowed.
     pub fn check_upload_allowed(&self, user_id: &str, incoming_bytes: i64) -> Result<()> {
         let per_file = self.limit(user_id, MAX_UPLOAD_BYTES)?;
         if incoming_bytes > per_file {
             return Err(CloudError::LimitReached {
                 limit: MAX_UPLOAD_BYTES,
+                plan_label: self.plan_label_of(user_id)?,
                 used: incoming_bytes,
                 allowed: per_file,
             });
         }
         let ceiling = self.limit(user_id, MAX_STORAGE_BYTES)?;
         let used = self.storage_used(user_id)?;
-        if used + incoming_bytes > ceiling {
-            return Err(CloudError::LimitReached { limit: MAX_STORAGE_BYTES, used, allowed: ceiling });
+        if used.saturating_add(incoming_bytes) > ceiling {
+            return Err(CloudError::LimitReached {
+                limit: MAX_STORAGE_BYTES,
+                plan_label: self.plan_label_of(user_id)?,
+                used,
+                allowed: ceiling,
+            });
         }
         Ok(())
     }
@@ -171,7 +191,12 @@ impl CloudDb {
             |r| r.get(0),
         )?;
         if used >= allowed {
-            return Err(CloudError::LimitReached { limit: MAX_BROADCASTS, used, allowed });
+            return Err(CloudError::LimitReached {
+                limit: MAX_BROADCASTS,
+                plan_label: self.plan_label_of(user_id)?,
+                used,
+                allowed,
+            });
         }
         Ok(())
     }

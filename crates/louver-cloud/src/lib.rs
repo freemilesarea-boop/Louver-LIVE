@@ -31,22 +31,38 @@ pub use storage::Storage;
 /// The default used to be `max_storage_bytes 한도를 초과했습니다
 /// (5368709120/5368709120)` — a database key and two byte counts. Storage is
 /// the limit a beta student is most likely to meet, so it says what to do about
-/// it instead.
-fn limit_message(limit: &str, used: i64, allowed: i64) -> String {
-    let gb = |b: i64| format!("{:.1}GB", b as f64 / 1_073_741_824.0);
+/// it instead — and which of the two storage limits it was, because "one file
+/// too big" and "account full" are fixed differently.
+fn limit_message(limit: &str, plan_label: &str, used: i64, allowed: i64) -> String {
     match limit {
-        entitlement::MAX_STORAGE_BYTES => format!(
-            "저장 공간이 부족합니다 (사용 {} / 한도 {}). 사용하지 않는 영상을 삭제한 뒤 다시 올려주세요.",
-            gb(used),
-            gb(allowed)
-        ),
-        entitlement::MAX_UPLOAD_BYTES => {
-            format!("파일이 너무 큽니다 ({} / 한 파일 최대 {}).", gb(used), gb(allowed))
+        // The unsubscribed plan allows nothing; "0GB를 초과" would read as a bug.
+        entitlement::MAX_STORAGE_BYTES | entitlement::MAX_UPLOAD_BYTES if allowed <= 0 => {
+            "영상을 올리려면 요금제가 필요합니다.".to_string()
         }
+        entitlement::MAX_STORAGE_BYTES => format!(
+            "{plan_label} 플랜 저장공간 {}를 초과합니다 (사용 중 {}). 사용하지 않는 영상을 삭제한 뒤 다시 올려주세요.",
+            gb(allowed),
+            gb(used)
+        ),
+        entitlement::MAX_UPLOAD_BYTES => format!(
+            "파일 크기가 {plan_label} 플랜의 파일당 최대 용량 {}를 초과했습니다 (파일 {}).",
+            gb(allowed),
+            gb(used)
+        ),
         entitlement::MAX_BROADCASTS => {
             format!("이 요금제에서는 방송을 {allowed}개까지 만들 수 있습니다.")
         }
         other => format!("{other} 한도를 초과했습니다 ({used}/{allowed})"),
+    }
+}
+
+/// Bytes as the product writes them: GiB, called "GB", whole when it is whole.
+fn gb(b: i64) -> String {
+    let g = b as f64 / 1_073_741_824.0;
+    if b % 1_073_741_824 == 0 {
+        format!("{g:.0}GB")
+    } else {
+        format!("{g:.1}GB")
     }
 }
 
@@ -63,8 +79,9 @@ pub enum CloudError {
     Forbidden,
     #[error("{0}")]
     Invalid(String),
-    #[error("{}", limit_message(limit, *used, *allowed))]
-    LimitReached { limit: &'static str, used: i64, allowed: i64 },
+    /// `plan_label` is only for the message: which plan's ceiling it was.
+    #[error("{}", limit_message(limit, plan_label, *used, *allowed))]
+    LimitReached { limit: &'static str, plan_label: String, used: i64, allowed: i64 },
     /// The concurrency ceiling, which is the entitlement that distinguishes the
     /// paid plans and therefore the one a user meets most often. Separate from
     /// `LimitReached` so the message can name their plan and their number
@@ -77,7 +94,7 @@ pub enum CloudError {
     /// The server's own disk, not the user's plan. Separate from
     /// `LimitReached` because paying more would not help and the operator is
     /// the one who has to act.
-    #[error("서버 저장 공간이 부족합니다. 잠시 후 다시 시도해 주세요.")]
+    #[error("현재 서버 저장공간이 부족하여 업로드할 수 없습니다. 잠시 후 다시 시도해 주세요.")]
     OutOfSpace,
     /// Too many attempts from one caller in a short time. Not about this
     /// account — about the machine, which has two cores and a password hash
