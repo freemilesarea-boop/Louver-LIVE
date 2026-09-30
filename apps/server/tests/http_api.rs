@@ -418,9 +418,65 @@ async fn an_upload_over_the_plans_ceiling_is_refused_before_it_is_stored() {
         .unwrap();
     let res = louver_server::router(s.app.clone()).oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::PAYMENT_REQUIRED);
+    // Says it was the one file, and on which plan — not the account total.
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let said =
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"].as_str().unwrap().to_string();
+    assert!(said.contains("Tiny 플랜의 파일당 최대 용량"), "{said}");
 
     // No row, and nothing left in the upload directory.
     assert_eq!(s.app.db.media_for(&uid).unwrap().len(), 0);
+    let leftovers = std::fs::read_dir(&s.app.upload_tmp).unwrap().count();
+    assert_eq!(leftovers, 0, "a refused upload left its temp file behind");
+}
+
+#[tokio::test]
+async fn an_upload_that_fits_one_file_but_not_the_account_says_so() {
+    let s = server();
+    let token = account(&s, "full@example.com").await;
+    let uid = get(&s, "/api/me", &token).await.id();
+
+    // Room for this file under the per-file ceiling, none left in the account.
+    s.app
+        .db
+        .raw()
+        .lock()
+        .unwrap()
+        .execute(
+            "INSERT INTO plans (id, label, limits) VALUES ('small','Small',?1)",
+            [r#"{"max_concurrent_streams":1,"max_broadcasts":1,"max_storage_bytes":5000,"max_upload_bytes":8192}"#],
+        )
+        .unwrap();
+    s.app.db.set_plan(&uid, "small").unwrap();
+    s.app.db.create_media(&uid, "old.mp4", 2000, "k/old.mp4").unwrap();
+
+    let boundary = "----louvertest";
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"next.mp4\"\r\nContent-Type: video/mp4\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&vec![b'x'; 4096]);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/api/media/upload")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .header(header::CONTENT_TYPE, format!("multipart/form-data; boundary={boundary}"))
+        .body(Body::from(body))
+        .unwrap();
+    let res = louver_server::router(s.app.clone()).oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::PAYMENT_REQUIRED, "same status as before: the API contract holds");
+    let bytes = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let said =
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["error"].as_str().unwrap().to_string();
+    assert!(said.contains("Small 플랜 저장공간"), "{said}");
+    assert!(!said.contains("파일당"), "an account-full refusal must not blame the file: {said}");
+
+    assert_eq!(s.app.db.media_for(&uid).unwrap().len(), 1, "only the file that was already there");
     let leftovers = std::fs::read_dir(&s.app.upload_tmp).unwrap().count();
     assert_eq!(leftovers, 0, "a refused upload left its temp file behind");
 }

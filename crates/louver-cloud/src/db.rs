@@ -272,6 +272,10 @@ struct SeedPlan {
     limits: &'static [(&'static str, i64)],
 }
 
+/// Storage figures are per **account** and in GiB (`1024³`), which is what the
+/// rest of the product calls "GB". Every Basic account gets its own 15GB; the
+/// plans do not share a pool. What protects the one physical disk is
+/// `ingest::DISK_FLOOR_BYTES`, checked on every upload whatever the plan says.
 const SEED_PLANS: &[SeedPlan] = &[
     SeedPlan {
         id: "basic",
@@ -283,8 +287,8 @@ const SEED_PLANS: &[SeedPlan] = &[
         limits: &[
             ("max_concurrent_streams", 1),
             ("max_broadcasts", 3),
-            ("max_storage_bytes", 5 * 1024 * 1024 * 1024),
-            ("max_upload_bytes", 2 * 1024 * 1024 * 1024),
+            ("max_storage_bytes", 15 * 1024 * 1024 * 1024),
+            ("max_upload_bytes", 10 * 1024 * 1024 * 1024),
             // Scheduling is a common feature of every paid plan now: a
             // broadcaster who cannot schedule cannot run 24/7 unattended, which
             // is the thing being sold.
@@ -302,8 +306,8 @@ const SEED_PLANS: &[SeedPlan] = &[
         limits: &[
             ("max_concurrent_streams", 2),
             ("max_broadcasts", 10),
-            ("max_storage_bytes", 10 * 1024 * 1024 * 1024),
-            ("max_upload_bytes", 4 * 1024 * 1024 * 1024),
+            ("max_storage_bytes", 30 * 1024 * 1024 * 1024),
+            ("max_upload_bytes", 15 * 1024 * 1024 * 1024),
             ("scheduling_enabled", 1),
             ("priority_recovery", 0),
         ],
@@ -318,8 +322,8 @@ const SEED_PLANS: &[SeedPlan] = &[
         limits: &[
             ("max_concurrent_streams", 3),
             ("max_broadcasts", 30),
-            ("max_storage_bytes", 20 * 1024 * 1024 * 1024),
-            ("max_upload_bytes", 8 * 1024 * 1024 * 1024),
+            ("max_storage_bytes", 60 * 1024 * 1024 * 1024),
+            ("max_upload_bytes", 20 * 1024 * 1024 * 1024),
             ("scheduling_enabled", 1),
             ("priority_recovery", 1),
         ],
@@ -355,6 +359,65 @@ impl std::fmt::Debug for CloudDb {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CloudDb")
     }
+}
+
+/// The 2026-09 upload relief: Basic 15/10GB, Pro 30/15GB, Business 60/20GB.
+const UPLOAD_RELIEF_2026_09: &str = "plan_storage_upload_relief_2026_09";
+
+/// Bring every seeded plan's storage keys **up** to `SEED_PLANS`, once.
+///
+/// `seed_plans` leaves `limits` alone on conflict, so without this a raised
+/// ceiling in code would reach nobody who already has a plan row — which is
+/// every paying customer. Raising is the safe direction: nobody's file or
+/// broadcast depends on a ceiling being low, so no operator has to look first
+/// the way `--audit-storage` exists for lowering one.
+///
+/// - Only `max_storage_bytes` and `max_upload_bytes`, and only upwards. A row an
+///   operator already set higher keeps its figure.
+/// - No price, subscription, billing or user row is in any statement here.
+/// - Once, recorded under `marker`: a ceiling an operator lowers afterwards is
+///   not raised back at the next restart.
+fn raise_storage_limits_once(conn: &Connection, marker: &str) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS cloud_migrations (
+             id         TEXT PRIMARY KEY,
+             applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+         );",
+    )?;
+    let done: Option<i64> =
+        conn.query_row("SELECT 1 FROM cloud_migrations WHERE id = ?1", [marker], |r| r.get(0)).optional()?;
+    if done.is_some() {
+        return Ok(());
+    }
+    for p in SEED_PLANS {
+        let target: BTreeMap<&str, i64> = p.limits.iter().copied().collect();
+        let Some(json) = conn
+            .query_row("SELECT limits FROM plans WHERE id = ?1", [p.id], |r| r.get::<_, String>(0))
+            .optional()?
+        else {
+            continue;
+        };
+        // A hand-edited row that will not parse is left exactly as it is:
+        // rewriting it from an empty map would drop whatever else it held.
+        let Ok(mut limits) = serde_json::from_str::<BTreeMap<String, i64>>(&json) else {
+            continue;
+        };
+        let mut moved = false;
+        for key in [crate::entitlement::MAX_STORAGE_BYTES, crate::entitlement::MAX_UPLOAD_BYTES] {
+            let want = target.get(key).copied().unwrap_or(0);
+            if limits.get(key).copied().unwrap_or(0) < want {
+                limits.insert(key.to_string(), want);
+                moved = true;
+            }
+        }
+        if moved {
+            let json = serde_json::to_string(&limits)
+                .map_err(|e| CloudError::Invalid(format!("한도를 저장할 수 없습니다: {e}")))?;
+            conn.execute("UPDATE plans SET limits = ?2 WHERE id = ?1", params![p.id, json])?;
+        }
+    }
+    conn.execute("INSERT INTO cloud_migrations (id) VALUES (?1)", [marker])?;
+    Ok(())
 }
 
 /// Add a column unless it is already there. The cloud's own small migration.
@@ -721,6 +784,7 @@ impl CloudDb {
                 ],
             )?;
         }
+        raise_storage_limits_once(&c, UPLOAD_RELIEF_2026_09)?;
         Ok(())
     }
 

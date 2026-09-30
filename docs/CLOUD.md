@@ -139,14 +139,32 @@ Prices are whole won in an `INTEGER` column. Money is never a float.
 
 ### Storage ceilings and the one server
 
-Basic 5GB / Pro 10GB / Business 20GB, against a single 80 GB disk that also holds
-the database, the container's logs and every broadcast's working directory. The
-per-file ceilings (2/4/8GB) are deliberately below the account's whole allowance.
+| plan | storage per account | largest single file |
+| --- | --- | --- |
+| Basic | 15GB | 10GB |
+| Pro | 30GB | 15GB |
+| Business | 60GB | 20GB |
+
+"GB" is GiB (1024³) throughout, in the database and in every message. Each
+figure is **per account**: two Basic accounts get 15GB each, not 15GB between
+them. The per-file ceilings are below the account's whole allowance.
+
+These are promises per account, not a division of the one 80 GB disk — the plans
+together can promise more than the server holds. What protects the disk is the
+free-space check every upload passes after its plan checks
+(`Ingest::check_disk_has_room`: free space must be at least three times the
+upload plus `DISK_FLOOR_BYTES`, 5GB). An upload is accepted only when all three
+hold — per-file ceiling, account ceiling, server disk — and each refusal says
+which it was (402 for the two plan limits, 507 for the disk).
 
 `seed_plans` does **not** overwrite a plan's `limits` on conflict — an operator
-may have raised one for a customer — so changing these numbers in code changes
-nothing for a database whose rows already exist. Lowering a ceiling is an
-explicit operator action:
+may have raised one for a customer. Raising the ceilings (2026-09, from
+5/10/20GB and 2/4/8GB) is therefore a one-time boot migration,
+`plan_storage_upload_relief_2026_09`, recorded in `cloud_migrations`: it moves
+only `max_storage_bytes` and `max_upload_bytes`, only upwards (a higher figure
+already in a row is kept), and never touches a price, subscription or billing
+row. After it has run once, a ceiling an operator changes is left alone by
+every later restart. Lowering a ceiling is still an explicit operator action:
 
 ```bash
 louver-server --audit-storage              # read-only: now → target, and who is over
