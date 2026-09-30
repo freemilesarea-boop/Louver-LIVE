@@ -132,7 +132,7 @@ fn env(tools: &FfmpegTools) -> Env {
 }
 
 #[test]
-fn a_conformant_upload_is_remuxed_and_becomes_broadcastable() {
+fn a_conformant_upload_becomes_broadcastable_without_being_copied() {
     let Some(tools) = tools() else {
         eprintln!("SKIP: no FFmpeg sidecar");
         return;
@@ -158,6 +158,16 @@ fn a_conformant_upload_is_remuxed_and_becomes_broadcastable() {
     // The original is still there — preparing must never destroy an upload.
     let store = LocalStorage::new(e.root.join("media"));
     assert_eq!(store.size_bytes(&done.storage_path).unwrap(), original_bytes);
+
+    // And there is nothing beside it. This upload already was a broadcastable
+    // file, so the preparation step had nothing to produce; a second copy of
+    // it would have been the entire cost of the step and none of its value.
+    assert_eq!(
+        done.prepared_path.as_deref(),
+        Some(done.storage_path.as_str()),
+        "a conformant upload was copied",
+    );
+    assert_eq!(done.size_bytes, original_bytes as i64);
 
     // And the manager can now read what it needs to start a broadcast.
     let ready = e.db.prepared_media_for(&m.id).unwrap();

@@ -436,6 +436,54 @@ describe("the media library", () => {
     expect(rows[0]?.querySelector("button")).toBeDisabled();
   });
 
+  it("says what a video costs, and what it is made of", async () => {
+    const t = fake({
+      listMedia: vi.fn().mockResolvedValue([
+        // Needed no conversion: one file, and the line says so rather than
+        // leaving a person to wonder where the other 10GB went.
+        {
+          ...READY_MEDIA,
+          id: "d1",
+          filename: "direct.mp4",
+          size_bytes: 716_195_569,
+          source_bytes: 716_195_569,
+          prepared_bytes: 0,
+        },
+        // Needed one: the total is still the total, with its two halves.
+        {
+          ...READY_MEDIA,
+          id: "c1",
+          filename: "converted.mp4",
+          size_bytes: 11_853_776_847,
+          source_bytes: 716_195_569,
+          prepared_bytes: 11_137_581_278,
+        },
+        // Prepared before the split was recorded: the total alone, because
+        // the halves are not known and guessing them would be worse.
+        {
+          ...READY_MEDIA,
+          id: "l1",
+          filename: "legacy.mp4",
+          size_bytes: 11_853_776_847,
+          source_bytes: null,
+          prepared_bytes: null,
+        },
+      ]),
+    });
+
+    show(<MediaLibrary />, t);
+
+    expect(
+      await screen.findByText(/683\.0 MB · 변환 없이 그대로 송출/),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/11\.0 GB \(원본 683\.0 MB \+ 변환본 10\.4 GB\)/),
+    ).toBeInTheDocument();
+    const rows = screen.getAllByTestId("media-row");
+    expect(rows[2]?.textContent).toContain("11.0 GB");
+    expect(rows[2]?.textContent).not.toContain("원본");
+  });
+
   it("reports an upload that the plan refuses", async () => {
     const t = fake({
       uploadMedia: vi

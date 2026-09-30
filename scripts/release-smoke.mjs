@@ -21,7 +21,7 @@
  */
 import { createServer } from 'node:http'
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, rmSync, readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -391,7 +391,21 @@ try {
   if (!/media [0-9a-f]{8}: mode=direct video=copy audio=copy/.test(prep)) {
     fail(`호환되는 업로드가 빠른 경로를 타지 않았습니다:\n${prep.split('\n').filter((l) => l.includes('media ')).join('\n')}`)
   }
-  log('업로드와 준비 ✓ (mode=direct, 아무것도 재인코딩하지 않음)')
+  // And it must not have been copied either. A file that needs nothing done to
+  // it is broadcast from where it lies: one file on the disk, and an account
+  // charged once for it rather than twice.
+  const stored = readdirSync(join(data, 'media'), { recursive: true, withFileTypes: true })
+    .filter((e) => e.isFile())
+    .map((e) => join(e.parentPath ?? e.path, e.name))
+  if (stored.length !== 1) {
+    fail(`변환이 필요 없는 업로드가 ${stored.length}개의 파일이 됐습니다:\n${stored.join('\n')}`)
+  }
+  const onDisk = statSync(stored[0]).size
+  const row = (await get(`/api/media/${mediaId}`)).json
+  if (row.prepared_bytes !== 0) fail(`변환본이 없는데 prepared_bytes=${row.prepared_bytes}`)
+  if (row.source_bytes !== onDisk) fail(`source_bytes ${row.source_bytes}, 실제 ${onDisk}`)
+  if (row.size_bytes !== onDisk) fail(`size_bytes ${row.size_bytes}, 실제 ${onDisk}`)
+  log(`업로드와 준비 ✓ (mode=direct, 재인코딩 없음, 사본 없음 — 파일 1개 ${onDisk}바이트)`)
 
   step(10, 'create a YouTube-backed playlist broadcast')
   const created = await post('/api/broadcasts', {

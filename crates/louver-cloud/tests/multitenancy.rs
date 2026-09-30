@@ -18,7 +18,7 @@ struct Tenant {
 fn tenant(db: &CloudDb, email: &str) -> Tenant {
     let u = db.create_user(email, "hash", "business").unwrap();
     let m = db.create_media(&u.id, "clip.mp4", 1024, &format!("{}/clip.mp4", u.id)).unwrap();
-    db.record_media_prepared(&m.id, &format!("{}/prepared.mp4", u.id), 60.0, 2048).unwrap();
+    db.record_media_prepared(&m.id, &format!("{}/prepared.mp4", u.id), 60.0, 0, 2048).unwrap();
     let d = db.create_destination(&u.id, "채널", "rtmps://a/live2", "••••").unwrap();
     let b = db.create_broadcast(&u.id, "LIVE", &m.id, &d.id, true).unwrap();
     Tenant { id: u.id, media: m.id, dest: d.id, broadcast: b.id }

@@ -13,7 +13,7 @@ use std::sync::{Arc, Barrier};
 fn user_with_broadcasts(db: &CloudDb, email: &str, plan: &str, n: usize) -> (String, Vec<String>) {
     let u = db.create_user(email, "hash", plan).unwrap();
     let media = db.create_media(&u.id, "clip.mp4", 1024, "key/clip.mp4").unwrap();
-    db.record_media_prepared(&media.id, "key/prepared.mp4", 60.0, 2048).unwrap();
+    db.record_media_prepared(&media.id, "key/prepared.mp4", 60.0, 0, 2048).unwrap();
     let dest = db.create_destination(&u.id, "채널", "rtmps://a/live2", "••••").unwrap();
 
     let ids = (0..n)
@@ -296,7 +296,7 @@ fn an_unsubscribed_account_cannot_claim_a_stream_slot() {
     // A broadcast row put in place directly: what is under test is the slot, and
     // creating one through the API is refused for the same reason.
     let media = db.create_media(&uid, "a.mp4", 10, "k").unwrap();
-    db.record_media_prepared(&media.id, "k", 10.0, 10).unwrap();
+    db.record_media_prepared(&media.id, "k", 10.0, 0, 10).unwrap();
     let dest = db.create_destination(&uid, "d", "rtmps://a/live2", "••••").unwrap();
     db.raw()
         .lock()
@@ -649,7 +649,7 @@ fn an_account_over_the_new_ceiling_keeps_everything_and_can_still_broadcast() {
     let (uid, b) = user_with_broadcasts(&db, "full@x.com", "basic", 1);
     // 6 GB stored on a plan that now allows 5.
     let m = db.create_media(&uid, "big.mp4", 6 * GB, "key/big.mp4").unwrap();
-    db.record_media_prepared(&m.id, "key/big-prepared.mp4", 3600.0, 6 * GB).unwrap();
+    db.record_media_prepared(&m.id, "key/big-prepared.mp4", 3600.0, 0, 6 * GB).unwrap();
     assert!(db.storage_used(&uid).unwrap() > 5 * GB);
 
     // The next upload is refused, in words that say what to do.

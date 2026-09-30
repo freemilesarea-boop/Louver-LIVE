@@ -171,7 +171,14 @@ export interface CloudMedia {
   id: string;
   user_id: string;
   filename: string;
+  /** Everything this video occupies: the upload, plus a converted copy if it
+   * needed one. This is what counts against the account's storage. */
   size_bytes: number;
+  /** The upload's own size. `null` on a video prepared before the two were
+   * recorded separately — then only the total can be shown. */
+  source_bytes?: number | null;
+  /** What the converted copy costs. `0` means there is not one. */
+  prepared_bytes?: number | null;
   state: MediaState;
   duration_secs: number;
   width: number;

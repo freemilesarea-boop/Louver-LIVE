@@ -16,6 +16,7 @@ pub mod db;
 pub mod entitlement;
 pub mod ingest;
 pub mod manager;
+pub mod media_audit;
 pub mod models;
 pub mod schedule;
 pub mod storage;

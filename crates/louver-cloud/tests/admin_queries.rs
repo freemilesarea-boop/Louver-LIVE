@@ -262,7 +262,7 @@ fn the_user_detail_carries_payments_channels_and_broadcasts() {
     let db = db();
     let (uid, _) = paying(&db, "dj@x.com", "pro", 39_900);
     let media = db.create_media(&uid, "clip.mp4", 1024, "key/clip.mp4").unwrap();
-    db.record_media_prepared(&media.id, "key/prepared.mp4", 60.0, 2048).unwrap();
+    db.record_media_prepared(&media.id, "key/prepared.mp4", 60.0, 0, 2048).unwrap();
     let dest = db.create_destination(&uid, "채널", "rtmps://a/live2", "••••").unwrap();
     let b = db.create_broadcast(&uid, "밤 라디오", &media.id, &dest.id, true).unwrap();
     db.replace_items(&uid, &b.id, &[NewItem { media_id: media.id, enabled: true, repeat_count: 1 }]).unwrap();
@@ -289,7 +289,7 @@ fn the_broadcast_list_shows_everybodys_and_filters_by_state() {
     let db = db();
     let (uid, _) = paying(&db, "dj@x.com", "pro", 39_900);
     let media = db.create_media(&uid, "clip.mp4", 1024, "key/clip.mp4").unwrap();
-    db.record_media_prepared(&media.id, "key/prepared.mp4", 60.0, 2048).unwrap();
+    db.record_media_prepared(&media.id, "key/prepared.mp4", 60.0, 0, 2048).unwrap();
     let dest = db.create_destination(&uid, "채널", "rtmps://a/live2", "••••").unwrap();
     let b = db.create_broadcast(&uid, "밤 라디오", &media.id, &dest.id, true).unwrap();
 
@@ -313,7 +313,7 @@ fn storage_and_problems_come_from_the_rows_the_service_already_keeps() {
     let db = db();
     let (uid, _) = paying(&db, "dj@x.com", "pro", 39_900);
     let media = db.create_media(&uid, "clip.mp4", 5_000_000, "key/clip.mp4").unwrap();
-    db.record_media_prepared(&media.id, "key/prepared.mp4", 60.0, 5_000_000).unwrap();
+    db.record_media_prepared(&media.id, "key/prepared.mp4", 60.0, 0, 5_000_000).unwrap();
     let dest = db.create_destination(&uid, "채널", "rtmps://a/live2", "••••").unwrap();
     let b = db.create_broadcast(&uid, "밤 라디오", &media.id, &dest.id, true).unwrap();
     db.record_failure(&b.id, "FFmpeg가 종료되었습니다").unwrap();

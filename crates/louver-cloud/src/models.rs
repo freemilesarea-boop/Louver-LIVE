@@ -359,7 +359,16 @@ pub struct CloudMedia {
     pub id: String,
     pub user_id: String,
     pub filename: String,
+    /// Everything this media occupies: the upload plus its converted copy, if
+    /// it needed one. Every storage ceiling in the product is a SUM of this.
     pub size_bytes: i64,
+    /// The upload's own size. `None` on a row written before the two halves
+    /// were recorded separately — readers show the total alone rather than
+    /// inventing a split.
+    pub source_bytes: Option<i64>,
+    /// What the converted copy costs. `0` means there is not one: the upload
+    /// needed nothing done to it and is broadcast from where it lies.
+    pub prepared_bytes: Option<i64>,
     pub state: MediaState,
     pub duration_secs: f64,
     pub width: i64,

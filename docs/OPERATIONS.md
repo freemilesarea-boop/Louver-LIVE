@@ -5,7 +5,8 @@
 
 배포 자체는 [CLOUD_TESTING.md](CLOUD_TESTING.md), 결제는 [PAYAPP.md](PAYAPP.md),
 YouTube 는 [YOUTUBE_OAUTH.md](YOUTUBE_OAUTH.md), 매출·회원·방송을 화면으로 보는
-관리 콘솔은 [ADMIN.md](ADMIN.md) 를 보세요.
+관리 콘솔은 [ADMIN.md](ADMIN.md), 디스크에 무엇이 쌓이고 무엇을 지워도 되는지는
+[STORAGE.md](STORAGE.md) 를 보세요.
 
 ---
 
@@ -20,6 +21,7 @@ YouTube 는 [YOUTUBE_OAUTH.md](YOUTUBE_OAUTH.md), 매출·회원·방송을 화�
 | 누가 어떤 요금제인지 | `docker compose exec louver louver-server --audit-plans` |
 | 해지했는데 권한이 남은 계정 | `docker compose exec louver louver-server --audit-billing` |
 | 요금제 저장 한도와 계정별 사용량 | `docker compose exec louver louver-server --audit-storage` |
+| 디스크에 실제로 뭐가 있는지 (읽기 전용) | `docker compose exec louver louver-server --audit-media-storage` |
 | 이 영상이 왜 이렇게 준비됐는지 | `docker compose exec louver louver-server --media-check <파일>` |
 | 매출·회원·방송을 화면으로 | `https://247streams.kr/admin` ([ADMIN.md](ADMIN.md)) |
 | 관리자 계정 목록 | `docker compose exec louver louver-server --list-admins` |
@@ -193,7 +195,17 @@ docker compose exec louver louver-server --audit-storage --apply --yes
 않습니다.** 새 한도를 이미 넘은 계정은 가진 것을 그대로 유지하고 방송도 계속하며,
 영상을 지울 때까지 추가 업로드만 거부됩니다.
 
-### 4-5. 새 계정이 Basic 으로 보인다
+### 4-5. 디스크에 남은 파일을 확인한다
+
+```bash
+docker compose exec louver louver-server --audit-media-storage
+```
+
+어떤 행도 가리키지 않고, manifest 에도 없고, 열려 있지도 않은 파일만 `[정리 가능]`
+으로 표시합니다. **이 명령은 아무것도 지우지 않습니다.** 삭제는 목록을 눈으로
+확인한 뒤 사람이 합니다. 자세한 절차와 예전 변환본 정리는 [STORAGE.md](STORAGE.md).
+
+### 4-6. 새 계정이 Basic 으로 보인다
 
 ```bash
 docker compose exec louver louver-server --audit-plans

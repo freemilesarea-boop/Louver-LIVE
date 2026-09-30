@@ -466,6 +466,127 @@ fn audit_storage(args: &[String]) -> std::process::ExitCode {
     }
 }
 
+/// `--audit-media-storage [--json]`
+///
+/// Every file in the object store, what points at it, and whether anything is
+/// reading it right now.
+///
+/// **It deletes nothing, and there is no flag that makes it delete anything.**
+/// That is not an oversight. The files it lists are hours of somebody's video
+/// and the cost of being wrong is a broadcast that dies at the next restart, so
+/// the command's whole job is to let a person look. Removing a file it calls
+/// safe is a separate decision, made by a person, with `rm`.
+///
+/// A file is called safe only when no media row names it, no manifest under the
+/// work directory names it, no process holds it open, **and** open files could
+/// be listed at all. Anything unknown reads as not safe.
+fn audit_media_storage(args: &[String]) -> std::process::ExitCode {
+    use louver_cloud::media_audit::human;
+
+    let data = std::path::PathBuf::from(
+        std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()),
+    );
+    let db = match louver_cloud::CloudDb::open(&data.join("cloud.db")) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[louver] 데이터베이스를 열 수 없습니다 ({}): {e}", data.display());
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let report = match louver_cloud::media_audit::audit(&db, &data) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[louver] 저장소를 읽지 못했습니다: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
+    if args.iter().any(|a| a == "--json") {
+        match serde_json::to_string_pretty(&report) {
+            Ok(j) => println!("{j}"),
+            Err(e) => {
+                eprintln!("[louver] {e}");
+                return std::process::ExitCode::FAILURE;
+            }
+        }
+        return std::process::ExitCode::SUCCESS;
+    }
+
+    println!("미디어 저장소: {}", report.media_root);
+    if !report.open_files_known {
+        println!();
+        println!("  ⚠ 열려 있는 파일 목록을 읽지 못했습니다. 어떤 파일도 삭제 가능으로 판정하지 않습니다.");
+    }
+    println!();
+    println!("  {:<10} {:>10}  경로", "역할", "크기");
+    println!("  {}", "-".repeat(76));
+    for o in &report.objects {
+        let marks = format!(
+            "{}{}{}",
+            if o.referenced_by_db { "" } else { " db✗" },
+            if o.in_manifest { " manifest" } else { "" },
+            if o.open_now { " OPEN" } else { "" },
+        );
+        println!(
+            "  {:<10} {:>10}  {}{}{}",
+            o.role.label(),
+            human(o.bytes),
+            o.key,
+            if marks.is_empty() { String::new() } else { format!("  ({})", marks.trim()) },
+            if o.safe_to_delete { "  [정리 가능]" } else { "" },
+        );
+        if let (Some(f), Some(id)) = (&o.filename, &o.media_id) {
+            println!("  {:<22}└ {f} ({})", "", &id[..8.min(id.len())]);
+        }
+    }
+
+    println!();
+    println!("합계");
+    println!("  파일 {}개, {}", report.totals.files, human(report.totals.bytes));
+    println!("  원본        {}", human(report.totals.source_bytes));
+    println!("  변환본      {}", human(report.totals.prepared_bytes));
+    println!("  교체된 변환본 {}개, {}", report.totals.retired_files, human(report.totals.retired_bytes));
+    println!("  미참조      {}개, {}", report.totals.orphan_files, human(report.totals.orphan_bytes));
+    println!("  작업 중(.scratch) {}", human(report.scratch_bytes));
+    if !report.manifests.is_empty() {
+        let names: Vec<String> =
+            report.manifests.iter().map(|(b, n)| format!("{}({}개)", &b[..8.min(b.len())], n)).collect();
+        println!("  실행 중 manifest: {}", names.join(", "));
+    }
+
+    if !report.accounting_drift.is_empty() {
+        println!();
+        println!("DB 값과 실제 파일 크기가 다른 항목");
+        for d in &report.accounting_drift {
+            println!(
+                "  {} {}  DB {} / 디스크 {}",
+                &d.media_id[..8.min(d.media_id.len())],
+                d.filename,
+                human(d.db_bytes.max(0) as u64),
+                human(d.disk_bytes.max(0) as u64),
+            );
+        }
+    }
+
+    println!();
+    if report.totals.reclaimable_files == 0 {
+        println!("정리 가능한 파일이 없습니다.");
+    } else {
+        println!(
+            "정리 가능 후보: {}개, {} — 아래 파일은 DB가 참조하지 않고, manifest 에도 없고, 열려 있지도 않습니다.",
+            report.totals.reclaimable_files,
+            human(report.totals.reclaimable_bytes),
+        );
+        for o in report.objects.iter().filter(|o| o.safe_to_delete) {
+            println!("  {}/{}", report.media_root, o.key);
+        }
+        println!();
+        println!("이 명령은 아무것도 지우지 않습니다. 삭제는 위 목록을 직접 확인한 뒤 사람이 결정합니다.");
+        println!("방송이 하나라도 돌고 있는 동안에는, 그 방송이 끝난 뒤 다시 실행해서 재확인하세요.");
+    }
+    std::process::ExitCode::SUCCESS
+}
+
 /// `--media-check <file> [--run] [--compare]`
 ///
 /// Why a file was prepared the way it was, and what that cost.
@@ -672,6 +793,10 @@ async fn main() -> std::process::ExitCode {
     // What the storage ceilings are, and what this build would set them to.
     if args.iter().any(|a| a == "--audit-storage") {
         return audit_storage(&args);
+    }
+    // What is actually on the disk, and what still points at it.
+    if args.iter().any(|a| a == "--audit-media-storage") {
+        return audit_media_storage(&args);
     }
     // Cancelled at the provider, but still holding the plan here.
     if args.iter().any(|a| a == "--audit-billing") {

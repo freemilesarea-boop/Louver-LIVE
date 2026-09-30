@@ -566,6 +566,50 @@ impl CloudDb {
         ensure_column(&conn, "media", "prepared_mode", "TEXT")?;
         ensure_column(&conn, "media", "prepare_target", "TEXT NOT NULL DEFAULT 'auto'")?;
 
+        // What the two halves of `size_bytes` are.
+        //
+        // `size_bytes` has always meant "what this media occupies on disk", and
+        // it keeps that meaning — every quota in the product is a SUM of it and
+        // none of them changes. What it could never say is *why*: a 700MB
+        // upload and a 700MB upload with a 10GB conversion beside it both
+        // arrived as one number, and the interface had nothing to explain with.
+        //
+        // NULL is a row written before this release. Those are readable — the
+        // total is right and the source's own size is in the filesystem — but
+        // the split is not known, so every reader falls back to showing the
+        // total alone rather than guessing a division.
+        //
+        // `prepared_bytes = 0` is the new normal for a file that needed no
+        // conversion: there is no second copy, and the number says so.
+        ensure_column(&conn, "media", "source_bytes", "INTEGER")?;
+        ensure_column(&conn, "media", "prepared_bytes", "INTEGER")?;
+
+        // Files that are no longer pointed at, and are not safe to unlink yet.
+        //
+        // A re-preparation writes its output to a new object and then moves the
+        // pointer. The file the pointer used to name is very probably still
+        // open: a broadcast that was on air when the re-preparation started is
+        // reading it, and on Linux it will keep reading it after an unlink —
+        // until the server restarts, when recovery opens the path again and
+        // finds nothing. So nothing is unlinked at swap time. The old object is
+        // written down here instead, and something that can see which files are
+        // open decides later.
+        //
+        // Deliberately not a queue with a worker behind it. Nothing in this
+        // release deletes a row from this table; the audit command reads it and
+        // an operator decides. A garbage collector that runs by itself is the
+        // kind of thing that is correct until the day it is not.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS storage_trash (
+                 path       TEXT PRIMARY KEY,
+                 media_id   TEXT,
+                 user_id    TEXT,
+                 reason     TEXT NOT NULL,
+                 bytes      INTEGER NOT NULL DEFAULT 0,
+                 at         TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )?;
+
         // §5: which kind of destination this is. Every existing row is a stream
         // key someone pasted, which is exactly what the default says.
         ensure_column(&conn, "stream_destinations", "kind", "TEXT NOT NULL DEFAULT 'manual_rtmps'")?;
@@ -1500,7 +1544,8 @@ impl CloudDb {
             .query_row(
                 "SELECT id, user_id, filename, size_bytes, state, duration_secs, width, height,
                         fps, video_codec, audio_codec, container, bitrate_bps, storage_path,
-                        prepared_path, prepared_duration_secs, last_error, created_at
+                        prepared_path, prepared_duration_secs, last_error, created_at,
+                    source_bytes, prepared_bytes
                  FROM media WHERE id=?1 AND user_id=?2",
                 params![id, user_id],
                 row_to_media,
@@ -1515,7 +1560,8 @@ impl CloudDb {
         let mut st = guard.prepare(
             "SELECT id, user_id, filename, size_bytes, state, duration_secs, width, height,
                     fps, video_codec, audio_codec, container, bitrate_bps, storage_path,
-                    prepared_path, prepared_duration_secs, last_error, created_at
+                    prepared_path, prepared_duration_secs, last_error, created_at,
+                    source_bytes, prepared_bytes
              FROM media WHERE user_id=?1 ORDER BY created_at DESC, id DESC",
         )?;
         let rows = st.query_map([user_id], row_to_media)?;
@@ -1545,18 +1591,64 @@ impl CloudDb {
         Ok(())
     }
 
+    /// Mark a media ready, and record what it costs on disk.
+    ///
+    /// `prepared_path` is where a broadcast will read from. It may be the
+    /// media's own `storage_path`: a source that needed nothing done to it is
+    /// broadcast from where it lies, and then there is one file rather than
+    /// two. `prepared_bytes` is 0 in that case, which is the honest answer and
+    /// the one the interface shows.
+    ///
+    /// `size_bytes` stays the total, because every storage ceiling in this
+    /// product is a SUM of it and none of them is being redefined here.
+    ///
+    /// The pointer moves inside one statement. A re-preparation that crashes
+    /// between producing its output and this call leaves the row pointing at
+    /// the file it was already pointing at, which is a file that still exists —
+    /// a broadcast reading it does not notice that anything happened.
     pub fn record_media_prepared(
         &self,
         id: &str,
         prepared_path: &str,
         duration_secs: f64,
-        total_bytes: i64,
+        source_bytes: i64,
+        prepared_bytes: i64,
     ) -> Result<()> {
         self.raw().lock().unwrap().execute(
             "UPDATE media SET state=?2, prepared_path=?3, prepared_duration_secs=?4,
-                    size_bytes=?5, last_error=NULL
+                    size_bytes=?5, source_bytes=?6, prepared_bytes=?7, last_error=NULL
              WHERE id=?1",
-            params![id, MediaState::Ready.id(), prepared_path, duration_secs, total_bytes],
+            params![
+                id,
+                MediaState::Ready.id(),
+                prepared_path,
+                duration_secs,
+                source_bytes + prepared_bytes,
+                source_bytes,
+                prepared_bytes,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Write an object off: no longer pointed at, not yet safe to unlink.
+    ///
+    /// Called when a pointer moves, never when a file is produced. Idempotent,
+    /// so a re-preparation that is retried does not fail on its own earlier
+    /// record. Nothing in this release removes the file; see `storage_trash`.
+    pub fn trash_object(
+        &self,
+        path: &str,
+        media_id: Option<&str>,
+        user_id: Option<&str>,
+        reason: &str,
+        bytes: i64,
+    ) -> Result<()> {
+        self.raw().lock().unwrap().execute(
+            "INSERT INTO storage_trash (path, media_id, user_id, reason, bytes)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(path) DO UPDATE SET reason=excluded.reason, bytes=excluded.bytes",
+            params![path, media_id, user_id, reason, bytes],
         )?;
         Ok(())
     }
@@ -1672,10 +1764,20 @@ impl CloudDb {
         Ok(())
     }
 
+    /// Delete a media row, once nothing is pointing at it.
+    ///
+    /// Both ways a broadcast can name a video are checked. `broadcasts.media_id`
+    /// is the one it was created with; `broadcast_items` is the playlist, and a
+    /// video can be the third item of a playlist without ever having been the
+    /// first. Checking only the first is how a file that a broadcast is about
+    /// to read gets unlinked — and it matters more now than it used to, because
+    /// the file a broadcast reads may be the source itself rather than a copy
+    /// of it.
     pub fn delete_media_owned(&self, user_id: &str, id: &str) -> Result<CloudMedia> {
         let m = self.media_owned(user_id, id)?;
         let used: i64 = self.raw().lock().unwrap().query_row(
-            "SELECT COUNT(*) FROM broadcasts WHERE media_id=?1",
+            "SELECT (SELECT COUNT(*) FROM broadcasts WHERE media_id=?1)
+                  + (SELECT COUNT(*) FROM broadcast_items WHERE media_id=?1)",
             [id],
             |r| r.get(0),
         )?;
@@ -2736,6 +2838,8 @@ fn row_to_media(r: &rusqlite::Row<'_>) -> rusqlite::Result<CloudMedia> {
         user_id: r.get(1)?,
         filename: r.get(2)?,
         size_bytes: r.get(3)?,
+        source_bytes: r.get(18)?,
+        prepared_bytes: r.get(19)?,
         state: MediaState::from_id(&state).unwrap_or(MediaState::Failed),
         duration_secs: r.get(5)?,
         width: r.get(6)?,

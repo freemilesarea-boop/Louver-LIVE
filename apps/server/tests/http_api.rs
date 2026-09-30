@@ -214,7 +214,7 @@ async fn ready_broadcast(s: &Server, token: &str, user_id: &str, name: &str) -> 
     std::fs::write(&src, b"prepared video bytes").unwrap();
     let key = s.app.storage.put_file(user_id, &format!("{name}.mp4"), &src).unwrap();
     let m = s.app.db.create_media(user_id, &format!("{name}.mp4"), 20, &key).unwrap();
-    s.app.db.record_media_prepared(&m.id, &key, 60.0, 20).unwrap();
+    s.app.db.record_media_prepared(&m.id, &key, 60.0, 0, 20).unwrap();
 
     let b = post(
         s,
@@ -992,7 +992,7 @@ async fn an_unsubscribed_account_can_look_around_and_cannot_spend_anything() {
     std::fs::write(&src, b"prepared video bytes").unwrap();
     let key = s.app.storage.put_file(&me, "x.mp4", &src).unwrap();
     let m = s.app.db.create_media(&me, "x.mp4", 20, &key).unwrap();
-    s.app.db.record_media_prepared(&m.id, &key, 60.0, 20).unwrap();
+    s.app.db.record_media_prepared(&m.id, &key, 60.0, 0, 20).unwrap();
     let dest = post(
         &s,
         "/api/stream-destinations",

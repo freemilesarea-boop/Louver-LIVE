@@ -487,7 +487,7 @@ async fn running_broadcast(s: &Server, user_id: &str, token: &str) -> String {
     std::fs::write(&src, b"prepared video bytes").unwrap();
     let key = s.app.storage.put_file(user_id, "clip.mp4", &src).unwrap();
     let m = s.app.db.create_media(user_id, "clip.mp4", 20, &key).unwrap();
-    s.app.db.record_media_prepared(&m.id, &key, 60.0, 20).unwrap();
+    s.app.db.record_media_prepared(&m.id, &key, 60.0, 0, 20).unwrap();
     let b = post(
         s,
         "/api/broadcasts",

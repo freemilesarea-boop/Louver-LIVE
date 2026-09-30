@@ -14,6 +14,30 @@ import type { CloudMedia } from '../cloud'
 
 const BUSY: CloudMedia['state'][] = ['uploaded', 'analysing', 'preparing']
 
+/**
+ * What this video costs, and why.
+ *
+ * One number was never enough here: a 683MB upload and a 683MB upload with a
+ * 10GB conversion beside it both showed the same way, next to the *source's*
+ * resolution, so the figure read as a lie about the file the person had
+ * uploaded. Now the total is still the total — it is what the storage limit
+ * counts — but it says what it is made of.
+ *
+ * A video prepared before the split was recorded has only the total, and gets
+ * only the total. Guessing which half it was would be worse than saying less.
+ */
+function storageLine(m: CloudMedia): string {
+  const prepared = m.prepared_bytes
+  const source = m.source_bytes
+  if (source === null || source === undefined || prepared === null || prepared === undefined) {
+    return formatBytes(m.size_bytes)
+  }
+  if (prepared === 0) {
+    return `${formatBytes(source)} · 변환 없이 그대로 송출`
+  }
+  return `${formatBytes(m.size_bytes)} (원본 ${formatBytes(source)} + 변환본 ${formatBytes(prepared)})`
+}
+
 export function MediaLibrary() {
   const t = useTransport()
   const [items, setItems] = useState<CloudMedia[]>([])
@@ -105,7 +129,7 @@ export function MediaLibrary() {
                   </Badge>
                 </div>
                 <div className="mt-1 text-xs text-ink-500">
-                  {formatBytes(m.size_bytes)}
+                  {storageLine(m)}
                   {m.duration_secs > 0 ? ` · ${formatDurationKo(m.duration_secs)}` : ''}
                   {m.width > 0 ? ` · ${m.width}×${m.height}` : ''}
                   {m.last_error ? ` · ${m.last_error}` : ''}

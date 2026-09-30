@@ -16,7 +16,9 @@ use crate::storage::Storage;
 use crate::{CloudError, Result};
 use louver_core::config::OutputProfile;
 use louver_core::media::cache::MediaCache;
-use louver_core::media::normalize::{normalize_one_with, plan_preparation, CancelToken, PrepareMode};
+use louver_core::media::normalize::{
+    direct_source_is_broadcastable, normalize_one_with, plan_preparation, CancelToken, PrepareMode,
+};
 use louver_core::media::probe::{probe, probe_max_keyframe_gap, probe_signature, StreamSignature};
 use louver_core::streaming::ffmpeg::{FfmpegCommandBuilder, FfmpegTools};
 use std::collections::HashSet;
@@ -123,11 +125,13 @@ impl Ingest {
 
     /// Is there room on the server's own disk for this, and for what it becomes?
     ///
-    /// An upload of N bytes costs about 2N once prepared — the original is kept
-    /// so a future profile change can re-prepare it — plus the scratch copy
-    /// FFmpeg writes on the way. Three times the incoming size is the estimate
-    /// this refuses on, which errs towards refusing an upload rather than
-    /// towards a server that cannot write.
+    /// An upload of N bytes costs N when it needs no conversion, and about 2N
+    /// when it does — the original is kept either way, so a future profile
+    /// change can re-prepare it — plus the scratch copy FFmpeg writes on the
+    /// way. Which of the two it will be is not known until the file has been
+    /// probed, and it is not worth probing before storing it, so the estimate
+    /// stays at three times the incoming size: it errs towards refusing an
+    /// upload rather than towards a server that cannot write.
     pub fn check_disk_has_room(&self, incoming_bytes: i64) -> Result<()> {
         let probe = self.storage.scratch_dir();
         let _ = std::fs::create_dir_all(&probe);
@@ -198,7 +202,7 @@ impl Ingest {
         // answer for media that has to match other items in a playlist — see
         // `ensure_playlist_compatible`.
         let pinned = self.db.prepare_target(media_id).unwrap_or_else(|_| "auto".into()) == "canonical";
-        let mut prep = plan_preparation(&builder, &local, &info, CLOUD_PROFILE, pinned);
+        let prep = plan_preparation(&builder, &local, &info, CLOUD_PROFILE, pinned);
         // §8: why, in a line an operator can read when a user says it was slow.
         // Nothing here is user content and nothing is a secret.
         println!(
@@ -213,6 +217,75 @@ impl Ingest {
             info.audio_sample_rate.unwrap_or(0),
             prep.measured_gop_secs.map(|g| format!("{g:.1}s")).unwrap_or_else(|| "?".into()),
         );
+
+        // Nothing to do to this file, so nothing is done to it.
+        //
+        // The preparation step exists to produce something a broadcast can
+        // read. When the upload already *is* that thing, producing a second
+        // copy of it is the whole cost of the step and none of its value: it
+        // doubles what the account stores, doubles what the disk holds, and
+        // hands the broadcast a file byte-identical to the one beside it.
+        //
+        // What makes this safe is not that the copy was unnecessary — it is
+        // that the signature is still probed, from the file a broadcast will
+        // actually open. The playlist compatibility check compares those
+        // signatures and knows nothing about where the file came from, so a
+        // playlist that mixes this with anything else converges exactly as it
+        // did before. See `direct_source_is_broadcastable` for what "already
+        // is that thing" means and why the container still has to be ours.
+        if direct_source_is_broadcastable(&info, &prep) {
+            let bytes = self.storage.size_bytes(&key).unwrap_or(0) as i64;
+            // Written before the row is marked ready, for the same reason the
+            // conversion path writes it first: the moment a media is ready a
+            // broadcast may be built on it, and a ready row with no signature
+            // reads as canonical when it is not.
+            match self.signature_of(&key) {
+                Ok(sig) => {
+                    println!(
+                        "[louver] media {}: prepared mode=direct {} (원본 그대로 사용, 사본 없음, {:.1}MB)",
+                        &media_id[..8.min(media_id.len())],
+                        sig.as_key(),
+                        bytes as f64 / 1_048_576.0,
+                    );
+                    self.db.record_prepared_signature(media_id, PrepareMode::Direct.id(), &sig.as_key())?;
+                }
+                // A file whose shape cannot be read cannot be judged against
+                // anything, and the copy would not have helped: the same probe
+                // would have failed on the copy. Fall through to the normal
+                // path, which is what has always handled a file this odd.
+                Err(e) => {
+                    eprintln!("[louver] media {media_id}: 원본을 읽지 못했습니다: {e}");
+                    return self.prepare_by_conversion(media_id, &user_id, &key, &local, &info, prep);
+                }
+            }
+            // The pointer is the source's own key. `prepared_media_for` needs
+            // no special case, the manifest names the file that is there, and
+            // nothing was written to the disk by getting here.
+            self.retire_replaced_prepared(media_id, &user_id, &key)?;
+            self.db.record_media_prepared(media_id, &key, info.duration_secs, bytes, 0)?;
+            return Ok(());
+        }
+
+        self.prepare_by_conversion(media_id, &user_id, &key, &local, &info, prep)
+    }
+
+    /// Produce a broadcastable file from a source that is not one yet.
+    ///
+    /// Everything from here down is what this step has always done; it moved
+    /// into a function of its own so the direct case above could return before
+    /// reaching it.
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_by_conversion(
+        &self,
+        media_id: &str,
+        user_id: &str,
+        key: &crate::storage::ObjectKey,
+        local: &std::path::Path,
+        info: &louver_core::media::probe::MediaInfo,
+        mut prep: louver_core::media::normalize::Preparation,
+    ) -> Result<()> {
+        let builder =
+            FfmpegCommandBuilder::new(self.tools.clone(), CLOUD_PROFILE).with_encoder(self.encoder.clone());
 
         // Prepared output goes beside the store, then gets filed like any other
         // object, so an S3 backend uploads it rather than leaving it on a disk.
@@ -229,9 +302,9 @@ impl Ingest {
         let mut out = normalize_one_with(
             &builder,
             &cache,
-            &local,
+            local,
             media_id,
-            &info,
+            info,
             CLOUD_PROFILE,
             Some(&prep),
             &CancelToken::new(),
@@ -254,13 +327,13 @@ impl Ingest {
                 let _ = std::fs::remove_dir_all(&scratch);
                 std::fs::create_dir_all(&scratch)?;
                 let cache = MediaCache::new(&scratch);
-                prep = plan_preparation(&builder, &local, &info, CLOUD_PROFILE, true);
+                prep = plan_preparation(&builder, local, info, CLOUD_PROFILE, true);
                 out = normalize_one_with(
                     &builder,
                     &cache,
-                    &local,
+                    local,
                     media_id,
-                    &info,
+                    info,
                     CLOUD_PROFILE,
                     Some(&prep),
                     &CancelToken::new(),
@@ -276,7 +349,7 @@ impl Ingest {
         debug_assert!(out.plan.label().len() > 2);
 
         let prepared_key =
-            match self.storage.put_file(&user_id, &format!("prepared-{media_id}.mp4"), &out.output_path) {
+            match self.storage.put_file(user_id, &format!("prepared-{media_id}.mp4"), &out.output_path) {
                 Ok(k) => k,
                 Err(e) => {
                     // The scratch copy is the largest thing on the disk at this
@@ -288,7 +361,7 @@ impl Ingest {
             };
         let _ = std::fs::remove_dir_all(&scratch);
 
-        let original = self.storage.size_bytes(&key).unwrap_or(0) as i64;
+        let original = self.storage.size_bytes(key).unwrap_or(0) as i64;
         let prepared = self.storage.size_bytes(&prepared_key).unwrap_or(0) as i64;
 
         // What the file turned out to be, read from the file rather than from
@@ -314,8 +387,58 @@ impl Ingest {
             // mixed with something else.
             Err(e) => eprintln!("[louver] media {media_id}: 준비된 파일을 읽지 못했습니다: {e}"),
         }
-        self.db.record_media_prepared(media_id, &prepared_key, out.duration_secs, original + prepared)?;
+        // Order matters, and this is the order: the new file exists and has
+        // been probed, *then* the file it replaces is written off, *then* the
+        // pointer moves. Nothing is unlinked at any point. A crash between any
+        // two of these steps leaves the row pointing at a file that exists.
+        self.retire_replaced_prepared(media_id, user_id, &prepared_key)?;
+        self.db.record_media_prepared(media_id, &prepared_key, out.duration_secs, original, prepared)?;
         Ok(())
+    }
+
+    /// Write off the file this media used to be broadcast from.
+    ///
+    /// Called with the object that is about to become the pointer. Whatever the
+    /// pointer named before — if it named anything, if it named something else,
+    /// and if that something was not the source itself — is recorded in
+    /// `storage_trash`.
+    ///
+    /// **It is not deleted.** This is the exact moment at which deleting is
+    /// most dangerous: a re-preparation is started by a playlist that mixes
+    /// formats, and a broadcast of that playlist may be on air right now with
+    /// the old file open. Unlinking it would keep that broadcast alive on
+    /// Linux and kill it at the next restart, when recovery re-opens a path
+    /// that no longer exists. Leaving it costs disk; taking it costs the
+    /// broadcast. This is where the orphans in production came from — they
+    /// were the safe half of this trade, made by accident.
+    fn retire_replaced_prepared(
+        &self,
+        media_id: &str,
+        user_id: &str,
+        new_key: &crate::storage::ObjectKey,
+    ) -> Result<()> {
+        let (old, source): (Option<String>, String) = match self.db.raw().lock().unwrap().query_row(
+            "SELECT prepared_path, storage_path FROM media WHERE id=?1",
+            [media_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        let Some(old) = old else { return Ok(()) };
+        // Unchanged pointer: nothing was replaced. And never the source — that
+        // is the upload, it is still pointed at by `storage_path`, and a media
+        // broadcast directly from it names it here on purpose.
+        if old == *new_key || old == source {
+            return Ok(());
+        }
+        let bytes = self.storage.size_bytes(&old).unwrap_or(0) as i64;
+        println!(
+            "[louver] media {}: 이전 변환본을 정리 대상으로 기록합니다 ({:.1}MB)",
+            &media_id[..8.min(media_id.len())],
+            bytes as f64 / 1_048_576.0,
+        );
+        self.db.trash_object(&old, Some(media_id), Some(user_id), "replaced_by_reprepare", bytes)
     }
 
     /// The exact shape of a prepared file, for the playlist compatibility check.

@@ -295,7 +295,7 @@ impl Env {
         std::fs::write(&src, format!("bytes of {name}")).unwrap();
         let key = store.put_file(&self.user, name, &src).unwrap();
         let m = self.db.create_media(&self.user, name, 42, &key).unwrap();
-        self.db.record_media_prepared(&m.id, &key, 60.0, 42).unwrap();
+        self.db.record_media_prepared(&m.id, &key, 60.0, 0, 42).unwrap();
         m.id
     }
 

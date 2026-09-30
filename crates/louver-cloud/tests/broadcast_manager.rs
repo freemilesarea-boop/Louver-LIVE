@@ -122,7 +122,7 @@ fn harness(plan: &str, broadcasts: usize) -> Harness {
         let key = store.put_file(&user, &format!("clip{i}.mp4"), &src).unwrap();
 
         let m = db.create_media(&user, &format!("clip{i}.mp4"), 20, &key).unwrap();
-        db.record_media_prepared(&m.id, &key, 60.0, 20).unwrap();
+        db.record_media_prepared(&m.id, &key, 60.0, 0, 20).unwrap();
         db.create_broadcast(&user, &format!("LIVE {i}"), &m.id, &dest.id, true).unwrap();
     }
     Harness { _dir: dir, db, mgr, fleet, user, path }
@@ -556,7 +556,7 @@ fn youtube_harness() -> YtHarness {
     let m = db.create_media(&user, "clip.mp4", 20, &key).unwrap();
     // Two seconds, so a single-pass playlist finishes inside a test rather than
     // in a minute. Nothing that loops reads this.
-    db.record_media_prepared(&m.id, &key, 2.0, 20).unwrap();
+    db.record_media_prepared(&m.id, &key, 2.0, 0, 20).unwrap();
 
     let dest = db.reserve_youtube_destination(&user, &account).unwrap();
     let b = db.create_broadcast(&user, "밤 라디오", &m.id, &dest.id, true).unwrap();
@@ -610,7 +610,7 @@ impl YtHarness {
         std::fs::write(&src, b"prepared video bytes").unwrap();
         let key = store.put_file(&self.user, &format!("{name}.mp4"), &src).unwrap();
         let m = self.db.create_media(&self.user, &format!("{name}.mp4"), 20, &key).unwrap();
-        self.db.record_media_prepared(&m.id, &key, 2.0, 20).unwrap();
+        self.db.record_media_prepared(&m.id, &key, 2.0, 0, 20).unwrap();
         let dest = self.db.reserve_youtube_destination(&self.user, &self.account).unwrap();
         let b = self.db.create_broadcast(&self.user, name, &m.id, &dest.id, true).unwrap();
         self.mgr.youtube().unwrap().provision(&self.user, &b.id, &self.account).unwrap();
@@ -887,7 +887,7 @@ fn one_accounts_cancellation_leaves_another_accounts_stream_alone() {
         store.put_file(&other, "other.mp4", &src).unwrap()
     };
     let m = h.db.create_media(&other, "other.mp4", 20, &key).unwrap();
-    h.db.record_media_prepared(&m.id, &key, 2.0, 20).unwrap();
+    h.db.record_media_prepared(&m.id, &key, 2.0, 0, 20).unwrap();
     let dest = h.db.create_destination(&other, "남의 채널", "rtmps://a/live2", "••••").unwrap();
     h.keys.set(&louver_cloud::credentials::destination_account(&dest.id), "aaaa-bbbb-cccc-dddd").unwrap();
     let theirs = h.db.create_broadcast(&other, "남의 방송", &m.id, &dest.id, true).unwrap().id;

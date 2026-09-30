@@ -149,6 +149,46 @@ impl Preparation {
     }
 }
 
+/// Containers whose packets can be handed to the concat demuxer as they lie.
+///
+/// ffprobe reports one name for the whole MP4 family
+/// (`mov,mp4,m4a,3gp,3g2,mj2`), which is the family this product's own
+/// preparation writes and the only one it has ever fed to a live ingest.
+/// Anything else — Matroska, WebM, MPEG-TS — may well stream-copy perfectly,
+/// but it has never been on air here, so it keeps the remux it has always had.
+/// The limit is deliberately about *proven* ground rather than what is
+/// theoretically possible.
+pub fn is_mp4_family(container: &str) -> bool {
+    container.split(',').any(|c| matches!(c.trim(), "mp4" | "mov" | "m4a"))
+}
+
+/// Can this source be broadcast from exactly where it lies, with no copy of it?
+///
+/// [`PrepareMode::Direct`] already means every stream would be copied: the
+/// codec, the pixel format, the geometry, the frame rate and the keyframe
+/// spacing have all been checked and none of them needs an encoder. What the
+/// remux was still buying at that point was the container — our own timescale,
+/// whole-frame durations, faststart.
+///
+/// Of those three, only the timescale can affect a broadcast, and it does so
+/// **between** items rather than within one: the concat demuxer needs its
+/// inputs to agree, and agreement is what `prepared_signature` records and
+/// `check_playlist_joinable` enforces — from a probe of the file that will
+/// actually be read. A playlist whose items disagree is converged on the
+/// canonical format exactly as before. So for a file already in our container
+/// family the remux produces a second copy of the same bytes and changes
+/// nothing about how it plays.
+///
+/// Whole-frame duration and faststart do not survive as reasons either: the
+/// first matters to a muxer writing a file, and the second to a player seeking
+/// over a network. Neither is what a local concat read does.
+pub fn direct_source_is_broadcastable(info: &MediaInfo, prep: &Preparation) -> bool {
+    prep.mode == PrepareMode::Direct
+        && prep.plan.video.is_copy()
+        && prep.plan.audio.is_copy()
+        && is_mp4_family(&info.container)
+}
+
 /// Bitrate for a re-encode that is only fixing the keyframes.
 ///
 /// The source is already a file somebody was happy to publish, so the target is
@@ -588,6 +628,78 @@ pub fn normalize_one_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::probe::StreamPlan;
+
+    /// A `Preparation` in the shape the caller checks, without a probe.
+    fn prep(mode: PrepareMode, video: StreamPlan, audio: StreamPlan) -> Preparation {
+        Preparation {
+            mode,
+            plan: TranscodePlan { video, audio, video_reasons: Vec::new(), audio_reasons: Vec::new() },
+            video: None,
+            measured_gop_secs: None,
+        }
+    }
+
+    #[test]
+    fn the_mp4_family_is_what_ffprobe_calls_it() {
+        assert!(is_mp4_family("mov,mp4,m4a,3gp,3g2,mj2"));
+        assert!(is_mp4_family("mp4"));
+        assert!(!is_mp4_family("matroska,webm"));
+        assert!(!is_mp4_family("mpegts"));
+        assert!(!is_mp4_family(""));
+    }
+
+    #[test]
+    fn a_direct_mp4_source_is_broadcast_where_it_lies() {
+        let info = MediaInfo { container: "mov,mp4,m4a,3gp,3g2,mj2".into(), ..MediaInfo::default() };
+        let p = prep(PrepareMode::Direct, StreamPlan::Copy, StreamPlan::Copy);
+        assert!(direct_source_is_broadcastable(&info, &p));
+    }
+
+    #[test]
+    fn anything_that_needs_an_encoder_is_still_converted() {
+        let info = MediaInfo { container: "mov,mp4,m4a".into(), ..MediaInfo::default() };
+        // Sound to fix.
+        assert!(!direct_source_is_broadcastable(
+            &info,
+            &prep(PrepareMode::Hybrid, StreamPlan::Copy, StreamPlan::Encode)
+        ));
+        // Keyframes to fix.
+        assert!(!direct_source_is_broadcastable(
+            &info,
+            &prep(PrepareMode::LiveNormalize, StreamPlan::Encode, StreamPlan::Copy)
+        ));
+        // Converging on the one interchangeable format.
+        assert!(!direct_source_is_broadcastable(
+            &info,
+            &prep(PrepareMode::Canonical, StreamPlan::Encode, StreamPlan::Encode)
+        ));
+    }
+
+    #[test]
+    fn a_container_we_have_never_broadcast_still_gets_its_remux() {
+        // Matroska with H.264 and AAC inside can stream-copy perfectly well,
+        // and it still gets the copy it has always had: the saving is not
+        // worth being the first to find out on somebody's live channel.
+        let mkv = MediaInfo { container: "matroska,webm".into(), ..MediaInfo::default() };
+        assert!(!direct_source_is_broadcastable(
+            &mkv,
+            &prep(PrepareMode::Direct, StreamPlan::Copy, StreamPlan::Copy)
+        ));
+    }
+
+    #[test]
+    fn a_mode_and_a_plan_that_disagree_are_not_trusted() {
+        // Direct means both streams are copied. If a plan ever says otherwise,
+        // the plan wins and a file is produced — the pair is checked rather
+        // than the label, so a future change to one cannot quietly skip the
+        // conversion.
+        let info = MediaInfo { container: "mp4".into(), ..MediaInfo::default() };
+        assert!(!direct_source_is_broadcastable(
+            &info,
+            &prep(PrepareMode::Direct, StreamPlan::Encode, StreamPlan::Copy)
+        ));
+    }
 
     #[test]
     fn percent_tracks_out_time() {
