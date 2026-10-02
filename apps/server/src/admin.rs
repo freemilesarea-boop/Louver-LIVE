@@ -20,6 +20,7 @@ use crate::state::App;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use louver_cloud::admin::{self, AuditEntry, Page};
+use louver_cloud::grants;
 use louver_cloud::CloudError;
 use serde::{Deserialize, Serialize};
 
@@ -93,6 +94,7 @@ pub async fn dashboard(State(app): State<App>, _: Admin) -> Out<admin::AdminDash
             let probe = app.upload_tmp.clone();
             let free = louver_core::system::available_disk_bytes(&probe);
             Ok(admin::AdminDashboard {
+                grants: app.db.grant_counts()?,
                 users: app.db.user_counts()?,
                 subscriptions: app.db.subscription_counts()?,
                 broadcasts: app.db.broadcast_counts()?,
@@ -264,6 +266,245 @@ pub async fn set_disabled(
     })
     .await?;
     Ok(Json(row))
+}
+
+// --- manual grants ---------------------------------------------------------
+
+/// What the console sends to grant a plan to one account or a hundred.
+#[derive(Debug, Deserialize)]
+pub struct GrantRequest {
+    pub user_ids: Vec<String>,
+    pub plan_id: String,
+    /// A preset term. Mutually exclusive with `from`/`to`.
+    #[serde(default)]
+    pub days: Option<i64>,
+    /// Seoul-local `YYYY-MM-DD`, both inclusive.
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    pub reason: String,
+    /// `extend`, `reset` or `skip`, for the accounts that already hold one.
+    #[serde(default)]
+    pub on_existing: Option<String>,
+}
+
+impl GrantRequest {
+    fn term(&self) -> std::result::Result<grants::Term, CloudError> {
+        match (self.days, &self.from, &self.to) {
+            (Some(d), None, None) => Ok(grants::Term::Days(d)),
+            (None, Some(f), Some(t)) => Ok(grants::Term::Between { from: f.clone(), to: t.clone() }),
+            _ => Err(CloudError::Invalid("기간을 일수로 주거나 시작일과 만료일을 함께 주세요".into())),
+        }
+    }
+}
+
+/// Grant a plan to the selected accounts, all of them or none.
+///
+/// The ids in the body are **targets**, never the caller: `Admin` has already
+/// resolved who is asking from their session cookie and re-read their role from
+/// the database, so a body cannot claim to be anybody. What the body can do is
+/// name who receives, which is the operator's whole job here.
+pub async fn create_grants(
+    State(app): State<App>,
+    who: Admin,
+    Json(body): Json<GrantRequest>,
+) -> Out<grants::BulkGrantResult> {
+    let out = crate::blocking(move || {
+        let term = body.term()?;
+        let on_existing = match body.on_existing.as_deref() {
+            None => grants::OnExisting::Extend,
+            Some(s) => grants::OnExisting::from_id(s)
+                .ok_or_else(|| CloudError::Invalid("기존 이용권 처리 방식이 올바르지 않습니다".into()))?,
+        };
+        let result = app.db.create_grants(
+            &body.user_ids,
+            &grants::NewGrant { plan_id: &body.plan_id, term, reason: &body.reason },
+            on_existing,
+            &who.0.id,
+            &who.0.email,
+        )?;
+
+        // The batch, then each account. One line an operator can find by the
+        // batch id, and one per person so a single grant can be traced without
+        // reading the batch.
+        let summary =
+            result.outcomes.iter().fold(std::collections::BTreeMap::<&str, i64>::new(), |mut m, o| {
+                *m.entry(o.action.as_str()).or_default() += 1;
+                m
+            });
+        who.audit_change(
+            &app,
+            if result.outcomes.len() > 1 {
+                "admin.manual_grant.bulk_create"
+            } else {
+                "admin.manual_grant.create"
+            },
+            Change {
+                target_type: "grant_batch",
+                target_id: &result.batch_id,
+                before: format!("{}명 요청", body.user_ids.len()),
+                after: format!(
+                    "plan={} {}",
+                    result.plan_id,
+                    summary.iter().map(|(k, n)| format!("{k}={n}")).collect::<Vec<_>>().join(" ")
+                ),
+                note: Some(body.reason.clone()),
+            },
+        );
+        for o in &result.outcomes {
+            who.audit_change(
+                &app,
+                "admin.manual_grant.create",
+                Change {
+                    target_type: "user",
+                    target_id: &o.user_id,
+                    before: format!("batch={}", result.batch_id),
+                    after: format!(
+                        "{} plan={} {}",
+                        o.action,
+                        result.plan_id,
+                        o.expires_at.as_deref().unwrap_or("-")
+                    ),
+                    note: Some(body.reason.clone()),
+                },
+            );
+        }
+        Ok(result)
+    })
+    .await?;
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ExtendRequest {
+    pub days: i64,
+    pub reason: String,
+}
+
+/// Push one grant's end further out.
+pub async fn extend_grant(
+    State(app): State<App>,
+    who: Admin,
+    Path(id): Path<String>,
+    Json(body): Json<ExtendRequest>,
+) -> Out<grants::Grant> {
+    let out = crate::blocking(move || {
+        let before = app.db.grant(&id)?;
+        let after = app.db.extend_grant(&id, body.days, &who.0.id, &who.0.email, &body.reason)?;
+        who.audit_change(
+            &app,
+            "admin.manual_grant.extend",
+            Change {
+                target_type: "user",
+                target_id: &before.user_id,
+                before: format!("{} ~ {}", before.plan_id, before.expires_at),
+                after: format!("{} ~ {} (+{}일)", after.plan_id, after.expires_at, body.days),
+                note: Some(body.reason.clone()),
+            },
+        );
+        Ok(after)
+    })
+    .await?;
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ChangePlanRequest {
+    pub plan_id: String,
+    pub reason: String,
+}
+
+/// Move one grant to another plan, keeping its term.
+pub async fn change_grant_plan(
+    State(app): State<App>,
+    who: Admin,
+    Path(id): Path<String>,
+    Json(body): Json<ChangePlanRequest>,
+) -> Out<grants::Grant> {
+    let out = crate::blocking(move || {
+        let before = app.db.grant(&id)?;
+        let after = app.db.change_grant_plan(&id, &body.plan_id, &who.0.id, &who.0.email, &body.reason)?;
+        who.audit_change(
+            &app,
+            "admin.manual_grant.change_plan",
+            Change {
+                target_type: "user",
+                target_id: &before.user_id,
+                before: format!("{} ~ {}", before.plan_id, before.expires_at),
+                after: format!("{} ~ {}", after.plan_id, after.expires_at),
+                note: Some(body.reason.clone()),
+            },
+        );
+        Ok(after)
+    })
+    .await?;
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RevokeRequest {
+    pub reason: String,
+}
+
+/// Take a grant back.
+///
+/// **No payment is touched.** An account that is also paying returns to the plan
+/// it pays for, and one that is not returns to unsubscribed — both on their own,
+/// because the plan in force is computed and this row stops counting.
+///
+/// Running broadcasts are left alone, which is what losing an entitlement has
+/// always done here: a lapsed card does not kill a stream either, it stops the
+/// next start, the scheduler and boot recovery. An operator who wants a stream
+/// off has the broadcast page for that.
+pub async fn revoke_grant(
+    State(app): State<App>,
+    who: Admin,
+    Path(id): Path<String>,
+    Json(body): Json<RevokeRequest>,
+) -> Out<grants::Grant> {
+    let out = crate::blocking(move || {
+        let before = app.db.grant(&id)?;
+        let after = app.db.revoke_grant(&id, &who.0.id, &who.0.email, &body.reason)?;
+        let back_to = app.db.subscription(&before.user_id)?;
+        who.audit_change(
+            &app,
+            "admin.manual_grant.revoke",
+            Change {
+                target_type: "user",
+                target_id: &before.user_id,
+                before: format!("{} ~ {}", before.plan_id, before.expires_at),
+                after: format!("revoked, 복귀={}", back_to.plan_id),
+                note: Some(body.reason.clone()),
+            },
+        );
+        Ok(after)
+    })
+    .await?;
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct GrantQuery {
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+/// Every grant, newest first, for the console's own page.
+pub async fn grants(
+    State(app): State<App>,
+    _: Admin,
+    Query(q): Query<GrantQuery>,
+) -> Out<Vec<grants::Grant>> {
+    let rows = crate::blocking(move || {
+        app.db.grants_page(q.filter.as_deref(), q.limit.unwrap_or(50), q.offset.unwrap_or(0))
+    })
+    .await?;
+    Ok(Json(rows))
 }
 
 // --- broadcasts ------------------------------------------------------------

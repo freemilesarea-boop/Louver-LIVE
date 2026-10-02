@@ -14,6 +14,7 @@ pub mod billing;
 pub mod credentials;
 pub mod db;
 pub mod entitlement;
+pub mod grants;
 pub mod ingest;
 pub mod manager;
 pub mod media_audit;

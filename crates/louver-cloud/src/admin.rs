@@ -46,6 +46,9 @@ pub const DEFAULT_PAGE: i64 = 50;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AdminDashboard {
+    /// Entitlement an operator handed out. Deliberately its own field, next to
+    /// nothing financial: a grant is not a sale and must never be read as one.
+    pub grants: crate::grants::GrantCounts,
     pub users: UserCounts,
     pub subscriptions: SubscriptionCounts,
     pub broadcasts: BroadcastCounts,
@@ -182,8 +185,20 @@ pub struct AdminUserRow {
     pub created_at: String,
     pub role: String,
     pub disabled_at: Option<String>,
+    /// What the account pays for. Unchanged by a grant.
     pub plan_id: String,
     pub plan_label: String,
+    /// The plan actually in force, once an operator's grant is taken into
+    /// account. Equal to `plan_id` whenever there is no grant.
+    pub effective_plan_id: String,
+    pub effective_plan_label: String,
+    /// `paid`, `grant` or `none` — why `effective_plan_id` is what it is.
+    pub entitlement_source: String,
+    /// The live grant's plan and remaining days, for a `Business 지급 · D-29`
+    /// badge. `None` when there is no grant in force.
+    pub grant_plan_id: Option<String>,
+    pub grant_expires_at: Option<String>,
+    pub grant_days_left: Option<i64>,
     pub subscription_status: String,
     pub billing_status: Option<String>,
     pub next_charge_at: Option<String>,
@@ -203,6 +218,9 @@ pub struct AdminUserDetail {
     pub first_paid_at: Option<String>,
     pub last_paid_at: Option<String>,
     pub billing: Vec<BillingSubscription>,
+    /// Every grant this account has had, newest first. The live one is whichever
+    /// has `state == active`; the rest are its history.
+    pub grants: Vec<crate::grants::Grant>,
     /// Channel titles only. No token, ever.
     pub youtube_channels: Vec<String>,
     pub broadcasts: Vec<AdminBroadcastRow>,
@@ -768,15 +786,32 @@ impl CloudDb {
         };
         let having = match filter.unwrap_or("all") {
             "paid" => "AND u.plan_id <> 'none'",
-            "none" => "AND u.plan_id = 'none'",
+            "none" => "AND u.plan_id = 'none' AND g.plan_id IS NULL",
             "basic" | "pro" | "business" => "AND u.plan_id = :plan",
             "disabled" => "AND u.disabled_at IS NOT NULL",
             "enabled" => "AND u.disabled_at IS NULL",
             "youtube" => "AND yt.n > 0",
             "live" => "AND live.n > 0",
+            // Entitlement an operator handed out, and when it runs out. The
+            // last two look past the live window on purpose: an operator
+            // chasing a cohort wants the ones that have already lapsed too.
+            "granted" => "AND g.plan_id IS NOT NULL",
+            "grant_7d" => "AND g.expires_at <= datetime('now', '+7 days')",
+            "grant_30d" => "AND g.expires_at <= datetime('now', '+30 days')",
+            "grant_expired" => {
+                "AND g.plan_id IS NULL AND EXISTS (SELECT 1 FROM admin_grants x
+                   WHERE x.user_id = u.id AND x.revoked_at IS NULL
+                     AND x.expires_at <= datetime('now'))"
+            }
             _ => "",
         }
         .replace(":plan", &format!("'{}'", filter.unwrap_or("all")));
+
+        // Every plan, once. `plan_rank` needs the limits of both sides and a
+        // page is up to a hundred rows; four plans fetched once beats two
+        // hundred lookups.
+        let catalog: std::collections::HashMap<String, crate::Plan> =
+            self.all_plans()?.into_iter().map(|p| (p.id.clone(), p)).collect();
 
         let conn = self.raw();
         let guard = conn.lock().unwrap();
@@ -785,7 +820,9 @@ impl CloudDb {
                     u.plan_id, COALESCE(p.label, u.plan_id), COALESCE(s.status, 'active'),
                     bs.status, bs.current_period_end,
                     COALESCE(m.bytes, 0), COALESCE(p.limits, '{{}}'),
-                    COALESCE(yt.n, 0), COALESCE(live.n, 0), COALESCE(paid.krw, 0)
+                    COALESCE(yt.n, 0), COALESCE(live.n, 0), COALESCE(paid.krw, 0),
+                    g.plan_id, g.expires_at,
+                    CAST(julianday(g.expires_at) - julianday('now') AS INTEGER)
              FROM users u
              LEFT JOIN plans p ON p.id = u.plan_id
              LEFT JOIN subscriptions s ON s.user_id = u.id
@@ -801,6 +838,14 @@ impl CloudDb {
                         GROUP BY user_id) b ON b.user_id = u.id
              LEFT JOIN (SELECT user_id, status, current_period_end FROM billing_subscriptions
                         GROUP BY user_id HAVING MAX(created_at)) bs ON bs.user_id = u.id
+             -- The grant in force, if any. Strongest first by the same measure
+             -- `grants::plan_rank` uses, then the one that ends latest.
+             LEFT JOIN (SELECT user_id, plan_id, expires_at FROM admin_grants
+                        WHERE revoked_at IS NULL
+                          AND starts_at <= datetime('now')
+                          AND expires_at > datetime('now')
+                        GROUP BY user_id
+                        HAVING MAX(expires_at)) g ON g.user_id = u.id
              WHERE (?3 IS NULL OR u.email LIKE ?3 COLLATE NOCASE OR u.name LIKE ?3 COLLATE NOCASE)
              {having}
              ORDER BY {order} LIMIT ?1 OFFSET ?2"
@@ -813,6 +858,34 @@ impl CloudDb {
                 .ok()
                 .and_then(|v| v[crate::entitlement::MAX_STORAGE_BYTES].as_i64())
                 .unwrap_or(0);
+            // Which source is in force, decided by the one function that
+            // decides it anywhere — `grants::plan_rank`, against plans loaded
+            // once above rather than a query per row. A second implementation
+            // of this comparison is how a list and a gate come to disagree.
+            let grant_plan: Option<String> = r.get(16)?;
+            let paid_id: String = r.get(6)?;
+            let paid_label: String = r.get(7)?;
+            let paid = catalog.get(&paid_id);
+            let granted = grant_plan.as_ref().and_then(|g| catalog.get(g));
+            let use_grant = match (granted, paid) {
+                (Some(g), Some(p)) => crate::grants::plan_rank(g) > crate::grants::plan_rank(p),
+                (Some(_), None) => true,
+                _ => false,
+            };
+            let (eff_id, eff_label, source) = match (use_grant, granted) {
+                (true, Some(g)) => (g.id.clone(), g.label.clone(), "grant"),
+                _ if paid.is_some_and(|p| p.can_broadcast()) => (paid_id.clone(), paid_label.clone(), "paid"),
+                _ if grant_plan.is_some() => (paid_id.clone(), paid_label.clone(), "grant"),
+                _ => (paid_id.clone(), paid_label.clone(), "none"),
+            };
+            // The ceiling shown has to be the one in force, or the list would
+            // say 15GB for an account currently allowed 60.
+            let storage_limit = match (use_grant, granted) {
+                (true, Some(g)) => {
+                    g.limits.get(crate::entitlement::MAX_STORAGE_BYTES).copied().unwrap_or(storage_limit)
+                }
+                _ => storage_limit,
+            };
             Ok(AdminUserRow {
                 id: r.get(0)?,
                 email: r.get(1)?,
@@ -820,8 +893,14 @@ impl CloudDb {
                 created_at: r.get(3)?,
                 role: r.get(4)?,
                 disabled_at: r.get(5)?,
-                plan_id: r.get(6)?,
-                plan_label: r.get(7)?,
+                plan_id: paid_id,
+                plan_label: paid_label,
+                effective_plan_id: eff_id,
+                effective_plan_label: eff_label,
+                entitlement_source: source.to_string(),
+                grant_plan_id: grant_plan,
+                grant_expires_at: r.get(17)?,
+                grant_days_left: r.get(18)?,
                 subscription_status: r.get(8)?,
                 billing_status: r.get(9)?,
                 next_charge_at: r.get(10)?,
@@ -881,6 +960,7 @@ impl CloudDb {
             last_paid_at,
             payments,
             billing: self.billing_subscriptions_for(user_id)?,
+            grants: self.grants_for(user_id)?,
             youtube_channels,
             broadcasts: self.admin_broadcasts(Some(user_id), None, MAX_PAGE, 0)?,
         })

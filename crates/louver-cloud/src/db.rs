@@ -644,6 +644,44 @@ impl CloudDb {
         //
         // `prepared_bytes = 0` is the new normal for a file that needed no
         // conversion: there is no second copy, and the number says so.
+        // Entitlement an operator hands out, kept apart from the one people pay
+        // for. See `grants.rs` for why it is a separate table and not a status
+        // on `subscriptions`: a free month for a student must not be able to
+        // reach the revenue figures, and the simplest way to guarantee that is
+        // for the money tables not to know this one exists.
+        //
+        // No `status` column, deliberately. The state of a grant is derived
+        // from `starts_at`, `expires_at` and `revoked_at` on every read, so
+        // there is no second copy of the truth to drift and no scheduled job
+        // whose failure leaves an expired grant still working.
+        //
+        // Nothing is ever deleted here. An extension or a plan change writes a
+        // new row and points the old one at it through `superseded_by`, so the
+        // history reads as what actually happened.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS admin_grants (
+                 id               TEXT PRIMARY KEY,
+                 user_id          TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 plan_id          TEXT NOT NULL,
+                 starts_at        TEXT NOT NULL,
+                 expires_at       TEXT NOT NULL,
+                 reason           TEXT NOT NULL,
+                 granted_by       TEXT NOT NULL,
+                 granted_by_email TEXT NOT NULL,
+                 batch_id         TEXT,
+                 revoked_at       TEXT,
+                 revoked_by       TEXT,
+                 revoke_reason    TEXT,
+                 superseded_by    TEXT,
+                 created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+                 updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             -- The lookup every entitlement check makes: this account, in force.
+             CREATE INDEX IF NOT EXISTS idx_grant_user ON admin_grants(user_id, expires_at);
+             CREATE INDEX IF NOT EXISTS idx_grant_live ON admin_grants(revoked_at, expires_at);
+             CREATE INDEX IF NOT EXISTS idx_grant_batch ON admin_grants(batch_id);",
+        )?;
+
         ensure_column(&conn, "media", "source_bytes", "INTEGER")?;
         ensure_column(&conn, "media", "prepared_bytes", "INTEGER")?;
 
@@ -898,6 +936,17 @@ impl CloudDb {
     /// Filtered on `active` rather than on a list of names, so the unsubscribed
     /// plan — and any internal one an operator adds later — stays off the public
     /// page without this function knowing they exist.
+    /// Every plan row, for sale or not.
+    ///
+    /// `plans_for_sale` filters to what a pricing page shows; this is what a
+    /// comparison needs, which includes the unsubscribed plan.
+    pub fn all_plans(&self) -> Result<Vec<Plan>> {
+        let conn = self.conn.lock().unwrap();
+        let mut st = conn.prepare(&format!("{PLAN_COLUMNS} ORDER BY sort_order"))?;
+        let rows = st.query_map([], row_to_plan)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     pub fn plans_for_sale(&self) -> Result<Vec<Plan>> {
         let conn = self.conn.lock().unwrap();
         let mut st = conn.prepare(&format!("{PLAN_COLUMNS} WHERE active = 1 ORDER BY sort_order, id"))?;
@@ -1040,7 +1089,7 @@ impl CloudDb {
     /// nothing, so "active with no row" cannot conjure an entitlement.
     pub fn subscription(&self, user_id: &str) -> Result<Subscription> {
         let u = self.user(user_id)?;
-        let plan = self.plan(&u.plan_id)?;
+        let paid = self.plan(&u.plan_id)?;
         let status: String = self
             .conn
             .lock()
@@ -1049,7 +1098,25 @@ impl CloudDb {
             .optional()?
             .unwrap_or_else(|| SUBSCRIPTION_ACTIVE.into());
 
-        let active = status == SUBSCRIPTION_ACTIVE && plan.can_broadcast();
+        let paid_active = status == SUBSCRIPTION_ACTIVE && paid.can_broadcast();
+
+        // A grant an operator handed out is a second, independent source of
+        // entitlement. It can only raise what the account already has: it takes
+        // over when the paid side grants nothing, or when it is the stronger of
+        // the two. It never cancels, changes or hides a payment — PayApp is not
+        // consulted here and `users.plan_id` is not written.
+        //
+        // With no grant in force, every line below is what it has always been.
+        let granted = self.active_grant_plan(user_id)?;
+        let use_grant = match &granted {
+            Some(g) => !paid_active || crate::grants::plan_rank(g) > crate::grants::plan_rank(&paid),
+            None => false,
+        };
+        let (plan, active, status) = match (use_grant, granted) {
+            (true, Some(g)) => (g, true, SUBSCRIPTION_ACTIVE.to_string()),
+            _ => (paid, paid_active, status),
+        };
+        let active = active && plan.can_broadcast();
         Ok(Subscription {
             user_id: u.id,
             plan_id: plan.id.clone(),

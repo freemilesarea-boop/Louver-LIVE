@@ -111,6 +111,12 @@ pub fn router(app: App) -> Router {
         .route("/api/admin/billing", get(admin::billing))
         .route("/api/admin/system", get(admin::system))
         .route("/api/admin/audit", get(admin::audit))
+        // Entitlement an operator hands out. Separate from everything billing:
+        // these routes never write a payment, a subscription or a plan.
+        .route("/api/admin/grants", get(admin::grants).post(admin::create_grants))
+        .route("/api/admin/grants/{id}/extend", post(admin::extend_grant))
+        .route("/api/admin/grants/{id}/plan", post(admin::change_grant_plan))
+        .route("/api/admin/grants/{id}/revoke", post(admin::revoke_grant))
         .route("/api/metrics", get(api::metrics))
         .route("/api/events", get(api::events))
         .with_state(app)

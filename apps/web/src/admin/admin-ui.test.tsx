@@ -18,6 +18,7 @@ import { AdminApp } from "./AdminApp";
 import type { AdminBroadcastRow, AdminDashboard, AdminUserRow } from "./api";
 
 const EMPTY_DASHBOARD: AdminDashboard = {
+  grants: { active: 0, by_plan: [], expiring_7d: 0, scheduled: 0 },
   users: { total: 0, today: 0, last_7_days: 0, last_30_days: 0, disabled: 0 },
   subscriptions: {
     by_plan: [],
@@ -86,6 +87,12 @@ const USER_ROW: AdminUserRow = {
   disabled_at: null,
   plan_id: "basic",
   plan_label: "Basic",
+  effective_plan_id: "basic",
+  effective_plan_label: "Basic",
+  entitlement_source: "paid",
+  grant_plan_id: null,
+  grant_expires_at: null,
+  grant_days_left: null,
   subscription_status: "active",
   billing_status: "active",
   next_charge_at: "2026-10-01",
@@ -316,6 +323,250 @@ describe("the console's screens", () => {
     await userEvent.click(await screen.findByText("김회원"));
     expect(window.location.pathname).toBe("/admin/users/u1");
     expect(await screen.findByText(/밤 라디오 채널/)).toBeTruthy();
+  });
+});
+
+describe("manual grants", () => {
+  const GRANTED: AdminUserRow = {
+    ...USER_ROW,
+    id: "g1",
+    email: "student@example.com",
+    name: "김수강",
+    plan_id: "none",
+    plan_label: "요금제 없음",
+    effective_plan_id: "business",
+    effective_plan_label: "Business",
+    entitlement_source: "grant",
+    grant_plan_id: "business",
+    grant_expires_at: "2026-11-01 15:00:00",
+    grant_days_left: 29,
+  };
+
+  it("shows the plan in force and that an operator gave it", async () => {
+    stubFetch({ "/users": { body: [GRANTED, USER_ROW] } });
+    at("/admin/users");
+    render(<AdminApp email="boss@example.com" />);
+
+    // The granted account reads as Business, and says where that came from.
+    expect(await screen.findByText("student@example.com")).toBeTruthy();
+    expect(screen.getByText(/관리자 지급 · D-29/)).toBeTruthy();
+    // Exactly one row carries the grant badge: the paying account must not.
+    expect(screen.getAllByText(/관리자 지급 · D-/)).toHaveLength(1);
+    expect(screen.getAllByText("Business").length).toBeGreaterThan(0);
+  });
+
+  it("will not grant anything until accounts are selected", async () => {
+    stubFetch({ "/users": { body: [GRANTED, USER_ROW] } });
+    at("/admin/users");
+    render(<AdminApp email="boss@example.com" />);
+    await screen.findByText("student@example.com");
+
+    const button = screen.getByRole("button", { name: "이용권 지급" });
+    expect(button).toBeDisabled();
+  });
+
+  it("sends exactly what the form says, for exactly the accounts picked", async () => {
+    const calls = stubFetch({
+      "/users": { body: [GRANTED, USER_ROW] },
+      "/grants": {
+        body: {
+          batch_id: "b1",
+          plan_id: "pro",
+          plan_label: "Pro",
+          outcomes: [{ user_id: "u1", email: "member@example.com", action: "created", grant_id: "x", expires_at: "2026-11-01" }],
+        },
+      },
+    });
+    at("/admin/users");
+    render(<AdminApp email="boss@example.com" />);
+    await screen.findByText("member@example.com");
+
+    await userEvent.click(screen.getByLabelText("member@example.com 선택"));
+    await userEvent.click(screen.getByRole("button", { name: "이용권 지급" }));
+
+    // The form, and the sentence that states what is about to happen.
+    const form = within(await screen.findByRole("dialog"));
+    await userEvent.click(form.getByRole("button", { name: "Pro" }));
+    await userEvent.click(form.getByRole("button", { name: "7일" }));
+    await userEvent.click(form.getByRole("button", { name: "이벤트" }));
+    expect(form.getByText(/선택한 1명에게 Pro 이용권을 7일간 지급합니다/)).toBeTruthy();
+
+    // Nothing has been sent yet: there is a confirmation step.
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
+    await userEvent.click(form.getByRole("button", { name: "이용권 지급" }));
+    await userEvent.click(await form.findByRole("button", { name: /1명에게 지급/ }));
+
+    await waitFor(() => {
+      const post = calls.find((c) => c.method === "POST");
+      expect(post?.url).toBe("/api/admin/grants");
+      expect(JSON.parse(post!.body!)).toEqual({
+        user_ids: ["u1"],
+        plan_id: "pro",
+        days: 7,
+        reason: "이벤트",
+        on_existing: "extend",
+      });
+    });
+    expect(await screen.findByRole("status")).toHaveTextContent("Pro 이용권을 1명에게 지급했습니다");
+  });
+
+  it("says how many of the selection already hold one, before anything happens", async () => {
+    stubFetch({ "/users": { body: [GRANTED, USER_ROW] } });
+    at("/admin/users");
+    render(<AdminApp email="boss@example.com" />);
+    await screen.findByText("student@example.com");
+
+    await userEvent.click(screen.getByLabelText("현재 목록 전체 선택"));
+    await userEvent.click(screen.getByRole("button", { name: "이용권 지급" }));
+    const form = within(await screen.findByRole("dialog"));
+
+    // Two picked, one of whom is already on a grant — said in the form, and
+    // the operator chooses what it means rather than it being decided for them.
+    expect(form.getByText(/1명 신규, 1명 기존 보유/)).toBeTruthy();
+    expect(form.getByRole("button", { name: "기존 만료일부터 연장" })).toBeTruthy();
+    expect(form.getByRole("button", { name: "오늘부터 새 기간으로" })).toBeTruthy();
+  });
+
+  it("counts grants on the dashboard without touching the money", async () => {
+    stubFetch({
+      "/dashboard": {
+        body: {
+          ...BUSY_DASHBOARD,
+          grants: {
+            active: 32,
+            by_plan: [["business", "Business", 25], ["pro", "Pro", 2], ["basic", "Basic", 5]],
+            expiring_7d: 8,
+            scheduled: 1,
+          },
+        },
+      },
+    });
+    at("/admin");
+    render(<AdminApp email="boss@example.com" />);
+
+    expect(await screen.findByText(/관리자 지급 이용권/)).toBeTruthy();
+    expect(screen.getByText(/매출·MRR 미포함/)).toBeTruthy();
+    expect(screen.getByText("32")).toBeTruthy();
+    expect(screen.getByText("8")).toBeTruthy();
+    // The money is still the money.
+    const mrr = screen.getByText("MRR").parentElement!;
+    expect(within(mrr).getByText("₩179,300")).toBeTruthy();
+  });
+
+  it("explains both sources on a member, and offers the three actions", async () => {
+    stubFetch({
+      "/users": { body: [GRANTED] },
+      "/users/g1": {
+        body: {
+          user: { ...GRANTED, plan_id: "basic", plan_label: "Basic" },
+          media_count: 0,
+          payments: [],
+          payment_count: 0,
+          first_paid_at: null,
+          last_paid_at: null,
+          billing: [],
+          grants: [
+            {
+              id: "gr1",
+              user_id: "g1",
+              email: "student@example.com",
+              plan_id: "business",
+              plan_label: "Business",
+              starts_at: "2026-10-02 15:00:00",
+              expires_at: "2026-11-01 15:00:00",
+              reason: "6기 수강생 혜택",
+              granted_by_email: "boss@example.com",
+              revoked_at: null,
+              revoked_by_email: null,
+              revoke_reason: null,
+              superseded_by: null,
+              batch_id: "b1",
+              created_at: "2026-10-02 01:00:00",
+              state: "active",
+              days_left: 29,
+            },
+          ],
+          youtube_channels: [],
+          broadcasts: [],
+        },
+      },
+    });
+    at("/admin/users/g1");
+    render(<AdminApp email="boss@example.com" />);
+
+    expect(await screen.findByText("이용 권한")).toBeTruthy();
+    // Both sources, so the operator can see why the final plan is Business.
+    expect(screen.getAllByText("Business").length).toBeGreaterThan(0);
+    expect(screen.getByText("관리자 지급")).toBeTruthy();
+    expect(screen.getByText(/Basic \//)).toBeTruthy();
+    // Once beside the live grant, once in the history below it.
+    expect(screen.getAllByText("6기 수강생 혜택")).toHaveLength(2);
+    expect(screen.getAllByText("boss@example.com").length).toBeGreaterThan(0);
+
+    for (const name of ["기간 연장", "이용권 변경", "이용권 회수"]) {
+      expect(screen.getByRole("button", { name })).toBeTruthy();
+    }
+  });
+
+  it("says a revoke does not touch the payment, and needs a reason", async () => {
+    const calls = stubFetch({
+      "/users/g1": {
+        body: {
+          user: { ...GRANTED, plan_id: "basic", plan_label: "Basic" },
+          media_count: 0,
+          payments: [],
+          payment_count: 0,
+          first_paid_at: null,
+          last_paid_at: null,
+          billing: [],
+          grants: [
+            {
+              id: "gr1",
+              user_id: "g1",
+              email: "student@example.com",
+              plan_id: "business",
+              plan_label: "Business",
+              starts_at: "2026-10-02 15:00:00",
+              expires_at: "2026-11-01 15:00:00",
+              reason: "6기 수강생 혜택",
+              granted_by_email: "boss@example.com",
+              revoked_at: null,
+              revoked_by_email: null,
+              revoke_reason: null,
+              superseded_by: null,
+              batch_id: null,
+              created_at: "2026-10-02 01:00:00",
+              state: "active",
+              days_left: 29,
+            },
+          ],
+          youtube_channels: [],
+          broadcasts: [],
+        },
+      },
+      "/grants/gr1/revoke": { body: {} },
+    });
+    at("/admin/users/g1");
+    render(<AdminApp email="boss@example.com" />);
+    await screen.findByText("이용 권한");
+
+    await userEvent.click(screen.getByRole("button", { name: "이용권 회수" }));
+    expect(
+      screen.getByText(/PayApp 유료 구독은 변경되지 않습니다/),
+    ).toBeTruthy();
+    expect(screen.getByText(/Basic 유료 구독으로 돌아갑니다/)).toBeTruthy();
+
+    // No reason, no action.
+    expect(screen.getByRole("button", { name: "회수" })).toBeDisabled();
+    expect(calls.filter((c) => c.method === "POST")).toHaveLength(0);
+
+    await userEvent.type(screen.getByLabelText("사유"), "수강 종료");
+    await userEvent.click(screen.getByRole("button", { name: "회수" }));
+    await waitFor(() => {
+      const post = calls.find((c) => c.method === "POST");
+      expect(post?.url).toBe("/api/admin/grants/gr1/revoke");
+      expect(JSON.parse(post!.body!)).toEqual({ reason: "수강 종료" });
+    });
   });
 });
 

@@ -17,6 +17,7 @@ import {
   type AdminBroadcastRow,
 } from "./api";
 import { Bars, Cell, Change, Confirm, Empty, Failed, Kpi, Loading, Panel, Row, Table, Tag, useLoad } from "./ui";
+import { EntitlementPanel, GrantBadge, GrantModal } from "./grants";
 
 const PLAN_TONE: Record<string, string> = {
   basic: "default",
@@ -93,6 +94,39 @@ export function AdminDashboardPage({ go }: { go: (path: string) => void }) {
             <Kpi key={p.plan_id} label={p.label} value={p.count} sub={won(p.monthly_price_krw)} />
           ))}
         </div>
+      </section>
+
+      {/* Entitlement an operator handed out. Its own section, below the money
+          and never inside it: these accounts pay nothing and counting them as
+          customers would overstate every figure above. */}
+      <section>
+        <h2 className="mb-2 text-xs font-semibold uppercase tracking-widest text-ink-500">
+          관리자 지급 이용권 <span className="text-ink-600">(매출·MRR 미포함)</span>
+        </h2>
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          <Kpi
+            label="활성 이용권"
+            value={d.grants.active}
+            sub={d.grants.scheduled > 0 ? `시작 전 ${d.grants.scheduled}` : undefined}
+            tone={d.grants.active > 0 ? "live" : "default"}
+          />
+          <Kpi
+            label="7일 이내 만료"
+            value={d.grants.expiring_7d}
+            tone={d.grants.expiring_7d > 0 ? "warn" : "default"}
+          />
+          {d.grants.by_plan.map(([id, label, n]) => (
+            <Kpi key={id} label={label} value={n} sub="지급" />
+          ))}
+        </div>
+        {d.grants.active > 0 && (
+          <button
+            onClick={() => go("/admin/users?filter=granted")}
+            className="mt-2 rounded-md border border-ink-600 px-3 py-1.5 text-xs text-ink-300 hover:bg-ink-800"
+          >
+            지급 회원 보기
+          </button>
+        )}
       </section>
 
       <section>
@@ -291,6 +325,10 @@ const FILTERS = [
   { id: "none", label: "미구독" },
   { id: "youtube", label: "YouTube 연결" },
   { id: "live", label: "방송 중" },
+  { id: "granted", label: "관리자 지급" },
+  { id: "grant_7d", label: "지급 7일 내 만료" },
+  { id: "grant_30d", label: "지급 30일 내" },
+  { id: "grant_expired", label: "지급 만료됨" },
   { id: "disabled", label: "비활성" },
 ];
 
@@ -310,6 +348,11 @@ export function AdminUsersPage({ go }: { go: (path: string) => void }) {
   const [filter, setFilter] = useState("all");
   const [sort, setSort] = useState("created");
   const [offset, setOffset] = useState(0);
+  // Selected ids rather than rows: a reload replaces the row objects, and a
+  // selection that survives a reload is what makes "grant, then check" work.
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  const [granting, setGranting] = useState(false);
+  const [note, setNote] = useState<string | null>(null);
   const { data, error, busy, reload } = useLoad(
     () => adminApi.users({ q, filter, sort, limit: PAGE, offset }),
     [q, filter, sort, offset],
@@ -374,19 +417,94 @@ export function AdminUsersPage({ go }: { go: (path: string) => void }) {
         <Empty title="조건에 맞는 회원이 없습니다." hint="검색어나 필터를 바꿔 보세요." />
       ) : (
         <>
-          <Table head={["회원", "가입", "플랜", "구독", "저장", "YouTube", "방송", "누적 결제"]}>
+          {/* What is selected, and the one thing that can be done with it.
+              The count is spelt out rather than implied by the checkboxes,
+              because a bulk action's only real risk is reaching further than
+              the operator meant. */}
+          <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-ink-700 bg-ink-900 px-3 py-2">
+            <label className="flex items-center gap-2 text-xs text-ink-300">
+              <input
+                type="checkbox"
+                aria-label="현재 목록 전체 선택"
+                checked={data.length > 0 && data.every((u) => picked.has(u.id))}
+                onChange={(e) => {
+                  const next = new Set(picked);
+                  for (const u of data) {
+                    if (e.target.checked) next.add(u.id);
+                    else next.delete(u.id);
+                  }
+                  setPicked(next);
+                }}
+              />
+              이 페이지 {data.length}명 전체 선택
+              {filter !== "all" || q ? <span className="text-ink-600">(현재 검색·필터 범위)</span> : null}
+            </label>
+            <div className="flex items-center gap-2">
+              {picked.size > 0 && (
+                <>
+                  <span className="text-xs text-ink-400">{picked.size}명 선택</span>
+                  <button
+                    onClick={() => setPicked(new Set())}
+                    className="rounded border border-ink-700 px-2 py-1 text-[11px] text-ink-400 hover:text-ink-100"
+                  >
+                    선택 해제
+                  </button>
+                </>
+              )}
+              <button
+                onClick={() => setGranting(true)}
+                disabled={picked.size === 0}
+                className="rounded-md border border-live-dim px-2.5 py-1 text-xs text-live hover:bg-ink-800 disabled:opacity-30"
+              >
+                이용권 지급
+              </button>
+            </div>
+          </div>
+
+          {note && (
+            <p role="status" className="rounded-md border border-ok-dim bg-ink-900 px-3 py-2 text-sm text-ok">
+              {note}
+            </p>
+          )}
+
+          <Table head={["", "회원", "가입", "최종 이용권", "구독", "저장", "YouTube", "방송", "누적 결제"]}>
             {data.map((u) => (
-              <Row key={u.id} onClick={() => go(`/admin/users/${u.id}`)}>
+              <Row key={u.id}>
                 <Cell>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-ink-100">{u.name ?? u.email}</span>
-                    {u.role === "admin" && <Tag tone="live">관리자</Tag>}
-                    {u.disabled_at && <Tag tone="warn">비활성</Tag>}
-                  </div>
-                  <div className="text-[11px] text-ink-500">{u.email}</div>
+                  <input
+                    type="checkbox"
+                    aria-label={`${u.email} 선택`}
+                    checked={picked.has(u.id)}
+                    onChange={(e) => {
+                      const next = new Set(picked);
+                      if (e.target.checked) next.add(u.id);
+                      else next.delete(u.id);
+                      setPicked(next);
+                    }}
+                  />
+                </Cell>
+                <Cell>
+                  <button onClick={() => go(`/admin/users/${u.id}`)} className="text-left">
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-ink-100">{u.name ?? u.email}</span>
+                      {u.role === "admin" && <Tag tone="live">관리자</Tag>}
+                      {u.disabled_at && <Tag tone="warn">비활성</Tag>}
+                    </div>
+                    <div className="text-[11px] text-ink-500">{u.email}</div>
+                  </button>
                 </Cell>
                 <Cell mono>{localDate(u.created_at)}</Cell>
-                <Cell>{planTag(u.plan_id, u.plan_label)}</Cell>
+                <Cell>
+                  {/* The plan in force, then where it came from. One without
+                      the other is what makes a free month look like a sale. */}
+                  <div className="flex flex-wrap items-center gap-1">
+                    {planTag(u.effective_plan_id, u.effective_plan_label)}
+                    <GrantBadge u={u} />
+                  </div>
+                  {u.entitlement_source === "grant" && u.plan_id !== "none" && (
+                    <div className="mt-0.5 text-[11px] text-ink-600">{u.plan_label} 결제 중</div>
+                  )}
+                </Cell>
                 <Cell>
                   <div className="text-xs text-ink-300">{u.billing_status ?? u.subscription_status}</div>
                   {u.next_charge_at && <div className="text-[11px] text-ink-600">~{u.next_charge_at}</div>}
@@ -421,6 +539,24 @@ export function AdminUsersPage({ go }: { go: (path: string) => void }) {
             </span>
           </div>
         </>
+      )}
+
+      {granting && data && (
+        <GrantModal
+          users={data.filter((u) => picked.has(u.id))}
+          onCancel={() => setGranting(false)}
+          onDone={(r) => {
+            setGranting(false);
+            setPicked(new Set());
+            const n = r.outcomes.filter((o) => o.action !== "skipped").length;
+            const skipped = r.outcomes.length - n;
+            setNote(
+              `${r.plan_label} 이용권을 ${n}명에게 지급했습니다.` +
+                (skipped > 0 ? ` ${skipped}명은 기존 이용권을 유지했습니다.` : ""),
+            );
+            reload();
+          }}
+        />
       )}
     </div>
   );
@@ -499,6 +635,10 @@ export function AdminUserPage({ id, go }: { id: string; go: (path: string) => vo
           tone={u.storage_limit_bytes > 0 && u.storage_bytes > u.storage_limit_bytes ? "warn" : "default"}
         />
       </div>
+
+      {/* Why this account is on the plan it is on, before anything else: it is
+          the first question an operator opening a member actually has. */}
+      <EntitlementPanel user={data.user} grants={data.grants} onChanged={reload} />
 
       <div className="grid gap-4 md:grid-cols-2">
         <Panel title="구독">

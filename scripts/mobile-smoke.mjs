@@ -179,6 +179,27 @@ try {
       await measure(`/admin ${s}`)
     }
 
+    // The grant form, at phone width. It is the densest thing in the console —
+    // four option rows, two date fields and a confirmation step — and it is
+    // opened from the members list, so that is the path it is measured on.
+    await page.getByRole('button', { name: '회원', exact: true }).first().click()
+    await page.waitForTimeout(400)
+    const pick = page.locator('input[type=checkbox]').first()
+    if ((await pick.count()) > 0) {
+      await pick.check()
+      await measure('/admin 회원(선택)')
+      await page.getByRole('button', { name: '이용권 지급', exact: true }).click()
+      await page.waitForTimeout(350)
+      await measure('이용권 지급 모달')
+      await page.getByRole('button', { name: '직접 설정', exact: true }).click()
+      await page.waitForTimeout(250)
+      await measure('이용권 지급 모달(직접 설정)')
+      await page.getByRole('button', { name: '기타', exact: true }).click()
+      await page.waitForTimeout(250)
+      await measure('이용권 지급 모달(사유 입력)')
+      await page.getByRole('button', { name: '취소', exact: true }).click()
+    }
+
     await ctx.close()
     if (problems.length) {
       console.error(`[mobile] ${vp.name} (${vp.width}px):`)

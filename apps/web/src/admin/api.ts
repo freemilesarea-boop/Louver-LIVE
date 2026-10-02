@@ -100,7 +100,52 @@ export interface RevenueSummary {
   month_change_pct: number | null;
 }
 
+export interface GrantCounts {
+  active: number;
+  /** `[plan_id, label, count]`, in the plans' own order. */
+  by_plan: [string, string, number][];
+  expiring_7d: number;
+  scheduled: number;
+}
+
+export interface Grant {
+  id: string;
+  user_id: string;
+  email: string;
+  plan_id: string;
+  plan_label: string;
+  starts_at: string;
+  expires_at: string;
+  reason: string;
+  granted_by_email: string;
+  revoked_at: string | null;
+  revoked_by_email: string | null;
+  revoke_reason: string | null;
+  superseded_by: string | null;
+  batch_id: string | null;
+  created_at: string;
+  state: "scheduled" | "active" | "expired" | "revoked";
+  days_left: number;
+}
+
+export interface GrantOutcome {
+  user_id: string;
+  email: string;
+  action: "created" | "extended" | "reset" | "skipped";
+  grant_id: string | null;
+  expires_at: string | null;
+}
+
+export interface BulkGrantResult {
+  batch_id: string;
+  plan_id: string;
+  plan_label: string;
+  outcomes: GrantOutcome[];
+}
+
 export interface AdminDashboard {
+  /** Entitlement an operator handed out. Never part of any revenue figure. */
+  grants: GrantCounts;
   users: UserCounts;
   subscriptions: SubscriptionCounts;
   broadcasts: BroadcastCounts;
@@ -162,8 +207,16 @@ export interface AdminUserRow {
   created_at: string;
   role: string;
   disabled_at: string | null;
+  /** What the account pays for. A grant never changes this. */
   plan_id: string;
   plan_label: string;
+  /** The plan actually in force, grant included. */
+  effective_plan_id: string;
+  effective_plan_label: string;
+  entitlement_source: "paid" | "grant" | "none";
+  grant_plan_id: string | null;
+  grant_expires_at: string | null;
+  grant_days_left: number | null;
   subscription_status: string;
   billing_status: string | null;
   next_charge_at: string | null;
@@ -215,6 +268,8 @@ export interface AdminUserDetail {
   first_paid_at: string | null;
   last_paid_at: string | null;
   billing: BillingSubscriptionRow[];
+  /** Every grant this account has had, newest first. */
+  grants: Grant[];
   youtube_channels: string[];
   broadcasts: AdminBroadcastRow[];
 }
@@ -357,6 +412,33 @@ export const adminApi = {
   billing: (p: { kind?: string; limit?: number }) => call<BillingOverview>(`/billing${query(p)}`),
   system: () => call<SystemView>("/system"),
   audit: (p: { limit?: number; before_id?: number }) => call<AuditRow[]>(`/audit${query(p)}`),
+  grants: (p: { filter?: string; limit?: number }) => call<Grant[]>(`/grants${query(p)}`),
+
+  /** Hand a plan to the selected accounts. All of them or none. */
+  createGrants: (body: {
+    user_ids: string[];
+    plan_id: string;
+    days?: number;
+    from?: string;
+    to?: string;
+    reason: string;
+    on_existing?: "extend" | "reset" | "skip";
+  }) => call<BulkGrantResult>("/grants", { method: "POST", body: JSON.stringify(body) }),
+  extendGrant: (id: string, days: number, reason: string) =>
+    call<Grant>(`/grants/${encodeURIComponent(id)}/extend`, {
+      method: "POST",
+      body: JSON.stringify({ days, reason }),
+    }),
+  changeGrantPlan: (id: string, plan_id: string, reason: string) =>
+    call<Grant>(`/grants/${encodeURIComponent(id)}/plan`, {
+      method: "POST",
+      body: JSON.stringify({ plan_id, reason }),
+    }),
+  revokeGrant: (id: string, reason: string) =>
+    call<Grant>(`/grants/${encodeURIComponent(id)}/revoke`, {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    }),
 
   setDisabled: (id: string, disabled: boolean, note?: string) =>
     call<AdminUserRow>(`/users/${encodeURIComponent(id)}/disabled`, {

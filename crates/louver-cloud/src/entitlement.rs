@@ -31,9 +31,13 @@ impl CloudDb {
     ///
     /// A limit absent from the plan is zero, not unlimited. Forgetting to write
     /// a limit must fail closed.
+    ///
+    /// The plan is whichever currently applies — what the account pays for, or
+    /// a stronger one an operator granted. With no grant in force this is
+    /// `users.plan_id`, exactly as it has always been, so no existing account's
+    /// limits move. See [`CloudDb::effective_plan`].
     pub fn limit(&self, user_id: &str, key: &str) -> Result<i64> {
-        let u = self.user(user_id)?;
-        Ok(self.plan(&u.plan_id)?.limits.get(key).copied().unwrap_or(0))
+        Ok(self.effective_plan(user_id)?.limits.get(key).copied().unwrap_or(0))
     }
 
     pub fn flag(&self, user_id: &str, key: &str) -> Result<bool> {
