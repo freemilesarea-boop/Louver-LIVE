@@ -186,9 +186,19 @@ export function App() {
   // with the sign-in card on `/`, so the way in has not moved.
   if (!me) {
     const page = publicPage;
+    // The banner says which kind of deployment this is — "REMOTE CLOUD SERVER",
+    // and that a broadcast survives closing the browser. That is for somebody
+    // operating a broadcast, and it is still shown to every signed-in member
+    // and on every other screen. On the public home page it was the first text
+    // on the document: a line about where the software runs, above the line
+    // that says what the service is for, and Google was quoting it as the
+    // search snippet. So the home page does not render it. Nothing is removed
+    // here — the banner, its wording and the health request behind it are
+    // untouched.
+    const publicHome = page?.path === "/";
     return (
       <>
-        <DeploymentBanner />
+        {!publicHome && <DeploymentBanner />}
         {page ? (
           <MarketingPage
             page={page}
