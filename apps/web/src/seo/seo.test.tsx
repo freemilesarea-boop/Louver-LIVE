@@ -86,7 +86,7 @@ describe("the public route table", () => {
 
 describe("the prices on the public pages", () => {
   it("are the prices the server charges", async () => {
-    const plans = await seedPlans(process.cwd());
+    const plans = await seedPlans();
     for (const plan of PUBLIC_PLANS) {
       const seeded = plans[plan.id];
       expect(seeded, `${plan.id} is not in SEED_PLANS`).toBeTruthy();
@@ -100,7 +100,7 @@ describe("the prices on the public pages", () => {
   });
 
   it("covers every plan that is on sale, and nothing that is not", async () => {
-    const plans = await seedPlans(process.cwd());
+    const plans = await seedPlans();
     const onSale = Object.entries(plans)
       .filter(([, p]) => p.active)
       .map(([id]) => id)
