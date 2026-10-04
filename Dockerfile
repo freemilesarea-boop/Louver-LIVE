@@ -16,10 +16,19 @@ RUN npm ci --no-audit --no-fund
 # and both are copied below. A `tsconfig*.json` glob here matches nothing and
 # fails the build.
 COPY vite.web.config.ts tailwind.config.js postcss.config.js ./
+# The second, tiny build that renders the public pages to static HTML, and the
+# script that writes them next to the bundle. `build:cloud` runs both, so the
+# image would fail to build without them — see docs/SEO.md.
+COPY vite.seo.config.ts ./
+COPY scripts/seo-prerender.mjs scripts/seo-prerender.mjs
 COPY apps/desktop/tsconfig.json apps/desktop/tsconfig.json
 COPY apps/desktop/src apps/desktop/src
 COPY apps/web apps/web
 RUN npm run build:cloud
+# The prerender must have produced a page per public URL, with its own title and
+# its content in the HTML. A silent failure here would deploy an empty shell to
+# every public URL, which is the one outcome worse than no SEO at all.
+RUN node -e "const fs=require('fs');for(const p of ['index.html','youtube-24-live/index.html','playlist-live/index.html','youtube-live-streaming/index.html','pricing/index.html','terms/index.html','privacy/index.html','robots.txt','sitemap.xml']){const f='apps/web/dist/'+p;const h=fs.readFileSync(f,'utf8');if(p.endsWith('.html')&&!/<div id=\"root\"><[a-z]/.test(h))throw new Error(p+' has no prerendered body');}console.log('prerendered pages ok')"
 
 # --- the server ------------------------------------------------------------
 FROM rust:1-bookworm AS server

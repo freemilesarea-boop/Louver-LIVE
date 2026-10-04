@@ -6,7 +6,7 @@
 배포 자체는 [CLOUD_TESTING.md](CLOUD_TESTING.md), 결제는 [PAYAPP.md](PAYAPP.md),
 YouTube 는 [YOUTUBE_OAUTH.md](YOUTUBE_OAUTH.md), 매출·회원·방송을 화면으로 보는
 관리 콘솔은 [ADMIN.md](ADMIN.md), 디스크에 무엇이 쌓이고 무엇을 지워도 되는지는
-[STORAGE.md](STORAGE.md) 를 보세요.
+[STORAGE.md](STORAGE.md), 공개 페이지와 검색 노출은 [SEO.md](SEO.md) 를 보세요.
 
 ---
 

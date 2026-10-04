@@ -27,3 +27,7 @@ license-signing-key*
 rc-results/*
 !rc-results/youtube-test.md
 tests/fixtures/rc/
+
+# The SEO prerender bundle: a build artefact, rebuilt by `npm run build:cloud`.
+apps/web/.seo-ssr/
+apps/web/.seo-shell.html

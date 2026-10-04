@@ -19,7 +19,18 @@ import type { Me } from "../cloud";
 
 type Mode = "login" | "register";
 
-export function SignIn({ onSignedIn }: { onSignedIn: (me: Me) => void }) {
+/**
+ * `heading` is false where the page already has an `<h1>` — the public landing
+ * page embeds this card under its own heading, and a second `<h1>` on one page
+ * is a worse answer to "what is this page about" than none.
+ */
+export function SignIn({
+  onSignedIn,
+  heading = true,
+}: {
+  onSignedIn: (me: Me) => void;
+  heading?: boolean;
+}) {
   const t = useTransport();
   const [mode, setMode] = useState<Mode>("login");
   const [name, setName] = useState("");
@@ -107,11 +118,19 @@ export function SignIn({ onSignedIn }: { onSignedIn: (me: Me) => void }) {
   const registering = mode === "register";
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-ink-950 p-6">
+    <div
+      className={
+        heading
+          ? "flex min-h-screen items-center justify-center bg-ink-950 p-6"
+          : "flex justify-center"
+      }
+    >
       <div className="w-full max-w-sm">
-        <h1 className="mb-6 text-center text-2xl">
-          <Wordmark />
-        </h1>
+        {heading && (
+          <h1 className="mb-6 text-center text-2xl">
+            <Wordmark />
+          </h1>
+        )}
         <Card title={registering ? "247streams 시작하기" : "로그인"}>
           {registering && (
             <p className="-mt-1 pb-1 text-sm text-ink-400">

@@ -31,6 +31,13 @@ const STEPS = [
   // ran. It passed on a developer's machine only because an earlier build had
   // left a `dist/` behind.
   { name: 'frontend build', cmd: 'npm', args: ['run', '--silent', 'build:web'] },
+  // The cloud bundle, and then the HTML it actually deploys: every public URL's
+  // title, description, canonical, structured data, `robots.txt` and
+  // `sitemap.xml` are checked against the route table and against the server's
+  // own plan prices. Cheap, and the only place a prerender that silently stopped
+  // writing bodies would be noticed.
+  { name: 'cloud build (web + SEO pages)', cmd: 'npm', args: ['run', '--silent', 'build:cloud'] },
+  { name: 'SEO check (built HTML)', cmd: 'node', args: ['scripts/seo-check.mjs'] },
   { name: 'rust fmt check', cmd: 'cargo', args: ['fmt', '--all', '--', '--check'] },
   { name: 'rust clippy', cmd: 'cargo', args: ['clippy', '--workspace', '--all-targets', '--', '-D', 'warnings'] },
   { name: 'rust tests', cmd: 'cargo', args: ['test', '--workspace'] },

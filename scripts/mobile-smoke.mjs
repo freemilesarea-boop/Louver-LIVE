@@ -36,6 +36,9 @@ const VIEWPORTS = [
   { name: 'iPhone SE', width: 375, height: 667 },
   { name: 'iPhone 15', width: 393, height: 852 },
   { name: 'Galaxy A', width: 360, height: 800 },
+  // A tablet, because the public pages lay their plan cards out in three
+  // columns from `sm:` up and this is the narrowest width that gets them.
+  { name: 'tablet', width: 768, height: 1024 },
   { name: 'desktop', width: 1280, height: 800 },
 ]
 
@@ -111,6 +114,26 @@ try {
         return out
       })
       if (offscreen.length) problems.push(`${where}: 화면을 벗어난 컨트롤 ${offscreen.join(' / ')}`)
+    }
+
+    // The public pages first, signed out — which is how somebody arriving from
+    // a search result sees them, and before anything here touches a session.
+    for (const path of [
+      '/',
+      '/youtube-24-live/',
+      '/playlist-live/',
+      '/youtube-live-streaming/',
+      '/pricing/',
+      '/terms/',
+      '/privacy/',
+    ]) {
+      await page.goto(BASE + path)
+      await page.locator('h1').first().waitFor({ timeout: 15000 })
+      await measure(`공개 ${path}`)
+      // One heading per page, and it is the page's own: the sign-in card on `/`
+      // renders without its wordmark heading for exactly this reason.
+      const h1s = await page.locator('h1').count()
+      if (h1s !== 1) problems.push(`공개 ${path}: h1 이 ${h1s}개`)
     }
 
     await page.goto(BASE)
