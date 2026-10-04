@@ -664,6 +664,59 @@ try {
   if (create.status !== 402) fail(`해지 후 방송 생성이 ${create.status}`)
   log('start / restart / create 모두 402 ✓')
 
+  step(21, 'the public pages a search result lands on')
+  // The real server, serving the real `apps/web/dist`. What is asserted is what
+  // a crawler gets before any script runs: each public URL answering with its
+  // own HTML, its own title, its own canonical, and its content already in it.
+  const SEO_ORIGIN = 'https://247streams.kr'
+  const PUBLIC_PATHS = [
+    '/',
+    '/youtube-24-live/',
+    '/playlist-live/',
+    '/youtube-live-streaming/',
+    '/pricing/',
+    '/terms/',
+    '/privacy/',
+  ]
+  for (const path of PUBLIC_PATHS) {
+    const page = await get(path)
+    if (page.status !== 200) fail(`${path} 가 ${page.status} (npm run build:cloud 을 먼저 실행했는지 확인)`)
+    if (!/<title>[^<]+<\/title>/.test(page.text)) fail(`${path} 에 title 이 없습니다`)
+    const canonical = page.text.match(/<link rel="canonical" href="([^"]*)"/)?.[1]
+    if (canonical !== `${SEO_ORIGIN}${path}`) fail(`${path} canonical=${canonical}`)
+    if (!/<div id="root"><[a-z]/.test(page.text)) fail(`${path} 본문이 HTML 에 없습니다 (prerender 누락)`)
+    const h1s = (page.text.match(/<h1[\s>]/g) ?? []).length
+    if (h1s !== 1) fail(`${path} 의 h1 이 ${h1s}개입니다`)
+  }
+  // Titles have to differ, or every page competes for the same query.
+  const titles = []
+  for (const path of PUBLIC_PATHS) {
+    titles.push((await get(path)).text.match(/<title>([^<]*)<\/title>/)[1])
+  }
+  if (new Set(titles).size !== titles.length) fail(`title 이 겹칩니다: ${titles.join(' / ')}`)
+  // Without the trailing slash the server redirects to the spelling the
+  // canonical names, rather than serving one page at two URLs.
+  const bare = await get('/youtube-24-live')
+  if (bare.status !== 307 || !(bare.location ?? '').endsWith('/youtube-24-live/')) {
+    fail(`/youtube-24-live → ${bare.status} ${bare.location}`)
+  }
+  const robots = await get('/robots.txt')
+  if (robots.status !== 200) fail(`robots.txt 가 ${robots.status}`)
+  if (!robots.text.includes(`Sitemap: ${SEO_ORIGIN}/sitemap.xml`)) fail('robots.txt 에 sitemap 선언이 없습니다')
+  if (!robots.text.includes('Disallow: /admin')) fail('robots.txt 가 /admin 을 막지 않습니다')
+  const sitemap = await get('/sitemap.xml')
+  if (sitemap.status !== 200) fail(`sitemap.xml 이 ${sitemap.status}`)
+  for (const path of PUBLIC_PATHS) {
+    if (!sitemap.text.includes(`<loc>${SEO_ORIGIN}${path}</loc>`)) fail(`sitemap.xml 에 ${path} 가 없습니다`)
+  }
+  if (sitemap.text.includes('/admin')) fail('sitemap.xml 에 /admin 이 있습니다')
+  // The console is served as the app shell with a 200, exactly as before — that
+  // is what makes every signed-in deep link work, and it is the front end that
+  // marks it noindex. Nothing about `/admin` changed here.
+  const adminShell = await get('/admin')
+  if (adminShell.status !== 200) fail(`/admin 이 ${adminShell.status}`)
+  log('공개 7페이지 title·canonical·본문·h1 ✓, robots.txt / sitemap.xml ✓, 슬래시 없는 URL 은 307 ✓')
+
   step('☑', '비밀정보가 로그에 남지 않았는지')
   const logs = serverLog.join('')
   for (const secret of [LINKKEY, LINKVAL, env.YOUTUBE_CLIENT_SECRET, env.LOUVER_MASTER_KEY, 'refresh-1', PASSWORD]) {

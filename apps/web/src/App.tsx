@@ -19,19 +19,19 @@ import { LegalPage, legalPageFor } from "./pages/Legal";
 import { DeploymentBanner, ServerStatus } from "./pages/ServerStatus";
 import { SignIn } from "./pages/SignIn";
 import { AdminApp, AdminDenied, isAdminPath } from "./admin/AdminApp";
+import { MarketingPage, PublicNotFound } from "./seo/Marketing";
+import { pageFor } from "./seo/content";
+import { markNoIndex } from "./seo/robots-meta";
 import { useTransport } from "./TransportContext";
 import { displayName } from "./cloud";
 import type { Me } from "./cloud";
 
-/** The service's name, in one place. */
-export function Wordmark({ className = "" }: { className?: string }) {
-  return (
-    <span className={`font-semibold tracking-tight ${className}`}>
-      <span className="text-ink-100">247</span>
-      <span className="text-ok">streams</span>
-    </span>
-  );
-}
+/**
+ * The service's name, in one place — now `brand.tsx`, re-exported here because
+ * this is where the rest of the app has always imported it from.
+ */
+import { Wordmark } from "./brand";
+export { Wordmark };
 
 type Tab = "broadcasts" | "media" | "destinations" | "pricing" | "status";
 
@@ -98,6 +98,24 @@ export function App() {
   const [wantsAdmin] = useState(
     () => typeof window !== "undefined" && isAdminPath(window.location.pathname),
   );
+  // The public, crawlable pages. `pageFor` answers for `/` as well, so this is
+  // non-null on the app's own front door; which of the two is shown there still
+  // depends on whether anybody is signed in.
+  const [publicPage] = useState(() =>
+    typeof window === "undefined" ? null : pageFor(window.location.pathname),
+  );
+  // A path with nothing behind it. Worked out from the same predicates the
+  // branches below use, so a URL this misses is a URL that renders something.
+  const [unknownPath] = useState(() => {
+    if (typeof window === "undefined") return false;
+    const path = window.location.pathname;
+    return (
+      !pageFor(path) &&
+      !legalPageFor(path) &&
+      !isBillingComplete(path) &&
+      !isAdminPath(path)
+    );
+  });
   const [me, setMe] = useState<Me | null>(null);
   const [checked, setChecked] = useState(false);
   const [consent] = useState(consentOutcome);
@@ -108,6 +126,17 @@ export function App() {
     outcome: string;
     detail: string;
   } | null>(consent);
+
+  // Nothing public lives under `/admin` or `/billing/complete`, and a URL with
+  // no page behind it is not a page. The prerendered public pages already carry
+  // their own `robots` tag from the server, and are left alone.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const path = window.location.pathname;
+    if (unknownPath || isAdminPath(path) || isBillingComplete(path)) {
+      markNoIndex();
+    }
+  }, [unknownPath]);
 
   useEffect(() => {
     let live = true;
@@ -128,6 +157,21 @@ export function App() {
     return <LegalPage which={legal} />;
   }
 
+  // A URL with nothing behind it. The server answers it with this bundle and a
+  // 200 — it answers *every* unknown path that way, which is what makes the
+  // signed-in deep links work without a router on the server — so the only
+  // place the truth can be told is here. See `seo/robots-meta.ts`.
+  if (unknownPath) {
+    return <PublicNotFound path={window.location.pathname} />;
+  }
+
+  // The landing pages. Rendered before the session check, because they say the
+  // same thing to everybody and a spinner is the wrong first thing to show
+  // somebody who arrived from a search result.
+  if (publicPage && publicPage.path !== "/" && publicPage.path !== "/pricing/") {
+    return <MarketingPage page={publicPage} />;
+  }
+
   if (!checked) {
     return (
       <div className="flex min-h-screen items-center justify-center text-sm text-ink-500">
@@ -136,11 +180,23 @@ export function App() {
     );
   }
 
+  // `/` and `/pricing/` are public pages too, but unlike the landings they are
+  // also the signed-in app's own URLs: a member who opens them gets the app,
+  // exactly as before. A visitor who is not signed in gets the public page —
+  // with the sign-in card on `/`, so the way in has not moved.
   if (!me) {
+    const page = publicPage;
     return (
       <>
         <DeploymentBanner />
-        <SignIn onSignedIn={setMe} />
+        {page ? (
+          <MarketingPage
+            page={page}
+            signIn={<SignIn onSignedIn={setMe} heading={false} />}
+          />
+        ) : (
+          <SignIn onSignedIn={setMe} />
+        )}
       </>
     );
   }

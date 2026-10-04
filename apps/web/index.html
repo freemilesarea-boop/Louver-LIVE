@@ -3,7 +3,21 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>247streams</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <!--seo:head-start-->
+    <!--
+      Everything between the two markers is replaced, per URL, by
+      `scripts/seo-prerender.mjs` after `vite build` — with that page's title,
+      description, canonical, robots, Open Graph tags and structured data. This
+      comment included: what is here is the fallback, which is what the dev
+      server shows and what any URL the prerender writes no file for is served.
+    -->
+    <title>247streams — 24시간 YouTube 라이브 송출</title>
+    <meta
+      name="description"
+      content="영상을 업로드하면 247streams 서버가 YouTube로 24시간 라이브를 송출합니다. 내 PC를 꺼도 방송이 유지됩니다."
+    />
+    <!--seo:head-end-->
   </head>
   <body class="bg-ink-950 text-ink-100 antialiased">
     <div id="root"></div>
