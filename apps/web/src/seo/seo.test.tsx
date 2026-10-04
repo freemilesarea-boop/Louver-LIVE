@@ -17,6 +17,7 @@ import type { ReactElement } from "react";
 import { App } from "../App";
 import { TransportProvider } from "../TransportContext";
 import type { Transport } from "../transport";
+import { DEPLOYMENT_LABELS } from "../cloud";
 import type { Me } from "../cloud";
 import { GIB, seedPlans } from "../../../../scripts/seo-plan-source.mjs";
 import {
@@ -389,6 +390,46 @@ describe("where the app sends each URL", () => {
         "aria-current",
         "page",
       ),
+    );
+  });
+
+  it("keeps the deployment banner off the public home page", async () => {
+    render(at("/"));
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(
+        pageFor("/")!.h1,
+      ),
+    );
+    // The banner reads "REMOTE CLOUD SERVER / 서버에서 방송이 실행됩니다…", which
+    // was the first text on the document and the sentence Google quoted as the
+    // snippet. It is not rendered here — and it is not removed from anywhere
+    // else, which the next two tests hold.
+    expect(screen.queryByTestId("deployment-banner")).not.toBeInTheDocument();
+    expect(screen.queryByText("REMOTE CLOUD SERVER")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(DEPLOYMENT_LABELS.cloud.hint),
+    ).not.toBeInTheDocument();
+    // What a search result should quote instead is on the page.
+    expect(screen.getByText(pageFor("/")!.lead)).toBeInTheDocument();
+  });
+
+  it("still shows a signed-in member the deployment banner", async () => {
+    const t = transport({ me: vi.fn().mockResolvedValue(ME) });
+    render(at("/", t));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "로그아웃" })).toBeInTheDocument(),
+    );
+    const banner = await screen.findByTestId("deployment-banner");
+    expect(banner).toHaveAttribute("data-deployment", "cloud");
+    expect(banner).toHaveTextContent("REMOTE CLOUD SERVER");
+    expect(banner).toHaveTextContent(DEPLOYMENT_LABELS.cloud.hint);
+  });
+
+  it("leaves the banner on the other signed-out screens", async () => {
+    // `/pricing/` is deliberately untouched: the change is the home page only.
+    render(at("/pricing/"));
+    expect(await screen.findByTestId("deployment-banner")).toHaveTextContent(
+      "REMOTE CLOUD SERVER",
     );
   });
 
