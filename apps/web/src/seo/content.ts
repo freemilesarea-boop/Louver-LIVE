@@ -140,11 +140,16 @@ export function formatKrw(won: number): string {
 
 const HOME: PublicPage = {
   path: "/",
-  title: "24시간 YouTube 라이브 송출 서비스 | 247streams",
+  title: "247streams | 유튜브 24시간 라이브 자동 송출",
   description:
-    "영상을 업로드하면 247streams 서버가 YouTube로 24시간 라이브를 송출합니다. 내 PC를 꺼도 방송이 유지되고, 여러 영상을 플레이리스트로 이어서 내보낼 수 있습니다.",
-  h1: "내 PC를 켜두지 않는 24시간 YouTube 라이브 송출",
-  lead: "영상을 올리고 채널을 연결하면, 송출은 247streams 서버에서 실행됩니다. 컴퓨터를 끄거나 인터넷을 바꿔도 방송은 서버에서 계속됩니다.",
+    "유튜브 플레이리스트 · 24시간 라이브 자동 송출 서비스. PC나 OBS를 계속 켜두지 않아도 서버에서 YouTube 라이브를 자동으로 송출합니다.",
+  // The first words a search result shows, and the first words on the page.
+  // They have to answer "what is this service" on their own: Google picks the
+  // snippet from the body when it likes the body better than the description,
+  // and an opening sentence about where the software runs told a first-time
+  // visitor nothing about what it does.
+  h1: "유튜브 플레이리스트 · 24시간 라이브 자동 송출",
+  lead: "PC를 계속 켜두지 않아도 됩니다. 영상과 플레이리스트를 등록하면 247streams가 서버에서 YouTube 라이브를 24시간 자동 송출합니다.",
   sections: [
     {
       heading: "어떻게 동작하나요",
