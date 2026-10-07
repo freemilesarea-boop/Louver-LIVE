@@ -545,6 +545,12 @@ impl CloudDb {
             ("current_position_secs", "REAL NOT NULL DEFAULT 0"),
             ("current_duration_secs", "REAL NOT NULL DEFAULT 0"),
             ("cycle_duration_secs", "REAL NOT NULL DEFAULT 0"),
+            // The traffic-CCTV proof of concept. NULL on every existing row,
+            // and NULL is "take the picture from the playlist like always", so
+            // a database from the previous release reads and behaves
+            // identically. One nullable column rather than a table: there is
+            // one URL per broadcast and nothing else to store about it.
+            ("cctv_url", "TEXT"),
         ] {
             ensure_column(&conn, "broadcasts", column, decl)?;
         }
@@ -2554,6 +2560,15 @@ impl CloudDb {
         if let Some(sc) = &patch.schedule {
             crate::schedule::validate(sc)?;
         }
+        // The one place a CCTV URL can enter the database, so the one place the
+        // check has to be. An empty string clears it; anything else must pass
+        // the protocol and address rules in `cctv`. Done before the connection
+        // is locked, because it resolves a host name.
+        if let Some(u) = &patch.cctv_url {
+            if !u.trim().is_empty() {
+                crate::cctv::validate(u)?;
+            }
+        }
         if let Some(d) = &patch.destination_id {
             // Moving a broadcast to a destination that is not yours would be a
             // way to send your video to someone else's channel.
@@ -2595,6 +2610,12 @@ impl CloudDb {
             set("fps = ?2", &v.fps)?;
             set("video_bitrate_kbps = ?2", &v.video_bitrate_kbps)?;
             set("audio_bitrate_kbps = ?2", &v.audio_bitrate_kbps)?;
+        }
+        if let Some(v) = &patch.cctv_url {
+            // Stored as NULL rather than '' when cleared, so "no live source"
+            // is one value in the column and not two.
+            let trimmed = v.trim();
+            set("cctv_url = ?2", &(if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }))?;
         }
         if let Some(v) = &patch.schedule {
             set("sched_enabled = ?2", &(v.enabled as i64))?;
@@ -3055,6 +3076,7 @@ fn row_to_broadcast(r: &rusqlite::Row<'_>) -> rusqlite::Result<Broadcast> {
         current_position_secs: r.get("current_position_secs")?,
         current_duration_secs: r.get("current_duration_secs")?,
         cycle_duration_secs: r.get("cycle_duration_secs")?,
+        cctv_url: r.get("cctv_url")?,
         youtube: crate::youtube::YoutubeLink {
             account_id: r.get("youtube_account_id")?,
             broadcast_id: r.get("youtube_broadcast_id")?,

@@ -667,6 +667,27 @@ impl BroadcastManager {
             );
         }
 
+        // The traffic-CCTV proof of concept. Re-validated here and not only
+        // where it was saved: this is the last point before a URL is handed to
+        // FFmpeg, and a row could have been written by an older build or by
+        // hand. A bad one fails this one start and nothing else.
+        if let Some(url) = b.cctv_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+            let checked = crate::cctv::validate(url).map_err(|e| {
+                let _ = self.db.append_event(
+                    broadcast_id,
+                    EventLevel::Error,
+                    &format!("CCTV 주소를 사용할 수 없습니다: {e}"),
+                );
+                e
+            })?;
+            let _ = self.db.append_event(
+                broadcast_id,
+                EventLevel::Info,
+                "CCTV 영상 + 플레이리스트 음악으로 송출합니다 (CCTV 원본 오디오는 사용하지 않습니다)",
+            );
+            rt.set_live_video_source(Some(checked.into_string()));
+        }
+
         rt.start(StartOptions {
             playlist_id,
             reason: StartReason::Manual,

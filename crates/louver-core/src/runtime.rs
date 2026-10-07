@@ -327,6 +327,13 @@ pub struct BroadcastRuntime {
     /// first: a window whose first attempt hit a transient API error should
     /// recover inside it rather than waiting for tomorrow.
     failed_occurrence: Option<(Occurrence, Instant, u32)>,
+    /// A live video source for this broadcast, or `None` for the ordinary
+    /// pipeline. Set by [`Self::set_live_video_source`].
+    ///
+    /// When it is set the playlist supplies the sound and this URL supplies the
+    /// picture — the traffic-CCTV proof of concept. `None` is every broadcast
+    /// that existed before it, and the code path they take is untouched.
+    live_video: Option<String>,
 }
 
 impl BroadcastRuntime {
@@ -372,7 +379,23 @@ impl BroadcastRuntime {
             pre_start: None,
             armed: false,
             failed_occurrence: None,
+            live_video: None,
         }
+    }
+
+    /// Use a live video source instead of the playlist's own picture.
+    ///
+    /// A setter rather than a field on [`StartOptions`] on purpose: that struct
+    /// is built literally in two dozen places, and a proof of concept should
+    /// not make every one of them say "no CCTV". Set before `start`; cleared by
+    /// passing `None`.
+    pub fn set_live_video_source(&mut self, url: Option<String>) {
+        self.live_video = url;
+    }
+
+    /// The live video source this runtime would use, if any.
+    pub fn live_video_source(&self) -> Option<&str> {
+        self.live_video.as_deref()
     }
 
     /// Start or stop watching the clock.
@@ -640,6 +663,12 @@ impl BroadcastRuntime {
             "compatibility_encode" => StreamMode::CompatibilityEncode,
             _ => StreamMode::StreamCopy,
         };
+        // A live video source has to be encoded: its picture and the playlist's
+        // sound arrive as two unrelated streams, and stream copy forwards
+        // packets rather than combining them. Forced here rather than refused,
+        // because the setting is the account's general preference and not an
+        // instruction about this one broadcast.
+        let mode = if self.live_video.is_some() { StreamMode::CompatibilityEncode } else { mode };
 
         self.supervisor = StreamSupervisor::new(mode);
         self.supervisor.begin()?;
@@ -670,7 +699,15 @@ impl BroadcastRuntime {
             build_ingest_url(&url, &self.keys.require()?)
         };
 
-        let args = self.builder.build_stream_args(&plan.manifest_path, &destination, mode, true);
+        let args = match &self.live_video {
+            // The picture comes from the live source and the sound from the
+            // playlist. Everything downstream — the launcher, the supervisor,
+            // the progress parsing, the restart backoff — is the same code.
+            Some(url) => {
+                self.builder.build_live_video_stream_args(&plan.manifest_path, url, &destination, true)
+            }
+            None => self.builder.build_stream_args(&plan.manifest_path, &destination, mode, true),
+        };
         self.last_args = args.clone();
 
         let session_id = self.db.create_session(

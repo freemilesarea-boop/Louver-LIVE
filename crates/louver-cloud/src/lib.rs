@@ -11,6 +11,10 @@
 
 pub mod admin;
 pub mod billing;
+// The traffic-CCTV proof of concept: a live video source for a broadcast whose
+// sound still comes from its playlist. See `cctv.rs` for why the URL checks are
+// where the weight of that feature is.
+pub mod cctv;
 pub mod credentials;
 pub mod db;
 pub mod entitlement;

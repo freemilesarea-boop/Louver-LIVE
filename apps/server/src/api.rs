@@ -253,6 +253,10 @@ pub struct NewBroadcast {
     pub settings: Option<louver_cloud::StreamSettings>,
     #[serde(default)]
     pub schedule: Option<louver_cloud::Schedule>,
+    /// A live video source — the traffic-CCTV test. Absent or empty is an
+    /// ordinary broadcast, which is every broadcast that existed before it.
+    #[serde(default)]
+    pub cctv_url: Option<String>,
 }
 
 impl NewBroadcast {
@@ -338,6 +342,7 @@ pub async fn create_broadcast(
             privacy: b.privacy,
             settings: b.settings.clone(),
             schedule: b.schedule.clone(),
+            cctv_url: b.cctv_url.clone(),
             ..Default::default()
         };
         let broadcast = app.db.update_broadcast_owned(&uid, &made.id, &patch)?;
@@ -658,4 +663,29 @@ pub async fn metrics(State(app): State<App>, Caller(uid): Caller) -> Out<Metrics
     })
     .await?;
     Ok(Json(m))
+}
+
+/// What `Test Connection` sends.
+#[derive(Debug, Deserialize)]
+pub struct CctvTest {
+    pub url: String,
+}
+
+/// Open a CCTV URL with ffprobe and say what is there (traffic-CCTV PoC).
+///
+/// Signed in only, like everything else here: this makes the server fetch an
+/// address a user chose, so it is not something an anonymous caller may ask
+/// for. The address itself is checked by `louver_cloud::cctv::validate` —
+/// loopback, private ranges and cloud metadata endpoints are refused — and the
+/// child is killed on a timeout so a hung probe leaves nothing running.
+///
+/// A URL that cannot be used answers 400 with the reason; a URL that can be
+/// reached but holds no video answers 200 with `ok: false`, because that is a
+/// fact about the stream rather than a bad request.
+pub async fn test_cctv(
+    State(app): State<App>,
+    Caller(_uid): Caller,
+    Json(body): Json<CctvTest>,
+) -> Out<louver_cloud::cctv::CctvCheck> {
+    Ok(Json(crate::blocking(move || louver_cloud::cctv::test_connection(&app.tools, &body.url)).await?))
 }

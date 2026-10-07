@@ -11,6 +11,15 @@ use crate::media::probe::TranscodePlan;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// The protocols a live video source may use. No `file`: an HLS playlist names
+/// its own segment URLs, and a playlist from the internet must not be able to
+/// name a path on this server. Kept in step with `louver_cloud::cctv`.
+pub const LIVE_SOURCE_PROTOCOLS: &str = "http,https,tcp,tls,crypto";
+
+/// How long a live source may stall before FFmpeg gives up, in microseconds.
+/// Fifteen seconds: longer than a hiccup, shorter than a user's patience.
+pub const LIVE_SOURCE_READ_TIMEOUT_US: u64 = 15_000_000;
+
 /// Locations of the bundled FFmpeg/ffprobe sidecar binaries.
 #[derive(Debug, Clone)]
 pub struct FfmpegTools {
@@ -905,6 +914,115 @@ impl FfmpegCommandBuilder {
         a
     }
 
+    /// A live video source with the playlist's sound (traffic-CCTV PoC).
+    ///
+    /// Two inputs, one output. Input 0 is the playlist's concat manifest and
+    /// only its audio is used; input 1 is the live URL and only its video is
+    /// used. So the picture is the camera and the sound is the broadcast's own
+    /// music, which is the whole point of the exercise.
+    ///
+    /// Three things about the argv are deliberate and easy to get wrong:
+    ///
+    ///  - `-re` and `-stream_loop` are **input options**, and they are placed
+    ///    before the manifest only. Pacing the live input would make FFmpeg
+    ///    read a real-time stream at its own idea of real time, and looping it
+    ///    makes no sense; pacing the manifest is what stops the music racing
+    ///    through the playlist as fast as the disk can read it.
+    ///  - the reconnect and timeout options likewise precede the live `-i`,
+    ///    because they are options of the protocol that reads it.
+    ///  - `-protocol_whitelist` is the one that matters for safety. An HLS
+    ///    playlist names the URLs of its own segments, so without this a
+    ///    playlist fetched from the internet could point FFmpeg at `file:`
+    ///    and read the server's disk. `file` is not on the list.
+    ///
+    /// Stream copy is not offered: the two inputs have nothing in common, so
+    /// the output has to be encoded. The caller passes the mode it would have
+    /// used and this ignores it, which is why there is no `mode` parameter.
+    pub fn build_live_video_stream_args(
+        &self,
+        manifest: &Path,
+        live_video_url: &str,
+        destination: &str,
+        loop_forever: bool,
+    ) -> Vec<String> {
+        let mut a: Vec<String> = vec![
+            "-hide_banner".into(),
+            "-nostdin".into(),
+            "-loglevel".into(),
+            "warning".into(),
+            "-progress".into(),
+            "pipe:1".into(),
+            "-y".into(),
+        ];
+
+        // --- input 0: the playlist, for its audio ---------------------------
+        a.extend(["-re".into()]);
+        if loop_forever {
+            a.extend(["-stream_loop".into(), "-1".into()]);
+        }
+        a.extend([
+            "-f".into(),
+            "concat".into(),
+            "-safe".into(),
+            "0".into(),
+            "-i".into(),
+            manifest.to_string_lossy().into_owned(),
+        ]);
+
+        // --- input 1: the live picture --------------------------------------
+        a.extend([
+            "-protocol_whitelist".into(),
+            LIVE_SOURCE_PROTOCOLS.into(),
+            // Reconnect inside FFmpeg for the small interruptions, so a
+            // two-second gap does not cost a process restart. The supervisor
+            // still catches the ones it cannot ride out.
+            "-reconnect".into(),
+            "1".into(),
+            "-reconnect_streamed".into(),
+            "1".into(),
+            "-reconnect_delay_max".into(),
+            "5".into(),
+            // Microseconds. A camera that accepts the connection and then goes
+            // quiet is the common failure, and without this FFmpeg waits for
+            // ever instead of exiting into the supervisor's restart.
+            "-rw_timeout".into(),
+            LIVE_SOURCE_READ_TIMEOUT_US.to_string(),
+            "-i".into(),
+            live_video_url.to_string(),
+        ]);
+
+        // --- what goes out --------------------------------------------------
+        a.extend(["-map".into(), "1:v:0".into(), "-map".into(), "0:a:0".into()]);
+        a.extend(self.video_encode_args());
+        a.extend([
+            "-r".into(),
+            self.profile.fps().to_string(),
+            "-fps_mode".into(),
+            "cfr".into(),
+            // The two inputs have independent clocks, so the audio has to be
+            // stretched onto the output's. Without this the sound drifts away
+            // from the timestamps and YouTube reports the stream as unstable.
+            "-af".into(),
+            "aresample=async=1:first_pts=0".into(),
+            "-c:a".into(),
+            "aac".into(),
+            "-b:a".into(),
+            format!("{}k", self.profile.audio_kbps()),
+            "-ar".into(),
+            self.profile.audio_sample_rate().to_string(),
+            "-ac".into(),
+            self.profile.audio_channels().to_string(),
+        ]);
+        a.extend([
+            "-f".into(),
+            "flv".into(),
+            "-flvflags".into(),
+            "no_duration_filesize".into(),
+            destination.to_string(),
+        ]);
+        a
+    }
+
     /// Dry run: identical pipeline, local file sink instead of RTMPS (§30).
     ///
     /// `-y` already comes from [`Self::build_stream_args`], so a restart
@@ -1069,6 +1187,102 @@ mod tests {
             FfmpegTools::new("/usr/bin/ffmpeg", "/usr/bin/ffprobe"),
             OutputProfile::P1080p30,
         )
+    }
+
+    // --- a live video source with the playlist's sound (CCTV PoC) --------
+
+    /// Where each input's options sit, which is the whole correctness of it.
+    fn live_args() -> Vec<String> {
+        builder().build_live_video_stream_args(
+            Path::new("/tmp/m.txt"),
+            "https://cam.example/live/stream.m3u8",
+            "rtmps://a.rtmps.youtube.com/live2/secret-key",
+            true,
+        )
+    }
+
+    #[test]
+    fn the_picture_comes_from_the_live_input_and_the_sound_from_the_playlist() {
+        let a = live_args();
+        let map: Vec<&String> = a
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| a.get(i.wrapping_sub(1)).map(|p| p == "-map").unwrap_or(false))
+            .map(|(_, v)| v)
+            .collect();
+        // Input 1 is the live URL, input 0 the concat manifest.
+        assert_eq!(map, vec!["1:v:0", "0:a:0"]);
+    }
+
+    #[test]
+    fn only_the_playlist_is_paced_and_looped() {
+        let a = live_args();
+        let manifest = a.iter().position(|x| x == "/tmp/m.txt").expect("manifest input");
+        let live = a.iter().position(|x| x.starts_with("https://cam.example")).expect("live input");
+        assert!(manifest < live, "the playlist is input 0");
+
+        // `-re` and `-stream_loop` are input options: pacing or looping a
+        // real-time camera is wrong, and both must land before the manifest.
+        for flag in ["-re", "-stream_loop"] {
+            let at = a.iter().position(|x| x == flag).unwrap_or_else(|| panic!("{flag} missing"));
+            assert!(at < manifest, "{flag} must apply to the playlist input");
+            assert_eq!(a.iter().filter(|x| *x == flag).count(), 1, "{flag} once only");
+        }
+    }
+
+    #[test]
+    fn the_live_input_is_restricted_to_http_and_cannot_reach_the_disk() {
+        let a = live_args();
+        let live = a.iter().position(|x| x.starts_with("https://cam.example")).unwrap();
+        let wl = a.iter().position(|x| x == "-protocol_whitelist").expect("whitelist");
+        assert!(wl < live, "the whitelist is an option of the input it guards");
+        let list = &a[wl + 1];
+        assert_eq!(list, LIVE_SOURCE_PROTOCOLS);
+        // An HLS playlist names its own segment URLs. `file` would let one name
+        // a path on this server.
+        assert!(!list.split(',').any(|p| p == "file"), "file must not be allowed: {list}");
+    }
+
+    #[test]
+    fn a_stalled_camera_times_out_rather_than_hanging_for_ever() {
+        let a = live_args();
+        let live = a.iter().position(|x| x.starts_with("https://cam.example")).unwrap();
+        let to = a.iter().position(|x| x == "-rw_timeout").expect("read timeout");
+        assert!(to < live);
+        assert_eq!(a[to + 1], LIVE_SOURCE_READ_TIMEOUT_US.to_string());
+        assert!(a.iter().any(|x| x == "-reconnect"));
+    }
+
+    #[test]
+    fn the_output_is_always_encoded_and_never_a_stream_copy() {
+        let a = live_args();
+        // Two unrelated inputs cannot be copied into one stream.
+        assert!(!a.windows(2).any(|w| w[0] == "-c" && w[1] == "copy"));
+        assert!(a.iter().any(|x| x == "-c:a"));
+        assert!(a.iter().any(|x| x == "-b:v"), "a video encoder is configured");
+        // And it still goes out as FLV to the same destination as always.
+        assert_eq!(a.last().unwrap(), "rtmps://a.rtmps.youtube.com/live2/secret-key");
+        assert!(a.windows(2).any(|w| w[0] == "-f" && w[1] == "flv"));
+    }
+
+    #[test]
+    fn the_key_is_masked_for_a_log_line_exactly_as_before() {
+        // The CCTV path writes the same kind of argv, so the existing masking
+        // has to cover it too.
+        let masked = mask_argv(&live_args());
+        assert!(!masked.iter().any(|x| x.contains("secret-key")), "{masked:?}");
+    }
+
+    #[test]
+    fn not_looping_leaves_the_pacing_in_place() {
+        let a = builder().build_live_video_stream_args(
+            Path::new("/tmp/m.txt"),
+            "https://cam.example/s.m3u8",
+            "/tmp/out.flv",
+            false,
+        );
+        assert!(a.iter().any(|x| x == "-re"));
+        assert!(!a.iter().any(|x| x == "-stream_loop"));
     }
 
     // --- path handling (§39) ---------------------------------------------

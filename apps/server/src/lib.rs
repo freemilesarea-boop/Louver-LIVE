@@ -89,6 +89,9 @@ pub fn router(app: App) -> Router {
         .route("/api/broadcasts/{id}/stop", post(api::stop_broadcast))
         .route("/api/broadcasts/{id}/restart", post(api::restart_broadcast))
         .route("/api/broadcasts/{id}/logs", get(api::broadcast_logs))
+        // The traffic-CCTV test: check a live video URL before a broadcast is
+        // pointed at it. Signed in only, like every route above.
+        .route("/api/cctv/test", post(api::test_cctv))
         // §2. `oauth/callback` is the one authenticated-by-state route: see the
         // module for why a session cookie cannot reach it.
         .route("/api/youtube", get(youtube::availability))

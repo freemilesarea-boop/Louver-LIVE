@@ -335,6 +335,14 @@ export interface Broadcast {
   current_position_secs: number;
   current_duration_secs: number;
   cycle_duration_secs: number;
+  /**
+   * A live video source for this broadcast — the traffic CCTV test.
+   *
+   * `null` on every ordinary broadcast, and that is the pipeline that has
+   * always run: the playlist supplies both picture and sound. With a URL here
+   * the picture comes from it and the sound still comes from the playlist.
+   */
+  cctv_url?: string | null;
 
   /** Where this broadcast's YouTube resources are, when an account is
    * connected. Every field is null for a pasted stream key. §7. */
@@ -358,6 +366,8 @@ export interface BroadcastPatch {
   destination_id?: string;
   settings?: StreamSettings;
   schedule?: Schedule;
+  /** Set a live video source, or clear it with an empty string. */
+  cctv_url?: string;
 }
 
 export interface NewBroadcast {
@@ -375,6 +385,8 @@ export interface NewBroadcast {
   privacy?: Privacy;
   settings?: StreamSettings;
   schedule?: Schedule;
+  /** A live video source. Absent is an ordinary broadcast. */
+  cctv_url?: string;
 }
 
 export interface Dashboard {
@@ -610,4 +622,31 @@ export function scheduleLabel(s: Schedule): string | null {
     return `${days} ${time}`;
   }
   return `${start.toLocaleDateString()} ${time}`;
+}
+
+/* ---------------------------------------------------------------------- *\
+   Traffic CCTV (test).
+
+   A broadcast normally takes its picture and its sound from the same videos.
+   This test source replaces the picture with a live stream and keeps the sound,
+   so the two values below are what a broadcast's visual source can be.
+\* ---------------------------------------------------------------------- */
+
+export type VideoSource = "playlist" | "traffic_cctv";
+
+/** What `POST /api/cctv/test` answers. */
+export interface CctvCheck {
+  ok: boolean;
+  /** A short cause when `ok` is false: `timeout`, `unauthorized`, `no_video`… */
+  reason?: string;
+  /** What to show the user. Always set. */
+  message: string;
+  video_codec?: string;
+  width?: number;
+  height?: number;
+  fps?: string;
+  /** FFmpeg's name for the container, e.g. `hls`. */
+  stream_type?: string;
+  /** Whether the source has sound. It is never sent: the playlist is. */
+  has_audio: boolean;
 }

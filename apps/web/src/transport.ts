@@ -12,6 +12,7 @@ import type {
   BroadcastEvent,
   BroadcastItem,
   BroadcastPatch,
+  CctvCheck,
   CloudMedia,
   Dashboard,
   Health,
@@ -79,6 +80,16 @@ export interface Transport {
   restartBroadcast(id: string): Promise<Broadcast>;
   deleteBroadcast(id: string): Promise<void>;
   logs(id: string, limit?: number): Promise<BroadcastEvent[]>;
+
+  /**
+   * Check a live video URL (the traffic-CCTV test).
+   *
+   * The server opens the address, so this is where the address is judged: it
+   * refuses loopback, private ranges and metadata endpoints before ffprobe is
+   * ever started. A reachable stream with no video answers `ok: false` rather
+   * than throwing — that is a fact about the stream, not a failed request.
+   */
+  testCctv(url: string): Promise<CctvCheck>;
 
   /** Live dashboard updates. Returns an unsubscribe function. */
   watchDashboard(onSnapshot: (d: Dashboard) => void): () => void;
@@ -357,6 +368,14 @@ export class WebTransport implements Transport {
       `/api/broadcasts/${encodeURIComponent(id)}/stop`,
       { method: "POST" },
     );
+  }
+
+  testCctv(url: string) {
+    return this.json<CctvCheck>("/api/cctv/test", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ url }),
+    });
   }
 
   restartBroadcast(id: string) {
