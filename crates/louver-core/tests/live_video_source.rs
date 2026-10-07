@@ -218,7 +218,7 @@ fn band_db(tools: &FfmpegTools, file: &Path, centre_hz: u32) -> f64 {
     let err = String::from_utf8_lossy(&out.stderr);
     err.lines()
         .find_map(|l| l.split("mean_volume:").nth(1))
-        .and_then(|v| v.trim().split_whitespace().next())
+        .and_then(|v| v.split_whitespace().next())
         .and_then(|v| v.parse::<f64>().ok())
         .unwrap_or_else(|| panic!("no mean_volume in:\n{err}"))
 }
