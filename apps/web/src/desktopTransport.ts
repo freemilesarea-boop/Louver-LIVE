@@ -186,6 +186,12 @@ export class DesktopTransport implements Transport {
     return toBroadcast(Number(id), status.playlist_name ?? "", status);
   }
 
+  async testCctv(): Promise<never> {
+    // The desktop app broadcasts from this computer and has no server to open
+    // the address with. Saying so is better than a fetch to nothing.
+    throw new Error("CCTV 테스트는 웹(클라우드)에서만 사용할 수 있습니다.");
+  }
+
   async restartBroadcast(id: string): Promise<Broadcast> {
     await api.stopBroadcast();
     return this.startBroadcast(id);

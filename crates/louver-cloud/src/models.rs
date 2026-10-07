@@ -664,6 +664,13 @@ pub struct Broadcast {
     /// One pass through the playlist, in seconds.
     pub cycle_duration_secs: f64,
 
+    /// A live video source for this broadcast — the traffic-CCTV proof of
+    /// concept. `None` on every broadcast made before it and on every ordinary
+    /// one, which is what keeps their pipeline exactly as it was: with this
+    /// set, the picture comes from here and the sound still comes from the
+    /// playlist above.
+    pub cctv_url: Option<String>,
+
     /// Where this broadcast's YouTube resources are, when an account is
     /// connected. Every field is `None` for a pasted stream key, which is how
     /// the two providers coexist without a branch in the sending path. §7.
@@ -713,6 +720,9 @@ pub struct BroadcastPatch {
     pub destination_id: Option<String>,
     pub settings: Option<StreamSettings>,
     pub schedule: Option<Schedule>,
+    /// Set a live video source, or clear it with an empty string. Absent leaves
+    /// whatever is stored alone, like every other field here.
+    pub cctv_url: Option<String>,
 }
 
 /// Where the playlist has got to, as the worker sees it.

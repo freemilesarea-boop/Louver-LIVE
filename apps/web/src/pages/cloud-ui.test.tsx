@@ -201,6 +201,7 @@ function fake(over: Partial<Transport> = {}): Transport {
     createDestination: vi.fn(),
     deleteDestination: vi.fn().mockResolvedValue(undefined),
     plans: vi.fn().mockResolvedValue(PLANS),
+    testCctv: vi.fn(),
     billingStatus: vi.fn().mockResolvedValue(NO_BILLING),
     startCheckout: vi.fn(),
     cancelBilling: vi.fn(),
@@ -742,6 +743,92 @@ describe("making a broadcast", () => {
     expect(sent.name).toBe("밤 라디오");
     expect(sent.loop_forever).toBe(true);
     expect(sent.destination_id).toBe("d1");
+  });
+
+  // --- the traffic-CCTV test source (PoC) -------------------------------
+
+  it("asks for nothing extra until a live video source is chosen", async () => {
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos(),
+    );
+    // The form opens on the behaviour every broadcast has always had.
+    expect(await screen.findByLabelText("영상 소스")).toHaveValue("playlist");
+    expect(screen.queryByLabelText("CCTV 주소")).not.toBeInTheDocument();
+  });
+
+  it("sends the CCTV address with the broadcast, and the playlist with it", async () => {
+    const created = vi.fn().mockResolvedValue({});
+    const t = withVideos({ createBroadcast: created });
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      t,
+    );
+
+    // The playlist is still what supplies the sound, so it is still required.
+    await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
+    await userEvent.selectOptions(
+      screen.getByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+    await userEvent.type(
+      screen.getByLabelText("CCTV 주소"),
+      "https://cam.example/live/a.m3u8",
+    );
+    await userEvent.click(screen.getByRole("button", { name: /^방송 만들기$/ }));
+
+    await waitFor(() => expect(created).toHaveBeenCalled());
+    const sent = created.mock.calls[0]?.[0];
+    expect(sent.cctv_url).toBe("https://cam.example/live/a.m3u8");
+    expect(sent.items.map((i: { media_id: string }) => i.media_id)).toEqual(["m1"]);
+  });
+
+  it("shows what the server found, and leaves the judging to it", async () => {
+    const testCctv = vi.fn().mockResolvedValue({
+      ok: true,
+      message: "연결됨 · h264 · 1280×720",
+      video_codec: "h264",
+      width: 1280,
+      height: 720,
+      fps: "30",
+      stream_type: "hls",
+      has_audio: true,
+    });
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos({ testCctv }),
+    );
+    await userEvent.selectOptions(
+      await screen.findByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+    await userEvent.type(
+      screen.getByLabelText("CCTV 주소"),
+      "https://cam.example/live/a.m3u8",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "연결 테스트" }));
+
+    expect(testCctv).toHaveBeenCalledWith("https://cam.example/live/a.m3u8");
+    expect(await screen.findByRole("status")).toHaveTextContent("SUCCESS");
+    expect(screen.getByText("resolution: 1280×720")).toBeInTheDocument();
+  });
+
+  it("says what went wrong when the server refuses the address", async () => {
+    const testCctv = vi
+      .fn()
+      .mockRejectedValue(new Error("127.0.0.1 는 루프백 주소로 연결됩니다."));
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos({ testCctv }),
+    );
+    await userEvent.selectOptions(
+      await screen.findByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+    await userEvent.type(screen.getByLabelText("CCTV 주소"), "http://127.0.0.1/a.m3u8");
+    await userEvent.click(screen.getByRole("button", { name: "연결 테스트" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("루프백");
   });
 
   it("reorders, repeats and disables, and sends exactly that", async () => {

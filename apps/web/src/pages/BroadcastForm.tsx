@@ -31,6 +31,7 @@ import {
 } from "../cloud";
 import type {
   BroadcastDetail,
+  CctvCheck,
   CloudMedia,
   DestinationKind,
   NewItem,
@@ -38,6 +39,7 @@ import type {
   Schedule,
   StreamDestination,
   StreamSettings,
+  VideoSource,
   YoutubeAccount,
 } from "../cloud";
 
@@ -79,6 +81,15 @@ export function BroadcastForm({
     editing?.youtube?.account_id ?? "",
   );
   const [loopAll, setLoopAll] = useState(editing?.loop_forever ?? true);
+  // Where the picture comes from. `playlist` is every broadcast that existed
+  // before the traffic-CCTV test, and the one the form opens on.
+  const [videoSource, setVideoSource] = useState<VideoSource>(
+    editing?.cctv_url ? "traffic_cctv" : "playlist",
+  );
+  const [cctvUrl, setCctvUrl] = useState(editing?.cctv_url ?? "");
+  const [cctvCheck, setCctvCheck] = useState<CctvCheck | null>(null);
+  const [cctvTesting, setCctvTesting] = useState(false);
+  const [cctvError, setCctvError] = useState<string | null>(null);
   const [settings, setSettings] = useState<StreamSettings>(
     editing?.settings ?? AUTO_SETTINGS,
   );
@@ -154,6 +165,30 @@ export function BroadcastForm({
     ]);
   }
 
+  /**
+   * Ask the server to open the URL.
+   *
+   * The server is what judges the address — it is the machine that will fetch
+   * it — so nothing is validated here beyond "the user typed something". A
+   * refusal arrives as an error; a reachable stream with no video arrives as a
+   * result with `ok: false`.
+   */
+  async function testCctv() {
+    setCctvTesting(true);
+    setCctvError(null);
+    setCctvCheck(null);
+    try {
+      setCctvCheck(await t.testCctv(cctvUrl.trim()));
+    } catch (e) {
+      setCctvError(e instanceof Error ? e.message : "확인할 수 없습니다.");
+    } finally {
+      setCctvTesting(false);
+    }
+  }
+
+  /** An empty string clears a stored URL; `playlist` means there is none. */
+  const cctvToSave = videoSource === "traffic_cctv" ? cctvUrl.trim() : "";
+
   async function save() {
     setBusy(true);
     setError(null);
@@ -178,6 +213,7 @@ export function BroadcastForm({
             provider === "manual_rtmps" ? destinationId : undefined,
           settings,
           schedule,
+          cctv_url: cctvToSave,
         });
         await t.replaceItems(editing.id, items);
       } else {
@@ -197,6 +233,7 @@ export function BroadcastForm({
           privacy,
           settings,
           schedule,
+          cctv_url: cctvToSave,
         });
       }
       onDone();
@@ -447,6 +484,97 @@ export function BroadcastForm({
           <p className="mt-3 text-xs text-warn">
             사용 가능한 영상이 없습니다. 먼저 영상 탭에서 업로드하세요.
           </p>
+        )}
+      </Card>
+
+      {/* 2-1 — the traffic-CCTV test source.
+          Additive on purpose: "플레이리스트 영상" is what every broadcast did
+          before this existed, and it is what the form opens on. The numbering
+          is 2-1 so that the sections below keep the numbers users already
+          know. */}
+      <Card title="2-1. 영상 소스 (테스트)">
+        <Field
+          label="영상"
+          hint="기본은 플레이리스트의 영상입니다. Traffic CCTV를 고르면 화면은 CCTV 실시간 영상, 소리는 위 플레이리스트의 음악으로 송출합니다."
+        >
+          <Select
+            aria-label="영상 소스"
+            value={videoSource}
+            onChange={(e) => {
+              setVideoSource(e.target.value as VideoSource);
+              setCctvCheck(null);
+              setCctvError(null);
+            }}
+          >
+            <option value="playlist">플레이리스트 영상 (기본)</option>
+            <option value="traffic_cctv">Traffic CCTV (Test)</option>
+          </Select>
+        </Field>
+
+        {videoSource === "traffic_cctv" && (
+          <div className="mt-3 space-y-3 rounded-md border border-ink-700 bg-ink-900 p-3">
+            <Field
+              label="CCTV 주소"
+              hint="HLS(.m3u8) 또는 FFmpeg가 바로 읽을 수 있는 http / https 라이브 주소. 내부망·localhost 주소는 서버가 거부합니다."
+            >
+              <Input
+                value={cctvUrl}
+                aria-label="CCTV 주소"
+                onChange={(e) => {
+                  setCctvUrl(e.target.value);
+                  setCctvCheck(null);
+                  setCctvError(null);
+                }}
+                placeholder="https://example.com/live/stream.m3u8"
+              />
+            </Field>
+            <Button
+              onClick={testCctv}
+              disabled={cctvTesting || cctvUrl.trim().length === 0}
+            >
+              {cctvTesting ? "확인 중…" : "연결 테스트"}
+            </Button>
+
+            {cctvError && (
+              <p role="alert" className="text-sm text-live">
+                FAILED · {cctvError}
+              </p>
+            )}
+            {cctvCheck && (
+              <div
+                role="status"
+                className={`text-sm ${cctvCheck.ok ? "text-ok" : "text-warn"}`}
+              >
+                <p>
+                  {cctvCheck.ok ? "SUCCESS" : "FAILED"} · {cctvCheck.message}
+                </p>
+                {cctvCheck.ok && (
+                  <ul className="mt-1 space-y-0.5 font-mono text-xs text-ink-400">
+                    <li>codec: {cctvCheck.video_codec ?? "—"}</li>
+                    <li>
+                      resolution:{" "}
+                      {cctvCheck.width && cctvCheck.height
+                        ? `${cctvCheck.width}×${cctvCheck.height}`
+                        : "—"}
+                    </li>
+                    <li>fps: {cctvCheck.fps ?? "—"}</li>
+                    <li>stream: {cctvCheck.stream_type ?? "—"}</li>
+                  </ul>
+                )}
+              </div>
+            )}
+
+            <p className="text-xs text-ink-500">
+              CCTV 원본 오디오는 송출하지 않습니다. 소리는 위 플레이리스트의
+              음악만 나갑니다. 테스트 기능이므로 CCTV가 끊기면 이 방송만 재연결을
+              시도합니다.
+            </p>
+            {rows.length === 0 && (
+              <p className="text-xs text-warn">
+                음악이 될 영상을 플레이리스트에 최소 한 개 넣어야 합니다.
+              </p>
+            )}
+          </div>
         )}
       </Card>
 

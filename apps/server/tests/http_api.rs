@@ -1846,3 +1846,102 @@ async fn a_burst_of_password_guesses_is_refused_before_the_hash_is_computed() {
     assert_eq!(attempt("198.51.100.4", "correct-horse-battery", s.app.clone()).await, StatusCode::OK,);
     louver_server::throttle::shared().clear();
 }
+
+// --- the traffic-CCTV test source (PoC) ------------------------------------
+
+/// The URL is the dangerous part of this feature, so the API has to refuse the
+/// addresses that point back at the server before anything is stored or run.
+#[tokio::test]
+async fn a_cctv_url_that_points_inside_the_server_is_refused() {
+    let s = server();
+    let token = account(&s, "cctv-ssrf@example.com").await;
+
+    for url in [
+        "http://127.0.0.1:8080/api/me",
+        "http://localhost:8080/health",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.1.2.3/stream.m3u8",
+        "file:///etc/passwd",
+        "rtsp://93.184.216.34/cam",
+        "http://trusted.example@127.0.0.1/api",
+    ] {
+        let r = post(&s, "/api/cctv/test", &token, Some(serde_json::json!({ "url": url }))).await;
+        assert_eq!(r.status, StatusCode::BAD_REQUEST, "{url} was not refused: {}", r.body);
+    }
+}
+
+/// And it is not something an anonymous caller can make the server do at all.
+#[tokio::test]
+async fn testing_a_cctv_url_needs_a_session() {
+    let s = server();
+    let r = send(
+        &s,
+        Method::POST,
+        "/api/cctv/test",
+        None,
+        Some(serde_json::json!({ "url": "https://93.184.216.34/live.m3u8" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+}
+
+/// A broadcast carries its live source, and one without stays empty — which is
+/// what keeps every broadcast made before this feature behaving as it did.
+#[tokio::test]
+async fn a_live_video_source_is_stored_on_the_broadcast_and_can_be_cleared() {
+    let s = server();
+    let token = account(&s, "cctv-store@example.com").await;
+    let uid = get(&s, "/api/me", &token).await.id();
+    let (id, _media) = ready_broadcast(&s, &token, &uid, "cctv-test").await;
+
+    // Nothing was asked for, so nothing is set.
+    assert!(s.app.db.broadcast(&id).unwrap().cctv_url.is_none());
+
+    let cam = "https://93.184.216.34/live/cam1.m3u8";
+    let r = send(
+        &s,
+        Method::PATCH,
+        &format!("/api/broadcasts/{id}"),
+        Some(&token),
+        Some(serde_json::json!({ "cctv_url": cam })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert_eq!(s.app.db.broadcast(&id).unwrap().cctv_url.as_deref(), Some(cam));
+    // And the dashboard says so, so the UI can show which source is in use.
+    assert!(get(&s, &format!("/api/broadcasts/{id}"), &token).await.body.contains(cam));
+
+    // An empty string means "back to the playlist's own picture", and is stored
+    // as NULL rather than as a second kind of empty.
+    let r = send(
+        &s,
+        Method::PATCH,
+        &format!("/api/broadcasts/{id}"),
+        Some(&token),
+        Some(serde_json::json!({ "cctv_url": "" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(s.app.db.broadcast(&id).unwrap().cctv_url.is_none());
+}
+
+/// Saving is the same chokepoint as testing: a URL the server would refuse to
+/// open cannot be parked on a broadcast and started later.
+#[tokio::test]
+async fn a_broadcast_cannot_be_saved_with_an_internal_cctv_url() {
+    let s = server();
+    let token = account(&s, "cctv-save@example.com").await;
+    let uid = get(&s, "/api/me", &token).await.id();
+    let (id, _media) = ready_broadcast(&s, &token, &uid, "cctv-save").await;
+
+    let r = send(
+        &s,
+        Method::PATCH,
+        &format!("/api/broadcasts/{id}"),
+        Some(&token),
+        Some(serde_json::json!({ "cctv_url": "http://127.0.0.1:8080/api/me" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(s.app.db.broadcast(&id).unwrap().cctv_url.is_none(), "nothing may be stored");
+}
