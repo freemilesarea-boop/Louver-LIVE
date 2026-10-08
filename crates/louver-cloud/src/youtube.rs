@@ -315,7 +315,17 @@ impl Youtube {
                 CloudError::Invalid("YouTube 계정 연결이 만료되었습니다. 다시 연결해 주세요.".into())
             })?;
 
-        let tokens = self.tokens.refresh(creds, &refresh).map_err(|e| CloudError::Engine(e.message))?;
+        // `CloudError::from` and not `Engine(e.message)`: the message is the
+        // sentence the user reads — "다시 연결해주세요" — and on its own it tells
+        // an operator nothing about *why* Google refused. What they need is in
+        // the detail `post_token` already built: the grant, the status, and
+        // Google's own `error` and `error_description` (`invalid_grant`,
+        // "Token has been expired or revoked"). The `From` impl in `lib.rs`
+        // keeps it; taking `e.message` by hand dropped it here, which is the
+        // one thing this line exists to fix. The detail passed through
+        // `mask_secrets` on its way out of the core, and the refresh token and
+        // client secret were never in it.
+        let tokens = self.tokens.refresh(creds, &refresh).map_err(CloudError::from)?;
         // §2: Google does not return a refresh token on every refresh, and
         // writing the absent one would disconnect the account for good.
         if let Some(new_refresh) = tokens.refresh_token.as_deref() {
