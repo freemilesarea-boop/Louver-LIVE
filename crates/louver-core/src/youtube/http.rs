@@ -9,6 +9,7 @@ use super::quota::ApiMethod;
 use crate::error::{ErrorCode, LouverError, Result};
 use crate::streaming::ffmpeg::mask_secrets;
 use std::time::Duration;
+use ureq::ResponseExt;
 
 const TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -39,8 +40,35 @@ impl UreqClient {
             // default, ureq raises those as errors and drops the body, and
             // every one of them would reach the user as "연결하지 못했습니다".
             .http_status_as_error(false)
+            // Observation only. This makes ureq keep the uris it already
+            // visits so a redirect becomes visible to us; it does not change
+            // whether redirects are followed, nor what is sent. `max_redirects`
+            // and `redirect_auth_headers` are left at their defaults — the
+            // latter is `Never`, and the whole point of this instrumentation is
+            // to find out whether that default is dropping our `Authorization`
+            // on a hop we cannot currently see.
+            .save_redirect_history(true)
             .build()
             .into()
+    }
+}
+
+/// What a response's redirect history says, in the two values a log line may
+/// carry: how many hops, and whether the last one was still the same host.
+///
+/// Deliberately not the uris. A `Location` can carry a path and a query, and
+/// this diagnosis has no need for either — the count alone decides whether a
+/// redirect was involved, and `SAME_HOST`/`DIFFERENT_HOST` is as much of the
+/// target as anyone needs to read. The borrowed uris end their life inside this
+/// function.
+fn redirect_summary(history: Option<&[ureq::http::Uri]>) -> (usize, &'static str) {
+    // The history includes the request itself, so a single entry is no redirect.
+    match history {
+        Some(h) if h.len() > 1 => {
+            let same = h.first().and_then(|u| u.authority()) == h.last().and_then(|u| u.authority());
+            (h.len().saturating_sub(1), if same { "SAME_HOST" } else { "DIFFERENT_HOST" })
+        }
+        _ => (0, "-"),
     }
 }
 
@@ -87,8 +115,14 @@ impl HttpClient for UreqClient {
                     .get("www-authenticate")
                     .and_then(|v| v.to_str().ok())
                     .map(|v| v.chars().take(WWW_AUTH_MAX_CHARS).collect::<String>());
+                // Also before the body, and for the same borrow reason. Reduced
+                // to two owned values here so no uri outlives this statement.
+                let (redirects, redirect_host) = redirect_summary(resp.get_redirect_history());
                 let text = resp.body_mut().read_to_string().unwrap_or_default();
-                println!("{}", exchange_line(method, url, status, &text, challenge.as_deref()));
+                println!(
+                    "{}",
+                    exchange_line(method, url, status, &text, challenge.as_deref(), redirects, redirect_host,)
+                );
                 Ok((status, text))
             }
             // Kept as a belt-and-braces path: with `http_status_as_error`
@@ -133,11 +167,26 @@ fn endpoint_of(url: &str) -> &str {
 ///
 /// The bearer token is not a parameter here. It cannot be logged by accident
 /// because it is not in scope.
-fn exchange_line(method: &str, url: &str, status: u16, body: &str, challenge: Option<&str>) -> String {
+fn exchange_line(
+    method: &str,
+    url: &str,
+    status: u16,
+    body: &str,
+    challenge: Option<&str>,
+    redirects: usize,
+    redirect_host: &str,
+) -> String {
     let called = ApiMethod::classify(method, url);
     let path = mask_secrets(endpoint_of(url));
+    // `redirect_auth_policy` is our own configuration, read back rather than
+    // guessed: ureq's default is `RedirectAuthHeaders::Never`, and this
+    // instrumentation does not change it. What the header did on a hop we did
+    // not send ourselves is not observable through ureq, so it is not claimed
+    // here — the count and the host verdict are, and together with this policy
+    // they are enough to say whether a redirect could have cost us the header.
+    let hops = format!("redirects={redirects} redirect_host={redirect_host} redirect_auth_policy=NEVER");
     if (200..300).contains(&status) {
-        return format!("[louver][youtube][http] {} {method} {path} status={status}", called.name());
+        return format!("[louver][youtube][http] {} {method} {path} status={status} {hops}", called.name());
     }
     // `reason` comes from the envelope and from nowhere else, so the shared
     // parser is safe for it.
@@ -147,7 +196,7 @@ fn exchange_line(method: &str, url: &str, status: u16, body: &str, challenge: Op
         .and_then(|v| v["error"]["message"].as_str().map(str::to_string));
     let dash = |s: String| if s.trim().is_empty() { "-".to_string() } else { s };
     format!(
-        "[louver][youtube][http] {} {method} {path} status={status} reason={} message={} www_authenticate={}",
+        "[louver][youtube][http] {} {method} {path} status={status} {hops} reason={} message={} www_authenticate={}",
         called.name(),
         dash(mask_secrets(&reason)),
         // No envelope means no message to quote. Saying so beats quoting a
@@ -446,6 +495,12 @@ mod secret_containment_tests {
 mod exchange_line_tests {
     use super::*;
 
+    /// The baseline for every assertion below: no redirect. The two
+    /// redirect fields have their own tests, so the rest stay readable.
+    fn line(method: &str, url: &str, status: u16, body: &str, challenge: Option<&str>) -> String {
+        exchange_line(method, url, status, body, challenge, 0, "-")
+    }
+
     const STREAM_KEY: &str = "abcd-efgh-ijkl-mnop-qrst";
     const INGEST: &str = "rtmps://a.rtmps.youtube.com/live2";
 
@@ -463,7 +518,7 @@ mod exchange_line_tests {
 
     #[test]
     fn a_success_says_the_status_and_nothing_from_the_body() {
-        let line = exchange_line(
+        let line = line(
             "POST",
             "https://www.googleapis.com/youtube/v3/liveStreams?part=id,snippet,cdn,status",
             200,
@@ -489,7 +544,7 @@ mod exchange_line_tests {
 
     #[test]
     fn a_failure_names_the_request_the_status_and_googles_own_words() {
-        let line = exchange_line(
+        let line = line(
             "POST",
             "https://www.googleapis.com/youtube/v3/liveStreams?part=id,snippet,cdn,status",
             401,
@@ -505,14 +560,14 @@ mod exchange_line_tests {
     #[test]
     fn the_two_inserts_are_told_apart_by_name() {
         // The question this whole diagnosis turns on: one of these succeeded.
-        let b = exchange_line(
+        let b = line(
             "POST",
             "https://www.googleapis.com/youtube/v3/liveBroadcasts?part=id,snippet,status,contentDetails",
             200,
             "{}",
             None,
         );
-        let s = exchange_line(
+        let s = line(
             "POST",
             "https://www.googleapis.com/youtube/v3/liveStreams?part=id,snippet,cdn,status",
             401,
@@ -525,20 +580,20 @@ mod exchange_line_tests {
 
     #[test]
     fn no_challenge_header_reads_as_none_rather_than_as_an_empty_field() {
-        let line = exchange_line("POST", "/liveStreams?part=id", 401, google_401(), None);
+        let line = line("POST", "/liveStreams?part=id", 401, google_401(), None);
         assert!(line.contains("www_authenticate=none"), "{line}");
     }
 
     #[test]
     fn an_empty_challenge_header_is_still_a_readable_field() {
-        let line = exchange_line("POST", "/liveStreams?part=id", 401, google_401(), Some("   "));
+        let line = line("POST", "/liveStreams?part=id", 401, google_401(), Some("   "));
         assert!(line.contains("www_authenticate=-"), "{line}");
     }
 
     #[test]
     fn a_challenge_header_is_kept_whole_when_it_is_what_google_sends() {
         let challenge = r#"Bearer realm="https://accounts.google.com/", error="invalid_token""#;
-        let line = exchange_line("POST", "/liveStreams?part=id", 401, google_401(), Some(challenge));
+        let line = line("POST", "/liveStreams?part=id", 401, google_401(), Some(challenge));
         // The discriminator this instrumentation exists to capture.
         assert!(line.contains("error=\"invalid_token\""), "{line}");
     }
@@ -550,7 +605,7 @@ mod exchange_line_tests {
         let long = format!("Bearer {} {}", "x".repeat(400), STREAM_KEY);
         let capped: String = long.chars().take(WWW_AUTH_MAX_CHARS).collect();
         assert_eq!(capped.chars().count(), WWW_AUTH_MAX_CHARS);
-        let line = exchange_line("POST", "/liveStreams?part=id", 401, google_401(), Some(&long));
+        let line = line("POST", "/liveStreams?part=id", 401, google_401(), Some(&long));
         // Masking applies to whatever reaches the line, capped or not.
         assert!(!line.contains(STREAM_KEY), "{line}");
     }
@@ -561,7 +616,7 @@ mod exchange_line_tests {
         // the first 200 characters of it, and masking does not save a key that
         // is glued to markup — so the line must not quote the body at all.
         let html = format!("<html><body>denied {STREAM_KEY}</body></html>");
-        let line = exchange_line("POST", "/liveStreams?part=id", 502, &html, None);
+        let line = line("POST", "/liveStreams?part=id", 502, &html, None);
         assert!(line.contains("status=502"), "{line}");
         assert!(line.contains("message=<no error envelope>"), "{line}");
         assert!(!line.contains(STREAM_KEY), "{line}");
@@ -598,5 +653,296 @@ mod exchange_line_tests {
         let detail = e.detail.expect("the detail names the request");
         assert!(detail.starts_with("liveStreams.insert HTTP 401"), "{detail}");
         assert!(detail.contains("reason=authError"), "{detail}");
+    }
+}
+
+/// What a redirect does to this transport, measured rather than assumed.
+///
+/// The question these tests exist for: ureq follows redirects by default and
+/// its default `RedirectAuthHeaders::Never` does not carry `Authorization`
+/// across one. If Google ever answers one of our calls with a 3xx, the hop we
+/// cannot see could arrive unauthenticated and come back `401 invalid_token` —
+/// indistinguishable, from our side, from a token that is genuinely bad.
+///
+/// Measuring it narrowed the question. ureq will not re-send a POST body across
+/// a 307/308 (`ureq-proto` `redirect.rs:51-60`, `need_request_body()` is true
+/// for POST/PUT/PATCH by method alone), so those come back as a transport
+/// error, never a 401. Only 301/302/303 are followed — as a GET, with the
+/// header dropped. The fake server here records, per hop, whether the header
+/// arrived, so that is a fact in a test rather than a reading of the library.
+#[cfg(test)]
+mod redirect_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    const TOKEN: &str = "ya29.thisMustNeverAppearInALogLine";
+
+    /// One hop as the server saw it: the method, and whether it was authorized.
+    type Hops = Arc<Mutex<Vec<(String, bool)>>>;
+
+    /// One scripted reply: a status, and a `Location` when it is a redirect.
+    #[derive(Clone)]
+    struct Reply {
+        status: u16,
+        location: Option<String>,
+    }
+
+    fn reply(status: u16) -> Reply {
+        Reply { status, location: None }
+    }
+
+    fn redirect(status: u16, to: &str) -> Reply {
+        Reply { status, location: Some(to.to_string()) }
+    }
+
+    /// Serves `script` in order, one reply per connection.
+    fn serve(listener: TcpListener, script: Vec<Reply>, hops: Hops) {
+        std::thread::spawn(move || {
+            for r in script {
+                let Ok((stream, _)) = listener.accept() else { return };
+                answer(stream, &r, &hops);
+            }
+        });
+    }
+
+    /// Reads one request (head and body, so the client is never left writing
+    /// into a closed socket), records it, then answers.
+    ///
+    /// The recording happens *before* the response is written: the client can
+    /// otherwise observe the reply and assert while this thread is still on its
+    /// way to the mutex.
+    fn answer(stream: TcpStream, r: &Reply, hops: &Hops) {
+        let mut buf = BufReader::new(stream);
+        let mut method = String::new();
+        let mut had_auth = false;
+        let mut len = 0usize;
+        let mut first = true;
+        loop {
+            let mut head = String::new();
+            if buf.read_line(&mut head).unwrap_or(0) == 0 {
+                break;
+            }
+            if first {
+                method = head.split_whitespace().next().unwrap_or("").to_string();
+                first = false;
+            }
+            let lower = head.to_ascii_lowercase();
+            if lower.starts_with("authorization:") {
+                had_auth = true;
+            }
+            if let Some(v) = lower.strip_prefix("content-length:") {
+                len = v.trim().parse().unwrap_or(0);
+            }
+            if head == "\r\n" || head == "\n" {
+                break;
+            }
+        }
+        if len > 0 {
+            let mut body = vec![0u8; len];
+            let _ = buf.read_exact(&mut body);
+        }
+        hops.lock().unwrap().push((method, had_auth));
+
+        let body = if r.status == 401 {
+            r#"{"error":{"code":401,"message":"Request had invalid authentication credentials.","errors":[{"reason":"authError"}]}}"#
+        } else {
+            "{}"
+        };
+        let mut out = format!("HTTP/1.1 {} X\r\nConnection: close\r\n", r.status);
+        if let Some(loc) = &r.location {
+            out.push_str(&format!("Location: {loc}\r\n"));
+        }
+        if r.status == 401 {
+            out.push_str(
+                "WWW-Authenticate: Bearer realm=\"https://accounts.google.com/\", error=\"invalid_token\"\r\n",
+            );
+        }
+        out.push_str(&format!("Content-Length: {}\r\n\r\n{}", body.len(), body));
+        let _ = buf.get_mut().write_all(out.as_bytes());
+        let _ = buf.get_mut().flush();
+    }
+
+    fn listener() -> (TcpListener, String) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        (l, base)
+    }
+
+    fn hops() -> Hops {
+        Arc::new(Mutex::new(Vec::new()))
+    }
+
+    fn json() -> serde_json::Value {
+        serde_json::json!({"snippet": {"title": "t"}})
+    }
+
+    // --- T1 / T2: no redirect -------------------------------------------
+    #[test]
+    fn t1_a_200_without_a_redirect_reports_zero_hops() {
+        let (l, base) = listener();
+        let seen = hops();
+        serve(l, vec![reply(200)], Arc::clone(&seen));
+        let (status, text) = UreqClient::new()
+            .request("POST", &format!("{base}/liveStreams?part=id"), TOKEN, Some(json()))
+            .unwrap();
+        assert_eq!((status, text.as_str()), (200, "{}"), "status and body as before");
+        assert_eq!(seen.lock().unwrap().as_slice(), &[("POST".into(), true)]);
+        assert_eq!(
+            exchange_line("POST", "/liveStreams?part=id", 200, "{}", None, 0, "-"),
+            "[louver][youtube][http] liveStreams.insert POST /liveStreams?part=id \
+             status=200 redirects=0 redirect_host=- redirect_auth_policy=NEVER"
+        );
+    }
+
+    #[test]
+    fn t2_a_401_without_a_redirect_keeps_every_existing_field() {
+        let (l, base) = listener();
+        let seen = hops();
+        serve(l, vec![reply(401)], Arc::clone(&seen));
+        let (status, text) = UreqClient::new()
+            .request("POST", &format!("{base}/liveStreams?part=id"), TOKEN, Some(json()))
+            .unwrap();
+        assert_eq!(status, 401);
+        assert!(text.contains("authError"), "{text}");
+        assert_eq!(seen.lock().unwrap().as_slice(), &[("POST".into(), true)]);
+        let line = exchange_line(
+            "POST",
+            "/liveStreams?part=id",
+            401,
+            &text,
+            Some("Bearer error=\"invalid_token\""),
+            0,
+            "-",
+        );
+        assert!(line.contains("redirects=0"), "{line}");
+        assert!(line.contains("redirect_host=-"), "{line}");
+        assert!(line.contains("reason=authError"), "{line}");
+        assert!(line.contains("www_authenticate=Bearer error=\"invalid_token\""), "{line}");
+    }
+
+    // --- T3 / T5: same-host redirect, and the header across it -----------
+    #[test]
+    fn t3_a_same_host_redirect_is_followed_and_the_header_does_not_survive_it() {
+        let (l, base) = listener();
+        let seen = hops();
+        serve(l, vec![redirect(303, &format!("{base}/second")), reply(200)], Arc::clone(&seen));
+        let (status, _text) = UreqClient::new()
+            .request("POST", &format!("{base}/liveStreams?part=id"), TOKEN, Some(json()))
+            .unwrap();
+        assert_eq!(status, 200, "the redirect is followed, as it was before");
+        // T5. The first hop is authorized; the second is not — this is ureq's
+        // `RedirectAuthHeaders::Never`, which this change deliberately leaves
+        // alone. It is also the mechanism the production log line now exposes.
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[("POST".into(), true), ("GET".into(), false)],
+            "hop 1 POST authorized, hop 2 GET unauthorized"
+        );
+    }
+
+    // --- T4: cross-host redirect ----------------------------------------
+    #[test]
+    fn t4_a_cross_host_redirect_loses_the_header_too_and_the_authority_differs() {
+        let (l1, base1) = listener();
+        let (l2, base2) = listener();
+        let seen1 = hops();
+        let seen2 = hops();
+        serve(l1, vec![redirect(303, &format!("{base2}/second"))], Arc::clone(&seen1));
+        serve(l2, vec![reply(401)], Arc::clone(&seen2));
+        let (status, text) = UreqClient::new()
+            .request("POST", &format!("{base1}/liveStreams?part=id"), TOKEN, Some(json()))
+            .unwrap();
+        assert_eq!(status, 401, "the second host refuses the unauthorized hop");
+        assert!(text.contains("authError"), "{text}");
+        assert_eq!(seen1.lock().unwrap().as_slice(), &[("POST".into(), true)]);
+        assert_eq!(seen2.lock().unwrap().as_slice(), &[("GET".into(), false)]);
+        assert_ne!(base1, base2, "two authorities, which is what the verdict reads");
+    }
+
+    /// A 307/308 on a POST is not followed at all, so it can never be the 401
+    /// this diagnosis is chasing. Stated as a test because it removes a whole
+    /// branch of the hypothesis.
+    #[test]
+    fn t4b_a_307_on_a_post_is_a_transport_error_and_never_a_401() {
+        for status in [307u16, 308] {
+            let (l, base) = listener();
+            let seen = hops();
+            serve(l, vec![redirect(status, &format!("{base}/second"))], Arc::clone(&seen));
+            let out = UreqClient::new().request(
+                "POST",
+                &format!("{base}/liveStreams?part=id"),
+                TOKEN,
+                Some(json()),
+            );
+            let e = out.expect_err("ureq will not re-send a POST body across a 307/308");
+            assert_eq!(e.code, ErrorCode::YoutubeApiFailed, "{status}");
+            assert!(e.detail.unwrap_or_default().contains("네트워크 오류"), "{status}");
+            assert_eq!(seen.lock().unwrap().len(), 1, "{status}: only the first hop happens");
+        }
+    }
+
+    #[test]
+    fn t4c_the_summary_reads_the_authority_and_nothing_else() {
+        let one: ureq::http::Uri =
+            "https://www.googleapis.com/youtube/v3/liveStreams?part=id".parse().unwrap();
+        let same: ureq::http::Uri = "https://www.googleapis.com/youtube/v3/elsewhere".parse().unwrap();
+        let other: ureq::http::Uri = "https://other.example.com/youtube/v3/liveStreams".parse().unwrap();
+        assert_eq!(redirect_summary(None), (0, "-"), "history off or absent");
+        assert_eq!(redirect_summary(Some(std::slice::from_ref(&one))), (0, "-"), "one entry is no redirect");
+        assert_eq!(redirect_summary(Some(&[one.clone(), same])), (1, "SAME_HOST"));
+        assert_eq!(redirect_summary(Some(&[one.clone(), other.clone()])), (1, "DIFFERENT_HOST"));
+        assert_eq!(
+            redirect_summary(Some(&[one.clone(), other, one])),
+            (2, "SAME_HOST"),
+            "counts hops, compares the ends"
+        );
+    }
+
+    // --- T6: nothing secret in the line ----------------------------------
+    #[test]
+    fn t6_the_line_never_carries_the_token_the_header_or_a_location() {
+        for (redirects, host) in [(0usize, "-"), (1, "SAME_HOST"), (2, "DIFFERENT_HOST")] {
+            for status in [200u16, 401] {
+                let line = exchange_line(
+                    "POST",
+                    "https://www.googleapis.com/youtube/v3/liveStreams?part=id",
+                    status,
+                    r#"{"error":{"message":"m","errors":[{"reason":"authError"}]}}"#,
+                    Some("Bearer realm=\"https://accounts.google.com/\", error=\"invalid_token\""),
+                    redirects,
+                    host,
+                );
+                assert!(!line.contains(TOKEN), "{line}");
+                assert!(!line.contains("ya29."), "{line}");
+                assert!(!line.contains("Authorization"), "{line}");
+                assert!(!line.contains("Location"), "{line}");
+                assert!(!line.contains("/second"), "{line}");
+                assert!(!line.contains("www.googleapis.com"), "the host is never printed: {line}");
+                assert!(line.contains(&format!("redirects={redirects}")), "{line}");
+                assert!(line.contains(&format!("redirect_host={host}")), "{line}");
+                assert!(line.contains("redirect_auth_policy=NEVER"), "{line}");
+            }
+        }
+    }
+
+    // --- T7: behaviour unchanged -----------------------------------------
+    #[test]
+    fn t7_the_transport_still_returns_the_status_and_the_body_it_always_did() {
+        // The three arms of `request`: GET, POST with a body, PUT without one.
+        for (method, body) in [("GET", None), ("POST", Some(json())), ("PUT", None)] {
+            let (l, base) = listener();
+            let seen = hops();
+            serve(l, vec![reply(401)], Arc::clone(&seen));
+            let (status, text) =
+                UreqClient::new().request(method, &format!("{base}/channels?part=id"), TOKEN, body).unwrap();
+            assert_eq!(status, 401, "{method}");
+            assert!(text.contains("authError"), "{method}: {text}");
+            assert_eq!(seen.lock().unwrap().as_slice(), &[(method.into(), true)], "{method}");
+            // The classification the caller depends on is untouched.
+            let e = crate::youtube::api::classify_call(ApiMethod::ChannelsList, status, &text);
+            assert_eq!(e.code, ErrorCode::YoutubeAuthExpired, "{method}");
+        }
     }
 }
