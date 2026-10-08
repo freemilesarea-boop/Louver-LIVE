@@ -224,6 +224,20 @@ impl Youtube {
         match call(&api, &token) {
             Ok(v) => Ok(v),
             Err(e) if e.code == ErrorCode::YoutubeAuthExpired => {
+                // The guard above is silent by design — a replaced token is not
+                // news. It is news when the replacement is refused too, and
+                // without this line the two attempts' transport logs sit next
+                // to each other with nothing saying which is which.
+                //
+                // `say` and not `note`: this is a boundary marker for the log
+                // stream the transport lines are already in, and `note` would
+                // also write a `broadcast_events` row — a dashboard entry a
+                // user would see, which a diagnosis has no business adding.
+                crate::manager::say(
+                    broadcast_id,
+                    "youtube",
+                    &format!("{} 첫 시도 401 — token 갱신 후 재시도", method.name()),
+                );
                 let fresh = self.refresh_access_token(account_id)?;
                 call(&api, &fresh).map_err(|e| self.explain(broadcast_id, method, e))
             }
