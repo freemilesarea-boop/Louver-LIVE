@@ -1030,3 +1030,145 @@ fn t3_provisioning_twice_reuses_the_destination_rather_than_piling_them_up() {
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
+
+// --- U: a refused refresh keeps Google's own reason ------------------------
+
+/// A token endpoint that answers one request with a status and a body, then
+/// closes. Real socket, real `UreqClient`, so `post_token` is the code under
+/// test rather than a stand-in for it.
+///
+/// Forty lines rather than a dependency: what this needs is a `Content-Length`
+/// and a status line, and the point of the test is that the error text survives
+/// a real HTTP round trip.
+fn refusing_token_endpoint(status_line: &str, body: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}/token", listener.local_addr().unwrap());
+    let status_line = status_line.to_string();
+    let handle = std::thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf); // the form body; nothing here asserts on it
+            let _ = sock.write_all(
+                format!(
+                    "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+        }
+    });
+    (url, handle)
+}
+
+/// The diagnosis this test exists for: a refresh Google refuses must arrive at
+/// the cloud layer with Google's own reason attached, not just with the sentence
+/// the user reads.
+///
+/// `CloudError::Engine(e.message)` used to drop `LouverError::detail` here, so
+/// an operator saw "다시 연결해주세요" and had no way to tell a revoked token
+/// from a wrong client secret from a clock skew.
+#[test]
+fn u_a_refused_refresh_keeps_googles_own_reason_all_the_way_up() {
+    // Google's answer when a refresh token has been revoked. No secret in it —
+    // and no secret anywhere in this test: the values below are the harness's
+    // obvious fakes.
+    const BODY: &str =
+        r#"{"error":"invalid_grant","error_description":"Token has been expired or revoked."}"#;
+    let (url, server) = refusing_token_endpoint("HTTP/1.1 400 Bad Request", BODY);
+
+    let e = env();
+    let account = e.connect(); // seals a refresh token, through the scripted fake
+
+    // The real HTTP token endpoint, pointed at the local server. Everything
+    // else — the database, the key store, the config — is the harness's.
+    let real = Arc::new(louver_core::youtube::http::UreqClient { token_endpoint: Some(url) });
+    let yt = Youtube::new(
+        e.db.clone(),
+        Arc::clone(&e.keys),
+        Arc::clone(&e.api) as Arc<dyn HttpClient>,
+        real as Arc<dyn TokenEndpoint>,
+        Config {
+            credentials: ClientCredentials {
+                client_id: "test-client.apps.googleusercontent.com".into(),
+                client_secret: CLIENT_SECRET.into(),
+            },
+            redirect_uri: "https://live.example.com/api/youtube/oauth/callback".into(),
+            api_base: Some("https://fake.googleapis.test/youtube/v3".into()),
+        },
+    );
+
+    // Force the cached access token to be stale, so `access_token` has to
+    // refresh rather than answering from the key store.
+    e.db.set_youtube_token_expiry(&account, -60).unwrap();
+    assert!(e.db.youtube_token_expired(&account).unwrap(), "the test needs a refresh to happen");
+
+    let err = yt.access_token(&account).expect_err("a 400 from the token endpoint must fail the refresh");
+    let text = err.to_string();
+    server.join().ok();
+
+    // The sentence the user reads is unchanged.
+    assert!(text.contains("Google 인증 갱신에 실패했습니다"), "the user-facing message must survive: {text}");
+    // And the diagnosis is there too — which is the whole point.
+    for expected in [
+        "oauth2.token(refresh_token)",       // which grant
+        "HTTP 400",                          // what status
+        "invalid_grant",                     // Google's `error`
+        "Token has been expired or revoked", // Google's `error_description`
+    ] {
+        assert!(text.contains(expected), "detail lost {expected:?} on the way up: {text}");
+    }
+
+    // Nothing secret travelled with it. `post_token` never puts the form in the
+    // detail, and this is the assertion that keeps it that way.
+    for secret in [CLIENT_SECRET, "refresh-1", "access-1"] {
+        assert!(!text.contains(secret), "a secret reached the error text: {text}");
+    }
+}
+
+/// The other half of the same change: when there is no detail to carry, the
+/// error is exactly what it was before. `From` falls back to the bare message,
+/// so this line did not become noisier for the failures that have nothing to
+/// add.
+#[test]
+fn u2_a_failure_without_detail_reads_exactly_as_it_did_before() {
+    let e = env();
+    let account = e.connect();
+    // A token endpoint that fails with a code and no detail at all.
+    #[derive(Debug)]
+    struct Bare;
+    impl TokenEndpoint for Bare {
+        fn exchange_code(
+            &self,
+            _: &ClientCredentials,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> CoreResult<TokenResponse> {
+            unreachable!("this test only refreshes")
+        }
+        fn refresh(&self, _: &ClientCredentials, _: &str) -> CoreResult<TokenResponse> {
+            Err(LouverError::new(ErrorCode::YoutubeAuthRefreshFailed))
+        }
+    }
+    let yt = Youtube::new(
+        e.db.clone(),
+        Arc::clone(&e.keys),
+        Arc::clone(&e.api) as Arc<dyn HttpClient>,
+        Arc::new(Bare) as Arc<dyn TokenEndpoint>,
+        Config {
+            credentials: ClientCredentials {
+                client_id: "test-client.apps.googleusercontent.com".into(),
+                client_secret: CLIENT_SECRET.into(),
+            },
+            redirect_uri: "https://live.example.com/api/youtube/oauth/callback".into(),
+            api_base: Some("https://fake.googleapis.test/youtube/v3".into()),
+        },
+    );
+    e.db.set_youtube_token_expiry(&account, -60).unwrap();
+
+    let text = yt.access_token(&account).expect_err("the refresh fails").to_string();
+    assert!(text.contains("Google 인증 갱신에 실패했습니다"), "{text}");
+    // No empty parentheses, no "(None)" — the message and nothing else.
+    assert!(!text.contains('('), "a detail-less failure must not grow brackets: {text}");
+}
