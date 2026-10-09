@@ -8,11 +8,31 @@
 # `caddy reload`, which replaces the configuration in the running Caddy
 # container without restarting it and without touching the `louver` container
 # at all — so no customer broadcast is interrupted. That mechanism was checked
-# against production's compose file (the Caddyfile is a bind mount, and there is
-# no `admin` directive turning the admin API off); the configuration here has
-# NOT been validated by a local Caddy, because this development environment has
-# no Docker daemon and no Caddy binary. Treat the syntax as unverified until
-# `caddy validate --config Caddyfile` has been run on it.
+# against production's compose file: the Caddyfile is a bind mount, and there
+# is no `admin` directive, so Caddy listens on its default `localhost:2019`
+# and `caddy reload` works. Do not add an `admin` directive on a random port —
+# that is what makes reload unreachable, as this config's own first draft
+# proved.
+#
+# ## VALIDATED — this has been run, not merely written
+#
+# Caddy v2.10.0, a real `live-source-api` process and a stand-in for the
+# `louver` container, all on loopback. `caddy validate` passes and every
+# numbered claim below was asserted against live traffic.
+#
+# One defect was found that way, which is why this section exists. An earlier
+# draft had
+#
+#     header_up -X-Louver-Gate
+#     header_up X-Louver-Gate {env.LOUVER_GATE_SECRET}
+#
+# on the theory that a client-supplied header should be deleted before the
+# proxy adds its own. Both lines land in **one** `HeaderOps`, and Caddy applies
+# `delete` *after* `set` — so the header reached the worker **absent** and
+# every beta request answered 403. `header_up <name> <value>` is a `set`, which
+# already replaces whatever the client sent: measured, a client sending
+# `X-Louver-Gate: CLIENT-FORGED` arrives upstream carrying the real secret
+# instead. The delete was not redundant, it was the bug.
 #
 # ## WHAT IT HAS TO GET RIGHT
 #
@@ -25,9 +45,10 @@
 #  3. The session cookie crosses to the worker on **one** path and is removed
 #     from every other. The worker refuses a `Cookie` header on those routes as
 #     well, so this is the outer half of a check made twice.
-#  4. An inbound `X-Louver-Gate` from a client is deleted before the proxy adds
-#     its own. Otherwise a client could supply the header itself and the gate
-#     would be decorative.
+#  4. An inbound gate header from a client is **overwritten**, not trusted —
+#     `header_up` is a `set`. Measured rather than assumed; see the defect
+#     note above for the version that looked more careful and did the
+#     opposite.
 #
 # ## THE SECRET
 #
@@ -51,7 +72,8 @@
 # The handshake: the one request that may carry the session cookie.
 handle @live_source_session {
 	reverse_proxy live-source:9080 {
-		header_up -X-Louver-Gate
+		# A `set`, so a client-supplied value is replaced. Nothing deletes
+		# this header first: that would delete what this line sets.
 		header_up X-Louver-Gate {env.LOUVER_GATE_SECRET}
 		# `Origin` is forwarded unchanged — the worker checks it itself, and a
 		# proxy that rewrote it would be forging the thing being checked.
@@ -61,8 +83,10 @@ handle @live_source_session {
 # Everything else: no cookie reaches the worker.
 handle @live_source_other {
 	reverse_proxy live-source:9080 {
+		# Deleting a header nothing else sets is fine, and this one is the
+		# whole point: the worker has no use for the session cookie here
+		# and refuses a request that carries one.
 		header_up -Cookie
-		header_up -X-Louver-Gate
 		header_up X-Louver-Gate {env.LOUVER_GATE_SECRET}
 		# An upload is up to 512MB and ffprobe runs over it before the response.
 		transport http {
