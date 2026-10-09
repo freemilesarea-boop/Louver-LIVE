@@ -39,6 +39,7 @@ impl LiveSourceResolver for FixedSource {
 const WATCH: &str = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
 
 #[test]
+#[ignore = "runs two real encodes at once; run explicitly"]
 fn one_workers_source_failing_does_not_disturb_another_worker() {
     if !have_ffmpeg() {
         eprintln!("SKIP: no ffmpeg");

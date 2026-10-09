@@ -121,4 +121,13 @@ the result over a real RTMP connection, then decode it: the fixtures are a
 **green** picture with a **440 Hz** tone for the playlist and a **red** picture
 with a **100 Hz** tone for the live source, so a correct output is red with
 440 Hz and any wrong wiring is unmistakable. They skip, rather than fail, where
-FFmpeg is not installed.
+FFmpeg is not installed, and they find it on `PATH` (`LOUVER_TEST_FFMPEG`
+overrides).
+
+The seven heaviest are `#[ignore]`d, following this repository's convention for
+tests that encode real video (`optimize_speed.rs`, `rc_live.rs`): together they
+take about two minutes and bind real sockets. Run them explicitly:
+
+```bash
+cargo test -p louver-live-source -- --ignored
+```

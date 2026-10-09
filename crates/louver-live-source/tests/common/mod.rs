@@ -20,17 +20,39 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub fn ffmpeg() -> &'static str {
-    "/usr/bin/ffmpeg"
+/// Where FFmpeg is, resolved rather than assumed.
+///
+/// Hardcoding `/usr/bin/ffmpeg` was wrong: CI downloads a sidecar and puts it
+/// on `PATH` under `$RUNNER_TEMP`, so the hardcoded path did not exist, every
+/// `have_ffmpeg()` guard read false, and the one test that forgot its guard
+/// failed the Linux gate with `ffmpeg: NotFound`. `PATH` is the only portable
+/// answer; `LOUVER_TEST_FFMPEG` overrides it for a machine with several.
+fn resolve(name: &str) -> Option<PathBuf> {
+    let env_key = format!("LOUVER_TEST_{}", name.to_ascii_uppercase());
+    if let Ok(p) = std::env::var(&env_key) {
+        let p = PathBuf::from(p);
+        return p.is_file().then_some(p);
+    }
+    let exe = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+    std::env::var_os("PATH")?
+        .to_string_lossy()
+        .split(if cfg!(windows) { ';' } else { ':' })
+        .map(|d| Path::new(d).join(&exe))
+        .find(|p| p.is_file())
 }
-pub fn ffprobe() -> &'static str {
-    "/usr/bin/ffprobe"
+
+pub fn ffmpeg() -> String {
+    resolve("ffmpeg").map(|p| p.display().to_string()).unwrap_or_else(|| "ffmpeg".to_string())
+}
+
+pub fn ffprobe() -> String {
+    resolve("ffprobe").map(|p| p.display().to_string()).unwrap_or_else(|| "ffprobe".to_string())
 }
 
 /// Skip rather than fail where FFmpeg is not installed, so this suite is
 /// useful on a machine that cannot run it.
 pub fn have_ffmpeg() -> bool {
-    Path::new(ffmpeg()).exists() && Path::new(ffprobe()).exists()
+    resolve("ffmpeg").is_some() && resolve("ffprobe").is_some()
 }
 
 /// A port nothing is listening on, by asking the kernel for one and letting go.

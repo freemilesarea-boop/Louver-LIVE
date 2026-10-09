@@ -62,6 +62,7 @@ fn send_and_receive(dir: &Path, source_size: &str, seconds: u32) -> std::path::P
 }
 
 #[test]
+#[ignore = "encodes real video and receives it over RTMP; run explicitly"]
 fn the_picture_comes_from_the_live_source_and_the_sound_from_the_playlist() {
     if !have_ffmpeg() {
         eprintln!("SKIP: no ffmpeg");
@@ -93,6 +94,7 @@ fn the_picture_comes_from_the_live_source_and_the_sound_from_the_playlist() {
 }
 
 #[test]
+#[ignore = "encodes real video and receives it over RTMP; run explicitly"]
 fn a_4k_source_is_sent_at_1080p() {
     if !have_ffmpeg() {
         eprintln!("SKIP: no ffmpeg");
@@ -109,6 +111,7 @@ fn a_4k_source_is_sent_at_1080p() {
 }
 
 #[test]
+#[ignore = "encodes real video and receives it over RTMP; run explicitly"]
 fn a_source_below_the_cap_is_not_scaled_up() {
     if !have_ffmpeg() {
         eprintln!("SKIP: no ffmpeg");

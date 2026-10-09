@@ -68,9 +68,9 @@ fn the_binary_never_prints_the_destination_even_while_failing() {
             "--worker-id",
             "sec1",
             "--ffmpeg",
-            ffmpeg(),
+            &ffmpeg(),
             "--ffprobe",
-            ffprobe(),
+            &ffprobe(),
             "--max-restarts",
             "0",
             "--stall-after",
@@ -95,6 +95,12 @@ fn the_binary_never_prints_the_destination_even_while_failing() {
 
 #[test]
 fn the_binary_never_prints_the_destination_while_resolving_youtube() {
+    // Needs FFmpeg for the playlist fixture, like the rest. The missing guard
+    // here is what failed the Linux gate.
+    if !have_ffmpeg() {
+        eprintln!("SKIP: no ffmpeg");
+        return;
+    }
     // The resolve path, which runs yt-dlp. Whether yt-dlp can reach YouTube
     // from this machine is not the point: either way the destination must not
     // appear in the output, and the failure must be classified rather than

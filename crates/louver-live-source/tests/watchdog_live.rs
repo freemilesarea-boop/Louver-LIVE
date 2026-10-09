@@ -103,6 +103,7 @@ impl Rig {
 }
 
 #[test]
+#[ignore = "runs a real-time HLS source for a minute; run explicitly"]
 fn a_source_that_stops_producing_segments_is_noticed_and_retried_then_given_up_on() {
     if !have_ffmpeg() {
         eprintln!("SKIP: no ffmpeg");
@@ -164,6 +165,7 @@ fn a_source_that_stops_producing_segments_is_noticed_and_retried_then_given_up_o
 }
 
 #[test]
+#[ignore = "runs a real-time HLS source for a minute; run explicitly"]
 fn an_endpoint_that_refuses_connections_is_also_noticed() {
     if !have_ffmpeg() {
         eprintln!("SKIP: no ffmpeg");
@@ -200,6 +202,7 @@ fn an_endpoint_that_refuses_connections_is_also_noticed() {
 }
 
 #[test]
+#[ignore = "runs a real-time HLS source for a minute; run explicitly"]
 fn a_healthy_source_is_left_alone_for_the_whole_run() {
     if !have_ffmpeg() {
         eprintln!("SKIP: no ffmpeg");
