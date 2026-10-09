@@ -2353,12 +2353,18 @@ dependencies = [
 name = "louver-live-source"
 version = "1.0.8"
 dependencies = [
+ "axum",
  "chrono",
  "louver-cloud",
  "louver-core",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "tempfile",
+ "tokio",
+ "tower-http",
+ "ureq",
 ]
 
 [[package]]

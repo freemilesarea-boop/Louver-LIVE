@@ -38,18 +38,28 @@
 //! key), the resolved manifest URL (YouTube signs it), and anything to do with
 //! OAuth — this crate has no OAuth code at all and never touches a token.
 
+pub mod api;
 pub mod args;
+pub mod auth;
 pub mod error;
+pub mod jobs;
 pub mod limits;
+pub mod media;
 pub mod process;
 pub mod resolver;
 pub mod state;
+pub mod token;
 pub mod watchdog;
 pub mod worker;
 
+pub use api::Api;
+pub use auth::{Identity, IdentitySource, ProductionMe};
 pub use error::{ErrorKind, LiveSourceError, Result};
+pub use jobs::{JobView, NewJob, Registry, Settings};
 pub use limits::Limits;
+pub use media::MediaRoot;
 pub use resolver::{classify, LiveSourceResolver, ResolvedSource, SourceKind, YtDlpResolver};
-pub use state::{Phase, StateStore, WorkerState};
+pub use state::{Desired, Phase, StateStore, WorkerState};
+pub use token::Signer;
 pub use watchdog::{FrameWatchdog, Verdict};
 pub use worker::{LiveWorker, Outcome, WorkerConfig};
