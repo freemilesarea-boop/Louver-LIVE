@@ -5,6 +5,10 @@ members = [
     "crates/louver-cloud",
     "apps/desktop/src-tauri",
     "apps/server",
+    # Isolated YouTube Live video-source worker (Beta). Its own process and its
+    # own state store; it shares no database, credential or FFmpeg child with
+    # the broadcasts running today.
+    "crates/louver-live-source",
 ]
 
 [workspace.package]
