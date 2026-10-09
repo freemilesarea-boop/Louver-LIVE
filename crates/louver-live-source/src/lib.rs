@@ -55,6 +55,7 @@
 //!     file? Both are keyed by user id, and another user's name reads as not
 //!     registered rather than as forbidden.
 
+pub mod admin;
 pub mod api;
 pub mod args;
 pub mod auth;
@@ -67,11 +68,13 @@ pub mod media;
 pub mod origin;
 pub mod process;
 pub mod resolver;
+pub(crate) mod secret;
 pub mod state;
 pub mod token;
 pub mod watchdog;
 pub mod worker;
 
+pub use admin::{AdminSecret, AuditEntry, AuditLog, RevokedUsers};
 pub use api::Api;
 pub use auth::{Identity, IdentitySource, ProductionMe};
 pub use destinations::Destinations;

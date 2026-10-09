@@ -43,6 +43,7 @@
 //!    so it needs none — and adding them would undo the `SameSite=Strict`
 //!    cookie's work.
 
+use crate::admin::{AdminSecret, AuditEntry, AuditLog, RevokedUsers, ADMIN_HEADER};
 use crate::auth::{bearer, Identity, IdentitySource};
 use crate::error::{ErrorKind, LiveSourceError};
 use crate::gate::{Gate, GATE_HEADER};
@@ -70,6 +71,13 @@ pub struct Api {
     pub gate: Arc<Gate>,
     /// Where a session may be started from.
     pub origins: Arc<AllowedOrigins>,
+    /// The operator's secret. A third secret, not the gate's — see
+    /// [`crate::admin`].
+    pub admin: Arc<AdminSecret>,
+    /// Accounts an operator has revoked, persisted.
+    pub revoked: Arc<RevokedUsers>,
+    /// Where operator actions are recorded.
+    pub audit: Arc<AuditLog>,
 }
 
 /// The body of every failure. One shape, so a client has one thing to parse.
@@ -226,6 +234,105 @@ async fn session(State(api): State<Api>, headers: HeaderMap) -> Out<SessionBody>
         max_storage_bytes: crate::media::MAX_USER_BYTES,
         allowed_extensions: crate::media::ALLOWED_EXTENSIONS.to_vec(),
     }))
+}
+
+/* ------------------------------------------------- the operator's routes */
+
+/// Who the operator says to act on. A user id and nothing else: this endpoint
+/// cannot be made to stop "all users" or to name a job directly.
+#[derive(Debug, serde::Deserialize)]
+pub struct AdminUserReq {
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RevokeBody {
+    /// Whether this call changed the stored decision, or repeated one.
+    pub changed: bool,
+    /// How many of that account's jobs this call stopped.
+    pub stopped: usize,
+    /// Which ones.
+    pub jobs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RevokedListBody {
+    pub users: Vec<String>,
+}
+
+/// Steps for an operator route: the admin secret, and nothing else.
+///
+/// Deliberately **not** the gate: see [`crate::admin`] for why requiring it
+/// would make the operator forge Caddy's header and would protect nothing.
+fn operator(api: &Api, headers: &HeaderMap) -> std::result::Result<(), Fail> {
+    let got = headers.get(ADMIN_HEADER).and_then(|v| v.to_str().ok());
+    api.admin.check(got).map_err(Fail)
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// `POST /admin/revoke` — stop one account's broadcasts, and keep them stopped.
+///
+/// Idempotent: calling it again on an account with nothing running records the
+/// repeat and returns `stopped: 0` rather than failing.
+async fn admin_revoke(State(api): State<Api>, headers: HeaderMap, raw: axum::body::Bytes) -> Out<RevokeBody> {
+    operator(&api, &headers)?;
+    let req: AdminUserReq = body_json(&raw)?;
+    let user = crate::admin::check_user_id(&req.user_id).map_err(Fail)?.to_string();
+
+    // Persist the decision *before* stopping anything. If the order were
+    // reversed, a crash in between would leave the jobs stopped and the
+    // account free to start new ones with its still-valid token.
+    let changed = api.revoked.revoke(&user).map_err(Fail)?;
+
+    let jobs = api.jobs.clone();
+    let who = user.clone();
+    let stopped = tokio::task::spawn_blocking(move || jobs.revoke_user(&who))
+        .await
+        .map_err(|_| Fail(LiveSourceError::ffmpeg("작업 중단이 중단되었습니다.")))?;
+
+    api.audit.append(&AuditEntry {
+        at: now_rfc3339(),
+        action: "revoke".into(),
+        user_id: user,
+        stopped: stopped.len(),
+        jobs: stopped.clone(),
+        changed,
+    });
+    Ok(Json(RevokeBody { changed, stopped: stopped.len(), jobs: stopped }))
+}
+
+/// `POST /admin/restore` — lift a revocation.
+///
+/// Starts nothing. An operator who re-enables an account is saying "this
+/// account may broadcast again", not "put it back on air" — the user does
+/// that, and anything that was stopped is `desired = Stopped` on disk.
+async fn admin_restore(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    raw: axum::body::Bytes,
+) -> Out<RevokeBody> {
+    operator(&api, &headers)?;
+    let req: AdminUserReq = body_json(&raw)?;
+    let user = crate::admin::check_user_id(&req.user_id).map_err(Fail)?.to_string();
+    let changed = api.revoked.restore(&user).map_err(Fail)?;
+    api.audit.append(&AuditEntry {
+        at: now_rfc3339(),
+        action: "restore".into(),
+        user_id: user,
+        stopped: 0,
+        jobs: vec![],
+        changed,
+    });
+    Ok(Json(RevokeBody { changed, stopped: 0, jobs: vec![] }))
+}
+
+/// `GET /admin/revoked` — who is currently revoked.
+async fn admin_revoked(State(api): State<Api>, headers: HeaderMap) -> Out<RevokedListBody> {
+    operator(&api, &headers)?;
+    Ok(Json(RevokedListBody { users: api.revoked.list() }))
 }
 
 #[derive(Debug, Serialize)]
@@ -455,6 +562,18 @@ async fn health(State(api): State<Api>, headers: HeaderMap) -> Out<Health> {
     }))
 }
 
+/// Anything the customer-facing router does not match.
+///
+/// Explicit, because the gate is applied as a layer on that router and a
+/// layer wraps the router's fallback as well as its routes. Leaving the
+/// default fallback in place meant that merging the operator routes — which
+/// are deliberately outside the gate — moved the fallback out with them, and
+/// an unmatched path answered an ungated 404 instead of a gated 403. Caught by
+/// `an_unmatched_path_is_also_behind_the_gate`.
+async fn not_found() -> Fail {
+    Fail(LiveSourceError::not_found("없는 경로입니다."))
+}
+
 /// Headers on every response, including the beta page's.
 ///
 /// The content policy is strict because it can be: the beta page has no inline
@@ -542,10 +661,26 @@ impl Api {
             );
         }
 
+        // The operator's routes, merged **after** the gate layer so they are
+        // outside it. Three reasons, in [`crate::admin`]: the gate asks "did
+        // this come through Caddy?" and the honest answer here is no; Caddy
+        // does not route `/admin/*` to this worker at all, so these are
+        // reachable only on its own port; and requiring the gate would protect
+        // nothing, because if Caddy ever did route them it would add the gate
+        // header itself. They are under no path prefix that Caddy forwards.
+        let admin = Router::new()
+            .route("/admin/revoke", post(admin_revoke))
+            .route("/admin/restore", post(admin_restore))
+            .route("/admin/revoked", get(admin_revoked));
+
         router
-            // Inner: the gate, around everything above.
+            // The fallback belongs inside the gate, so an unmatched path is a
+            // 403 without the header rather than a free 404.
+            .fallback(not_found)
+            // Inner: the gate, around the customer-facing routes above.
             .layer(axum::middleware::from_fn_with_state(self.clone(), gate_layer))
-            // Outer, so the gate's own 403 carries them too.
+            .merge(admin)
+            // Outer, so the gate's own 403 and the admin 403 both carry them.
             .layer(axum::middleware::map_response(add_security_headers))
             .with_state(self)
     }

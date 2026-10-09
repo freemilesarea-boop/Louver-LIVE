@@ -117,32 +117,78 @@ never comes — none of them stop anything. There is deliberately no "I could no
 confirm this user is still allowed, so I am stopping" path. That path is how a
 sixty-second production blip takes every beta broadcast off air at once.
 
-## 5. Operator-triggered revocation — zero production change
+## 5. Operator-triggered revocation — zero production change — **IMPLEMENTED**
 
-The achievable answer today. The worker gains one route:
+The achievable answer today, and now built (`src/admin.rs`, three routes in
+`src/api.rs`, ten tests in `tests/admin_api.rs`):
 
 ```
-POST /admin/revoke     { "user_id": "<id>" }
+POST /admin/revoke     { "user_id": "<id>" }   → { changed, stopped, jobs[] }
+POST /admin/restore    { "user_id": "<id>" }   → { changed, stopped: 0 }
+GET  /admin/revoked                            → { users[] }
 X-Louver-Admin: <LOUVER_LIVE_SOURCE_ADMIN_SECRET>
-→ { "revoked": 2 }
 ```
+
+`restore` exists because an operator who re-enables an account must be able to
+undo this; without it the only way back is editing a file on the VPS. It lifts
+the decision and starts nothing — anything stopped is `desired = Stopped` on
+disk, and the user starts it again themselves.
+
+A revocation is **not just a stop**. A stop alone is undone twice over: by the
+account's own bearer token, valid for up to five minutes after suspension and
+able to start a new job in that window; and by a restart, which reads the state
+directory. So it is a persisted decision that [`jobs::Registry`] consults on
+both `create` and `recover`, written to `revoked.json` by temp-and-rename so a
+crash mid-write cannot leave a file that reads as "nobody is revoked".
 
 - A **third** secret, distinct from the signing secret and the gate secret.
-  Constant-time compared, env-var only, fail-closed, 32 bytes minimum — the
-  same construction as [`crate::gate`]. Reusing the gate secret here would mean
-  that anything able to reach the beta through Caddy could also revoke.
+  Constant-time compared, env-var only, fail-closed, 32 bytes minimum. The
+  binary will not start without it; there is no flag that disables the operator
+  API.
+
+  The three are not interchangeable, and that is enforced cryptographically
+  rather than by configuration discipline: each is hashed under its own
+  domain-separation label (`src/secret.rs`), so **the gate secret offered in
+  the admin header fails even if an operator sets both variables to the same
+  string.** That matters because the gate secret travels on every proxied beta
+  request — a leak of it must not become the power to take customers off air.
 - **Not reachable from a browser.** Caddy's `handle` blocks match only
-  `/api/live-source/*` and `/beta/*`, so `/admin/revoke` falls through to the
+  `/api/live-source/*` and `/beta/*`, so `/admin/*` falls through to the
   production catch-all and never reaches the worker from outside. It is
   reachable only on the worker's own port — an operator on the VPS, over SSH,
   against loopback. That is the right exposure for an operator action, and it
-  comes for free from the routing that already exists.
-- **Effect:** look up the running jobs whose `owner` is that user, set each
-  one's own stop flag, write `desired = Stopped`. This reuses the existing
-  `cancel` path, which already touches exactly one job's flag per call and is
-  covered by the isolation tests. Another user's job cannot be reached, because
-  the map is filtered by owner exactly as `running_count_for` does.
-- **Idempotent**: revoking an account with nothing running returns `0`.
+  comes for free from the routing that already exists. `Caddyfile.sample` now
+  says so explicitly, and a test pins the paths.
+- **Deliberately outside the gate layer.** The gate asks "did this come through
+  Caddy?", and for an operator action the honest answer is no. Requiring it
+  would make the operator forge Caddy's header, and would protect nothing: if
+  Caddy ever did route `/admin/*`, it would add the gate header itself. So the
+  admin routes are merged after the gate layer — which also meant giving the
+  customer-facing router an explicit fallback, because a layer wraps a
+  router's fallback and the merge would otherwise have moved it outside the
+  gate too. That regression was caught by an existing test, not by review.
+- **Effect:** look up the running jobs whose `owner` is that user, then stop
+  each through the existing `cancel` path — which writes the intent, sets only
+  that job's flag, joins, and writes the intent again to close the race with
+  the worker's read-modify-write. Reusing it means revocation cannot drift from
+  cancellation. The ids are collected under the map lock and the lock is
+  released before any join, because joining a worker thread while holding the
+  map would deadlock against the worker's own state write.
+- **Only that account's.** The map is filtered by `owner`, exactly as
+  `running_count_for` does. Tested: Alice's two jobs stop, Bob's keeps running,
+  and Bob is not revoked.
+- **Idempotent**: a second call changes no decision and finds nothing to stop,
+  returning `changed: false, stopped: 0` rather than failing. Both calls are
+  recorded, the repeat marked as one.
+- **Audited**: one JSONL line per call in `admin-audit.jsonl` beside the job
+  state — timestamp, action, subject, how many jobs stopped and which, and
+  whether the decision changed. A failure to write the log is reported but
+  never undoes the action. Tested to contain no secret, no token and no
+  destination.
+- **Durable across a restart**: tested both ways — a revoked account's jobs are
+  not recovered, and a state file forged back to `Running` (a stale backup, or
+  a crash between the two writes) still does not put it back on air, because
+  `recover` consults the list as well as `desired`.
 
 ### Operator runbook
 

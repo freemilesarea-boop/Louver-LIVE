@@ -30,6 +30,9 @@ WORKER_BIN=${WORKER_BIN:-$CRATE/../../target/debug/live-source-api}
 
 GATE="a-local-caddy-validation-gate-secret"
 SIGN="a-local-caddy-validation-sign-secret"
+# The worker fail-closes without this, so the script must supply it even
+# though nothing here exercises the operator routes (tests/admin_api.rs does).
+ADMIN="a-local-caddy-validation-admin-secret"
 WORK=$(mktemp -d); trap 'cleanup' EXIT
 PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; rm -rf "$WORK"; }
@@ -79,6 +82,7 @@ python3 "$WORK/up.py" "$P_LOUVER" & PIDS+=($!)
 mkdir -p "$WORK/media" "$WORK/state"
 LOUVER_LIVE_SOURCE_SECRET="$SIGN" \
 LOUVER_LIVE_SOURCE_GATE_SECRET="$GATE" \
+LOUVER_LIVE_SOURCE_ADMIN_SECRET="$ADMIN" \
 LOUVER_LIVE_SOURCE_DESTINATIONS='{"u":{"sink":"rtmp://127.0.0.1:1935/live/x"}}' \
 "$WORKER_BIN" --listen "127.0.0.1:$P_WORKER" --origin https://247streams.kr \
   --allow-origin "http://127.0.0.1:$P_CADDY" \
@@ -122,6 +126,13 @@ fi
 "$CADDY" run --config "$WORK/Caddyfile" --adapter caddyfile > "$WORK/caddy.log" 2>&1 & PIDS+=($!)
 B="http://127.0.0.1:$P_CADDY"
 for _ in $(seq 1 40); do curl -sf -m 2 -o /dev/null "$B/" && break; sleep 0.25; done
+# The worker is the thing most likely to have refused to start (it fail-closes
+# on each of its three secrets). Say so once, rather than failing every check
+# below with the same cause.
+if ! curl -sf -m 5 -o /dev/null -H "X-Louver-Gate: $GATE" "http://127.0.0.1:$P_WORKER/api/live-source/health"; then
+  echo "  the worker did not come up - its log:"; sed 's/^/    /' "$WORK/worker.log" | head -10
+  bad "the worker did not start"; echo; echo "1 CHECK(S) FAILED"; exit 1
+fi
 
 code() { curl -s -m 10 -o /dev/null -w '%{http_code}' "$@"; }
 body() { curl -s -m 10 "$@"; }

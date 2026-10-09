@@ -241,6 +241,7 @@ fn the_api_binary_never_prints_its_secret_or_its_destination_map() {
         ])
         .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
         .env("LOUVER_LIVE_SOURCE_GATE_SECRET", "a-gate-secret-that-must-not-leak-32!")
+        .env("LOUVER_LIVE_SOURCE_ADMIN_SECRET", "an-admin-secret-that-must-not-leak32")
         .env(
             "LOUVER_LIVE_SOURCE_DESTINATIONS",
             format!(r#"{{"user-alice":{{"test-sink":"rtmps://a.rtmps.youtube.com/live2/{STREAM_KEY}"}}}}"#),
@@ -253,6 +254,8 @@ fn the_api_binary_never_prints_its_secret_or_its_destination_map() {
     assert_clean(&both, "the api binary");
     assert!(!both.contains("a-signing-secret-that-must-not-leak-32"), "the signing secret leaked:\n{both}");
     assert!(!both.contains("a-gate-secret-that-must-not-leak-32!"), "the gate secret leaked:\n{both}");
+    assert!(!both.contains("an-admin-secret-that-must-not-leak32"), "the admin secret leaked:\n{both}");
+    assert!(both.contains("admin=on"), "the banner should say the admin API is on:\n{both}");
     // The destination *URL* is not printed, and neither is a name: the banner
     // says how many users have one and nothing else.
     assert!(!both.contains("live2/"), "{both}");
@@ -276,6 +279,7 @@ fn a_malformed_destination_map_is_not_echoed_back() {
         ])
         .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
         .env("LOUVER_LIVE_SOURCE_GATE_SECRET", "a-gate-secret-that-must-not-leak-32!")
+        .env("LOUVER_LIVE_SOURCE_ADMIN_SECRET", "an-admin-secret-that-must-not-leak32")
         .env(
             "LOUVER_LIVE_SOURCE_DESTINATIONS",
             format!(r#"{{"user-alice":{{"broken": "rtmps://x/live2/{STREAM_KEY}"#),
@@ -301,6 +305,7 @@ fn a_short_signing_secret_is_refused_at_startup() {
         ])
         .env("LOUVER_LIVE_SOURCE_SECRET", "short")
         .env("LOUVER_LIVE_SOURCE_GATE_SECRET", "a-gate-secret-that-must-not-leak-32!")
+        .env("LOUVER_LIVE_SOURCE_ADMIN_SECRET", "an-admin-secret-that-must-not-leak32")
         .env("LOUVER_LIVE_SOURCE_DESTINATIONS", r#"{"user-alice":{"a":"rtmp://127.0.0.1/live/x"}}"#)
         .output()
         .expect("api binary");
@@ -330,6 +335,7 @@ fn the_api_will_not_start_without_a_usable_gate_secret() {
         ])
         .env_remove("LOUVER_LIVE_SOURCE_GATE_SECRET")
         .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
+        .env("LOUVER_LIVE_SOURCE_ADMIN_SECRET", "an-admin-secret-that-must-not-leak32")
         .env("LOUVER_LIVE_SOURCE_DESTINATIONS", r#"{"user-alice":{"a":"rtmp://127.0.0.1/live/x"}}"#);
         if let Some(g) = gate {
             cmd.env("LOUVER_LIVE_SOURCE_GATE_SECRET", g);
@@ -364,6 +370,7 @@ fn a_flat_destination_map_is_refused_rather_than_shared_between_users() {
         ])
         .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
         .env("LOUVER_LIVE_SOURCE_GATE_SECRET", "a-gate-secret-that-must-not-leak-32!")
+        .env("LOUVER_LIVE_SOURCE_ADMIN_SECRET", "an-admin-secret-that-must-not-leak32")
         // The old flat shape, with a key that looks exactly like a real one.
         .env(
             "LOUVER_LIVE_SOURCE_DESTINATIONS",
@@ -375,4 +382,42 @@ fn a_flat_destination_map_is_refused_rather_than_shared_between_users() {
     let both = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     assert_clean(&both, "the flat-map path");
     assert!(!both.contains("live2/"), "{both}");
+}
+
+#[test]
+fn the_api_will_not_start_without_a_usable_admin_secret() {
+    // Fail-closed, for the same reason as the gate: an operator endpoint that
+    // can be run without a secret is one that eventually is. There is
+    // deliberately no flag that disables the admin API.
+    let dir = tempfile::tempdir().unwrap();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+
+    for (what, admin) in [("missing", None), ("too short", Some("short")), ("empty", Some(""))] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_live-source-api"));
+        cmd.args([
+            "--media-dir",
+            media.to_str().unwrap(),
+            "--state-dir",
+            dir.path().join("state").to_str().unwrap(),
+        ])
+        .env_remove("LOUVER_LIVE_SOURCE_ADMIN_SECRET")
+        .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
+        .env("LOUVER_LIVE_SOURCE_GATE_SECRET", "a-gate-secret-that-must-not-leak-32!")
+        .env("LOUVER_LIVE_SOURCE_DESTINATIONS", r#"{"user-alice":{"a":"rtmp://127.0.0.1/live/x"}}"#);
+        if let Some(a) = admin {
+            cmd.env("LOUVER_LIVE_SOURCE_ADMIN_SECRET", a);
+        }
+        let out = cmd.output().expect("api binary");
+        assert_ne!(out.status.code(), Some(0), "{what}: it must not start");
+        let err = String::from_utf8_lossy(&out.stderr);
+        // Names its own variable, so an operator is not left guessing which of
+        // the three secrets is being complained about.
+        assert!(err.contains("ADMIN_SECRET"), "{what}: {err}");
+        if let Some(a) = admin {
+            if !a.is_empty() {
+                assert!(!err.contains(a), "{what}: the secret itself was echoed: {err}");
+            }
+        }
+    }
 }

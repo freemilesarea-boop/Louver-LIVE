@@ -17,6 +17,7 @@ use common::*;
 use louver_core::streaming::ffmpeg::FfmpegTools;
 use louver_core::OutputProfile;
 use louver_live_source::{
+    admin::RevokedUsers,
     destinations::Destinations,
     jobs::{NewJob, Registry, Settings},
     limits::Limits,
@@ -85,6 +86,9 @@ fn registry_limits(w: &World, limits: Limits) -> Arc<Registry> {
         max_restarts: 50,
         stall_after: Duration::from_secs(60),
         grace: Duration::from_secs(60),
+        // Loaded from the same state directory each time, so a revocation
+        // would survive the simulated restart — none is set here.
+        revoked: Arc::new(RevokedUsers::load(&w.state_dir)),
     };
     Arc::new(Registry::new(settings, Arc::new(Never)))
 }

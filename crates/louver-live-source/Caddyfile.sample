@@ -49,6 +49,15 @@
 #     `header_up` is a `set`. Measured rather than assumed; see the defect
 #     note above for the version that looked more careful and did the
 #     opposite.
+#  5. **`/admin/*` is not here, and must never be added.** The worker's
+#     operator routes (revoke, restore, revoked — see REVOCATION.md §5) live
+#     under `/admin/`, which neither matcher below covers, so they fall to
+#     production's catch-all and never reach the worker from the internet.
+#     They are reachable only on the worker's own port: an operator on the
+#     VPS, over SSH, against loopback. Adding a `handle` for them would make
+#     the power to take customers off air internet-reachable behind one
+#     shared secret. The firewall is the second layer; the admin secret is
+#     the third.
 #
 # ## THE SECRET
 #

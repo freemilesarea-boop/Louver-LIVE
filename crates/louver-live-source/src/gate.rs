@@ -32,24 +32,23 @@
 //! of it.
 
 use crate::error::{LiveSourceError, Result};
-use sha2::{Digest, Sha256};
-use subtle::ConstantTimeEq;
+use crate::secret::ConstantTimeSecret;
 
 /// Shortest gate secret this will accept.
-pub const MIN_SECRET_LEN: usize = 32;
+pub use crate::secret::MIN_SECRET_LEN;
 
 /// The header Caddy adds and this worker requires.
 pub const GATE_HEADER: &str = "x-louver-gate";
 
-/// The shared secret, as a digest.
-///
-/// The bytes are hashed once at construction and the original is dropped, so
-/// what sits in this process's memory for its whole life is not the secret
-/// itself. The comparison hashes the candidate the same way, which also makes
-/// it a fixed-length compare whatever length the attacker sent.
+/// Domain separation. The admin secret uses a different one, so the gate
+/// secret presented in the admin header does not match even if an operator
+/// configures both to the same string — see [`crate::secret`].
+const LABEL: &[u8] = b"louver-live-source-gate";
+
+/// The shared secret with the proxy.
 #[derive(Clone)]
 pub struct Gate {
-    digest: [u8; 32],
+    secret: ConstantTimeSecret,
 }
 
 impl std::fmt::Debug for Gate {
@@ -61,12 +60,10 @@ impl std::fmt::Debug for Gate {
 impl Gate {
     /// Build from the configured secret, refusing one too short to matter.
     pub fn new(secret: &str) -> Result<Self> {
-        if secret.len() < MIN_SECRET_LEN {
-            return Err(LiveSourceError::invalid(format!(
-                "게이트 비밀값은 {MIN_SECRET_LEN}바이트 이상이어야 합니다."
-            )));
-        }
-        Ok(Self { digest: digest(secret.as_bytes()) })
+        let secret = ConstantTimeSecret::new(LABEL, secret).ok_or_else(|| {
+            LiveSourceError::invalid(format!("게이트 비밀값은 {MIN_SECRET_LEN}바이트 이상이어야 합니다."))
+        })?;
+        Ok(Self { secret })
     }
 
     /// Accept this request's gate header, or refuse it.
@@ -74,11 +71,7 @@ impl Gate {
     /// `None` — the header is absent — is refused here rather than by a caller,
     /// so there is no code path where forgetting to check means allowing.
     pub fn check(&self, header: Option<&str>) -> Result<()> {
-        let got = header.unwrap_or("");
-        // Constant-time over equal-length digests. Hashing first is what makes
-        // the lengths equal: comparing the raw values would leak the secret's
-        // length through timing, and `==` on `str` would leak its prefix.
-        if digest(got.as_bytes()).ct_eq(&self.digest).into() {
+        if self.secret.matches(LABEL, header) {
             return Ok(());
         }
         // No detail at all. "Missing" and "wrong" are the same answer, because
@@ -86,16 +79,6 @@ impl Gate {
         // right.
         Err(LiveSourceError::new(crate::ErrorKind::Forbidden, "이 경로로는 접근할 수 없습니다."))
     }
-}
-
-fn digest(bytes: &[u8]) -> [u8; 32] {
-    let mut h = Sha256::new();
-    // Domain separation: this digest is only ever compared with another of its
-    // own kind, and the prefix keeps it from colliding with any other use of
-    // SHA-256 in this process.
-    h.update(b"louver-live-source-gate\0");
-    h.update(bytes);
-    h.finalize().into()
 }
 
 #[cfg(test)]

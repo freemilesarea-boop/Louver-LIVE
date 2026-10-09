@@ -7,6 +7,7 @@
 //! ```text
 //! LOUVER_LIVE_SOURCE_SECRET=<32+ bytes> \
 //! LOUVER_LIVE_SOURCE_GATE_SECRET=<32+ bytes> \
+//! LOUVER_LIVE_SOURCE_ADMIN_SECRET=<32+ bytes> \
 //! LOUVER_LIVE_SOURCE_DESTINATIONS='{"<user-id>":{"test-sink":"rtmp://127.0.0.1:1935/live/test"}}' \
 //! live-source-api \
 //!   --listen 127.0.0.1:9080 \
@@ -15,10 +16,16 @@
 //!   --state-dir /var/lib/live-source
 //! ```
 //!
-//! All three secrets come from the environment, never from argv: a process
+//! All four secrets come from the environment, never from argv: a process
 //! listing is readable by every user on the machine, the destination map
-//! contains stream keys, and the gate secret is what keeps a request that did
-//! not come through Caddy from reaching a handler.
+//! contains stream keys, the gate secret is what keeps a request that did not
+//! come through Caddy from reaching a handler, and the admin secret is what
+//! keeps a stranger from taking customers off air.
+//!
+//! The three shared secrets answer three different questions and are not
+//! interchangeable — each is hashed under its own domain-separation label, so
+//! reusing one value across two variables does not make either accept the
+//! other's header. Set them to three different values anyway.
 //!
 //! Note the destination shape: it is keyed by **user id** first. A flat
 //! `{name: url}` map would be one map shared by every beta account, which is
@@ -32,6 +39,7 @@
 use louver_core::streaming::ffmpeg::FfmpegTools;
 use louver_core::OutputProfile;
 use louver_live_source::{
+    admin::{AdminSecret, AuditLog, RevokedUsers},
     api::Api,
     auth::ProductionMe,
     destinations::Destinations,
@@ -94,6 +102,17 @@ async fn main() {
     };
     drop(gate_secret);
 
+    // Fail-closed again: an operator endpoint that can run without a secret
+    // is one that eventually does.
+    let admin_secret = std::env::var("LOUVER_LIVE_SOURCE_ADMIN_SECRET").unwrap_or_else(|_| {
+        die("LOUVER_LIVE_SOURCE_ADMIN_SECRET 를 설정해 주세요 (32바이트 이상). 관리자 API를 끌 수는 없습니다.")
+    });
+    let admin = match AdminSecret::new(&admin_secret) {
+        Ok(a) => Arc::new(a),
+        Err(e) => die(&format!("LOUVER_LIVE_SOURCE_ADMIN_SECRET: {}", e.message)),
+    };
+    drop(admin_secret);
+
     let raw_destinations = std::env::var("LOUVER_LIVE_SOURCE_DESTINATIONS").unwrap_or_else(|_| {
         die("LOUVER_LIVE_SOURCE_DESTINATIONS 를 설정해 주세요 ({\"<user-id>\":{\"name\":\"rtmp://…\"}}).")
     });
@@ -125,6 +144,11 @@ async fn main() {
         die(&format!("상태 디렉터리를 만들 수 없습니다: {e}"));
     }
 
+    // The operator's decisions, read back from the state directory before any
+    // job is recovered — a revoked account must not come back on air.
+    let revoked = Arc::new(RevokedUsers::load(std::path::Path::new(&state_dir)));
+    let audit = Arc::new(AuditLog::new(std::path::Path::new(&state_dir)));
+
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let absolute_max = arg(&args, "--max-concurrent").and_then(|v| v.parse().ok()).unwrap_or(4);
     let mut limits = Limits::for_machine(cores, absolute_max);
@@ -144,6 +168,7 @@ async fn main() {
             arg(&args, "--stall-after").and_then(|v| v.parse().ok()).unwrap_or(12),
         ),
         grace: Duration::from_secs(arg(&args, "--grace").and_then(|v| v.parse().ok()).unwrap_or(20)),
+        revoked: Arc::clone(&revoked),
     };
 
     let resolver = Arc::new(YtDlpResolver::new(arg(&args, "--yt-dlp").unwrap_or_else(|| "yt-dlp".into())));
@@ -161,15 +186,27 @@ async fn main() {
     println!("[louver][live-source-api] state={state_dir} media={media_dir} origin={origin}");
     // Counts and the allowed origins, never a name and never a URL.
     println!(
-        "[louver][live-source-api] gate=on allow-origin={allow_origin} 송출 대상 사용자 {}명",
+        "[louver][live-source-api] gate=on admin=on allow-origin={allow_origin} 송출 대상 사용자 {}명",
         api_destination_users
     );
+    // Counts only. Which accounts are revoked is in the state directory and
+    // the audit log, not in a banner.
+    println!("[louver][live-source-api] 송출 정지된 계정 {}건", revoked.len());
 
     // Anything that was meant to be running when this process last died.
     let restored = jobs.recover();
     println!("[louver][live-source-api] 복원된 작업 {restored}건");
 
-    let api = Api { jobs: Arc::clone(&jobs), signer, identity, gate, origins };
+    let api = Api {
+        jobs: Arc::clone(&jobs),
+        signer,
+        identity,
+        gate,
+        origins,
+        admin,
+        revoked: Arc::clone(&revoked),
+        audit: Arc::clone(&audit),
+    };
     let app = api.router_with_beta(std::path::Path::new(&beta_dir));
     let listener = match tokio::net::TcpListener::bind(&listen).await {
         Ok(l) => l,

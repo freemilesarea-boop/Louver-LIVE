@@ -20,6 +20,7 @@ use common::*;
 use louver_core::streaming::ffmpeg::FfmpegTools;
 use louver_core::OutputProfile;
 use louver_live_source::{
+    admin::{AdminSecret, AuditLog, RevokedUsers},
     api::Api,
     auth::{Identity, IdentitySource},
     destinations::Destinations,
@@ -40,6 +41,8 @@ use std::time::Duration;
 const SECRET: &str = "a-test-secret-long-enough-to-pass-32";
 /// The shared secret between the proxy and the worker.
 const GATE: &str = "a-test-gate-secret-also-32-bytes-long";
+/// The operator's secret. A third one — `admin_api.rs` covers what it opens.
+const ADMIN: &str = "a-test-admin-secret-32-bytes-long!!!";
 /// The one origin a session may be started from in these tests.
 const ORIGIN: &str = "https://beta.test";
 /// Looks like a real stream key, so a leak is unmistakable.
@@ -98,12 +101,16 @@ fn test_destinations() -> Destinations {
 }
 
 fn api_for(jobs: &Arc<Registry>) -> Api {
+    let state_dir = jobs.settings().state_dir.clone();
     Api {
         jobs: Arc::clone(jobs),
         signer: Arc::new(Signer::new(SECRET).unwrap()),
         identity: Arc::new(Cookies),
         gate: Arc::new(Gate::new(GATE).unwrap()),
         origins: Arc::new(AllowedOrigins::parse(ORIGIN).unwrap()),
+        admin: Arc::new(AdminSecret::new(ADMIN).unwrap()),
+        revoked: Arc::clone(&jobs.settings().revoked),
+        audit: Arc::new(AuditLog::new(&state_dir)),
     }
 }
 
@@ -144,6 +151,9 @@ fn rig_limits(limits: Limits) -> Rig {
         max_restarts: 50,
         stall_after: Duration::from_secs(60),
         grace: Duration::from_secs(60),
+        // No account is revoked in these tests; `admin_api.rs` is where that
+        // is exercised.
+        revoked: Arc::new(RevokedUsers::load(&state_dir)),
     };
     let jobs = Arc::new(Registry::new(settings, Arc::new(Never)));
     let signer = Signer::new(SECRET).unwrap();
@@ -1280,6 +1290,9 @@ fn a_dead_session_stops_the_next_handshake_but_not_the_token_already_minted() {
         identity: revoked.clone(),
         gate: Arc::new(Gate::new(GATE).unwrap()),
         origins: Arc::new(AllowedOrigins::parse(ORIGIN).unwrap()),
+        admin: Arc::new(AdminSecret::new(ADMIN).unwrap()),
+        revoked: Arc::clone(&r.jobs.settings().revoked),
+        audit: Arc::new(AuditLog::new(&r.state_dir)),
     };
     let port = free_port();
     let app = api.router();

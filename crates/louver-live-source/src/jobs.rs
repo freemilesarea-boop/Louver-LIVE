@@ -39,6 +39,7 @@
 //! rather than being told the machine is full when it is their own broadcasts
 //! filling it.
 
+use crate::admin::RevokedUsers;
 use crate::args;
 use crate::destinations::Destinations;
 use crate::error::{LiveSourceError, Result};
@@ -120,6 +121,9 @@ pub struct Settings {
     pub max_restarts: u32,
     pub stall_after: Duration,
     pub grace: Duration,
+    /// Accounts an operator has revoked. Shared, persisted, and consulted on
+    /// both `create` and `recover` — see [`crate::admin`].
+    pub revoked: Arc<RevokedUsers>,
 }
 
 /// One running job, from the registry's point of view.
@@ -239,6 +243,18 @@ impl Registry {
         }
         if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
             return Err(LiveSourceError::invalid("broadcast_id 는 영숫자·하이픈·밑줄만 쓸 수 있습니다."));
+        }
+
+        // --- an operator's decision outranks a valid token -------------------
+        // Checked first, and before the reservation: the account's own bearer
+        // token stays valid for up to five minutes after it is suspended, so
+        // without this a revoked user could start a job in that window with a
+        // credential that is still cryptographically fine.
+        if self.settings.revoked.is_revoked(owner) {
+            return Err(LiveSourceError::new(
+                crate::ErrorKind::Forbidden,
+                "이 계정은 현재 송출할 수 없습니다. 운영자에게 문의해 주세요.",
+            ));
         }
 
         // --- one creation per id at a time -----------------------------------
@@ -439,6 +455,48 @@ impl Registry {
         self.get(owner, broadcast_id)
     }
 
+    /// Stop every job belonging to one account. The operator's hammer.
+    ///
+    /// Returns the broadcast ids actually stopped, so the audit line can say
+    /// which — a count alone is not auditable.
+    ///
+    /// Three properties, each of which is a test:
+    ///
+    ///  * **only that account's.** The map is filtered by `owner`, exactly as
+    ///    [`Self::running_count_for`] does, and each job's own stop flag is set
+    ///    — the same per-job path `cancel` uses, which the isolation tests
+    ///    already cover. No other user's FFmpeg is signalled.
+    ///  * **idempotent.** A second call finds nothing running and returns an
+    ///    empty list rather than failing.
+    ///  * **durable.** `desired = Stopped` is written for each, so `recover`
+    ///    will not restart them even before it consults the revocation list.
+    ///
+    /// The revocation itself is recorded by the caller ([`crate::api`]), not
+    /// here: this function stops jobs, and a stop that was not also persisted
+    /// would be undone by the account's still-valid token.
+    pub fn revoke_user(&self, owner: &str) -> Vec<String> {
+        // Collected under the lock, then released: joining a worker thread
+        // while holding the map would deadlock against the worker's own
+        // state write.
+        let ids: Vec<String> = {
+            let map = self.map();
+            map.iter().filter(|(_, r)| r.owner == owner).map(|(id, _)| id.clone()).collect()
+        };
+
+        let mut stopped = Vec::new();
+        for id in ids {
+            // `cancel` is the proven per-job path: it writes the intent, sets
+            // only this job's flag, joins, and writes the intent again to
+            // close the race with the worker's read-modify-write. Reusing it
+            // means revocation cannot drift from cancellation.
+            if self.cancel(owner, &id).is_ok() {
+                stopped.push(id);
+            }
+        }
+        stopped.sort();
+        stopped
+    }
+
     /// Restart the jobs that were meant to be running when this process died.
     ///
     /// Reads `desired` and not `phase`: after a crash the last observed phase
@@ -448,6 +506,14 @@ impl Registry {
         let mut started = 0;
         for s in crate::state::scan(&self.settings.state_dir) {
             if s.desired != Desired::Running || s.owner.is_empty() {
+                continue;
+            }
+            // A revocation outlives the process. `revoke_user` already wrote
+            // `desired = Stopped`, so this is belt and braces — but a state
+            // file that says `Running` for a revoked account (a crash between
+            // the two writes, or a file restored from a backup) must not put
+            // that account back on air.
+            if self.settings.revoked.is_revoked(&s.owner) {
                 continue;
             }
             if self.map().contains_key(&s.worker_id) {
