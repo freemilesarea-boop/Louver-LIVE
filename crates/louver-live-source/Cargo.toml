@@ -15,6 +15,17 @@ louver-cloud = { path = "../louver-cloud" }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
+# Already in this project's tree: the token signature is HMAC-SHA-256 composed
+# over `sha2` (RFC 2104, pinned against the RFC 4231 vectors), and `subtle`
+# gives the constant-time comparison a signature check needs.
+sha2.workspace = true
+subtle = "2.6"
+# The HTTP surface. axum, tokio and tower-http are the same versions
+# `apps/server` already uses, so this adds no new crate to the workspace.
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tower-http = { version = "0.6", features = ["fs"] }
+ureq = { version = "3.2.1", features = ["json"] }
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -22,3 +33,7 @@ tempfile.workspace = true
 [[bin]]
 name = "live-source-worker"
 path = "src/bin/live-source-worker.rs"
+
+[[bin]]
+name = "live-source-api"
+path = "src/bin/live-source-api.rs"

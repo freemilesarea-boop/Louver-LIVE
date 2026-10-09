@@ -157,9 +157,27 @@ impl LiveWorker {
         println!("[louver][live-source][{}] {line}", self.cfg.worker_id);
     }
 
+    /// Write the observed state, keeping what the registry owns.
+    ///
+    /// Two writers share this file and they own different fields. The registry
+    /// owns `owner` (who may read the job) and `desired` (whether it is meant to
+    /// be running); this worker owns everything it observes. A plain `save` of
+    /// the worker's own struct overwrote both — which blanked `owner`, so every
+    /// authenticated read of the job started answering "not found", and reset
+    /// `desired` to `Running`, so a cancel could be undone by the next
+    /// two-second tick. So the file is read back and those two fields are
+    /// carried over on every write.
+    fn save_observed(&mut self) {
+        if let Ok(on_disk) = self.store.load() {
+            self.state.owner = on_disk.owner;
+            self.state.desired = on_disk.desired;
+        }
+        let _ = self.store.save(&self.state);
+    }
+
     fn persist(&mut self, phase: Phase) {
         self.state.phase = phase;
-        let _ = self.store.save(&self.state);
+        self.save_observed();
     }
 
     /// Resolve the source for this attempt.
@@ -365,7 +383,7 @@ impl LiveWorker {
                 last_persist = now;
                 self.state.frames = dog.frame();
                 self.state.last_verdict = "healthy".into();
-                let _ = self.store.save(&self.state);
+                self.save_observed();
             }
         }
     }

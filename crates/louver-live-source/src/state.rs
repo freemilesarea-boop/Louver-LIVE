@@ -16,6 +16,21 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// What the operator asked for, as opposed to what is happening.
+///
+/// Split from [`Phase`] because the two answer different questions and only one
+/// of them survives a restart usefully. After the worker process dies and comes
+/// back, "it was Sending" is history; "it is meant to be running" is an
+/// instruction. Recovery reads this field and nothing else, which is what makes
+/// a crash mid-send resume instead of being forgotten.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Desired {
+    Running,
+    Stopped,
+}
+
+/// What is actually happening, as last observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
@@ -34,6 +49,13 @@ pub enum Phase {
 pub struct WorkerState {
     /// This worker's own id, chosen by the caller.
     pub worker_id: String,
+    /// Who the job belongs to. Checked on every read through the API, so one
+    /// user cannot see or cancel another's job.
+    #[serde(default)]
+    pub owner: String,
+    /// The instruction. Recovery after a restart reads this and not `phase`.
+    #[serde(default = "desired_running")]
+    pub desired: Desired,
     /// The YouTube video id, when the source is a watch URL. Not a secret.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_id: Option<String>,
@@ -57,6 +79,8 @@ impl WorkerState {
     pub fn new(worker_id: impl Into<String>) -> Self {
         Self {
             worker_id: worker_id.into(),
+            owner: String::new(),
+            desired: Desired::Running,
             video_id: None,
             phase: Phase::Resolving,
             frames: 0,
@@ -67,6 +91,10 @@ impl WorkerState {
             updated_at: now(),
         }
     }
+}
+
+fn desired_running() -> Desired {
+    Desired::Running
 }
 
 fn now() -> String {
@@ -112,6 +140,30 @@ impl StateStore {
         let body = std::fs::read(&self.path)?;
         serde_json::from_slice(&body).map_err(std::io::Error::other)
     }
+}
+
+/// Every job this worker has a state file for, for recovery and for listing.
+///
+/// A file that cannot be parsed is skipped rather than failing the whole scan:
+/// one corrupt file must not stop the other jobs from being restored.
+pub fn scan(dir: &Path) -> Vec<WorkerState> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        let is_state = p.extension().map(|x| x == "json").unwrap_or(false)
+            && p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with("worker-")).unwrap_or(false);
+        if !is_state {
+            continue;
+        }
+        if let Ok(body) = std::fs::read(&p) {
+            if let Ok(s) = serde_json::from_slice::<WorkerState>(&body) {
+                out.push(s);
+            }
+        }
+    }
+    out.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+    out
 }
 
 #[cfg(test)]
@@ -166,6 +218,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = StateStore::new(dir.path(), "w");
         let mut s = WorkerState::new("w");
+        s.owner = "user-1".into();
         s.last_error = Some("영상 소스가 멈췄습니다".into());
         s.output = Some("1920x1080".into());
         s.video_id = Some("dQw4w9WgXcQ".into());
@@ -175,6 +228,10 @@ mod tests {
         let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
         let allowed = [
             "worker_id",
+            // Checked on every API read so one user cannot see another's job;
+            // never serialised back to a client (see `jobs::JobView`).
+            "owner",
+            "desired",
             "video_id",
             "phase",
             "frames",

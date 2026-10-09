@@ -21,6 +21,15 @@ pub enum ErrorKind {
     ResolverFailed,
     /// Refused on purpose: too many workers, or a cap was hit.
     Limit,
+    /// No usable credential. The caller has to authenticate.
+    Unauthorized,
+    /// Authenticated, but this is not theirs. Reported the same way as
+    /// `NotFound` over the wire, so one user cannot probe for another's jobs.
+    Forbidden,
+    /// No such job for this caller.
+    NotFound,
+    /// The request contradicts the current state.
+    Conflict,
     /// FFmpeg could not be started, or died in a way a restart will not fix.
     Ffmpeg,
 }
@@ -34,6 +43,10 @@ impl ErrorKind {
             Self::Unavailable => "unavailable",
             Self::ResolverFailed => "resolver_failed",
             Self::Limit => "limit",
+            Self::Unauthorized => "unauthorized",
+            Self::Forbidden => "forbidden",
+            Self::NotFound => "not_found",
+            Self::Conflict => "conflict",
             Self::Ffmpeg => "ffmpeg",
         }
     }
@@ -67,6 +80,15 @@ impl LiveSourceError {
     }
     pub fn ffmpeg(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Ffmpeg, message)
+    }
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Unauthorized, message)
+    }
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::NotFound, message)
+    }
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(ErrorKind::Conflict, message)
     }
 }
 

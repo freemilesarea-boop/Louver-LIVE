@@ -213,3 +213,89 @@ fn the_only_logging_function_cannot_be_given_the_destination() {
         }
     }
 }
+
+/* ----------------------------------------- the API binary's own output */
+
+#[test]
+fn the_api_binary_never_prints_its_secret_or_its_destination_map() {
+    // Both are given to it through the environment, and both are the kind of
+    // thing a startup banner cheerfully echoes. The destination map holds
+    // stream keys; the signing secret mints tokens for every user.
+    let dir = tempfile::tempdir().unwrap();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    std::fs::write(media.join("song-a.mp4"), b"x").unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_live-source-api"))
+        .args([
+            // A port that cannot be bound, so it starts, logs, and exits —
+            // which is exactly the window a banner would leak in.
+            "--listen",
+            "127.0.0.1:1",
+            "--media-dir",
+            media.to_str().unwrap(),
+            "--state-dir",
+            dir.path().join("state").to_str().unwrap(),
+            "--origin",
+            "https://247streams.kr",
+        ])
+        .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
+        .env(
+            "LOUVER_LIVE_SOURCE_DESTINATIONS",
+            format!(r#"{{"test-sink":"rtmps://a.rtmps.youtube.com/live2/{STREAM_KEY}"}}"#),
+        )
+        .output()
+        .expect("api binary");
+
+    let both = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(both.contains("[louver][live-source-api]"), "expected its own log:\n{both}");
+    assert_clean(&both, "the api binary");
+    assert!(!both.contains("a-signing-secret-that-must-not-leak-32"), "the signing secret leaked:\n{both}");
+    // The destination *name* is fine; the URL is not.
+    assert!(!both.contains("live2/"), "{both}");
+}
+
+#[test]
+fn a_malformed_destination_map_is_not_echoed_back() {
+    // A JSON error message quotes the input, and the input is a map of stream
+    // keys. The binary must refuse without printing what it read.
+    let dir = tempfile::tempdir().unwrap();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_live-source-api"))
+        .args([
+            "--media-dir",
+            media.to_str().unwrap(),
+            "--state-dir",
+            dir.path().join("state").to_str().unwrap(),
+        ])
+        .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
+        .env("LOUVER_LIVE_SOURCE_DESTINATIONS", format!(r#"{{"broken": "rtmps://x/live2/{STREAM_KEY}"#))
+        .output()
+        .expect("api binary");
+    let both = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_clean(&both, "the malformed-map path");
+    assert!(both.contains("JSON"), "it should still say what is wrong:\n{both}");
+}
+
+#[test]
+fn a_short_signing_secret_is_refused_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_live-source-api"))
+        .args([
+            "--media-dir",
+            media.to_str().unwrap(),
+            "--state-dir",
+            dir.path().join("state").to_str().unwrap(),
+        ])
+        .env("LOUVER_LIVE_SOURCE_SECRET", "short")
+        .env("LOUVER_LIVE_SOURCE_DESTINATIONS", r#"{"a":"rtmp://127.0.0.1/live/x"}"#)
+        .output()
+        .expect("api binary");
+    assert_ne!(out.status.code(), Some(0), "it must not start with a decorative signature");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("32"), "{err}");
+    assert!(!err.contains("short"), "the secret itself must not be echoed: {err}");
+}
