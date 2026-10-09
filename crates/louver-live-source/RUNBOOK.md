@@ -26,8 +26,13 @@ stating before any command:
 | Docker socket | not shared | not mounted |
 | media volume | its own | not mounted |
 
-The only link between the two is one HTTP call: the worker asks production
-`GET /api/me` who a session cookie belongs to, once per token. Nothing else.
+In the **standalone configuration (§3.1), which is the one this test uses, there
+is no link at all**: `/api/me` is answered on the test VPS itself, so not one
+packet goes to production and not one production credential exists on the box.
+
+The production-Caddy configuration (§3.2), for later, has exactly one link: the
+worker asks production `GET /api/me` who a session cookie belongs to, once per
+token. Nothing else, in either configuration.
 
 Three source-scanned tests enforce the left column: this crate cannot name
 `pkill`, `pgrep`, `/proc/`, `libc::kill`, `sysinfo`, `from_pid`; cannot name
@@ -94,11 +99,29 @@ was verified empirically against 6.1.1 and nothing else.
 ```bash
 # NOT `apt-get install yt-dlp`: the distro version is always too old, and a
 # stale yt-dlp fails to extract as YouTube changes.
-curl -L -o /usr/local/bin/yt-dlp \
-  https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_linux
+# The asset name is architecture-specific. `yt-dlp_linux` is x86_64 ONLY.
+case "$(uname -m)" in
+  x86_64)  YTDLP_ASSET=yt-dlp_linux ;;
+  aarch64) YTDLP_ASSET=yt-dlp_linux_aarch64 ;;
+  armv7l)  YTDLP_ASSET=yt-dlp_linux_armv7l ;;
+  *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+esac
+curl -fL -o /usr/local/bin/yt-dlp \
+  "https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/$YTDLP_ASSET"
 chmod 755 /usr/local/bin/yt-dlp
 yt-dlp --version    # expect 2026.08.19
 ```
+
+Both assets exist at this tag — checked by HTTP HEAD: `yt-dlp_linux` → 200 and
+`yt-dlp_linux_aarch64` → 200. Note `-f`, so a 404 fails the command instead of
+writing an HTML error page to `/usr/local/bin/yt-dlp` and chmod-ing it 755.
+
+**The architecture decides more than this one file.** `live-source-api` is a
+compiled binary: one built on an x86_64 host does not run on an ARM VPS. Several
+of the cheap plans with the large traffic allowances §1 requires are ARM
+(Ampere, Graviton, Hetzner CAX). Decide the architecture **before** building, and
+if it is ARM, the FFmpeg measurements in §1 do not transfer — they were taken on
+x86_64 and the per-core encode cost will differ.
 
 `2026.08.19` is the version the resolver was developed and tested against.
 **Pin it.** Update it as a deliberate step with a re-run of the resolver tests
@@ -114,6 +137,7 @@ output template; `resolver.rs` asserts that in a test.
 useradd --system --create-home --home-dir /srv/live-source --shell /usr/sbin/nologin louver
 install -d -o louver -g louver -m 750 /srv/live-source/media
 install -d -o louver -g louver -m 750 /var/lib/live-source
+install -d -o louver -g louver -m 750 /var/lib/live-source/cache
 ```
 
 The worker runs as `louver`, not root. It spawns FFmpeg, writes media and
@@ -138,17 +162,36 @@ install -o louver -g louver -m 640 beta/index.html beta/app.js beta/app.css /srv
 printf 'LOUVER_LIVE_SOURCE_SECRET=%s\n'       "$(openssl rand -hex 32)" >  /etc/louver-live-source.env
 printf 'LOUVER_LIVE_SOURCE_GATE_SECRET=%s\n'  "$(openssl rand -hex 32)" >> /etc/louver-live-source.env
 printf 'LOUVER_LIVE_SOURCE_ADMIN_SECRET=%s\n' "$(openssl rand -hex 32)" >> /etc/louver-live-source.env
+
+# A FOURTH mandatory value. The worker EXITS at startup without it. It is not a
+# secret-length check: it is `die("LOUVER_LIVE_SOURCE_DESTINATIONS 를 설정해 주세요")`.
+# The placeholder below is replaced in §4.2 once the tester's user id is known.
+printf 'LOUVER_LIVE_SOURCE_DESTINATIONS=%s\n' \
+  '{"PLACEHOLDER-USER-ID":{"beta-test":"rtmp://127.0.0.1:1935/live/test"}}' \
+  >> /etc/louver-live-source.env
+
 chown root:louver /etc/louver-live-source.env
 chmod 640 /etc/louver-live-source.env
 ```
+
+**Ordering, found by reading the binary rather than by running it:**
+`LOUVER_LIVE_SOURCE_DESTINATIONS` is **required**, and it is keyed by user id —
+so the worker cannot start until a user id exists to key it by. The id comes from
+whatever `/api/me` the worker is pointed at (§3). Without the placeholder above,
+`systemctl enable --now live-source` in §2.7 exits immediately and the banner
+never appears. With the placeholder it starts, and the only thing that does not
+work is starting a broadcast, until §4.2 substitutes the real id and restarts the
+service.
 
 They answer three different questions — which user is this (signing), did this
 come through Caddy (gate), is this the operator (admin) — and each is hashed
 under its own domain-separation label, so **reusing one value across two
 variables does not make either accept the other's header.** Use three anyway.
 
-The binary refuses to start if any is missing or under 32 bytes. There is no
-flag that disables the gate or the admin API.
+The binary refuses to start if any of the three is missing or under 32 bytes, and
+refuses to start without a destination map. There is no flag that disables the
+gate or the admin API, and no flag that supplies any of these on argv — a process
+listing is world-readable and the map contains stream keys.
 
 **The gate secret must also be given to Caddy** (§3). Nothing else leaves this
 file.
@@ -167,10 +210,13 @@ Type=simple
 User=louver
 Group=louver
 EnvironmentFile=/etc/louver-live-source.env
+# yt-dlp writes a cache under $HOME, and ProtectSystem=strict makes
+# /srv/live-source read-only. Point it at the one directory that is writable.
+Environment=XDG_CACHE_HOME=/var/lib/live-source/cache
 ExecStart=/usr/local/bin/live-source-api \
-  --listen 10.0.0.2:9080 \
-  --origin https://247streams.kr \
-  --allow-origin https://247streams.kr \
+  --listen 127.0.0.1:9080 \
+  --origin https://<TEST_HOST> \
+  --allow-origin https://<TEST_HOST> \
   --beta-dir /srv/live-source/beta \
   --media-dir /srv/live-source/media \
   --state-dir /var/lib/live-source \
@@ -197,18 +243,28 @@ systemctl status live-source --no-pager | head -5
 journalctl -u live-source -n 20 --no-pager
 ```
 
-**`--listen 10.0.0.2:9080` — the private address, never `0.0.0.0`.** Substitute
-the VPS's actual private/Caddy-facing IP. Binding to all interfaces would make
-the firewall the only layer instead of the second.
+**`--listen 127.0.0.1:9080` — loopback, never `0.0.0.0`.** In the standalone
+configuration (§3.1) Caddy runs on the same box, so loopback is the whole of the
+worker's exposure and the firewall never has to be the layer that saves it.
+`<TEST_HOST>` is the test VPS's own hostname — never `247streams.kr`; §3.1 says
+why that substitution is not optional.
+
+For the later production-Caddy configuration (§3.2) this becomes the VPS's
+**private** address, e.g. `--listen 10.0.0.2:9080`, because Caddy is then on a
+different host. Do not use a private address on a provider where the box has no
+private network: `10.0.0.2` pasted literally fails to bind with
+`EADDRNOTAVAIL` and `Restart=always` turns that into a restart loop every 5 s.
+Check with `ip -brief addr` first, and bind an address that command actually
+prints.
 
 Expect in the log:
 
 ```
 [louver][live-source-api] cores=4 max_concurrent=2 max_per_user=1 예상 비용=3.0 core / 800 MB
-[louver][live-source-api] gate=on admin=on allow-origin=https://247streams.kr 송출 대상 사용자 N명
+[louver][live-source-api] gate=on admin=on allow-origin=https://<TEST_HOST> 송출 대상 사용자 N명
 [louver][live-source-api] 송출 정지된 계정 0건
 [louver][live-source-api] 복원된 작업 0건
-[louver][live-source-api] listening on http://10.0.0.2:9080  (beta UI: /beta/)
+[louver][live-source-api] listening on http://127.0.0.1:9080  (beta UI: /beta/)
 ```
 
 No secret, no destination name and no URL appears in that banner — eight tests
@@ -225,38 +281,221 @@ systemctl restart systemd-journald
 
 ### 2.9 Firewall — default deny
 
+**Read the SSH warning below before running any of this.**
+
 ```bash
+# 1. Know your own address FIRST, from the machine you will SSH from.
+#    Run this on your laptop, not on the VPS:
+#      curl -s https://api.ipify.org; echo
+OPERATOR_IP=<the address that command printed>
+
+# 2. Rules BEFORE enabling. ufw applies them in order and `enable` is the
+#    commit, so an SSH rule added after `enable` is added too late.
 ufw default deny incoming
-ufw default allow outgoing          # YouTube ingest out, the live source in
-ufw allow from <OPERATOR_IP>/32 to any port 22   proto tcp   # SSH, key only
-ufw allow from <PRODUCTION_IP>/32 to any port 9080 proto tcp # Caddy → worker
+ufw default allow outgoing              # YouTube ingest out, the live source in
+ufw allow from "$OPERATOR_IP"/32 to any port 22 proto tcp   # SSH, key only
+ufw allow 443/tcp                       # Caddy, standalone configuration (§3.1)
+
+# 3. The worker's port gets NO rule at all in the standalone configuration:
+#    it is on loopback, so nothing off-box can reach it regardless of ufw.
+
 ufw --force enable
-ufw status numbered
+ufw status numbered                     # read this before you log out
 ```
 
 Then harden SSH: `PasswordAuthentication no`, `PermitRootLogin no`.
 
-Three layers in front of the worker's port, and this is the second:
+**Keeping SSH while the firewall goes up.** `ufw --force enable` does not drop
+the connection you are typing on — ufw admits `ESTABLISHED,RELATED` — but the
+*next* connection is governed by the rules above, so a mistake is only visible
+once you have logged out. Three precautions, in order of how much grief they
+save:
 
-1. it listens on the private address only;
-2. the firewall admits only production's IP;
-3. the gate secret — measured: a request reaching the port directly without
-   the header answers **403**.
+1. **Do not log out until a second session proves it works.** Open a new
+   terminal and SSH in again *while the first one is still connected*. If it
+   hangs, fix it from the session you still have.
+2. **A dynamic address will lock you out later.** Most domestic ISPs rotate.
+   If `$OPERATOR_IP` is not static, either use the provider's web console/VNC as
+   the recovery path (confirm it works *before* enabling ufw), or widen the rule
+   to `ufw limit 22/tcp` and rely on key-only auth instead of the address.
+3. **IPv6.** `/etc/default/ufw` ships `IPV6=yes`, so the v6 default is deny too,
+   and `allow from <v4>/32` grants nothing over v6. If you SSH to the box's AAAA
+   record you are locked out by a rule that looks correct. Either connect over
+   v4 explicitly (`ssh -4`) or add the v6 counterpart:
+   `ufw allow from <OPERATOR_V6>/128 to any port 22 proto tcp`.
 
-**`/admin/*` is deliberately not reachable through any of this.** Caddy's
-matchers cover only `/api/live-source/*` and `/beta/*`, so the operator routes
-fall to production's catch-all and never arrive from the internet. They are
-reachable only from the VPS itself:
+Verify from off-box, after enabling, that the worker's port is not reachable:
 
 ```bash
-# On the VPS, over SSH. Note the loopback address: this is why --listen must
-# also accept local connections, or use the private IP here.
-curl -s -H "X-Louver-Admin: $ADMIN" http://10.0.0.2:9080/admin/revoked
+# From the operator's machine. Both must fail in the standalone configuration.
+curl -m 5 -sS -o /dev/null -w '%{http_code}\n' http://<TEST_HOST>:9080/health
+nc -z -w 5 <TEST_HOST> 9080 && echo "REACHABLE — STOP" || echo "closed, as intended"
 ```
+
+Three layers in front of the worker's port. Only the third is the same in both
+configurations of §3:
+
+| | standalone (§3.1) | production Caddy (§3.2) |
+|---|---|---|
+| 1 | bound to loopback, so there is no off-box path to the port at all | bound to the private address only |
+| 2 | ufw admits 22 and 443 from the operator's address only | ufw admits production's IP to 9080 |
+| 3 | the gate secret — measured: a request reaching the port directly without the header answers **403** | identical |
+
+**`/admin/*` is deliberately not reachable through any of this**, in either
+configuration. The Caddy matchers cover only `/api/live-source/*` and `/beta/*`,
+so an `/admin/…` request from the internet is answered by Caddy's own catch-all
+and never proxied. The operator routes are reachable only from the VPS itself:
+
+```bash
+# On the VPS, over SSH. This address must match --listen exactly: in the
+# standalone configuration that is 127.0.0.1, and in the production-Caddy
+# configuration it is the private address the worker bound.
+curl -s -H "X-Louver-Admin: $ADMIN" http://127.0.0.1:9080/admin/revoked
+```
+
+**In the standalone configuration `/admin/*` is kept off the internet by two
+independent things, and only one of them is the admin secret:** the worker is on
+loopback, and §3.1's Caddy routes only `/beta/*` and `/api/live-source/*`, so an
+`/admin/…` request from outside is answered by Caddy — not proxied. Verify both,
+per §8's authorization-boundary check. If you ever bind the worker to a public
+address "just to test from your laptop", the admin secret becomes the *only*
+thing between the internet and taking a broadcast off air.
 
 ---
 
-## 3. Caddy — production side, by a human, not by this runbook
+## 3. Serving the beta
+
+Two configurations. **§3.1 is the one to use for this test**: it runs entirely on
+the test VPS and does not involve production's Caddy at all. §3.2 is the later
+path, for the day the beta is actually offered to a customer, and it is a human's
+action on the production host.
+
+### 3.1 Standalone — the test VPS's own Caddy (use this one)
+
+Nothing here touches production: not its Caddyfile, not its container, not its
+network. The cost is one real limitation, stated at the end of this section.
+
+**Why a reverse proxy is still needed even standalone.** `/beta/*` is served by
+the worker from inside the gated router (`api.rs:658` nests it *before* the gate
+layer is applied), so every request to it must carry `X-Louver-Gate`. A browser
+cannot add that header. Something in front has to inject it — in production that
+is production's Caddy, and here it is the test VPS's own.
+
+**Why the production session cookie cannot be reused.** Verified in the source
+rather than assumed:
+
+- `/session` is the only route that reads a cookie, and it requires the gate
+  header, an **exact** `Origin` match, and a `Cookie`, then calls
+  `{--origin}/api/me` with it (`api.rs:202`, `auth.rs:132`).
+- `app.js` sends the handshake with `credentials: "same-origin"`, so the browser
+  attaches cookies belonging to **the page's own origin** — the test host's.
+- production issues its cookie with `Path=/; HttpOnly; SameSite=Strict` and
+  **no `Domain=`** (`apps/server/src/auth.rs:149`), making it host-only to
+  `247streams.kr`. A browser will not send it to any other host, not even a
+  `247streams.kr` subdomain.
+
+That last fact is good news twice: the test VPS **cannot** receive a production
+credential by accident, and a test subdomain is therefore not a leak risk. It
+also means the standalone beta needs an identity of its own.
+
+**The configuration.** `--origin` must be an `https://` host-only origin
+(`ProductionMe::new` refuses `http://`, a path, a port-less bare host, or
+credentials) and its TLS certificate must be one the system trusts, because
+`ureq` verifies against the system roots. So: a real DNS name for the test VPS
+and a real certificate.
+
+```caddy
+# /etc/caddy/Caddyfile on the TEST VPS. This is not production's file.
+<TEST_HOST> {
+	encode zstd gzip
+
+	# TEST-ONLY IDENTITY. It vouches for a fixed id and checks nothing, so
+	# whoever can reach this host IS the test user. Read the warning below
+	# before opening port 443 to anything.
+	handle /api/me {
+		header Content-Type application/json
+		respond `{"id":"beta-tester","plan_id":"basic"}` 200
+	}
+
+	handle /api/live-source/* {
+		reverse_proxy 127.0.0.1:9080 {
+			header_up X-Louver-Gate {env.LOUVER_GATE_SECRET}
+		}
+	}
+
+	handle /beta/* {
+		# The handshake sends credentials: "same-origin", so the browser needs
+		# a cookie for THIS host. Any value will do — /api/me ignores it.
+		header +Set-Cookie "louver_session=beta-tester; Path=/; Secure; HttpOnly; SameSite=Strict"
+		reverse_proxy 127.0.0.1:9080 {
+			header_up X-Louver-Gate {env.LOUVER_GATE_SECRET}
+		}
+	}
+
+	# /admin/* is deliberately absent, so an /admin request from outside gets
+	# this 404 from Caddy and never reaches the worker.
+	handle {
+		respond 404
+	}
+}
+```
+
+Never write `header_up -X-Louver-Gate` before the `header_up X-Louver-Gate`
+line. Both land in one `HeaderOps` and Caddy applies `delete` after `set`, so
+the header arrives **absent** and every request is 403. `caddy validate` passes
+on the broken version — this was found by running it, not by reading it.
+
+```bash
+export LOUVER_GATE_SECRET=<same value as LOUVER_LIVE_SOURCE_GATE_SECRET>
+caddy validate --config /etc/caddy/Caddyfile
+systemctl restart caddy
+
+# Point the host at itself, so the worker's own /api/me call goes over loopback
+# instead of out and back through the provider's NAT.
+echo "127.0.0.1 <TEST_HOST>" >> /etc/hosts
+
+# Then set --origin and --allow-origin to https://<TEST_HOST> in §2.7 and:
+systemctl restart live-source
+```
+
+Substitute `https://<TEST_HOST>` for `https://247streams.kr` everywhere in
+§§4–9 — in the media upload (§4.3), the handshake (§6.1) and the soak sampler
+(§9.2).
+
+**Two warnings, both load-bearing.**
+
+1. **Port 443 must not stay open to the internet.** With the stub identity,
+   anyone who reaches this host is `beta-tester` and can start a broadcast to
+   the tester's own stream key on the tester's own CPU. Let's Encrypt needs
+   inbound 443 for the TLS-ALPN-01 challenge, so: open it, let Caddy issue the
+   certificate, then narrow it.
+
+   ```bash
+   ufw allow 443/tcp                                  # for issuance only
+   journalctl -u caddy -n 20 --no-pager | grep -i "certificate obtained"
+   ufw delete allow 443/tcp
+   ufw allow from "$OPERATOR_IP"/32 to any port 443 proto tcp
+   ```
+
+   A test box lives for days and Caddy renews about 30 days before expiry, so no
+   renewal falls inside the test window. If one would, re-open 443 for it
+   deliberately.
+
+2. **Use a hostname that is not a production hostname.** A `247streams.kr`
+   subdomain is safe as far as the cookie goes (host-only, proven above), but it
+   puts a box with a stub identity under the service's own name. Prefer a
+   separate domain the tester owns.
+
+**What §3.1 does not test.** Composition, recovery, the admin API, the
+concurrency ceilings, the media rules and the 24-hour soak are all exercised
+exactly as in production — the worker's code path is identical. What is **not**
+exercised is the real handshake: a production cookie, production's `/api/me`
+answering for a real user id, and production's Caddy injecting the gate header
+and stripping the cookie elsewhere. Those three stay unverified until §3.2 is
+done, and the test report must say so rather than implying the beta is proven
+end to end.
+
+### 3.2 Production Caddy — a human's action, later, not for this test
 
 **This runbook does not change production.** `Caddyfile.sample` holds the two
 blocks to copy into production's `./Caddyfile`, and they have been validated
@@ -325,10 +564,62 @@ Note the watch URL: `https://www.youtube.com/watch?v=<VIDEO_ID>`.
 nothing leaves the machine:
 
 ```bash
-# A sink that accepts and discards, so composition can be checked by recording.
+# For the composition check (§6) ONLY: a sink that accepts one connection and
+# records a short clip. `-t 60` and mpegts are both deliberate — see below.
 ffmpeg -hide_banner -listen 1 -i "rtmp://127.0.0.1:1935/live/test" \
-       -c copy -f mp4 -y /tmp/received.mp4
+       -c copy -t 60 -f mpegts -y /tmp/received.ts
 ```
+
+**Three limits of that one-liner, each of which breaks a later test if ignored:**
+
+1. **`-listen 1` accepts exactly one connection and then exits.** Test 3 (§7)
+   makes the worker reconnect after a stall; it will find nothing listening and
+   fail for the wrong reason. Test 5 (§9) needs two broadcasts, and one listener
+   cannot take two. For those, run a sink that stays up — a loop is enough:
+   `while true; do ffmpeg -hide_banner -listen 1 -i "rtmp://127.0.0.1:1935/live/test" -f null - ; sleep 1; done`
+   — or give each broadcast its own port (`:1935` and `:1936`) with its own
+   listener, which is what two destinations in the map require anyway.
+2. **Never record the soak.** Two broadcasts at ~6.4 Mbit/s each write about
+   **138 GB in 24 hours**. That fills the 80 GB disk of §1 in roughly 7 hours and
+   the first thing to fail will be the worker's own state write, not the
+   recording. For the soak the sink must discard: `-f null -`.
+3. **`-f mp4` to a file you will interrupt gives you an unplayable file**, because
+   the moov atom is written at the end. `mpegts` is readable even if truncated,
+   which is what a verification clip needs.
+
+### 4.2a Test destination vs. real YouTube — keep them apart on purpose
+
+The two options above are not interchangeable, and the difference matters more
+than it looks:
+
+| | **(a) local sink** | **(b) tester's own second channel** |
+|---|---|---|
+| URL shape | `rtmp://127.0.0.1:1935/live/test` | `rtmp://a.rtmp.youtube.com/live2/<KEY>` |
+| leaves the box | no | yes — real egress, real ingest |
+| proves | composition, recovery, admin stop, concurrency | that the real ingest path works |
+| traffic cost | none | ~138 GB per 24 h for two (§1) |
+| risk if confused | none | a stream key in a file, and real public video |
+
+Rules that keep them distinguishable:
+
+- **Use (a) for every test up to and including §8.** Composition, recovery and
+  the forced-stop tests need nothing from YouTube's ingest, and a local sink
+  cannot accidentally publish anything.
+- **Use (b) only for the soak**, and only for the tester's own second channel.
+  Never a customer's key, never production's, never the key from §4.1 that the
+  *source* is publishing to — pointing the output at the input's own ingest makes
+  a loop whose symptoms look like a product bug.
+- **Name them for what they are.** `beta-test-local` and `beta-test-youtube`,
+  not `beta-test`. The destination name is what the tester picks in the UI, and
+  a wrong pick at hour 0 of a 24-hour run is discovered at hour 24.
+- **Check before starting, not after.** `/session` returns the destination names
+  for the signed-in user; the names tell you which map is loaded. To confirm the
+  URL behind a name without printing it, start a broadcast and look at where the
+  bytes went: `pgrep -x ffmpeg | wc -l` plus the receiving end. Never echo
+  `LOUVER_LIVE_SOURCE_DESTINATIONS`, and never paste it into a terminal that
+  scrolls back into a report.
+- Set the YouTube key only when you reach §9, and remove it from
+  `/etc/louver-live-source.env` when the soak ends.
 
 **(b) A second YouTube channel the tester owns** — needed to prove the real
 ingest path works.
@@ -560,12 +851,12 @@ and measuring it is the point.
 ADMIN=$(grep ADMIN_SECRET /etc/louver-live-source.env | cut -d= -f2)
 
 # 1. Nobody revoked yet.
-curl -s -H "X-Louver-Admin: $ADMIN" http://10.0.0.2:9080/admin/revoked
+curl -s -H "X-Louver-Admin: $ADMIN" http://127.0.0.1:9080/admin/revoked
 #    {"users":[]}
 
 # 2. Revoke the tester.
 curl -s -X POST -H "X-Louver-Admin: $ADMIN" -H 'Content-Type: application/json' \
-  -d '{"user_id":"<TESTER_USER_ID>"}' http://10.0.0.2:9080/admin/revoke
+  -d '{"user_id":"<TESTER_USER_ID>"}' http://127.0.0.1:9080/admin/revoke
 #    {"changed":true,"stopped":1,"jobs":["beta-1"]}
 
 # 3. The broadcast is off air. Check the destination, not just the API.
@@ -581,12 +872,12 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
 systemctl restart live-source
 journalctl -u live-source -n 10 --no-pager | grep -E "정지된|복원"
 #    expect "송출 정지된 계정 1건" and "복원된 작업 0건"
-curl -s -H "X-Louver-Admin: $ADMIN" http://10.0.0.2:9080/admin/revoked
+curl -s -H "X-Louver-Admin: $ADMIN" http://127.0.0.1:9080/admin/revoked
 #    {"users":["<TESTER_USER_ID>"]}
 
 # 6. Idempotency: revoking again is safe.
 curl -s -X POST -H "X-Louver-Admin: $ADMIN" -H 'Content-Type: application/json' \
-  -d '{"user_id":"<TESTER_USER_ID>"}' http://10.0.0.2:9080/admin/revoke
+  -d '{"user_id":"<TESTER_USER_ID>"}' http://127.0.0.1:9080/admin/revoke
 #    {"changed":false,"stopped":0,"jobs":[]}
 
 # 7. The audit trail.
@@ -595,7 +886,7 @@ cat /var/lib/live-source/admin-audit.jsonl
 
 # 8. Lift it, and confirm broadcasting works again.
 curl -s -X POST -H "X-Louver-Admin: $ADMIN" -H 'Content-Type: application/json' \
-  -d '{"user_id":"<TESTER_USER_ID>"}' http://10.0.0.2:9080/admin/restore
+  -d '{"user_id":"<TESTER_USER_ID>"}' http://127.0.0.1:9080/admin/restore
 ```
 
 **Also verify the authorization boundary** — each of these must answer 403:
@@ -604,7 +895,7 @@ curl -s -X POST -H "X-Louver-Admin: $ADMIN" -H 'Content-Type: application/json' 
 for cred in "" "$GATE" "$SIGN" "$TOKEN" "wrong"; do
   printf '%-10s -> ' "${cred:0:8}"
   curl -s -o /dev/null -w '%{http_code}\n' \
-    ${cred:+-H "X-Louver-Admin: $cred"} http://10.0.0.2:9080/admin/revoked
+    ${cred:+-H "X-Louver-Admin: $cred"} http://127.0.0.1:9080/admin/revoked
 done
 ```
 
@@ -614,8 +905,14 @@ domain-separation label. And confirm the admin route is **not** reachable
 through Caddy:
 
 ```bash
-# From anywhere on the internet. Must NOT be the worker's answer.
-curl -s -o /dev/null -w '%{http_code}\n' https://247streams.kr/admin/revoked
+# From anywhere on the internet. Must NOT be the worker's answer: expect this
+# host's own 404, never 200 and never the worker's 403.
+curl -s -o /dev/null -w '%{http_code}\n' https://<TEST_HOST>/admin/revoked
+# And on the production-Caddy path, when that configuration is eventually used:
+#   curl -s -o /dev/null -w '%{http_code}\n' https://247streams.kr/admin/revoked
+
+# A 403 here would be its own finding: it would mean the request REACHED the
+# worker and was refused by the admin secret, i.e. only one layer was left.
 ```
 
 **With two users**, confirm revoking one leaves the other's broadcast running
@@ -641,12 +938,16 @@ pgrep -x ffmpeg | wc -l
 cat /proc/net/dev | grep -E "eth0|ens" 
 ```
 
-**And on production, to prove the test cannot have touched it** — read-only,
-by a human:
+**On production: nothing.** In the standalone configuration there is no link to
+production at all (§0), so there is no "before" reading to take and no reason to
+log in. The isolation is established by the configuration, not by observing
+production — and logging in to check would itself be the access this test is
+supposed to avoid.
 
-```
-pgrep -x ffmpeg | wc -l     # record; must be unchanged at the end
-```
+If a reading is ever wanted for a report, it is a human's own decision on a
+session they already have, read-only and count-only
+(`pgrep -x ffmpeg | wc -l`, never `pgrep -af`, which prints argv and therefore
+stream keys). It is not a step of this runbook.
 
 ### 9.2 Start two broadcasts, then sample hourly
 
@@ -715,11 +1016,14 @@ journal that was not expected.
 
 Tick every row before a customer sees `/beta/`.
 
+Rows 1–3 and 20 read differently in the two configurations of §3; the
+**standalone** reading is given, with the production one after the slash.
+
 | | requirement | how it is met | verified |
 |---|---|---|---|
-| 1 | worker not on a public address | `--listen` private IP | runbook §2.7 |
-| 2 | inbound default-deny | ufw, two rules | §2.9 — **needs the VPS** |
-| 3 | worker port reachable only from Caddy | ufw from production IP | §2.9 — **needs the VPS** |
+| 1 | worker not on a public address | `--listen 127.0.0.1` / private IP | runbook §2.7 |
+| 2 | inbound default-deny | ufw; 22 and 443 to the operator's address only | §2.9 — **needs the VPS** |
+| 3 | worker port unreachable from off-box | loopback bind, so no rule needed / ufw from production IP | §2.9 — **needs the VPS** |
 | 4 | direct port access without the gate refused | 403 | measured locally |
 | 5 | admin API not on a public path | `/admin/*` outside Caddy's matchers | tested; §8 re-checks live |
 | 6 | admin secret ≠ gate secret, enforced | per-secret domain labels | tested |
@@ -737,8 +1041,13 @@ Tick every row before a customer sees `/beta/`.
 | 18 | FFmpeg owned by handle, never by pid | source-scanned for `pkill`/`pgrep`/`/proc/` | tested |
 | 19 | **suspension stops a running beta job automatically** | **NOT MET** — manual §8, or a production change that interrupts customers | REVOCATION.md §6 |
 
-**Row 19 is the open blocker.** Rows 2 and 3 need the VPS. Everything else is
-measured.
+| 20 | the beta identifies a real user | **standalone: NOT MET BY DESIGN** — §3.1's `/api/me` is a stub that vouches for a fixed id and checks nothing, so the firewall is the authentication. Production (§3.2): a real cookie production vouches for | §3.1 |
+
+**Row 19 is the open blocker** for offering the beta to a customer. **Row 20 is
+the price of standalone testing** and is acceptable only because the box holds
+no customer data, carries only the tester's own stream key, and admits only the
+operator's address — it must never be how a customer reaches `/beta/`. Rows 2
+and 3 need the VPS. Everything else is measured.
 
 ---
 
@@ -778,16 +1087,133 @@ Two independent reasons not to budget from them:
 A test does not need a year's commitment: an hourly instance for the soak, then
 destroy, is the cheapest way to answer the open questions.
 
+### 11.1 Traffic overrun — the risk that is not in the table
+
+The ~138 GB per 24 h of §1 is the **steady-state** figure for two healthy
+broadcasts to a remote destination. Three things multiply it, and all three are
+states this test deliberately provokes:
+
+| cause | effect on traffic | guard |
+|---|---|---|
+| the soak runs past 24 h (the pass condition is that it is *still running*) | +~5.8 GB per hour per broadcast | decide the stop time in advance; it is the operator who ends it, by design |
+| watchdog restart loop on a bad source | each restart re-resolves and re-pulls the source; a 4K rendition is the worst case | `restarts` is sampled hourly in §9.2 — a climbing count is a stop condition, not a curiosity |
+| local sink mistaken for a remote one, or the reverse | 0 vs. full rate | §4.2a |
+
+Ingress (pulling the live source) is metered by some providers and not others.
+Assume it counts until the provider's own console says otherwise: that doubles
+the figure to **~276 GB per 24 h**, still inside 5 TB but not inside 1 TB.
+
+Set a hard stop that does not depend on anyone watching:
+
+```bash
+# Provider-side billing alert first — it is the only one that works when the
+# box is wedged. Then a local tripwire, sampled with the §9.2 cron:
+TX_GB=$(awk '/eth0|ens/ {print $10/1024/1024/1024}' /proc/net/dev)
+# If TX_GB exceeds the budget, stop the broadcasts (admin §8) rather than the box:
+# a destroyed VPS loses the evidence the soak exists to collect.
+```
+
 ---
 
 ## 12. What this runbook does not cover
 
 - **Buying anything.** No VPS has been purchased or created.
-- **Touching production.** The Caddy step (§3) is for a human on the production
-  host, and this document cannot perform it.
+- **Touching production.** The standalone configuration (§3.1) never contacts
+  it. The production-Caddy step (§3.2) is for a human on the production host,
+  later, and this document cannot perform it.
+- **Proving the real handshake.** §3.1 substitutes a stub `/api/me`, so a real
+  cookie, a real user id and production's own gate injection stay untested until
+  §3.2 is done — §3.1 says this in full, and the test report must repeat it.
 - **Automatic suspension revocation** — REVOCATION.md §6; needs a production
   change whose deploy recreates the `louver` container.
 - **A user-set stop time** — REVOCATION.md §9 option B, additive, not needed
   for this test, and it must default to "no end".
 - **Scaling past two broadcasts.** The arithmetic extends linearly (1.5 cores,
   400 MB each) but nothing above four has been measured.
+
+---
+
+## 13. Static review of this runbook — what was wrong, and what is still unproven
+
+Every command above was reviewed against the crate's own source on
+`claude/live-source-hardening`. **Nothing was executed on a VPS, because no VPS
+exists.** The review found six defects that would have stopped a tester, and
+they are fixed in the text above. They are listed here because a runbook that
+silently changed is a runbook nobody can trust.
+
+| | defect | consequence had it not been found | evidence |
+|---|---|---|---|
+| 1 | `LOUVER_LIVE_SOURCE_DESTINATIONS` was not written until §4.2, but the binary **requires** it | §2.7's `systemctl enable --now` exits immediately; the expected banner never appears and the tester debugs systemd instead of reading one error | `bin/live-source-api.rs:116` — `die("…DESTINATIONS 를 설정해 주세요")` |
+| 2 | `yt-dlp_linux` is x86_64-only, with no architecture check | silent on x86_64; on an ARM box the binary will not execute, and ARM is common among the high-traffic plans §1 needs | separate `yt-dlp_linux_aarch64` asset exists at the same tag (both HEAD → 200) |
+| 3 | `--listen 10.0.0.2:9080` as the primary example | pasted literally on a provider with no private network it fails to bind `EADDRNOTAVAIL`, and `Restart=always` makes that a 5-second loop | `ip -brief addr` is now the check; standalone binds loopback |
+| 4 | the admin example called `10.0.0.2` a "loopback address" | the operator curls an address the worker is not bound to and concludes the admin API is broken | plain contradiction in the text |
+| 5 | `ProtectSystem=strict` leaves `$HOME` (`/srv/live-source`) read-only, where yt-dlp wants its cache | a warning per resolve, suppressed by `--no-warnings`, so it degrades invisibly rather than failing loudly | `resolver.rs:192` passes no `--no-cache-dir`; `XDG_CACHE_HOME` now points into a `ReadWritePaths` directory |
+| 6 | the RTMP sink was `-listen 1` into an mp4 file, used for every test | one connection only (so §7's reconnect finds nothing), one stream only (so §9's two broadcasts cannot both land), ~138 GB into an 80 GB disk, and an unplayable file if interrupted | §4.2 |
+
+**Checked and found correct, no change needed:**
+
+- the `ufw` ordering — every `allow` precedes `--force enable`, which is the
+  order that does not lock you out;
+- the yt-dlp version pin `2026.08.19` matches the version the resolver was
+  developed against, and the release URL resolves (HTTP 200);
+- `EnvironmentFile` at `0640 root:louver` is readable by `User=louver`;
+- `ReadWritePaths` covers both directories the worker writes;
+- Ubuntu 24.04's FFmpeg is 6.1.1, the version every measurement used;
+- no secret is ever passed on argv, so `ps` cannot leak one;
+- the production session cookie is host-only, so it cannot reach a test host
+  even by subdomain.
+
+**Still unproven, and only a real VPS can prove it:**
+
+| | what | why it cannot be checked here |
+|---|---|---|
+| 1 | that yt-dlp resolves a real YouTube Live URL | this environment has no YouTube egress (`youtube.com` → `000`) |
+| 2 | that the composition is right at a real receiving end | needs §5 to succeed first |
+| 3 | FFmpeg's sustained cost over 24 h on the chosen instance | measured here for minutes, on different hardware |
+| 4 | that Caddy issues a certificate for `<TEST_HOST>` | needs DNS and inbound 443 |
+| 5 | the provider's real price and included traffic | vendor pricing pages are 403 through this proxy (§11) |
+| 6 | that ufw keeps SSH alive on the provider's network | §2.9's precautions are the mitigation, not a proof |
+
+---
+
+## 14. Teardown — stopping the work and stopping the bill
+
+Run this in order. **Powering a VPS off does not stop billing at most
+providers**; only destroying the instance does, and a detached volume, snapshot
+or reserved IP keeps charging after the instance is gone.
+
+```bash
+# 1. End the broadcasts deliberately, so the logs show an operator stop rather
+#    than a machine that vanished mid-stream.
+curl -s -X POST -H "X-Louver-Admin: $ADMIN" \
+  -H 'Content-Type: application/json' \
+  -d '{"user_id":"beta-tester"}' http://127.0.0.1:9080/admin/revoke
+pgrep -x ffmpeg | wc -l        # expect 0
+
+# 2. Collect what the test was for, BEFORE the box goes away.
+systemctl stop live-source
+journalctl -u live-source --since "25 hours ago" --no-pager > /tmp/live-source.log
+tar czf /tmp/soak-evidence.tgz /tmp/live-source.log /var/log/soak.log
+#    Copy it off the box now: scp, not later.
+```
+
+Then, in this order:
+
+1. **Revoke the test stream key** on the tester's own YouTube channel (Live
+   Control Room → reset the key). It is the one credential that outlives the
+   VPS. Also end the §4.1 source stream.
+2. **Remove the destination map** from `/etc/louver-live-source.env` if the box
+   survives for any reason.
+3. **Destroy the instance** in the provider's console — destroy, not stop.
+4. **Then hunt the leftovers**, each of which bills on its own: detached
+   volumes, snapshots and backups, a reserved/floating IP, a private network, a
+   load balancer, and the provider's own log retention.
+5. **Delete the DNS record** for `<TEST_HOST>`.
+6. **Confirm** on the billing page that the hourly charge has stopped, and check
+   again the next day — the final invoice is where a forgotten floating IP shows
+   up.
+7. The three secrets die with the box. If any value was reused anywhere else,
+   rotate it there; the whole point of §2.6 is that none of them was.
+
+Nothing in this procedure touches production, and none of it requires the
+production host to be reachable.
