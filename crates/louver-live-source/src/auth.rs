@@ -29,6 +29,43 @@
 //!
 //! Moving to A later changes [`Identity::from_production`] and nothing else.
 //!
+//! ## Logout, expiry and suspension — what this actually does
+//!
+//! Read from production's own code rather than assumed, because a wrong answer
+//! here is the difference between a bounded window and an open door:
+//!
+//!  * **Logout** — `apps/server/src/auth.rs` `logout` calls
+//!    `delete_auth_session(hash)`, so that cookie's row is gone and the cookie
+//!    stops working on the next request.
+//!  * **Session expiry** — `db.user_for_token` is
+//!    `… WHERE token_hash=?1 AND expires_at > datetime('now')`, so an expired
+//!    cookie resolves to nothing.
+//!  * **Suspension** — `louver_cloud::admin::set_disabled` sets `disabled_at`
+//!    **and** runs `DELETE FROM auth_sessions WHERE user_id=?1`. So disabling
+//!    an account destroys every one of its cookies immediately; it does not
+//!    merely mark a flag that `/api/me` would have to report.
+//!
+//! In all three cases `GET /api/me` with that cookie answers 401, so the next
+//! handshake here fails and this page's `connect()` tells the user to sign in
+//! again. The worker needs no new production endpoint for that.
+//!
+//! **What is left, stated precisely.** A bearer token this worker already
+//! minted is *not* revoked by any of the three: it is self-contained and this
+//! worker does not ask production again until the next handshake. So a user who
+//! logs out, or is suspended, keeps a usable token for **at most the remainder
+//! of [`crate::token::TOKEN_TTL_SECS`]** — five minutes, and on average less.
+//! That window is why the lifetime is five minutes and not thirty.
+//!
+//! **What is left that five minutes does not bound.** A beta job that is
+//! already running keeps running. Production's `set_disabled` stops the
+//! broadcasts *it* manages (`mgr.stop_all_for`); it knows nothing about this
+//! worker, so a suspended account's live-source job sends until it ends or is
+//! cancelled. Closing that needs either a production change (option A, or a
+//! revocation list this worker can read) or an operator step, and until one
+//! exists this is a **blocker for opening the beta to customers** rather than
+//! something the five-minute token fixes. It is recorded here, not papered
+//! over: nothing in this crate claims suspension is handled.
+//!
 //! ## What this module will not do
 //!
 //! It will not accept an identity from the caller. There is no "user_id" field

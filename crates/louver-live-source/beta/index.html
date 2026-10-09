@@ -7,66 +7,29 @@
 <!--
   247streams — YouTube Live 영상 소스 베타 페이지
 
-  One file, no build step, no npm. Deliberately: this page is served by the
-  separate worker VPS, so it must not be part of `apps/web`'s bundle and must
-  not need the production image rebuilt to change. Plain HTML keeps that true.
+  No build step and no npm. Deliberately: this page is served by the separate
+  worker VPS, so it must not be part of `apps/web`'s bundle and must not need
+  the production image rebuilt to change. Plain HTML keeps that true.
+
+  Three files rather than one, though: `app.css` and `app.js` are separate so
+  the response's content policy can say `script-src 'self'` instead of
+  `'unsafe-inline'`. An inline-script allowance gives away most of what a CSP
+  is for, which is not worth saving two requests.
 
   It runs on the same origin as 247streams (Caddy routes /beta/ here), so the
-  session cookie reaches /api/live-source/session and nothing needs CORS.
+  session cookie reaches …/session and nothing needs CORS. That one request is
+  also the only one that carries the cookie: the API refuses a Cookie header on
+  every other route.
 
   The token lives in memory only. Not localStorage: a token in storage outlives
-  the tab and survives an XSS long enough to be stolen at leisure.
+  the tab and survives an XSS long enough to be stolen at leisure. It is valid
+  for five minutes, and this page renews it from the cookie before it expires.
 -->
-<style>
-  :root {
-    --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3;
-    --dim: #8b949e; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --accent: #58a6ff;
-  }
-  @media (prefers-color-scheme: light) {
-    :root:not([data-theme="dark"]) {
-      --bg: #ffffff; --panel: #f6f8fa; --line: #d0d7de; --text: #1f2328;
-      --dim: #59636e; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --accent: #0969da;
-    }
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; background: var(--bg); color: var(--text);
-    font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", sans-serif;
-  }
-  .wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
-  h1 { font-size: 20px; margin: 0 0 4px; }
-  .sub { color: var(--dim); font-size: 13px; margin: 0 0 24px; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .card h2 { font-size: 14px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); }
-  label { display: block; font-size: 13px; margin: 12px 0 4px; color: var(--dim); }
-  input, select, textarea {
-    width: 100%; padding: 8px 10px; background: var(--bg); color: var(--text);
-    border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 14px;
-  }
-  textarea { min-height: 76px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
-  button {
-    padding: 8px 14px; border-radius: 6px; border: 1px solid var(--line);
-    background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
-  }
-  button.ghost { background: transparent; color: var(--text); font-weight: 400; }
-  button:disabled { opacity: .5; cursor: not-allowed; }
-  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
-  .msg { font-size: 13px; margin-top: 10px; }
-  .msg.ok { color: var(--ok); } .msg.bad { color: var(--bad); } .msg.warn { color: var(--warn); }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
-  th { color: var(--dim); font-weight: 600; font-size: 12px; text-transform: uppercase; }
-  .pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; border: 1px solid currentColor; }
-  .pill.sending { color: var(--ok); } .pill.reconnecting { color: var(--warn); }
-  .pill.gave_up { color: var(--bad); } .pill.stopped, .pill.resolving, .pill.starting { color: var(--dim); }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--dim); }
-  .note { font-size: 12px; color: var(--dim); margin-top: 8px; }
-  .empty { color: var(--dim); font-size: 13px; padding: 12px 0; }
-</style>
+<link rel="stylesheet" href="app.css">
 </head>
 <body>
 <div class="wrap">
-  <h1>YouTube Live 영상 소스 <span style="color:var(--warn);font-size:13px">Beta</span></h1>
+  <h1>YouTube Live 영상 소스 <span class="beta">Beta</span></h1>
   <p class="sub">
     YouTube Live의 <strong>영상</strong>과 플레이리스트의 <strong>음악</strong>을 합쳐 송출합니다.
     원본 영상의 소리는 사용하지 않습니다. 출력은 최대 <span id="cap">1080p</span>입니다.
@@ -77,14 +40,30 @@
     <div id="authMsg" class="msg">247streams 로그인 상태를 확인하는 중…</div>
     <div class="row"><button id="authBtn" class="ghost">다시 확인</button></div>
     <p class="note">
-      이 페이지는 247streams와 같은 주소에서 열립니다. 로그인 세션은 이 확인 한 번에만 쓰이고,
-      이후 요청은 30분 동안만 유효한 별도 토큰을 씁니다.
+      이 페이지는 247streams와 같은 주소에서 열립니다. 로그인 세션은 이 확인에만 쓰이고,
+      이후 요청은 5분 동안만 유효한 별도 토큰을 씁니다. 토큰은 만료되기 전에 자동으로 갱신되고,
+      247streams에서 로그아웃하면 다음 갱신에서 연결이 끊어집니다.
+    </p>
+  </div>
+
+  <div class="card" id="mediaCard" hidden>
+    <h2>내 음악 파일 <span class="plain" id="mediaUsage"></span></h2>
+    <div id="mediaList" class="empty">아직 올린 파일이 없습니다.</div>
+    <label for="file">파일 올리기 <span class="hint" id="mediaHint"></span></label>
+    <input id="file" type="file" multiple>
+    <div class="bar" id="upBar" hidden><i id="upFill"></i></div>
+    <div class="row">
+      <button id="upBtn">올리기</button>
+      <span id="upMsg" class="msg"></span>
+    </div>
+    <p class="note">
+      본인이 권리를 가진 파일만 올려 주세요. 파일은 이 베타 서버에만 저장되고, 다른 사용자는 접근할 수 없습니다.
     </p>
   </div>
 
   <div class="card" id="newCard" hidden>
     <h2>새 방송</h2>
-    <label for="bid">방송 ID <span style="color:var(--dim)">(같은 ID로 다시 보내면 기존 작업이 그대로 반환됩니다)</span></label>
+    <label for="bid">방송 ID <span class="hint">(같은 ID로 다시 보내면 기존 작업이 그대로 반환됩니다)</span></label>
     <input id="bid" placeholder="my-live-01" autocomplete="off">
 
     <label for="src">YouTube Live 주소</label>
@@ -111,7 +90,7 @@
   </div>
 
   <div class="card" id="jobsCard" hidden>
-    <h2>내 작업 <span id="counts" style="text-transform:none;font-weight:400"></span></h2>
+    <h2>내 작업 <span class="plain" id="counts"></span></h2>
     <table>
       <thead><tr><th>방송 ID</th><th>상태</th><th>프레임</th><th>재연결</th><th>영상</th><th></th></tr></thead>
       <tbody id="jobsBody"></tbody>
@@ -119,181 +98,6 @@
     <div id="jobsEmpty" class="empty">아직 작업이 없습니다.</div>
   </div>
 </div>
-
-<script>
-"use strict";
-// The token is held here and nowhere else — not in localStorage, not in a
-// cookie this page sets. It dies with the tab.
-let token = null;
-let poll = null;
-
-const $ = (id) => document.getElementById(id);
-const say = (el, text, kind) => { el.textContent = text; el.className = "msg" + (kind ? " " + kind : ""); };
-
-async function call(path, opts = {}) {
-  const headers = Object.assign({}, opts.headers || {});
-  if (opts.body) headers["Content-Type"] = "application/json";
-  if (token) headers["Authorization"] = "Bearer " + token;
-  const res = await fetch("/api/live-source" + path, {
-    method: opts.method || "GET",
-    // Same origin, so the session cookie rides along on the handshake and
-    // nothing needs CORS. `same-origin` and not `include`: this page has no
-    // business sending credentials anywhere else.
-    credentials: "same-origin",
-    headers,
-    body: opts.body ? JSON.stringify(opts.body) : undefined,
-  });
-  let data = null;
-  try { data = await res.json(); } catch (_) { /* a body is not guaranteed */ }
-  if (!res.ok) {
-    const err = new Error((data && data.message) || ("요청이 실패했습니다 (HTTP " + res.status + ")"));
-    err.status = res.status;
-    err.code = data && data.error;
-    throw err;
-  }
-  return data;
-}
-
-async function authenticate() {
-  $("authBtn").disabled = true;
-  say($("authMsg"), "확인 중…", null);
-  try {
-    const s = await call("/session", { method: "POST" });
-    token = s.token;
-    $("cap").textContent = s.max_height + "p";
-    const dest = $("dest");
-    dest.innerHTML = "";
-    for (const name of s.destinations) {
-      const o = document.createElement("option");
-      o.value = name; o.textContent = name;
-      dest.appendChild(o);
-    }
-    say($("authMsg"), "연결됨 · 동시 " + s.max_concurrent + "개까지 · 토큰 " + Math.round(s.expires_in / 60) + "분", "ok");
-    $("newCard").hidden = false;
-    $("jobsCard").hidden = false;
-    // Re-run the handshake a minute before the token dies.
-    setTimeout(authenticate, Math.max(30, s.expires_in - 60) * 1000);
-    refresh();
-    if (!poll) poll = setInterval(refresh, 3000);
-  } catch (e) {
-    token = null;
-    $("newCard").hidden = true;
-    say($("authMsg"), e.status === 401
-      ? "247streams에 로그인한 뒤 이 페이지를 새로고침해 주세요."
-      : e.message, "bad");
-  } finally {
-    $("authBtn").disabled = false;
-  }
-}
-
-async function check() {
-  const url = $("src").value.trim();
-  if (!url) return say($("checkMsg"), "주소를 입력해 주세요.", "warn");
-  $("checkBtn").disabled = true;
-  say($("checkMsg"), "확인 중…", null);
-  try {
-    const r = await call("/check", { method: "POST", body: { source_url: url } });
-    say($("checkMsg"), (r.ok ? "OK · " : "실패 · ") + r.message, r.ok ? "ok" : "bad");
-  } catch (e) {
-    say($("checkMsg"), e.message, "bad");
-  } finally {
-    $("checkBtn").disabled = false;
-  }
-}
-
-async function create() {
-  const playlist = $("pl").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  $("createBtn").disabled = true;
-  say($("createMsg"), "시작 중…", null);
-  try {
-    const j = await call("/jobs", {
-      method: "POST",
-      body: {
-        broadcast_id: $("bid").value.trim(),
-        source_url: $("src").value.trim(),
-        playlist,
-        destination: $("dest").value,
-      },
-    });
-    say($("createMsg"), "시작됨 · " + j.broadcast_id, "ok");
-    refresh();
-  } catch (e) {
-    say($("createMsg"), e.message, "bad");
-  } finally {
-    $("createBtn").disabled = false;
-  }
-}
-
-async function cancel(id, btn) {
-  btn.disabled = true;
-  try { await call("/jobs/" + encodeURIComponent(id), { method: "DELETE" }); }
-  catch (e) { say($("createMsg"), e.message, "bad"); }
-  finally { btn.disabled = false; refresh(); }
-}
-
-const PHASE_KO = {
-  resolving: "소스 확인 중", starting: "시작 중", sending: "송출 중",
-  reconnecting: "재연결 중", gave_up: "중단됨", stopped: "정지",
-};
-
-async function refresh() {
-  if (!token) return;
-  let data;
-  try { data = await call("/jobs"); }
-  catch (e) { if (e.status === 401) { token = null; authenticate(); } return; }
-
-  $("counts").textContent = "· 실행 " + data.running + " / " + data.max_concurrent;
-  const body = $("jobsBody");
-  body.textContent = "";
-  $("jobsEmpty").hidden = data.jobs.length > 0;
-
-  for (const j of data.jobs) {
-    const tr = document.createElement("tr");
-    const cell = (text) => { const td = document.createElement("td"); td.textContent = text; return td; };
-
-    // textContent everywhere, never innerHTML: a broadcast id and an error
-    // message are user-influenced strings, and this page will not render them
-    // as markup.
-    const idTd = document.createElement("td");
-    const code = document.createElement("code");
-    code.textContent = j.broadcast_id;
-    idTd.appendChild(code);
-    tr.appendChild(idTd);
-
-    const stTd = document.createElement("td");
-    const pill = document.createElement("span");
-    pill.className = "pill " + j.phase;
-    pill.textContent = PHASE_KO[j.phase] || j.phase;
-    stTd.appendChild(pill);
-    if (j.last_error) {
-      const d = document.createElement("div");
-      d.className = "note";
-      d.textContent = j.last_error;
-      stTd.appendChild(d);
-    }
-    tr.appendChild(stTd);
-
-    tr.appendChild(cell(j.frames.toLocaleString()));
-    tr.appendChild(cell(j.restarts + (j.last_verdict && j.last_verdict !== "healthy" ? " (" + j.last_verdict + ")" : "")));
-    tr.appendChild(cell(j.video_id || "—"));
-
-    const actTd = document.createElement("td");
-    if (j.desired === "running") {
-      const b = document.createElement("button");
-      b.className = "ghost";
-      b.textContent = "정지";
-      b.addEventListener("click", () => cancel(j.broadcast_id, b));
-      actTd.appendChild(b);
-    }
-    tr.appendChild(actTd);
-    body.appendChild(tr);
-  }
-}
-
-$("authBtn").addEventListener("click", authenticate);
-$("checkBtn").addEventListener("click", check);
-$("createBtn").addEventListener("click", create);
-authenticate();
-</script>
+<script src="app.js"></script>
 </body>
 </html>

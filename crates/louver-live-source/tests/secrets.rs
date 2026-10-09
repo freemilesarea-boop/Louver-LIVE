@@ -240,9 +240,12 @@ fn the_api_binary_never_prints_its_secret_or_its_destination_map() {
             "https://247streams.kr",
         ])
         .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
+        .env("LOUVER_LIVE_SOURCE_GATE_SECRET", "a-gate-secret-that-must-not-leak-32!")
         .env(
             "LOUVER_LIVE_SOURCE_DESTINATIONS",
-            format!(r#"{{"test-sink":"rtmps://a.rtmps.youtube.com/live2/{STREAM_KEY}"}}"#),
+            format!(
+                r#"{{"user-alice":{{"test-sink":"rtmps://a.rtmps.youtube.com/live2/{STREAM_KEY}"}}}}"#
+            ),
         )
         .output()
         .expect("api binary");
@@ -251,8 +254,12 @@ fn the_api_binary_never_prints_its_secret_or_its_destination_map() {
     assert!(both.contains("[louver][live-source-api]"), "expected its own log:\n{both}");
     assert_clean(&both, "the api binary");
     assert!(!both.contains("a-signing-secret-that-must-not-leak-32"), "the signing secret leaked:\n{both}");
-    // The destination *name* is fine; the URL is not.
+    assert!(!both.contains("a-gate-secret-that-must-not-leak-32!"), "the gate secret leaked:\n{both}");
+    // The destination *URL* is not printed, and neither is a name: the banner
+    // says how many users have one and nothing else.
     assert!(!both.contains("live2/"), "{both}");
+    assert!(!both.contains("test-sink"), "a destination name is itself a leak:\n{both}");
+    assert!(both.contains("사용자 1명"), "the banner should count them:\n{both}");
 }
 
 #[test]
@@ -270,7 +277,11 @@ fn a_malformed_destination_map_is_not_echoed_back() {
             dir.path().join("state").to_str().unwrap(),
         ])
         .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
-        .env("LOUVER_LIVE_SOURCE_DESTINATIONS", format!(r#"{{"broken": "rtmps://x/live2/{STREAM_KEY}"#))
+        .env("LOUVER_LIVE_SOURCE_GATE_SECRET", "a-gate-secret-that-must-not-leak-32!")
+        .env(
+            "LOUVER_LIVE_SOURCE_DESTINATIONS",
+            format!(r#"{{"user-alice":{{"broken": "rtmps://x/live2/{STREAM_KEY}"#),
+        )
         .output()
         .expect("api binary");
     let both = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
@@ -291,11 +302,79 @@ fn a_short_signing_secret_is_refused_at_startup() {
             dir.path().join("state").to_str().unwrap(),
         ])
         .env("LOUVER_LIVE_SOURCE_SECRET", "short")
-        .env("LOUVER_LIVE_SOURCE_DESTINATIONS", r#"{"a":"rtmp://127.0.0.1/live/x"}"#)
+        .env("LOUVER_LIVE_SOURCE_GATE_SECRET", "a-gate-secret-that-must-not-leak-32!")
+        .env("LOUVER_LIVE_SOURCE_DESTINATIONS", r#"{"user-alice":{"a":"rtmp://127.0.0.1/live/x"}}"#)
         .output()
         .expect("api binary");
     assert_ne!(out.status.code(), Some(0), "it must not start with a decorative signature");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("32"), "{err}");
     assert!(!err.contains("short"), "the secret itself must not be echoed: {err}");
+}
+
+#[test]
+fn the_api_will_not_start_without_a_usable_gate_secret() {
+    // Fail-closed, and the only way to make it so: if a missing gate secret
+    // merely disabled the gate, a deployment that forgot the variable would
+    // expose the port to anything that can route to the machine and nothing
+    // would say so. There is deliberately no flag that turns it off.
+    let dir = tempfile::tempdir().unwrap();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+
+    for (what, gate) in [("missing", None), ("too short", Some("short")), ("empty", Some(""))] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_live-source-api"));
+        cmd.args([
+            "--media-dir",
+            media.to_str().unwrap(),
+            "--state-dir",
+            dir.path().join("state").to_str().unwrap(),
+        ])
+        .env_remove("LOUVER_LIVE_SOURCE_GATE_SECRET")
+        .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
+        .env("LOUVER_LIVE_SOURCE_DESTINATIONS", r#"{"user-alice":{"a":"rtmp://127.0.0.1/live/x"}}"#);
+        if let Some(g) = gate {
+            cmd.env("LOUVER_LIVE_SOURCE_GATE_SECRET", g);
+        }
+        let out = cmd.output().expect("api binary");
+        assert_ne!(out.status.code(), Some(0), "{what}: it must not start");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("GATE_SECRET"), "{what}: {err}");
+        if let Some(g) = gate {
+            if !g.is_empty() {
+                assert!(!err.contains(g), "{what}: the secret itself was echoed: {err}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_flat_destination_map_is_refused_rather_than_shared_between_users() {
+    // The isolation defect, as a configuration mistake: the old shape was one
+    // `{name: url}` map for everybody. If the binary accepted it now, every
+    // beta account would share one set of destinations again — so it has to be
+    // a refusal to start rather than something reinterpreted.
+    let dir = tempfile::tempdir().unwrap();
+    let media = dir.path().join("media");
+    std::fs::create_dir_all(&media).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_live-source-api"))
+        .args([
+            "--media-dir",
+            media.to_str().unwrap(),
+            "--state-dir",
+            dir.path().join("state").to_str().unwrap(),
+        ])
+        .env("LOUVER_LIVE_SOURCE_SECRET", "a-signing-secret-that-must-not-leak-32")
+        .env("LOUVER_LIVE_SOURCE_GATE_SECRET", "a-gate-secret-that-must-not-leak-32!")
+        // The old flat shape, with a key that looks exactly like a real one.
+        .env(
+            "LOUVER_LIVE_SOURCE_DESTINATIONS",
+            format!(r#"{{"test-sink":"rtmps://a.rtmps.youtube.com/live2/{STREAM_KEY}"}}"#),
+        )
+        .output()
+        .expect("api binary");
+    assert_ne!(out.status.code(), Some(0), "the flat shape must not start");
+    let both = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_clean(&both, "the flat-map path");
+    assert!(!both.contains("live2/"), "{both}");
 }

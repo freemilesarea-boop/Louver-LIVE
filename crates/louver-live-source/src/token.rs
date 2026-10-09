@@ -45,7 +45,7 @@ pub const AUDIENCE: &str = "live-source";
 /// Short enough that a leaked one is a small window, long enough that a user
 /// filling in a form does not get logged out mid-edit. The beta page re-runs the
 /// handshake when a call comes back 401.
-pub const TOKEN_TTL_SECS: i64 = 30 * 60;
+pub const TOKEN_TTL_SECS: i64 = 5 * 60;
 
 /// The smallest secret this will accept, in bytes.
 ///

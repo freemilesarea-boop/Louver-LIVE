@@ -17,6 +17,7 @@ use common::*;
 use louver_core::streaming::ffmpeg::FfmpegTools;
 use louver_core::OutputProfile;
 use louver_live_source::{
+    destinations::Destinations,
     jobs::{NewJob, Registry, Settings},
     limits::Limits,
     media::MediaRoot,
@@ -46,22 +47,41 @@ fn world() -> World {
     let dir = tempfile::tempdir().unwrap();
     let media_dir = dir.path().join("media");
     std::fs::create_dir_all(&media_dir).unwrap();
-    std::fs::write(media_dir.join("song-a.mp4"), b"x").unwrap();
     let state_dir = dir.path().join("state");
     std::fs::create_dir_all(&state_dir).unwrap();
+    // Each user's own directory, because media is resolved per user now — and
+    // a recovery has to find the file again under the owner recorded in the
+    // state file rather than under whoever is asking.
+    let root = MediaRoot::new(&media_dir, FfmpegTools::new(ffmpeg(), ffprobe())).unwrap();
+    for user in ["user-alice", "user-bob"] {
+        std::fs::write(root.dir_for(user).unwrap().join("song-a.mp4"), b"x").unwrap();
+    }
     World { _dir: dir, state_dir, media_dir }
+}
+
+/// Where each user may send. Both have a `test-sink`; only Alice has the
+/// second, so a recovery that resolved under the wrong owner would fail.
+fn destinations() -> Destinations {
+    let url = "rtmp://127.0.0.1:1/live/abcd-efgh-ijkl-mnop".to_string();
+    let mut by_user: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+    by_user.insert("user-alice".into(), BTreeMap::from([("test-sink".to_string(), url.clone())]));
+    by_user.insert("user-bob".into(), BTreeMap::from([("test-sink".to_string(), url)]));
+    Destinations::from_map(by_user).unwrap()
 }
 
 /// A fresh registry over an existing state directory — i.e. a restarted process.
 fn registry(w: &World, max_concurrent: usize) -> Arc<Registry> {
-    let mut dests = BTreeMap::new();
-    dests.insert("test-sink".to_string(), "rtmp://127.0.0.1:1/live/abcd-efgh-ijkl-mnop".to_string());
+    registry_limits(w, Limits { max_concurrent, max_per_user: max_concurrent })
+}
+
+fn registry_limits(w: &World, limits: Limits) -> Arc<Registry> {
     let settings = Settings {
         state_dir: w.state_dir.clone(),
-        media: MediaRoot::new(&w.media_dir, dests).unwrap(),
+        media: MediaRoot::new(&w.media_dir, FfmpegTools::new(ffmpeg(), ffprobe())).unwrap(),
+        destinations: destinations(),
         tools: FfmpegTools::new(ffmpeg(), ffprobe()),
         profile: OutputProfile::P1080p30,
-        limits: Limits { max_concurrent },
+        limits,
         max_restarts: 50,
         stall_after: Duration::from_secs(60),
         grace: Duration::from_secs(60),
