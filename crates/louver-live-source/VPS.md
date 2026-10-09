@@ -354,10 +354,13 @@ database, no shared Docker socket.
     broadcasts must come back by themselves via `recover()`, with the same
     owners. Note the gap — this is a real interruption to the beta broadcast,
     and measuring it is the point.
-18. At hour 24, confirm the `MAX_JOB_SECS` cap behaves as REVOCATION.md §3
-    specifies — **if** it has been implemented. It has not been yet, so on
-    today's code the broadcast simply continues; record that rather than
-    reporting a pass.
+18. At hour 24, confirm the broadcasts are **still running**. There is no
+    maximum duration and there must not be one: 247streams is a 24/7
+    unattended service, and `Schedule.stop_at` is already `Option` in
+    production — a broadcast with none set runs until something ends it
+    (REVOCATION.md §9). The 24 hours here is the **length of this test**, not
+    a limit on a broadcast. A broadcast that stopped on its own at hour 24
+    would be a **failure**, not a pass.
 
 ### Finishing
 
@@ -374,6 +377,7 @@ database, no shared Docker socket.
 - The destination shows the wrong picture, the wrong sound, or the source's
   original audio.
 - A broadcast stops when the browser closes or the user logs out.
+- A broadcast stops by itself at any point, including hour 24.
 - A frozen picture that `frames` does not catch, or a `gave_up` with no
   recorded reason.
 - RSS climbing across the 24 hours.
@@ -385,6 +389,9 @@ database, no shared Docker socket.
 - **Prices.** §8 — not verifiable here.
 - **A second region, or any redundancy.** One box, for a test.
 - **Automatic suspension revocation.** REVOCATION.md §6; it needs either a
-  manual operator step or a production change that interrupts broadcasts.
+  manual operator step (now implemented, REVOCATION.md §5) or a production
+  change that interrupts broadcasts.
+- **A user-set stop time.** REVOCATION.md §9 option B — additive, not needed
+  for this test, and it must default to "no end".
 - **Scaling past two broadcasts.** The arithmetic in §2 extends linearly
   (1.5 cores and 400 MB each), but nothing above four has been measured.

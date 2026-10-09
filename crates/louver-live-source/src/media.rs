@@ -450,26 +450,28 @@ mod tests {
         }
     }
 
+    /// Unix only, and gated at the test rather than inside it.
+    ///
+    /// An earlier version kept the test on every platform and wrapped its body
+    /// in `#[cfg(unix)]`, which left `bob` and `d` bound but unused on Windows
+    /// — invisible here, and `-D warnings` in CI turned it into a build
+    /// failure on that runner alone. Gating the whole test says what is
+    /// actually true: this is about unix symlinks, and on Windows there is
+    /// nothing to assert rather than a test that silently does nothing.
     #[test]
+    #[cfg(unix)]
     fn a_symlink_out_of_a_users_directory_is_refused() {
         let (d, mr) = root();
         plant(&mr, "user-alice", "alice.mp4", b"secret");
         let bob = mr.dir_for("user-bob").unwrap();
-        #[cfg(unix)]
-        {
-            // The case a name check cannot see: a plain name pointing elsewhere.
-            std::os::unix::fs::symlink(d.path().join("secret.txt"), bob.join("escape.mp4")).unwrap();
-            std::os::unix::fs::symlink(
-                mr.dir_for("user-alice").unwrap().join("alice.mp4"),
-                bob.join("peek.mp4"),
-            )
+        // The case a name check cannot see: a plain name pointing elsewhere.
+        std::os::unix::fs::symlink(d.path().join("secret.txt"), bob.join("escape.mp4")).unwrap();
+        std::os::unix::fs::symlink(mr.dir_for("user-alice").unwrap().join("alice.mp4"), bob.join("peek.mp4"))
             .unwrap();
-            for name in ["escape.mp4", "peek.mp4"] {
-                let e = mr.resolve("user-bob", name).unwrap_err();
-                assert!(e.message.contains("디렉터리를 벗어납니다"), "{name} → {}", e.message);
-            }
+        for name in ["escape.mp4", "peek.mp4"] {
+            let e = mr.resolve("user-bob", name).unwrap_err();
+            assert!(e.message.contains("디렉터리를 벗어납니다"), "{name} → {}", e.message);
         }
-        let _ = d;
     }
 
     #[test]

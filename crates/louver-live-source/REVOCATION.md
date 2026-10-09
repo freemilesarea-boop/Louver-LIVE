@@ -57,24 +57,49 @@ the TTL was cut from thirty minutes to five.
 
 ## 3. The policy that keeps a broadcast alive
 
-The requirement is 24 hours of broadcasting with the browser closed, and a
-plain logout must not stop anything. Both follow from one rule:
+The requirement is that a broadcast survives the browser closing, and that a
+plain logout does not stop anything. Both follow from one rule:
 
 > **Renewal is liveness for the UI. It is never authority over a job.**
 
-A job's lifetime comes from its own `desired` field plus a hard cap — never
-from whether a browser is still attached.
+A job's lifetime comes from its own `desired` field — never from whether a
+browser is still attached.
 
 - **Browser closed** → no renewal → *nothing happens*. The worker never asked.
 - **Logout** → the next renewal 401s → *nothing happens to the job*. The page
   says "signed out"; the broadcast continues.
-- **Hard cap** → `MAX_JOB_SECS = 24 * 3600`, measured from a `started_at` field
-  added to `WorkerState`. At the cap the worker stops the job itself and writes
-  `desired = Stopped` with a reason, so a forgotten tab cannot hold an encode
-  for a week.
 
-This is the separation the brief asks for, stated as a rule rather than left to
-emerge from error handling.
+### A correction: there is no 24-hour cap, and there should not be one
+
+An earlier draft of this document proposed `MAX_JOB_SECS = 24 * 3600` — a hard
+cap that stopped a job after a day "so a forgotten tab cannot hold an encode
+for a week". **That was wrong, and it is withdrawn.** It came from conflating
+two unrelated numbers: the length of the *acceptance test* (24 hours, because
+that is long enough to expose a leak or a drift) and the maximum duration of a
+*real broadcast*. 247streams is a 24/7 unattended service. A cap that stops a
+healthy broadcast after a day is not a safety limit, it is an outage on a
+timer.
+
+Production already settles the question, and in the opposite direction.
+`louver_cloud::Schedule` is:
+
+```rust
+pub struct Schedule {
+    pub enabled: bool,
+    pub start_at: Option<String>,
+    /// RFC 3339, UTC. Optional automatic stop.
+    pub stop_at: Option<String>,
+    …
+}
+```
+
+`stop_at` is an **`Option`**, and its own comment says *optional*. A broadcast
+with `stop_at: None` runs until the source ends or somebody stops it — that is
+the shipped semantics of the product this worker is a beta feature of. The beta
+must mirror it, not invent a limit the rest of the service does not have.
+
+See §9 for the three lifecycle options compared, and what stops a broadcast
+instead of a clock.
 
 ## 4. Fail-open on continuation, fail-closed on admission
 
@@ -185,7 +210,7 @@ problem into a production one.
 
 | requirement | status |
 |---|---|
-| 24h broadcast with the browser closed | §3 — needs `MAX_JOB_SECS` + `started_at` |
+| broadcast survives the browser closing | §3 — holds today, no change needed |
 | a plain logout does not stop a broadcast | §3 — holds by the renewal rule |
 | suspension blocks new broadcasts | §2 — **already true**, ≤5 min, tested |
 | suspension can stop a running broadcast | §5 manual, or §6 Option A automatic |
@@ -200,3 +225,81 @@ Until either the §5 runbook is accepted as the operating procedure, or §6
 Option A has ridden a scheduled maintenance window, **the beta stays closed to
 customers.** A suspended account whose broadcast keeps running is a real
 failure, and five minutes of token life does not bound it.
+
+## 9. Broadcast lifecycle for a 24/7 service
+
+Three ways a broadcast can end, compared. They are not alternatives — the
+recommendation is all three, in this order of precedence.
+
+### A. Permanent until something ends it *(the default, and what ships)*
+
+No time limit. The job runs until the source ends, the user stops it, or an
+operator stops it.
+
+- **Fits the product.** 247streams sells unattended broadcasting; a feature
+  that quietly stops after a day is not that feature.
+- **Matches production.** `Schedule.stop_at: None` is already the default for
+  every existing broadcast.
+- **The resource worry is already handled, and not by a clock.** The fear a cap
+  was reaching for is "an abandoned job holds a core forever". But admission
+  control already bounds that: `max_per_user` and `max_concurrent` cap how many
+  encodes can exist at all, so an abandoned job costs one slot — it cannot
+  grow. A time cap would not reduce the ceiling; it would only make healthy
+  broadcasts fail too.
+- **What it does cost** is egress: ~6.4 Mbps is ~2 TB/month per broadcast left
+  running. That is a billing question for the operator, answered by C, not a
+  reason to stop a customer's stream.
+
+### B. A user-set stop time *(optional, mirror production's field)*
+
+The user may give an absolute instant to stop at — not a duration the system
+imposes.
+
+- **Already modelled**: `Schedule.stop_at`, RFC 3339 UTC, honoured by
+  `louver_cloud::schedule`. The beta should take the same shape and the same
+  semantics so the two do not diverge, rather than inventing a second concept.
+- **Must default to `None`.** The moment a default is anything else, A is
+  broken for every user who did not ask for it.
+- Worth having because a finite event — a concert, a match, a service — is a
+  real case, and "remember to come back and press stop" is a bad answer to it.
+- Not needed for the first VPS test; it is additive and can follow.
+
+### C. Operator forced stop *(§5, necessary regardless)*
+
+The admin revocation API. Needed whatever A and B do, because the cases it
+covers are not time-based at all: a suspended account, abuse, a copyright
+complaint, a cost runaway, a source that turned out not to be the user's.
+
+- Stops nothing on its own, so it cannot cause an outage.
+- It is the answer to "what if a broadcast should not be running" — which is a
+  judgement, and judgement is exactly what a clock cannot make.
+
+### What stops a broadcast *instead of* a clock
+
+The thing a 24-hour cap was really trying to catch is a broadcast that has
+*stopped working* but not stopped running. That already has a mechanism, and it
+is time-based in the right way — seconds of no progress, not hours of
+operation:
+
+- the **watchdog** notices the picture frozen while the sound runs on
+  (`VideoStalled`) or both frozen (`ProcessStalled`) — the measured FFmpeg
+  defect where a vanished live source does not make FFmpeg exit;
+- **`max_restarts`** bounds the retries, after which the job is `GaveUp` with a
+  reason and stops.
+
+So a dead broadcast stops within a minute or so, and a healthy one never does.
+That is the correct shape, and it is already implemented and tested.
+
+### Recommendation
+
+| | ship it? | default |
+|---|---|---|
+| A — permanent | **yes, now** | the only default |
+| B — user-set `stop_at` | later, additive | `None` |
+| C — operator forced stop | **yes, now** (§5) | n/a |
+| a system-imposed maximum duration | **no** | — |
+
+And a naming discipline, because the confusion that produced the withdrawn cap
+is easy to repeat: the 24 hours in `VPS.md` §13 is a **test duration**. It is
+how long the acceptance test runs. It is not, and must not become, a maximum
+broadcast length.
