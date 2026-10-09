@@ -170,12 +170,7 @@ impl Drop for CreateGuard<'_> {
 
 impl Registry {
     pub fn new(settings: Settings, resolver: Arc<dyn LiveSourceResolver>) -> Self {
-        Self {
-            settings,
-            resolver,
-            running: Mutex::new(HashMap::new()),
-            creating: Mutex::new(HashSet::new()),
-        }
+        Self { settings, resolver, running: Mutex::new(HashMap::new()), creating: Mutex::new(HashSet::new()) }
     }
 
     pub fn settings(&self) -> &Settings {

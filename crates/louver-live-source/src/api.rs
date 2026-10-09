@@ -144,10 +144,7 @@ async fn gate_layer(State(api): State<Api>, request: Request, next: Next) -> Res
 /// that needs it.
 fn no_cookie(headers: &HeaderMap) -> std::result::Result<(), Fail> {
     if headers.contains_key(axum::http::header::COOKIE) {
-        return Err(Fail(LiveSourceError::new(
-            ErrorKind::Forbidden,
-            "이 요청에는 쿠키를 보낼 수 없습니다.",
-        )));
+        return Err(Fail(LiveSourceError::new(ErrorKind::Forbidden, "이 요청에는 쿠키를 보낼 수 없습니다.")));
     }
     Ok(())
 }
@@ -197,9 +194,7 @@ async fn session(State(api): State<Api>, headers: HeaderMap) -> Out<SessionBody>
     gate(&api, &headers)?;
     // Before the cookie is read: a request from the wrong page does not get as
     // far as having its credential used.
-    api.origins
-        .check(headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()))
-        .map_err(Fail)?;
+    api.origins.check(headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok())).map_err(Fail)?;
 
     let cookie = headers
         .get(axum::http::header::COOKIE)

@@ -54,9 +54,16 @@ fn tiny_media() -> Option<Vec<u8>> {
     let out = dir.path().join("t.m4a");
     let ok = std::process::Command::new(ffmpeg())
         .args([
-            "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-            "-c:a", "aac",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-c:a",
+            "aac",
         ])
         .arg(&out)
         .status()

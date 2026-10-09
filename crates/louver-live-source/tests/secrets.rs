@@ -243,9 +243,7 @@ fn the_api_binary_never_prints_its_secret_or_its_destination_map() {
         .env("LOUVER_LIVE_SOURCE_GATE_SECRET", "a-gate-secret-that-must-not-leak-32!")
         .env(
             "LOUVER_LIVE_SOURCE_DESTINATIONS",
-            format!(
-                r#"{{"user-alice":{{"test-sink":"rtmps://a.rtmps.youtube.com/live2/{STREAM_KEY}"}}}}"#
-            ),
+            format!(r#"{{"user-alice":{{"test-sink":"rtmps://a.rtmps.youtube.com/live2/{STREAM_KEY}"}}}}"#),
         )
         .output()
         .expect("api binary");

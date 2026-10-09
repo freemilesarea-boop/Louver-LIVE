@@ -162,12 +162,10 @@ fn rig_limits(limits: Limits) -> Rig {
     // Wait for the listener rather than sleeping a guess. The health route is
     // gated like everything else, so the probe carries the header.
     assert!(
-        wait_until(Duration::from_secs(10), || ureq::get(&format!(
-            "{base}/api/live-source/health"
-        ))
-        .header("X-Louver-Gate", GATE)
-        .call()
-        .is_ok()),
+        wait_until(Duration::from_secs(10), || ureq::get(&format!("{base}/api/live-source/health"))
+            .header("X-Louver-Gate", GATE)
+            .call()
+            .is_ok()),
         "api did not come up"
     );
     Rig { _dir: dir, base, state_dir, media_dir: media, signer, jobs }
@@ -635,10 +633,7 @@ fn the_beta_page_is_served_from_the_same_origin_as_the_api() {
     });
     let base = format!("http://127.0.0.1:{port}");
     let get = |path: &str| ureq::get(&format!("{base}{path}")).header("X-Louver-Gate", GATE).call();
-    assert!(
-        wait_until(Duration::from_secs(10), || get("/beta/").is_ok()),
-        "beta page did not come up"
-    );
+    assert!(wait_until(Duration::from_secs(10), || get("/beta/").is_ok()), "beta page did not come up");
     let mut resp = get("/beta/").unwrap();
     let html = resp.body_mut().read_to_string().unwrap();
     assert!(html.contains("YouTube Live 영상 소스"), "the page should be the beta UI");
@@ -705,8 +700,7 @@ fn every_route_refuses_a_request_without_the_gate_header() {
         ("DELETE", "/media/x.mp4"),
     ] {
         let body = (m == "POST").then(|| serde_json::json!({"source_url":"https://youtu.be/dQw4w9WgXcQ"}));
-        let (s, got) =
-            req_full(m, &r.url(p), Some(&t), None, Some(ORIGIN), None, body.clone());
+        let (s, got) = req_full(m, &r.url(p), Some(&t), None, Some(ORIGIN), None, body.clone());
         assert_eq!(s, 403, "{m} {p} with no gate → {got}");
         assert_eq!(got["error"], "forbidden");
 
@@ -763,10 +757,7 @@ fn a_session_is_refused_without_the_right_origin() {
     ] {
         let (s, got) = req_full("POST", &r.url("/session"), None, cookie, origin, Some(GATE), None);
         assert_eq!(s, 401, "{origin:?} was accepted → {got}");
-        assert!(
-            got["message"].as_str().unwrap_or_default().contains("Origin"),
-            "{origin:?} → {got}"
-        );
+        assert!(got["message"].as_str().unwrap_or_default().contains("Origin"), "{origin:?} → {got}");
         // The rejected origin is attacker-controlled and is not echoed back.
         // `null` is excepted: it is a fixed value this code names on purpose,
         // not a string an attacker chose, and saying which of the three
@@ -793,15 +784,8 @@ fn the_origin_check_is_only_on_the_handshake() {
     }
     let r = rig(1);
     let t = r.token_for("alice");
-    let (s, got) = req_full(
-        "GET",
-        &r.url("/jobs"),
-        Some(&t),
-        None,
-        Some("https://evil.test"),
-        Some(GATE),
-        None,
-    );
+    let (s, got) =
+        req_full("GET", &r.url("/jobs"), Some(&t), None, Some("https://evil.test"), Some(GATE), None);
     assert_eq!(s, 200, "{got}");
 }
 
@@ -896,8 +880,7 @@ fn a_session_reply_is_never_cached() {
 fn the_token_lives_five_minutes_and_the_page_is_told_so() {
     let r = rig(1);
     assert_eq!(louver_live_source::token::TOKEN_TTL_SECS, 300);
-    let (s, body) =
-        req("POST", &r.url("/session"), None, Some("louver_session=alice"), None);
+    let (s, body) = req("POST", &r.url("/session"), None, Some("louver_session=alice"), None);
     assert_eq!(s, 200, "{body}");
     assert_eq!(body["expires_in"], 300, "the page renews on this number");
 
@@ -977,12 +960,8 @@ fn one_user_cannot_see_use_or_delete_another_users_media() {
     // Alice's listing has her own file; Bob's does not.
     let (s, mine) = req("GET", &r.url("/media"), Some(&alice), None, None);
     assert_eq!(s, 200, "{mine}");
-    let names: Vec<String> = mine["media"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["name"].as_str().unwrap().to_string())
-        .collect();
+    let names: Vec<String> =
+        mine["media"].as_array().unwrap().iter().map(|m| m["name"].as_str().unwrap().to_string()).collect();
     assert!(names.contains(&"alice-secret.mp4".to_string()), "{names:?}");
 
     let (_, theirs) = req("GET", &r.url("/media"), Some(&bob), None, None);
@@ -1118,9 +1097,16 @@ fn tiny_media() -> Option<Vec<u8>> {
     let out = dir.path().join("t.m4a");
     let ok = std::process::Command::new(ffmpeg())
         .args([
-            "-hide_banner", "-loglevel", "error", "-y",
-            "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-            "-c:a", "aac",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-c:a",
+            "aac",
         ])
         .arg(&out)
         .status()
@@ -1239,11 +1225,8 @@ fn the_upload_route_needs_the_gate_and_a_token_like_everything_else() {
     let r = rig(1);
     let agent: ureq::Agent = ureq::Agent::config_builder().http_status_as_error(false).build().into();
     let t = r.token_for("alice");
-    for (gate, token, want) in [
-        (None, Some(t.as_str()), 403u16),
-        (Some(GATE), None, 401),
-        (None, None, 403),
-    ] {
+    for (gate, token, want) in [(None, Some(t.as_str()), 403u16), (Some(GATE), None, 401), (None, None, 403)]
+    {
         let mut b = agent.put(&r.url("/media/x.mp4"));
         if let Some(g) = gate {
             b = b.header("X-Louver-Gate", g);

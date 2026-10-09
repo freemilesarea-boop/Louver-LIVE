@@ -114,9 +114,8 @@ impl MediaRoot {
     /// Separate from [`Self::resolve`] so an upload can validate the name it
     /// was given before it writes a single byte.
     pub fn check_name(name: &str) -> Result<&str> {
-        let refuse = |why: &str| {
-            Err(LiveSourceError::invalid(format!("영상 이름을 사용할 수 없습니다: {why}")))
-        };
+        let refuse =
+            |why: &str| Err(LiveSourceError::invalid(format!("영상 이름을 사용할 수 없습니다: {why}")));
         let n = name.trim();
         if n.is_empty() {
             return refuse("비어 있습니다");
@@ -224,7 +223,12 @@ impl MediaRoot {
         let dir = self.dir_for(user_id)?;
         // Replacing a file of their own is allowed; its bytes are not counted
         // twice against the quota.
-        let replacing = self.resolve(user_id, &n).ok().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0);
+        let replacing = self
+            .resolve(user_id, &n)
+            .ok()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
         let used = self.used_bytes(user_id).saturating_sub(replacing);
         if used + len > MAX_USER_BYTES {
             return Err(LiveSourceError::limit(format!(
@@ -340,10 +344,7 @@ impl MediaRoot {
 }
 
 fn now_nanos() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -358,9 +359,16 @@ mod tests {
         let out = dir.path().join("t.mp4");
         let ok = std::process::Command::new(ff)
             .args([
-                "-hide_banner", "-loglevel", "error", "-y",
-                "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
-                "-c:a", "aac",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:a",
+                "aac",
             ])
             .arg(&out)
             .status()
@@ -488,11 +496,7 @@ mod tests {
         for body in [b"not a video at all".as_slice(), &[0u8; 2048]] {
             let e = mr.store("user-alice", "claim.mp4", body).unwrap_err();
             assert_eq!(e.kind, crate::ErrorKind::Invalid);
-            assert!(
-                e.message.contains("영상") || e.message.contains("파일"),
-                "{}",
-                e.message
-            );
+            assert!(e.message.contains("영상") || e.message.contains("파일"), "{}", e.message);
         }
         // And nothing is left behind, not even a temporary.
         let left: Vec<_> = std::fs::read_dir(mr.dir_for("user-alice").unwrap()).unwrap().flatten().collect();
