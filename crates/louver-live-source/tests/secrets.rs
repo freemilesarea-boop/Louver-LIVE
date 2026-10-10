@@ -228,10 +228,14 @@ fn the_api_binary_never_prints_its_secret_or_its_destination_map() {
 
     let out = Command::new(env!("CARGO_BIN_EXE_live-source-api"))
         .args([
-            // A port that cannot be bound, so it starts, logs, and exits —
-            // which is exactly the window a banner would leak in.
+            // An address that is not on this machine, so the bind fails and it
+            // starts, logs, and exits — exactly the window a banner would leak
+            // in. Not a privileged port: as root `127.0.0.1:1` binds, and the
+            // process then serves forever instead of exiting, so this test
+            // would hang rather than fail. It passed before only because a
+            // previous run had left something holding port 1.
             "--listen",
-            "127.0.0.1:1",
+            "203.0.113.1:9080",
             "--media-dir",
             media.to_str().unwrap(),
             "--state-dir",

@@ -214,6 +214,7 @@ EnvironmentFile=/etc/louver-live-source.env
 # /srv/live-source read-only. Point it at the one directory that is writable.
 Environment=XDG_CACHE_HOME=/var/lib/live-source/cache
 ExecStart=/usr/local/bin/live-source-api \
+  --standalone-test \
   --listen 127.0.0.1:9080 \
   --origin https://<TEST_HOST> \
   --allow-origin https://<TEST_HOST> \
@@ -261,11 +262,29 @@ Expect in the log:
 
 ```
 [louver][live-source-api] cores=4 max_concurrent=2 max_per_user=1 예상 비용=3.0 core / 800 MB
-[louver][live-source-api] gate=on admin=on allow-origin=https://<TEST_HOST> 송출 대상 사용자 N명
+[louver][live-source-api] state=/var/lib/live-source media=/srv/live-source/media
+[louver][live-source-api] mode=standalone-test auth-origin=https://<TEST_HOST> allow-origin=https://<TEST_HOST>
+[louver][live-source-api] gate=on admin=on 송출 대상 사용자 N명
 [louver][live-source-api] 송출 정지된 계정 0건
 [louver][live-source-api] 복원된 작업 0건
 [louver][live-source-api] listening on http://127.0.0.1:9080  (beta UI: /beta/)
 ```
+
+**Read the `mode=` line before anything else.** It must say
+`mode=standalone-test`, and `auth-origin=` must be the test host. If
+`auth-origin` says `247streams.kr`, the worker would be asking the live service
+who your cookies belong to — but it will not get that far: `--standalone-test`
+refuses to start on a production origin, and refuses to start with `--origin`
+missing rather than falling back to its production default. The refusal looks
+like this, and no `복원된 작업` line follows it:
+
+```
+[louver][live-source-api] --standalone-test 에서는 운영 호스트(247streams.kr)를 --origin 으로 쓸 수 없습니다. …
+```
+
+`--standalone-test` is the only thing that turns those checks on. Without it
+the binary reads `--origin` and `--allow-origin` exactly as it always has, so
+the production configuration (§3.2) is unaffected.
 
 No secret, no destination name and no URL appears in that banner — eight tests
 assert it, including over the binary's own startup output.
@@ -444,6 +463,11 @@ Never write `header_up -X-Louver-Gate` before the `header_up X-Louver-Gate`
 line. Both land in one `HeaderOps` and Caddy applies `delete` after `set`, so
 the header arrives **absent** and every request is 403. `caddy validate` passes
 on the broken version — this was found by running it, not by reading it.
+
+The worker side of this must be started with `--standalone-test` (§2.7). That
+flag makes `--origin` mandatory and refuses a production host, so the one way
+this arrangement could quietly fall back to production authentication is closed
+by the binary rather than by remembering to set a flag correctly.
 
 ```bash
 export LOUVER_GATE_SECRET=<same value as LOUVER_LIVE_SOURCE_GATE_SECRET>
@@ -1041,6 +1065,7 @@ Rows 1–3 and 20 read differently in the two configurations of §3; the
 | 18 | FFmpeg owned by handle, never by pid | source-scanned for `pkill`/`pgrep`/`/proc/` | tested |
 | 19 | **suspension stops a running beta job automatically** | **NOT MET** — manual §8, or a production change that interrupts customers | REVOCATION.md §6 |
 
+| 21 | standalone mode cannot authenticate against production | `--standalone-test` makes `--origin` mandatory and refuses a production host; `--allow-origin` must name the same origin | tested — unit and real-binary |
 | 20 | the beta identifies a real user | **standalone: NOT MET BY DESIGN** — §3.1's `/api/me` is a stub that vouches for a fixed id and checks nothing, so the firewall is the authentication. Production (§3.2): a real cookie production vouches for | §3.1 |
 
 **Row 19 is the open blocker** for offering the beta to a customer. **Row 20 is

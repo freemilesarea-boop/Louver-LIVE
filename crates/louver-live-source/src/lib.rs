@@ -69,6 +69,7 @@ pub mod origin;
 pub mod process;
 pub mod resolver;
 pub(crate) mod secret;
+pub mod standalone;
 pub mod state;
 pub mod token;
 pub mod watchdog;

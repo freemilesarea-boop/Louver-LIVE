@@ -219,3 +219,51 @@ fn this_crate_contains_no_oauth_or_youtube_api_code() {
         }
     }
 }
+
+#[test]
+fn standalone_mode_cannot_reach_production_at_all() {
+    use louver_live_source::standalone;
+
+    // The crate has exactly ONE outbound HTTP call — `{origin}/api/me` in
+    // `auth.rs` — so "where can this reach production?" has one answer, and
+    // the standalone guard is on it. If a second HTTP client appears, this
+    // fails and the guard has to be extended to cover it.
+    let with_http: Vec<String> = crate_sources()
+        .into_iter()
+        .filter(|(_, body)| {
+            body.lines()
+                .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("//!"))
+                .any(|l| l.contains("ureq") || l.contains("reqwest") || l.contains("TcpStream::connect"))
+        })
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(with_http.len(), 1, "expected one outbound HTTP call site, found {with_http:?}");
+    assert!(with_http[0].ends_with("auth.rs"), "the outbound call moved to {:?}", with_http[0]);
+
+    // And on that one call site, standalone mode refuses every spelling of the
+    // production host, so the configured target cannot be the live service.
+    for production in [
+        "https://247streams.kr",
+        "https://247streams.kr/",
+        "https://247STREAMS.KR",
+        "https://247streams.kr:443",
+        "https://www.247streams.kr",
+    ] {
+        assert!(standalone::check(Some(production), None).is_err(), "{production} was not refused");
+    }
+    // Omitting it is refused too, which is what stops the production default.
+    assert!(standalone::check(None, Some("https://beta-test.example.com")).is_err());
+
+    // Nothing else production owns is nameable from here: no database and no
+    // OAuth (their own tests above), and no Caddy configuration or container.
+    const FORBIDDEN: &[&str] = &["Caddyfile", "docker compose", "docker-compose", "louver:8080"];
+    for (path, body) in crate_sources() {
+        for needle in FORBIDDEN {
+            let in_code = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && !l.trim_start().starts_with("//!"))
+                .any(|l| l.contains(needle));
+            assert!(!in_code, "{path} names {needle} outside a comment");
+        }
+    }
+}

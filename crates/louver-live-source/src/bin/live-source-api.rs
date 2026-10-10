@@ -48,6 +48,7 @@ use louver_live_source::{
     limits::Limits,
     media::MediaRoot,
     origin::AllowedOrigins,
+    standalone,
     token::Signer,
     IdentitySource, YtDlpResolver,
 };
@@ -70,11 +71,25 @@ async fn main() {
     let listen = arg(&args, "--listen").unwrap_or_else(|| "127.0.0.1:9080".to_string());
     let Some(media_dir) = arg(&args, "--media-dir") else { die("--media-dir 가 필요합니다.") };
     let Some(state_dir) = arg(&args, "--state-dir") else { die("--state-dir 가 필요합니다.") };
-    let origin = arg(&args, "--origin").unwrap_or_else(|| "https://247streams.kr".to_string());
-    // Where a browser may start a session. Defaults to the production origin,
-    // which is also where the beta page is served from; a local test adds its
-    // own with `--allow-origin`.
-    let allow_origin = arg(&args, "--allow-origin").unwrap_or_else(|| origin.clone());
+    // Standalone test mode is opt-in, and only it changes how these two are
+    // read. Without the flag the two lines in the `else` branch are what ran
+    // before this guard existed: same default, same fallback.
+    let standalone = standalone::is_enabled(&args);
+    let origin_arg = arg(&args, "--origin");
+    let allow_arg = arg(&args, "--allow-origin");
+    let (origin, allow_origin, origin_warning) = if standalone {
+        match standalone::check(origin_arg.as_deref(), allow_arg.as_deref()) {
+            Ok(o) => (o.auth, o.allow, o.warning),
+            Err(e) => die(&e.message),
+        }
+    } else {
+        let o = origin_arg.unwrap_or_else(|| "https://247streams.kr".to_string());
+        // Where a browser may start a session. Defaults to the production
+        // origin, which is also where the beta page is served from; a local
+        // test adds its own with `--allow-origin`.
+        let a = allow_arg.unwrap_or_else(|| o.clone());
+        (o, a, None)
+    };
     let beta_dir =
         arg(&args, "--beta-dir").unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/beta").to_string());
 
@@ -183,12 +198,19 @@ async fn main() {
         "[louver][live-source-api] cores={cores} max_concurrent={} max_per_user={} 예상 비용={budget_cores:.1} core / {budget_mb} MB",
         limits.max_concurrent, limits.max_per_user
     );
-    println!("[louver][live-source-api] state={state_dir} media={media_dir} origin={origin}");
-    // Counts and the allowed origins, never a name and never a URL.
+    println!("[louver][live-source-api] state={state_dir} media={media_dir}");
+    // The two origins side by side and labelled for what they do, because the
+    // mistake worth catching by eye is an auth-origin that still says
+    // production while everything else says test. Neither is a secret.
     println!(
-        "[louver][live-source-api] gate=on admin=on allow-origin={allow_origin} 송출 대상 사용자 {}명",
-        api_destination_users
+        "[louver][live-source-api] mode={} auth-origin={origin} allow-origin={allow_origin}",
+        if standalone { "standalone-test" } else { "production" }
     );
+    if let Some(w) = &origin_warning {
+        println!("[louver][live-source-api] {w}");
+    }
+    // Counts, never a name and never a URL.
+    println!("[louver][live-source-api] gate=on admin=on 송출 대상 사용자 {}명", api_destination_users);
     // Counts only. Which accounts are revoked is in the state directory and
     // the audit log, not in a banner.
     println!("[louver][live-source-api] 송출 정지된 계정 {}건", revoked.len());
