@@ -9,6 +9,14 @@
 //! double-clicked button, a retried request and a client that lost the response
 //! all land on the same job.
 //!
+//! Sequentially that is just a state-file read. Concurrently it is not: two
+//! requests arriving together would both miss the file, both pass the ceiling
+//! and both spawn, which is the two-senders-on-one-ingest failure this check
+//! exists to prevent. So an id is *reserved* for the duration of a `create`
+//! ([`CreateGuard`]) and a second concurrent request for the same id is
+//! refused — with the same wording as an id that belongs to somebody else, so
+//! the refusal is not an oracle either.
+//!
 //! ## Ownership
 //!
 //! Every lookup takes the caller's user id and a job is invisible without it.
@@ -23,8 +31,17 @@
 //! directory and restarts the jobs whose `desired` is `Running` — the
 //! instruction, not the last observed phase. Sequentially, because starting six
 //! x264 encodes in the same instant is how a recovery turns into an outage.
+//!
+//! ## Two ceilings
+//!
+//! A request has to pass the caller's own ceiling and then the machine's. The
+//! per-user one is checked first so that a user at their own limit is told so,
+//! rather than being told the machine is full when it is their own broadcasts
+//! filling it.
 
+use crate::admin::RevokedUsers;
 use crate::args;
+use crate::destinations::Destinations;
 use crate::error::{LiveSourceError, Result};
 use crate::limits::Limits;
 use crate::media::MediaRoot;
@@ -34,7 +51,7 @@ use crate::worker::{LiveWorker, WorkerConfig};
 use louver_core::streaming::ffmpeg::FfmpegTools;
 use louver_core::OutputProfile;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -95,12 +112,18 @@ impl JobView {
 pub struct Settings {
     pub state_dir: PathBuf,
     pub media: MediaRoot,
+    /// Where each user may send. Keyed by user id, so one user's names are not
+    /// reachable from another's request.
+    pub destinations: Destinations,
     pub tools: FfmpegTools,
     pub profile: OutputProfile,
     pub limits: Limits,
     pub max_restarts: u32,
     pub stall_after: Duration,
     pub grace: Duration,
+    /// Accounts an operator has revoked. Shared, persisted, and consulted on
+    /// both `create` and `recover` — see [`crate::admin`].
+    pub revoked: Arc<RevokedUsers>,
 }
 
 /// One running job, from the registry's point of view.
@@ -116,11 +139,42 @@ pub struct Registry {
     /// broadcast_id → running job. The lock is held only to read or change the
     /// map, never across a spawn or an FFmpeg call.
     running: Mutex<HashMap<String, Running>>,
+    /// The ids currently inside [`Registry::create`]. Separate from `running`
+    /// because a job is reserved before it exists and released whether or not
+    /// it came to exist.
+    creating: Mutex<HashSet<String>>,
+}
+
+/// Holds one broadcast id for the length of a `create`, and gives it back on
+/// every exit path — the early `?` returns included, which is why this is a
+/// guard and not a pair of calls.
+struct CreateGuard<'a> {
+    set: &'a Mutex<HashSet<String>>,
+    id: String,
+}
+
+impl<'a> CreateGuard<'a> {
+    /// Reserve, or report that somebody is already creating this id.
+    fn take(set: &'a Mutex<HashSet<String>>, id: &str) -> Result<Self> {
+        let mut held = set.lock().unwrap_or_else(|e| e.into_inner());
+        if !held.insert(id.to_string()) {
+            // Deliberately the same message as "that id is someone else's":
+            // a distinct one would say whether the id exists.
+            return Err(LiveSourceError::conflict("이 broadcast_id 는 사용할 수 없습니다."));
+        }
+        Ok(Self { set, id: id.to_string() })
+    }
+}
+
+impl Drop for CreateGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().unwrap_or_else(|e| e.into_inner()).remove(&self.id);
+    }
 }
 
 impl Registry {
     pub fn new(settings: Settings, resolver: Arc<dyn LiveSourceResolver>) -> Self {
-        Self { settings, resolver, running: Mutex::new(HashMap::new()) }
+        Self { settings, resolver, running: Mutex::new(HashMap::new()), creating: Mutex::new(HashSet::new()) }
     }
 
     pub fn settings(&self) -> &Settings {
@@ -167,9 +221,18 @@ impl Registry {
 
     /// How many jobs are currently running, across all users.
     ///
-    /// The ceiling is about the machine, so it counts everyone's.
+    /// The machine ceiling is about the host, so it counts everyone's.
     pub fn running_count(&self) -> usize {
         self.map().len()
+    }
+
+    /// How many of them are this caller's.
+    ///
+    /// Counted from the live map rather than from the state directory: a
+    /// stopped job still has a state file, and a ceiling that counted history
+    /// would lock a user out of a feature they are not using.
+    pub fn running_count_for(&self, owner: &str) -> usize {
+        self.map().values().filter(|r| r.owner == owner).count()
     }
 
     /// Create, or hand back what already exists.
@@ -181,6 +244,23 @@ impl Registry {
         if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
             return Err(LiveSourceError::invalid("broadcast_id 는 영숫자·하이픈·밑줄만 쓸 수 있습니다."));
         }
+
+        // --- an operator's decision outranks a valid token -------------------
+        // Checked first, and before the reservation: the account's own bearer
+        // token stays valid for up to five minutes after it is suspended, so
+        // without this a revoked user could start a job in that window with a
+        // credential that is still cryptographically fine.
+        if self.settings.revoked.is_revoked(owner) {
+            return Err(LiveSourceError::new(
+                crate::ErrorKind::Forbidden,
+                "이 계정은 현재 송출할 수 없습니다. 운영자에게 문의해 주세요.",
+            ));
+        }
+
+        // --- one creation per id at a time -----------------------------------
+        // Taken before the state file is read, because the window this closes
+        // is exactly between that read and the write further down.
+        let _reserved = CreateGuard::take(&self.creating, id)?;
 
         // --- idempotency, and the ownership check that goes with it ----------
         // Done before the limit check: a repeat of an existing job must not be
@@ -197,15 +277,23 @@ impl Registry {
             // A stopped job of theirs may be started again under the same id.
         }
 
-        // --- the ceiling -----------------------------------------------------
+        // --- the two ceilings ------------------------------------------------
+        // This user's first, so somebody at their own limit is not told the
+        // machine is full when it is their own broadcasts filling it.
+        self.settings.limits.admit_user(self.running_count_for(owner))?;
         self.settings.limits.admit(self.running_count())?;
-        let _ = plan; // per-plan ceilings are a later refinement; the machine
-                      // ceiling is the one that protects the host.
+        let _ = plan; // per-plan ceilings are a later refinement; these two are
+                      // what protect the host and the other users on it.
 
         // --- everything a request may not choose -----------------------------
-        let destination = self.settings.media.destination(&req.destination)?;
+        // The destination is looked up under *this* caller's id. A name
+        // belonging to anyone else reads as not registered, so a request cannot
+        // aim at another customer's ingest by guessing their name for it.
+        let destination = self.settings.destinations.url_for(owner, &req.destination)?;
         let job_dir = self.settings.state_dir.join(format!("job-{id}"));
-        let manifest = self.settings.media.write_manifest(&job_dir, &req.playlist)?;
+        // And the playlist is resolved inside this caller's own media
+        // directory, so a name cannot reach another user's file.
+        let manifest = self.settings.media.write_manifest(owner, &job_dir, &req.playlist)?;
         // The source is validated here as well as inside the worker, so a bad
         // URL is a 400 on the request rather than a job that fails later.
         //
@@ -367,6 +455,48 @@ impl Registry {
         self.get(owner, broadcast_id)
     }
 
+    /// Stop every job belonging to one account. The operator's hammer.
+    ///
+    /// Returns the broadcast ids actually stopped, so the audit line can say
+    /// which — a count alone is not auditable.
+    ///
+    /// Three properties, each of which is a test:
+    ///
+    ///  * **only that account's.** The map is filtered by `owner`, exactly as
+    ///    [`Self::running_count_for`] does, and each job's own stop flag is set
+    ///    — the same per-job path `cancel` uses, which the isolation tests
+    ///    already cover. No other user's FFmpeg is signalled.
+    ///  * **idempotent.** A second call finds nothing running and returns an
+    ///    empty list rather than failing.
+    ///  * **durable.** `desired = Stopped` is written for each, so `recover`
+    ///    will not restart them even before it consults the revocation list.
+    ///
+    /// The revocation itself is recorded by the caller ([`crate::api`]), not
+    /// here: this function stops jobs, and a stop that was not also persisted
+    /// would be undone by the account's still-valid token.
+    pub fn revoke_user(&self, owner: &str) -> Vec<String> {
+        // Collected under the lock, then released: joining a worker thread
+        // while holding the map would deadlock against the worker's own
+        // state write.
+        let ids: Vec<String> = {
+            let map = self.map();
+            map.iter().filter(|(_, r)| r.owner == owner).map(|(id, _)| id.clone()).collect()
+        };
+
+        let mut stopped = Vec::new();
+        for id in ids {
+            // `cancel` is the proven per-job path: it writes the intent, sets
+            // only this job's flag, joins, and writes the intent again to
+            // close the race with the worker's read-modify-write. Reusing it
+            // means revocation cannot drift from cancellation.
+            if self.cancel(owner, &id).is_ok() {
+                stopped.push(id);
+            }
+        }
+        stopped.sort();
+        stopped
+    }
+
     /// Restart the jobs that were meant to be running when this process died.
     ///
     /// Reads `desired` and not `phase`: after a crash the last observed phase
@@ -378,6 +508,14 @@ impl Registry {
             if s.desired != Desired::Running || s.owner.is_empty() {
                 continue;
             }
+            // A revocation outlives the process. `revoke_user` already wrote
+            // `desired = Stopped`, so this is belt and braces — but a state
+            // file that says `Running` for a revoked account (a crash between
+            // the two writes, or a file restored from a backup) must not put
+            // that account back on air.
+            if self.settings.revoked.is_revoked(&s.owner) {
+                continue;
+            }
             if self.map().contains_key(&s.worker_id) {
                 continue;
             }
@@ -386,7 +524,9 @@ impl Registry {
             let Ok(saved) = JobRequest::load(&self.settings.state_dir, &s.worker_id) else {
                 continue;
             };
-            let Ok(destination) = self.settings.media.destination(&saved.destination) else {
+            // Resolved again under the owner recorded in the state file, not
+            // under whoever is asking: recovery runs with no request at all.
+            let Ok(destination) = self.settings.destinations.url_for(&s.owner, &saved.destination) else {
                 continue;
             };
             let manifest = self.settings.state_dir.join(format!("job-{}", s.worker_id)).join("manifest.txt");
@@ -395,6 +535,13 @@ impl Registry {
             }
             if self.settings.limits.admit(self.running_count()).is_err() {
                 break;
+            }
+            // A user's own ceiling applies to a restart too, otherwise a
+            // recovery could put one account above a limit a request could not
+            // have passed. Theirs is skipped, not fatal: another user's jobs
+            // further down the directory still deserve to come back.
+            if self.settings.limits.admit_user(self.running_count_for(&s.owner)).is_err() {
+                continue;
             }
             if self.spawn(&s.owner, &s.worker_id, &saved.source_url, &manifest, &destination).is_ok() {
                 started += 1;

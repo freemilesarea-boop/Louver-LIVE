@@ -37,27 +37,54 @@
 //! anywhere in this crate: the RTMP(S) destination (it contains the stream
 //! key), the resolved manifest URL (YouTube signs it), and anything to do with
 //! OAuth — this crate has no OAuth code at all and never touches a token.
+//!
+//! ## The security boundary
+//!
+//! Four checks, in this order, and a request has to pass all of the ones that
+//! apply to it:
+//!
+//!  1. [`gate`] — did this request come through 247streams' proxy at all? One
+//!     shared secret, constant-time. Not authentication, and never a substitute
+//!     for it.
+//!  2. [`origin`] — on the one route that reads a browser cookie, did the
+//!     request come from the beta page? Exact match; missing and `null` are
+//!     refused.
+//!  3. [`auth`] / [`token`] — who is this? A session cookie once, for a
+//!     five-minute bearer token, and that token on everything else.
+//!  4. [`destinations`] and [`media`] — is this *their* destination, *their*
+//!     file? Both are keyed by user id, and another user's name reads as not
+//!     registered rather than as forbidden.
 
+pub mod admin;
 pub mod api;
 pub mod args;
 pub mod auth;
+pub mod destinations;
 pub mod error;
+pub mod gate;
 pub mod jobs;
 pub mod limits;
 pub mod media;
+pub mod origin;
 pub mod process;
 pub mod resolver;
+pub(crate) mod secret;
+pub mod standalone;
 pub mod state;
 pub mod token;
 pub mod watchdog;
 pub mod worker;
 
+pub use admin::{AdminSecret, AuditEntry, AuditLog, RevokedUsers};
 pub use api::Api;
 pub use auth::{Identity, IdentitySource, ProductionMe};
+pub use destinations::Destinations;
 pub use error::{ErrorKind, LiveSourceError, Result};
+pub use gate::Gate;
 pub use jobs::{JobView, NewJob, Registry, Settings};
 pub use limits::Limits;
-pub use media::MediaRoot;
+pub use media::{MediaRoot, StoredMedia};
+pub use origin::AllowedOrigins;
 pub use resolver::{classify, LiveSourceResolver, ResolvedSource, SourceKind, YtDlpResolver};
 pub use state::{Desired, Phase, StateStore, WorkerState};
 pub use token::Signer;

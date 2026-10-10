@@ -1,30 +1,59 @@
 //! The HTTP surface.
 //!
-//! Five routes and one rule: **nothing here reads an identity from a request
-//! body.** The caller is whoever the token says, and the token is either minted
-//! by the cookie handshake or rejected. There is no `user_id` field anywhere in
-//! this module's input types.
+//! Every request passes the same gauntlet, in this order, and the order is the
+//! design:
+//!
+//!  1. **[`crate::gate`]** — `X-Louver-Gate`, the secret Caddy adds to
+//!     everything it proxies here. A request that reached this port some other
+//!     way stops at a 403 having told the attacker nothing. Not
+//!     authentication: see step 3.
+//!
+//!     Enforced as a layer around the whole router — the beta page included —
+//!     so a route added later cannot forget it, and checked again inside
+//!     [`enter`] so a route moved out from under that layer would fail closed
+//!     rather than open.
+//!  2. **No `Cookie`** — on every route except `POST …/session`. Caddy strips
+//!     it, and this refuses it as well, so a misconfigured proxy that started
+//!     forwarding the session cookie to this machine would fail loudly on the
+//!     next request rather than quietly hand this worker a credential it has no
+//!     use for. The raw header is never logged or echoed.
+//!  3. **Identity** — the bearer token on everything, or, on `POST …/session`
+//!     alone, the session cookie once, with an exact `Origin` check. **Nothing
+//!     here reads an identity from a request body.** There is no `user_id`
+//!     field anywhere in this module's input types.
+//!  4. **Ownership** — the caller's id goes into every registry, destination
+//!     and media call, so a name or an id belonging to someone else resolves to
+//!     nothing rather than to their data.
 //!
 //! Errors map to status codes so a client can act on them without parsing
-//! Korean: 400 for a bad request, 401 for no usable credential, 404 for
-//! somebody else's job as well as a missing one, 409 for an id in use, 429 for
-//! the concurrency ceiling, 502 for a source this worker could not reach.
+//! Korean: 400 for a bad request, 401 for no usable credential, 403 for a
+//! request that did not come through the front door, 404 for somebody else's
+//! job as well as a missing one, 409 for an id in use, 413 for an upload over
+//! the cap, 429 for a concurrency ceiling, 502 for a source this worker could
+//! not reach.
 //!
 //! What is deliberately absent:
 //!
 //!  * no route that takes or returns a destination URL;
-//!  * no route that takes a file path;
+//!  * no route that takes a file path — media is named, and resolved inside the
+//!    caller's own directory;
 //!  * no route that reports another user's existence;
-//!  * no CORS headers, so a page on another origin cannot call this at all.
-//!    The beta page is served from this same origin through Caddy, so it needs
-//!    none — and adding them would undo the `SameSite=Strict` cookie's work.
+//!  * no CORS headers, so a page on another origin cannot read a reply from
+//!    here at all. The beta page is served from this same origin through Caddy,
+//!    so it needs none — and adding them would undo the `SameSite=Strict`
+//!    cookie's work.
 
+use crate::admin::{AdminSecret, AuditEntry, AuditLog, RevokedUsers, ADMIN_HEADER};
 use crate::auth::{bearer, Identity, IdentitySource};
 use crate::error::{ErrorKind, LiveSourceError};
+use crate::gate::{Gate, GATE_HEADER};
 use crate::jobs::{JobView, NewJob, Registry};
+use crate::media::StoredMedia;
+use crate::origin::AllowedOrigins;
 use crate::token::Signer;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -37,6 +66,18 @@ pub struct Api {
     pub jobs: Arc<Registry>,
     pub signer: Arc<Signer>,
     pub identity: Arc<dyn IdentitySource>,
+    /// The shared secret with the proxy. Not optional: there is no constructor
+    /// for an open gate, so this API cannot be run without one.
+    pub gate: Arc<Gate>,
+    /// Where a session may be started from.
+    pub origins: Arc<AllowedOrigins>,
+    /// The operator's secret. A third secret, not the gate's — see
+    /// [`crate::admin`].
+    pub admin: Arc<AdminSecret>,
+    /// Accounts an operator has revoked, persisted.
+    pub revoked: Arc<RevokedUsers>,
+    /// Where operator actions are recorded.
+    pub audit: Arc<AuditLog>,
 }
 
 /// The body of every failure. One shape, so a client has one thing to parse.
@@ -53,8 +94,13 @@ impl IntoResponse for Fail {
         let status = match self.0.kind {
             ErrorKind::Invalid => StatusCode::BAD_REQUEST,
             ErrorKind::Unauthorized => StatusCode::UNAUTHORIZED,
-            // Reported as 404: a 403 would confirm the job exists.
-            ErrorKind::Forbidden | ErrorKind::NotFound => StatusCode::NOT_FOUND,
+            // 403, and it means one thing only: this request did not come
+            // through the proxy, or it carried a cookie it should not have.
+            // Nothing in this crate reports *ownership* as `Forbidden` —
+            // somebody else's job is `NotFound`, because a 403 there would
+            // confirm the job exists.
+            ErrorKind::Forbidden => StatusCode::FORBIDDEN,
+            ErrorKind::NotFound => StatusCode::NOT_FOUND,
             ErrorKind::Conflict => StatusCode::CONFLICT,
             ErrorKind::Limit => StatusCode::TOO_MANY_REQUESTS,
             ErrorKind::NotLive | ErrorKind::Unavailable | ErrorKind::ResolverFailed => {
@@ -79,6 +125,38 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// Step 1: did this come through the proxy?
+fn gate(api: &Api, headers: &HeaderMap) -> std::result::Result<(), Fail> {
+    let got = headers.get(GATE_HEADER).and_then(|v| v.to_str().ok());
+    api.gate.check(got).map_err(Fail)
+}
+
+/// The same check as a layer, around every route including the static page.
+///
+/// A per-handler call can be forgotten by whoever adds the next route; a layer
+/// cannot. Both exist: this one is the enforcement, and the call inside
+/// [`enter`] means a route that ever ends up outside this layer still refuses
+/// rather than opens.
+async fn gate_layer(State(api): State<Api>, request: Request, next: Next) -> Response {
+    if let Err(fail) = gate(&api, request.headers()) {
+        return fail.into_response();
+    }
+    next.run(request).await
+}
+
+/// Step 2: a `Cookie` header is refused everywhere but the handshake.
+///
+/// The value is looked at only to know that it is there. It is not parsed, not
+/// copied into the error, and not logged — the one place in this crate that
+/// reads a cookie is [`crate::auth::session_cookie_only`], on the one route
+/// that needs it.
+fn no_cookie(headers: &HeaderMap) -> std::result::Result<(), Fail> {
+    if headers.contains_key(axum::http::header::COOKIE) {
+        return Err(Fail(LiveSourceError::new(ErrorKind::Forbidden, "이 요청에는 쿠키를 보낼 수 없습니다.")));
+    }
+    Ok(())
+}
+
 /// Who is calling, from the `Authorization` header and nothing else.
 fn caller(api: &Api, headers: &HeaderMap) -> std::result::Result<Identity, Fail> {
     let raw = headers
@@ -89,23 +167,43 @@ fn caller(api: &Api, headers: &HeaderMap) -> std::result::Result<Identity, Fail>
     Identity::from_token(&api.signer, token, now()).map_err(Fail)
 }
 
+/// Steps 1–3 for every route but the handshake: gate, no cookie, bearer token.
+///
+/// One function so that none of them can be forgotten on a route added later.
+fn enter(api: &Api, headers: &HeaderMap) -> std::result::Result<Identity, Fail> {
+    gate(api, headers)?;
+    no_cookie(headers)?;
+    caller(api, headers)
+}
+
 #[derive(Debug, Serialize)]
 pub struct SessionBody {
     pub token: String,
     pub expires_in: i64,
-    /// What this user may send to, by name. Never a URL.
+    /// What **this** user may send to, by name. Never a URL, and never another
+    /// user's name.
     pub destinations: Vec<String>,
     pub max_concurrent: usize,
+    pub max_per_user: usize,
     pub max_width: u32,
     pub max_height: u32,
+    pub max_upload_bytes: u64,
+    pub max_storage_bytes: u64,
+    pub allowed_extensions: Vec<&'static str>,
 }
 
 /// `POST /api/live-source/session` — the one endpoint that reads the cookie.
 ///
-/// It is used once per token lifetime. Everything else takes the bearer token,
-/// and Caddy strips `Cookie` from those routes, so the session cookie is not
-/// handed to this machine on every request.
+/// It is used once per token lifetime, and the token lives five minutes. The
+/// `Origin` check is here and nowhere else, because this is the only route
+/// where a cross-site request could achieve anything: it is the only one that
+/// uses a credential the browser attaches on its own.
 async fn session(State(api): State<Api>, headers: HeaderMap) -> Out<SessionBody> {
+    gate(&api, &headers)?;
+    // Before the cookie is read: a request from the wrong page does not get as
+    // far as having its credential used.
+    api.origins.check(headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok())).map_err(Fail)?;
+
     let cookie = headers
         .get(axum::http::header::COOKIE)
         .and_then(|v| v.to_str().ok())
@@ -113,7 +211,7 @@ async fn session(State(api): State<Api>, headers: HeaderMap) -> Out<SessionBody>
         .to_string();
     let api2 = api.clone();
     // Blocking: the handshake calls production over HTTP.
-    let (_id, token) = tokio::task::spawn_blocking(move || {
+    let (who, token) = tokio::task::spawn_blocking(move || {
         Identity::from_production(api2.identity.as_ref(), &cookie, &api2.signer, now())
     })
     .await
@@ -121,29 +219,139 @@ async fn session(State(api): State<Api>, headers: HeaderMap) -> Out<SessionBody>
     .map_err(Fail)?;
 
     let (w, h) = crate::jobs::output_cap();
+    let s = api.jobs.settings();
     Ok(Json(SessionBody {
         token,
         expires_in: crate::token::TOKEN_TTL_SECS,
-        destinations: api.jobs.settings().media.destination_names(),
-        max_concurrent: api.jobs.settings().limits.max_concurrent,
+        // Keyed by the id production just vouched for, so this list cannot
+        // contain anybody else's destination.
+        destinations: s.destinations.names_for(&who.user_id),
+        max_concurrent: s.limits.max_concurrent,
+        max_per_user: s.limits.max_per_user,
         max_width: w,
         max_height: h,
+        max_upload_bytes: crate::media::MAX_UPLOAD_BYTES,
+        max_storage_bytes: crate::media::MAX_USER_BYTES,
+        allowed_extensions: crate::media::ALLOWED_EXTENSIONS.to_vec(),
     }))
+}
+
+/* ------------------------------------------------- the operator's routes */
+
+/// Who the operator says to act on. A user id and nothing else: this endpoint
+/// cannot be made to stop "all users" or to name a job directly.
+#[derive(Debug, serde::Deserialize)]
+pub struct AdminUserReq {
+    pub user_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RevokeBody {
+    /// Whether this call changed the stored decision, or repeated one.
+    pub changed: bool,
+    /// How many of that account's jobs this call stopped.
+    pub stopped: usize,
+    /// Which ones.
+    pub jobs: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RevokedListBody {
+    pub users: Vec<String>,
+}
+
+/// Steps for an operator route: the admin secret, and nothing else.
+///
+/// Deliberately **not** the gate: see [`crate::admin`] for why requiring it
+/// would make the operator forge Caddy's header and would protect nothing.
+fn operator(api: &Api, headers: &HeaderMap) -> std::result::Result<(), Fail> {
+    let got = headers.get(ADMIN_HEADER).and_then(|v| v.to_str().ok());
+    api.admin.check(got).map_err(Fail)
+}
+
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// `POST /admin/revoke` — stop one account's broadcasts, and keep them stopped.
+///
+/// Idempotent: calling it again on an account with nothing running records the
+/// repeat and returns `stopped: 0` rather than failing.
+async fn admin_revoke(State(api): State<Api>, headers: HeaderMap, raw: axum::body::Bytes) -> Out<RevokeBody> {
+    operator(&api, &headers)?;
+    let req: AdminUserReq = body_json(&raw)?;
+    let user = crate::admin::check_user_id(&req.user_id).map_err(Fail)?.to_string();
+
+    // Persist the decision *before* stopping anything. If the order were
+    // reversed, a crash in between would leave the jobs stopped and the
+    // account free to start new ones with its still-valid token.
+    let changed = api.revoked.revoke(&user).map_err(Fail)?;
+
+    let jobs = api.jobs.clone();
+    let who = user.clone();
+    let stopped = tokio::task::spawn_blocking(move || jobs.revoke_user(&who))
+        .await
+        .map_err(|_| Fail(LiveSourceError::ffmpeg("작업 중단이 중단되었습니다.")))?;
+
+    api.audit.append(&AuditEntry {
+        at: now_rfc3339(),
+        action: "revoke".into(),
+        user_id: user,
+        stopped: stopped.len(),
+        jobs: stopped.clone(),
+        changed,
+    });
+    Ok(Json(RevokeBody { changed, stopped: stopped.len(), jobs: stopped }))
+}
+
+/// `POST /admin/restore` — lift a revocation.
+///
+/// Starts nothing. An operator who re-enables an account is saying "this
+/// account may broadcast again", not "put it back on air" — the user does
+/// that, and anything that was stopped is `desired = Stopped` on disk.
+async fn admin_restore(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    raw: axum::body::Bytes,
+) -> Out<RevokeBody> {
+    operator(&api, &headers)?;
+    let req: AdminUserReq = body_json(&raw)?;
+    let user = crate::admin::check_user_id(&req.user_id).map_err(Fail)?.to_string();
+    let changed = api.revoked.restore(&user).map_err(Fail)?;
+    api.audit.append(&AuditEntry {
+        at: now_rfc3339(),
+        action: "restore".into(),
+        user_id: user,
+        stopped: 0,
+        jobs: vec![],
+        changed,
+    });
+    Ok(Json(RevokeBody { changed, stopped: 0, jobs: vec![] }))
+}
+
+/// `GET /admin/revoked` — who is currently revoked.
+async fn admin_revoked(State(api): State<Api>, headers: HeaderMap) -> Out<RevokedListBody> {
+    operator(&api, &headers)?;
+    Ok(Json(RevokedListBody { users: api.revoked.list() }))
 }
 
 #[derive(Debug, Serialize)]
 pub struct JobsBody {
     pub jobs: Vec<JobView>,
     pub running: usize,
+    pub running_mine: usize,
     pub max_concurrent: usize,
+    pub max_per_user: usize,
 }
 
 async fn list_jobs(State(api): State<Api>, headers: HeaderMap) -> Out<JobsBody> {
-    let who = caller(&api, &headers)?;
+    let who = enter(&api, &headers)?;
     Ok(Json(JobsBody {
         jobs: api.jobs.list(&who.user_id),
         running: api.jobs.running_count(),
+        running_mine: api.jobs.running_count_for(&who.user_id),
         max_concurrent: api.jobs.settings().limits.max_concurrent,
+        max_per_user: api.jobs.settings().limits.max_per_user,
     }))
 }
 
@@ -165,7 +373,7 @@ async fn create_job(
     headers: HeaderMap,
     raw: axum::body::Bytes,
 ) -> std::result::Result<(StatusCode, Json<JobView>), Fail> {
-    let who = caller(&api, &headers)?;
+    let who = enter(&api, &headers)?;
     let req: NewJob = body_json(&raw)?;
     let jobs = Arc::clone(&api.jobs);
     let (owner, plan) = (who.user_id.clone(), who.plan.clone());
@@ -178,12 +386,12 @@ async fn create_job(
 }
 
 async fn get_job(State(api): State<Api>, headers: HeaderMap, Path(id): Path<String>) -> Out<JobView> {
-    let who = caller(&api, &headers)?;
+    let who = enter(&api, &headers)?;
     api.jobs.get(&who.user_id, &id).map(Json).map_err(Fail)
 }
 
 async fn cancel_job(State(api): State<Api>, headers: HeaderMap, Path(id): Path<String>) -> Out<JobView> {
-    let who = caller(&api, &headers)?;
+    let who = enter(&api, &headers)?;
     let jobs = Arc::clone(&api.jobs);
     let owner = who.user_id.clone();
     tokio::task::spawn_blocking(move || jobs.cancel(&owner, &id))
@@ -191,6 +399,67 @@ async fn cancel_job(State(api): State<Api>, headers: HeaderMap, Path(id): Path<S
         .map_err(|_| Fail(LiveSourceError::ffmpeg("작업 취소가 중단되었습니다.")))?
         .map(Json)
         .map_err(Fail)
+}
+
+#[derive(Debug, Serialize)]
+pub struct MediaBody {
+    pub media: Vec<StoredMedia>,
+    pub used_bytes: u64,
+    pub max_storage_bytes: u64,
+    pub max_upload_bytes: u64,
+    pub allowed_extensions: Vec<&'static str>,
+}
+
+fn media_body(api: &Api, user_id: &str) -> std::result::Result<MediaBody, Fail> {
+    let m = &api.jobs.settings().media;
+    let media = m.list(user_id).map_err(Fail)?;
+    Ok(MediaBody {
+        used_bytes: media.iter().map(|x| x.bytes).sum(),
+        media,
+        max_storage_bytes: crate::media::MAX_USER_BYTES,
+        max_upload_bytes: crate::media::MAX_UPLOAD_BYTES,
+        allowed_extensions: crate::media::ALLOWED_EXTENSIONS.to_vec(),
+    })
+}
+
+/// `GET …/media` — what this caller has stored. Theirs only.
+async fn list_media(State(api): State<Api>, headers: HeaderMap) -> Out<MediaBody> {
+    let who = enter(&api, &headers)?;
+    media_body(&api, &who.user_id).map(Json)
+}
+
+/// `PUT …/media/{name}` — the raw bytes of one file.
+///
+/// The name comes from the path, so axum's own routing refuses one containing a
+/// `/` before this handler exists; [`crate::media::MediaRoot::check_name`] then
+/// refuses the rest, and the file is written, probed and only then renamed into
+/// place inside this caller's own directory.
+async fn put_media(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    raw: axum::body::Bytes,
+) -> std::result::Result<(StatusCode, Json<StoredMedia>), Fail> {
+    let who = enter(&api, &headers)?;
+    let media = api.jobs.settings().media.clone();
+    let owner = who.user_id.clone();
+    // Blocking: this writes up to half a gigabyte and runs ffprobe over it.
+    let stored = tokio::task::spawn_blocking(move || media.store(&owner, &name, &raw))
+        .await
+        .map_err(|_| Fail(LiveSourceError::ffmpeg("업로드가 중단되었습니다.")))?
+        .map_err(Fail)?;
+    Ok((StatusCode::CREATED, Json(stored)))
+}
+
+/// `DELETE …/media/{name}` — one of this caller's files, and only theirs.
+async fn delete_media(
+    State(api): State<Api>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Out<MediaBody> {
+    let who = enter(&api, &headers)?;
+    api.jobs.settings().media.delete(&who.user_id, &name).map_err(Fail)?;
+    media_body(&api, &who.user_id).map(Json)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -215,7 +484,7 @@ pub struct CheckBody {
 /// Authenticated, because it makes this worker open a network connection and an
 /// unauthenticated version of that is a probe anyone could aim.
 async fn check(State(api): State<Api>, headers: HeaderMap, raw: axum::body::Bytes) -> Out<CheckBody> {
-    let _who = caller(&api, &headers)?;
+    let _who = enter(&api, &headers)?;
     let req: CheckReq = body_json(&raw)?;
     // The same boundary check `POST /jobs` makes, and for the same reason: this
     // endpoint makes the server open an address, so an unusable one is a 400
@@ -278,36 +547,141 @@ struct Health {
     max_concurrent: usize,
 }
 
-/// Unauthenticated on purpose, and it says nothing about any user.
-async fn health(State(api): State<Api>) -> Json<Health> {
-    Json(Health {
+/// Gated but not authenticated, and it says nothing about any user.
+///
+/// The gate applies here too: an upstream check runs through the same proxy and
+/// can carry the same header, and an ungated route would be a liveness oracle
+/// for anything that can reach the port.
+async fn health(State(api): State<Api>, headers: HeaderMap) -> Out<Health> {
+    gate(&api, &headers)?;
+    no_cookie(&headers)?;
+    Ok(Json(Health {
         ok: true,
         running: api.jobs.running_count(),
         max_concurrent: api.jobs.settings().limits.max_concurrent,
-    })
+    }))
+}
+
+/// Anything the customer-facing router does not match.
+///
+/// Explicit, because the gate is applied as a layer on that router and a
+/// layer wraps the router's fallback as well as its routes. Leaving the
+/// default fallback in place meant that merging the operator routes — which
+/// are deliberately outside the gate — moved the fallback out with them, and
+/// an unmatched path answered an ungated 404 instead of a gated 403. Caught by
+/// `an_unmatched_path_is_also_behind_the_gate`.
+async fn not_found() -> Fail {
+    Fail(LiveSourceError::not_found("없는 경로입니다."))
+}
+
+/// Headers on every response, including the beta page's.
+///
+/// The content policy is strict because it can be: the beta page has no inline
+/// script and no inline style — they are `app.js` and `app.css` beside it,
+/// which is what lets `script-src` be `'self'` instead of `'unsafe-inline'`.
+/// `default-src 'none'` means anything added later has to be allowed on
+/// purpose.
+const SECURITY_HEADERS: &[(&str, &str)] = &[
+    (
+        "content-security-policy",
+        "default-src 'none'; \
+         script-src 'self'; \
+         style-src 'self'; \
+         img-src 'self' data:; \
+         font-src 'self'; \
+         connect-src 'self'; \
+         form-action 'none'; \
+         base-uri 'none'; \
+         frame-ancestors 'none'",
+    ),
+    // `frame-ancestors` above covers a modern browser; this covers the rest.
+    ("x-frame-options", "DENY"),
+    ("x-content-type-options", "nosniff"),
+    // No referrer at all: a URL here can carry a broadcast id.
+    ("referrer-policy", "no-referrer"),
+    ("cross-origin-opener-policy", "same-origin"),
+    ("cross-origin-resource-policy", "same-origin"),
+    ("permissions-policy", "camera=(), microphone=(), geolocation=()"),
+    // A session reply contains a bearer token, and a job list contains a
+    // customer's broadcast ids. Neither belongs in a shared cache or on disk.
+    ("cache-control", "no-store"),
+];
+
+async fn add_security_headers(mut res: Response) -> Response {
+    let h = res.headers_mut();
+    for (name, value) in SECURITY_HEADERS {
+        if let (Ok(n), Ok(v)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) {
+            h.insert(n, v);
+        }
+    }
+    res
 }
 
 impl Api {
     /// The router, without the static beta page, so tests can drive the API
     /// alone.
     pub fn router(self) -> Router {
-        Router::new()
+        self.routes(None)
+    }
+
+    /// The router plus `/beta/`, which is what the binary serves.
+    pub fn router_with_beta(self, beta_dir: &std::path::Path) -> Router {
+        self.routes(Some(beta_dir))
+    }
+
+    /// One place where the routes and the two layers are assembled, so the
+    /// beta page is inside the gate and gets the security headers rather than
+    /// being bolted on outside them.
+    fn routes(self, beta_dir: Option<&std::path::Path>) -> Router {
+        let upload_limit = crate::media::MAX_UPLOAD_BYTES as usize;
+        let mut router = Router::new()
             .route("/api/live-source/health", get(health))
             .route("/api/live-source/session", post(session))
             .route("/api/live-source/check", post(check))
             .route("/api/live-source/jobs", get(list_jobs).post(create_job))
             .route("/api/live-source/jobs/{id}", get(get_job))
             .route("/api/live-source/jobs/{id}", delete(cancel_job))
-            .with_state(self)
-    }
+            .route("/api/live-source/media", get(list_media))
+            // The only route with a large body, and the limit is the same
+            // number `MediaRoot::store` enforces — so an oversized upload is
+            // refused by the server before it is buffered, and again by the
+            // store if it ever gets that far.
+            .route(
+                "/api/live-source/media/{name}",
+                axum::routing::put(put_media).layer(DefaultBodyLimit::max(upload_limit)),
+            )
+            .route("/api/live-source/media/{name}", delete(delete_media));
 
-    /// The router plus `/beta/`, which is what the binary serves.
-    pub fn router_with_beta(self, beta_dir: &std::path::Path) -> Router {
-        let index = beta_dir.join("index.html");
-        self.router().nest_service(
-            "/beta",
-            tower_http::services::ServeDir::new(beta_dir)
-                .fallback(tower_http::services::ServeFile::new(index)),
-        )
+        if let Some(dir) = beta_dir {
+            let index = dir.join("index.html");
+            router = router.nest_service(
+                "/beta",
+                tower_http::services::ServeDir::new(dir)
+                    .fallback(tower_http::services::ServeFile::new(index)),
+            );
+        }
+
+        // The operator's routes, merged **after** the gate layer so they are
+        // outside it. Three reasons, in [`crate::admin`]: the gate asks "did
+        // this come through Caddy?" and the honest answer here is no; Caddy
+        // does not route `/admin/*` to this worker at all, so these are
+        // reachable only on its own port; and requiring the gate would protect
+        // nothing, because if Caddy ever did route them it would add the gate
+        // header itself. They are under no path prefix that Caddy forwards.
+        let admin = Router::new()
+            .route("/admin/revoke", post(admin_revoke))
+            .route("/admin/restore", post(admin_restore))
+            .route("/admin/revoked", get(admin_revoked));
+
+        router
+            // The fallback belongs inside the gate, so an unmatched path is a
+            // 403 without the header rather than a free 404.
+            .fallback(not_found)
+            // Inner: the gate, around the customer-facing routes above.
+            .layer(axum::middleware::from_fn_with_state(self.clone(), gate_layer))
+            .merge(admin)
+            // Outer, so the gate's own 403 and the admin 403 both carry them.
+            .layer(axum::middleware::map_response(add_security_headers))
+            .with_state(self)
     }
 }

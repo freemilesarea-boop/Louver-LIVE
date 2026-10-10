@@ -1,0 +1,58 @@
+/* 247streams — YouTube Live 영상 소스 베타 페이지, 스타일
+ *
+ * A separate file rather than a `<style>` block, and `app.js` likewise, so the
+ * page's content policy can be `style-src 'self'; script-src 'self'` instead of
+ * `'unsafe-inline'`. An inline-script allowance is the one CSP relaxation that
+ * gives most of the policy's value back, so it is worth two extra files to
+ * avoid. */
+:root {
+  --bg: #0d1117; --panel: #161b22; --line: #30363d; --text: #e6edf3;
+  --dim: #8b949e; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --accent: #58a6ff;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #ffffff; --panel: #f6f8fa; --line: #d0d7de; --text: #1f2328;
+    --dim: #59636e; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --accent: #0969da;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans KR", sans-serif;
+}
+.wrap { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+.beta { color: var(--warn); font-size: 13px; }
+.sub { color: var(--dim); font-size: 13px; margin: 0 0 24px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.card h2 { font-size: 14px; margin: 0 0 12px; text-transform: uppercase; letter-spacing: .04em; color: var(--dim); }
+.card h2 .plain { text-transform: none; font-weight: 400; }
+label { display: block; font-size: 13px; margin: 12px 0 4px; color: var(--dim); }
+label .hint { color: var(--dim); }
+input, select, textarea {
+  width: 100%; padding: 8px 10px; background: var(--bg); color: var(--text);
+  border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 14px;
+}
+input[type="file"] { padding: 6px; }
+textarea { min-height: 76px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+button {
+  padding: 8px 14px; border-radius: 6px; border: 1px solid var(--line);
+  background: var(--accent); color: #fff; font: inherit; font-weight: 600; cursor: pointer;
+}
+button.ghost { background: transparent; color: var(--text); font-weight: 400; }
+button.small { padding: 3px 9px; font-size: 12px; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.msg { font-size: 13px; margin-top: 10px; }
+.msg.ok { color: var(--ok); } .msg.bad { color: var(--bad); } .msg.warn { color: var(--warn); }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--dim); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+.pill { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; border: 1px solid currentColor; }
+.pill.sending { color: var(--ok); } .pill.reconnecting { color: var(--warn); }
+.pill.gave_up { color: var(--bad); } .pill.stopped, .pill.resolving, .pill.starting { color: var(--dim); }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--dim); }
+.note { font-size: 12px; color: var(--dim); margin-top: 8px; }
+.empty { color: var(--dim); font-size: 13px; padding: 12px 0; }
+.bar { height: 4px; background: var(--line); border-radius: 2px; overflow: hidden; margin-top: 10px; }
+.bar > i { display: block; height: 100%; background: var(--accent); width: 0; }

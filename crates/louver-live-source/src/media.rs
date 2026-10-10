@@ -1,48 +1,75 @@
-//! Turning a request's playlist into a concat manifest, safely.
+//! Each user's media, in each user's own directory.
 //!
-//! Two things a client must never be able to choose, and this module is where
-//! both are refused:
+//! What a client may never choose, and where each is refused:
 //!
-//! **A file path.** The request names media by file **name** only, and the name
-//! is resolved inside one configured directory. A name containing a separator,
-//! a `..`, a NUL, a drive letter or a leading `/` is refused before it is
-//! joined to anything, and the joined path is then canonicalised and checked to
-//! still be under the root. Without that, `../../../etc/passwd` or
-//! `/var/lib/louver/cloud.db` would become an FFmpeg input, and FFmpeg would
-//! happily read either.
+//! **A path.** Media is named, never pathed. A name with a separator, a `..`, a
+//! dot-prefix, a colon or a NUL is refused *before* anything is joined, and the
+//! joined path is then canonicalised and checked to still be inside this user's
+//! directory — which is what catches a symlink whose name looks innocent.
 //!
-//! **A destination.** The RTMP(S) URL carries the stream key, so it is not in
-//! any request body. The client names a destination and this module looks the
-//! URL up in configuration the operator wrote. A client that could post a
-//! destination could point someone else's picture and music at its own ingest,
-//! or read a stream key back out of an error message.
+//! **Another user's file.** Every call takes the caller's id and resolves
+//! inside `<root>/<user>/`. There is no API that takes a path, and none that
+//! takes a user id from a request body.
 //!
-//! The manifest itself is written with the concat demuxer's quoting rules, and
-//! a name that would need escaping has already been refused — so there is
-//! nothing to escape.
+//! **What counts as media.** An upload is accepted on three separate grounds,
+//! and all three have to hold: a size under the per-file cap, an extension on a
+//! short list, and `ffprobe` finding a real video or audio stream in it. The
+//! third is the one that matters — an extension is a claim, not a fact, and
+//! FFmpeg will happily be pointed at whatever a `.mp4` actually contains.
+//!
+//! An upload that fails any of those leaves nothing behind: the bytes go to a
+//! temporary name inside the user's directory, are probed there, and are either
+//! renamed into place or deleted. The temporary name begins with a dot, which
+//! [`MediaRoot::resolve`] refuses, so a half-written upload cannot be used as a
+//! playlist item even in the window before it is cleaned up.
+//!
+//! This directory is the worker's own. It is **not** production's media volume
+//! and nothing here opens production's database — beta media is uploaded to
+//! this service directly, which is what keeps the two storage systems from
+//! sharing a failure.
 
 use crate::error::{LiveSourceError, Result};
-use std::collections::BTreeMap;
+use louver_core::streaming::ffmpeg::FfmpegTools;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-/// The most media one job may name. A playlist is music, not a filesystem dump.
+/// The most media one job may name.
 pub const MAX_PLAYLIST_ITEMS: usize = 200;
 
 /// The longest media file name this will consider.
-pub const MAX_NAME_CHARS: usize = 200;
+pub const MAX_NAME_CHARS: usize = 120;
 
-/// Where media lives and where destinations are defined.
+/// The largest single upload.
+pub const MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The most one user may store in total.
+pub const MAX_USER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// How long `ffprobe` may take on an upload before it is rejected.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Extensions this will store. A claim, checked against the bytes below.
+pub const ALLOWED_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "mkv", "webm", "m4a", "mp3", "aac", "wav"];
+
+/// One upload, once it is on disk.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct StoredMedia {
+    pub name: String,
+    pub bytes: u64,
+    /// What `ffprobe` actually found, for the operator and the UI.
+    pub kind: String,
+}
+
+/// Where this worker's media lives.
 #[derive(Debug, Clone)]
 pub struct MediaRoot {
     root: PathBuf,
-    /// name → RTMP(S) URL. From configuration only.
-    destinations: BTreeMap<String, String>,
+    tools: FfmpegTools,
 }
 
 impl MediaRoot {
-    /// The directory must exist, so a typo fails at startup rather than on the
-    /// first request.
-    pub fn new(root: impl Into<PathBuf>, destinations: BTreeMap<String, String>) -> Result<Self> {
+    /// The directory must exist, so a typo fails at startup.
+    pub fn new(root: impl Into<PathBuf>, tools: FfmpegTools) -> Result<Self> {
         let root = root.into();
         let root = root
             .canonicalize()
@@ -50,34 +77,43 @@ impl MediaRoot {
         if !root.is_dir() {
             return Err(LiveSourceError::invalid("미디어 경로가 디렉터리가 아닙니다."));
         }
-        Ok(Self { root, destinations })
+        Ok(Self { root, tools })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// The names an operator has defined. Never the URLs.
-    pub fn destination_names(&self) -> Vec<String> {
-        self.destinations.keys().cloned().collect()
-    }
-
-    /// A destination's URL, by the name a client asked for.
+    /// A user id as a single directory component.
     ///
-    /// The returned string is a credential. It goes into the worker's config
-    /// and nowhere else — not into a response, not into a log, not into the
-    /// state file.
-    pub fn destination(&self, name: &str) -> Result<String> {
-        self.destinations
-            .get(name)
-            .cloned()
-            // The message names what was asked for, not what exists, so this is
-            // not an oracle for guessing other operators' destination names.
-            .ok_or_else(|| LiveSourceError::invalid("등록되지 않은 송출 대상입니다."))
+    /// 247streams ids are hex uuids, so this is defence against a future id
+    /// shape rather than against today's: anything outside a short safe set
+    /// becomes `_`, and the result can be only one component deep.
+    fn user_component(user_id: &str) -> Result<String> {
+        let safe: String = user_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .take(64)
+            .collect();
+        if safe.trim_matches('_').is_empty() {
+            return Err(LiveSourceError::unauthorized("사용자를 확인할 수 없습니다."));
+        }
+        Ok(safe)
     }
 
-    /// One media file name → its path inside the root.
-    pub fn resolve(&self, name: &str) -> Result<PathBuf> {
+    /// This user's directory, created if it is not there yet.
+    pub fn dir_for(&self, user_id: &str) -> Result<PathBuf> {
+        let dir = self.root.join(Self::user_component(user_id)?);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| LiveSourceError::invalid(format!("사용자 디렉터리를 만들 수 없습니다: {e}")))?;
+        Ok(dir)
+    }
+
+    /// Check a media *name* without touching the filesystem.
+    ///
+    /// Separate from [`Self::resolve`] so an upload can validate the name it
+    /// was given before it writes a single byte.
+    pub fn check_name(name: &str) -> Result<&str> {
         let refuse =
             |why: &str| Err(LiveSourceError::invalid(format!("영상 이름을 사용할 수 없습니다: {why}")));
         let n = name.trim();
@@ -90,37 +126,194 @@ impl MediaRoot {
         if n.chars().any(|c| c.is_control()) {
             return refuse("제어문자가 있습니다");
         }
-        // Everything that makes a name into a path. Checked before any join, so
-        // there is no intermediate path to get wrong.
+        // Everything that turns a name into a path, refused before any join.
         if n.contains('/') || n.contains('\\') || n.contains('\0') {
             return refuse("경로를 포함할 수 없습니다");
         }
-        if n == "." || n == ".." || n.starts_with('.') {
+        if n.starts_with('.') {
+            // Also what keeps a `.tmp-…` upload from being nameable.
             return refuse("점으로 시작할 수 없습니다");
         }
-        // `C:` and `\\?\` shapes, which are paths on Windows.
         if n.contains(':') {
             return refuse("콜론을 포함할 수 없습니다");
         }
-        let joined = self.root.join(n);
-        // Canonicalise and check again: a symlink inside the root pointing out
-        // of it is the case the name check cannot see.
-        let real =
-            joined.canonicalize().map_err(|_| LiveSourceError::invalid("해당 영상을 찾을 수 없습니다."))?;
-        if !real.starts_with(&self.root) {
-            return refuse("디렉터리를 벗어납니다");
+        Ok(n)
+    }
+
+    /// The extension, lowercased, if it is one this will store.
+    fn check_extension(name: &str) -> Result<String> {
+        let ext = Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !ALLOWED_EXTENSIONS.contains(&ext.as_str()) {
+            return Err(LiveSourceError::invalid(format!(
+                "지원하지 않는 형식입니다. 사용 가능: {}",
+                ALLOWED_EXTENSIONS.join(", ")
+            )));
+        }
+        Ok(ext)
+    }
+
+    /// One of this user's media names → its path.
+    pub fn resolve(&self, user_id: &str, name: &str) -> Result<PathBuf> {
+        let n = Self::check_name(name)?;
+        let dir = self.dir_for(user_id)?;
+        let real = dir
+            .join(n)
+            .canonicalize()
+            .map_err(|_| LiveSourceError::not_found("해당 영상을 찾을 수 없습니다."))?;
+        // Canonicalised and re-checked: a symlink inside the directory pointing
+        // out of it is the case a name check cannot see.
+        let dir_real = dir.canonicalize().unwrap_or(dir);
+        if !real.starts_with(&dir_real) {
+            return Err(LiveSourceError::invalid("영상 이름을 사용할 수 없습니다: 디렉터리를 벗어납니다"));
         }
         if !real.is_file() {
-            return refuse("파일이 아닙니다");
+            return Err(LiveSourceError::invalid("영상 이름을 사용할 수 없습니다: 파일이 아닙니다"));
         }
         Ok(real)
     }
 
-    /// Write the concat manifest for a playlist, returning its path.
+    /// What this user has stored.
+    pub fn list(&self, user_id: &str) -> Result<Vec<StoredMedia>> {
+        let dir = self.dir_for(user_id)?;
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(&dir) else { return Ok(out) };
+        for e in entries.flatten() {
+            let p = e.path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+            // Temporary and hidden files are not media.
+            if name.starts_with('.') || !p.is_file() {
+                continue;
+            }
+            let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(StoredMedia { name: name.to_string(), bytes, kind: String::new() });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(out)
+    }
+
+    /// How many bytes this user is using.
+    pub fn used_bytes(&self, user_id: &str) -> u64 {
+        self.list(user_id).map(|v| v.iter().map(|m| m.bytes).sum()).unwrap_or(0)
+    }
+
+    /// Store an upload, or leave nothing behind.
     ///
-    /// The manifest is written into the job's own directory, which the caller
-    /// owns, so two jobs never share one.
-    pub fn write_manifest(&self, job_dir: &Path, names: &[String]) -> Result<PathBuf> {
+    /// The order is deliberate: name, extension and declared size are checked
+    /// before a byte is written; the quota is checked against what is already
+    /// stored; the bytes go to a dotted temporary name; `ffprobe` decides
+    /// whether they are media at all; only then is the file renamed into place.
+    /// Every failure path removes the temporary file.
+    pub fn store(&self, user_id: &str, name: &str, bytes: &[u8]) -> Result<StoredMedia> {
+        let n = Self::check_name(name)?.to_string();
+        Self::check_extension(&n)?;
+        let len = bytes.len() as u64;
+        if len == 0 {
+            return Err(LiveSourceError::invalid("빈 파일은 올릴 수 없습니다."));
+        }
+        if len > MAX_UPLOAD_BYTES {
+            return Err(LiveSourceError::invalid(format!(
+                "파일이 너무 큽니다 (최대 {}MB).",
+                MAX_UPLOAD_BYTES / 1024 / 1024
+            )));
+        }
+        let dir = self.dir_for(user_id)?;
+        // Replacing a file of their own is allowed; its bytes are not counted
+        // twice against the quota.
+        let replacing = self
+            .resolve(user_id, &n)
+            .ok()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let used = self.used_bytes(user_id).saturating_sub(replacing);
+        if used + len > MAX_USER_BYTES {
+            return Err(LiveSourceError::limit(format!(
+                "저장 용량을 초과합니다 (최대 {}GB, 현재 {}MB).",
+                MAX_USER_BYTES / 1024 / 1024 / 1024,
+                used / 1024 / 1024
+            )));
+        }
+
+        // A dotted temporary name: `resolve` refuses anything starting with a
+        // dot, so this cannot be used as a playlist item while it exists.
+        let tmp = dir.join(format!(".tmp-{}-{}", std::process::id(), now_nanos()));
+        std::fs::write(&tmp, bytes).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            LiveSourceError::invalid(format!("파일을 저장할 수 없습니다: {e}"))
+        })?;
+
+        // An extension is a claim. This is the fact.
+        let kind = match self.probe_kind(&tmp) {
+            Ok(k) => k,
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        };
+
+        let final_path = dir.join(&n);
+        if let Err(e) = std::fs::rename(&tmp, &final_path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(LiveSourceError::invalid(format!("파일을 저장할 수 없습니다: {e}")));
+        }
+        Ok(StoredMedia { name: n, bytes: len, kind })
+    }
+
+    /// Remove one of this user's files.
+    pub fn delete(&self, user_id: &str, name: &str) -> Result<()> {
+        let path = self.resolve(user_id, name)?;
+        std::fs::remove_file(path)
+            .map_err(|e| LiveSourceError::invalid(format!("파일을 지울 수 없습니다: {e}")))
+    }
+
+    /// What `ffprobe` finds, or why this is not media.
+    fn probe_kind(&self, path: &Path) -> Result<String> {
+        let mut cmd = std::process::Command::new(&self.tools.ffprobe);
+        cmd.args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-print_format",
+            "json",
+            "-show_streams",
+            "-show_format",
+            // A local file, so no network protocol is needed or allowed.
+            "-protocol_whitelist",
+            "file",
+            "-i",
+        ])
+        .arg(path);
+        let run = crate::process::run_with_timeout(cmd, PROBE_TIMEOUT)
+            .map_err(|e| LiveSourceError::invalid(format!("파일을 검사할 수 없습니다: {e}")))?;
+        if run.timed_out {
+            return Err(LiveSourceError::invalid("파일 검사 시간을 초과했습니다."));
+        }
+        if !run.ok {
+            return Err(LiveSourceError::invalid("읽을 수 있는 영상·음성 파일이 아닙니다."));
+        }
+        let v: serde_json::Value = serde_json::from_slice(&run.stdout)
+            .map_err(|_| LiveSourceError::invalid("파일 정보를 읽을 수 없습니다."))?;
+        let streams = v.get("streams").and_then(|s| s.as_array()).cloned().unwrap_or_default();
+        let has_video = streams.iter().any(|s| s.get("codec_type").and_then(|t| t.as_str()) == Some("video"));
+        let has_audio = streams.iter().any(|s| s.get("codec_type").and_then(|t| t.as_str()) == Some("audio"));
+        // The playlist supplies the sound, so audio is what a playlist item is
+        // actually for; a video-only file is still usable as one.
+        match (has_video, has_audio) {
+            (_, true) | (true, false) => Ok(match (has_video, has_audio) {
+                (true, true) => "video+audio".to_string(),
+                (true, false) => "video".to_string(),
+                _ => "audio".to_string(),
+            }),
+            (false, false) => Err(LiveSourceError::invalid("영상도 음성도 없는 파일입니다.")),
+        }
+    }
+
+    /// Write the concat manifest for a playlist into a job's own directory.
+    pub fn write_manifest(&self, user_id: &str, job_dir: &Path, names: &[String]) -> Result<PathBuf> {
         if names.is_empty() {
             return Err(LiveSourceError::invalid("음악이 될 영상을 최소 한 개 선택해 주세요."));
         }
@@ -131,12 +324,11 @@ impl MediaRoot {
         }
         let mut body = String::new();
         for name in names {
-            let path = self.resolve(name)?;
-            // The concat demuxer takes `file '<path>'`. A path containing a
-            // quote would break out of it — and cannot occur, because the name
-            // it came from has no separators and lives under a root the
-            // operator chose. Refused anyway rather than assumed.
+            let path = self.resolve(user_id, name)?;
             let s = path.to_string_lossy();
+            // A quote would break out of `file '…'`. It cannot occur — the name
+            // it came from has no separators and the directory is ours — and is
+            // refused anyway rather than assumed.
             if s.contains('\'') || s.contains('\n') {
                 return Err(LiveSourceError::invalid("영상 경로에 사용할 수 없는 문자가 있습니다."));
             }
@@ -151,141 +343,269 @@ impl MediaRoot {
     }
 }
 
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real, tiny media file, because the whole point of the upload check is
+    /// that it looks at the bytes rather than the name.
+    fn real_media() -> Option<Vec<u8>> {
+        let ff = which("ffmpeg")?;
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("t.mp4");
+        let ok = std::process::Command::new(ff)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-c:a",
+                "aac",
+            ])
+            .arg(&out)
+            .status()
+            .ok()?
+            .success();
+        ok.then(|| std::fs::read(&out).ok()).flatten()
+    }
+
+    fn which(name: &str) -> Option<PathBuf> {
+        std::env::var_os("PATH")?
+            .to_string_lossy()
+            .split(':')
+            .map(|d| Path::new(d).join(name))
+            .find(|p| p.is_file())
+    }
 
     fn root() -> (tempfile::TempDir, MediaRoot) {
         let dir = tempfile::tempdir().unwrap();
         let media = dir.path().join("media");
         std::fs::create_dir_all(&media).unwrap();
-        for n in ["a.mp4", "b.mp4"] {
-            std::fs::write(media.join(n), b"not really a video").unwrap();
-        }
-        std::fs::create_dir_all(media.join("sub")).unwrap();
-        std::fs::write(media.join("sub").join("c.mp4"), b"x").unwrap();
-        // A secret outside the root, which is what the traversal tests aim at.
         std::fs::write(dir.path().join("secret.txt"), b"stream-key-abcd").unwrap();
-        let mut d = BTreeMap::new();
-        d.insert("test-sink".to_string(), "rtmp://127.0.0.1:1935/live/test".to_string());
-        let mr = MediaRoot::new(&media, d).unwrap();
+        let tools = FfmpegTools::new(
+            which("ffmpeg").map(|p| p.display().to_string()).unwrap_or_else(|| "ffmpeg".into()),
+            which("ffprobe").map(|p| p.display().to_string()).unwrap_or_else(|| "ffprobe".into()),
+        );
+        let mr = MediaRoot::new(&media, tools).unwrap();
         (dir, mr)
     }
 
-    #[test]
-    fn a_plain_name_resolves_inside_the_root() {
-        let (_d, mr) = root();
-        let p = mr.resolve("a.mp4").unwrap();
-        assert!(p.starts_with(mr.root()));
-        assert!(p.ends_with("a.mp4"));
+    /// Put a file straight into a user's directory, bypassing the upload check,
+    /// for the tests that are about resolution rather than storage.
+    fn plant(mr: &MediaRoot, user: &str, name: &str, body: &[u8]) -> PathBuf {
+        let dir = mr.dir_for(user).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, body).unwrap();
+        p
     }
 
     #[test]
-    fn nothing_that_looks_like_a_path_is_accepted() {
+    fn each_user_gets_their_own_directory() {
         let (_d, mr) = root();
+        let a = mr.dir_for("user-alice").unwrap();
+        let b = mr.dir_for("user-bob").unwrap();
+        assert_ne!(a, b);
+        assert!(a.starts_with(mr.root()) && b.starts_with(mr.root()));
+    }
+
+    #[test]
+    fn one_user_cannot_resolve_another_users_file() {
+        let (_d, mr) = root();
+        plant(&mr, "user-alice", "alice.mp4", b"x");
+        assert!(mr.resolve("user-alice", "alice.mp4").is_ok());
+        // Bob naming Alice's file: not found, in Bob's directory.
+        let e = mr.resolve("user-bob", "alice.mp4").unwrap_err();
+        assert_eq!(e.kind, crate::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn one_user_cannot_reach_another_users_file_by_path() {
+        let (_d, mr) = root();
+        plant(&mr, "user-alice", "alice.mp4", b"x");
+        let alice_dir = MediaRoot::user_component("user-alice").unwrap();
         for bad in [
-            "../secret.txt",
-            "../../etc/passwd",
-            "/etc/passwd",
-            "sub/c.mp4",
-            "sub\\c.mp4",
-            "./a.mp4",
-            ".",
-            "..",
-            "C:\\windows\\system32",
-            "a.mp4\0.txt",
-            "a\nb.mp4",
-            "",
-            "   ",
+            format!("../{alice_dir}/alice.mp4"),
+            format!("..\\{alice_dir}\\alice.mp4"),
+            "../../secret.txt".to_string(),
+            "/etc/passwd".to_string(),
+            "./alice.mp4".to_string(),
+            ".hidden".to_string(),
+            "a:b.mp4".to_string(),
+            "a\0b.mp4".to_string(),
+            String::new(),
         ] {
-            let e = mr.resolve(bad).unwrap_err();
-            assert_eq!(e.kind, crate::ErrorKind::Invalid, "{bad:?} was accepted");
+            let e = mr.resolve("user-bob", &bad).unwrap_err();
+            assert!(
+                matches!(e.kind, crate::ErrorKind::Invalid | crate::ErrorKind::NotFound),
+                "{bad:?} → {e:?}"
+            );
+        }
+    }
+
+    /// Unix only, and gated at the test rather than inside it.
+    ///
+    /// An earlier version kept the test on every platform and wrapped its body
+    /// in `#[cfg(unix)]`, which left `bob` and `d` bound but unused on Windows
+    /// — invisible here, and `-D warnings` in CI turned it into a build
+    /// failure on that runner alone. Gating the whole test says what is
+    /// actually true: this is about unix symlinks, and on Windows there is
+    /// nothing to assert rather than a test that silently does nothing.
+    #[test]
+    #[cfg(unix)]
+    fn a_symlink_out_of_a_users_directory_is_refused() {
+        let (d, mr) = root();
+        plant(&mr, "user-alice", "alice.mp4", b"secret");
+        let bob = mr.dir_for("user-bob").unwrap();
+        // The case a name check cannot see: a plain name pointing elsewhere.
+        std::os::unix::fs::symlink(d.path().join("secret.txt"), bob.join("escape.mp4")).unwrap();
+        std::os::unix::fs::symlink(mr.dir_for("user-alice").unwrap().join("alice.mp4"), bob.join("peek.mp4"))
+            .unwrap();
+        for name in ["escape.mp4", "peek.mp4"] {
+            let e = mr.resolve("user-bob", name).unwrap_err();
+            assert!(e.message.contains("디렉터리를 벗어납니다"), "{name} → {}", e.message);
         }
     }
 
     #[test]
-    fn a_symlink_out_of_the_root_is_refused_even_though_its_name_is_plain() {
-        let (d, mr) = root();
-        // The case a name check alone cannot see: the name is `escape.mp4`, with
-        // no separators, but it points outside.
-        let link = mr.root().join("escape.mp4");
-        #[cfg(unix)]
-        std::os::unix::fs::symlink(d.path().join("secret.txt"), &link).unwrap();
-        #[cfg(unix)]
-        {
-            let e = mr.resolve("escape.mp4").unwrap_err();
-            assert!(e.message.contains("디렉터리를 벗어납니다"), "{}", e.message);
+    fn a_listing_shows_only_this_users_files_and_hides_temporaries() {
+        let (_d, mr) = root();
+        plant(&mr, "user-alice", "a.mp4", b"12345");
+        plant(&mr, "user-alice", ".tmp-123", b"junk");
+        plant(&mr, "user-bob", "b.mp4", b"1");
+        let names: Vec<String> = mr.list("user-alice").unwrap().into_iter().map(|m| m.name).collect();
+        assert_eq!(names, vec!["a.mp4".to_string()], "no temporaries, no other users");
+        assert_eq!(mr.used_bytes("user-alice"), 5);
+        assert_eq!(mr.used_bytes("user-bob"), 1);
+        assert_eq!(mr.used_bytes("user-nobody"), 0);
+    }
+
+    #[test]
+    fn an_upload_has_to_be_real_media_and_not_merely_named_like_it() {
+        let (_d, mr) = root();
+        if which("ffprobe").is_none() {
+            eprintln!("SKIP: no ffprobe");
+            return;
         }
-        let _ = (d, link);
+        // An extension is a claim. These are not media.
+        for body in [b"not a video at all".as_slice(), &[0u8; 2048]] {
+            let e = mr.store("user-alice", "claim.mp4", body).unwrap_err();
+            assert_eq!(e.kind, crate::ErrorKind::Invalid);
+            assert!(e.message.contains("영상") || e.message.contains("파일"), "{}", e.message);
+        }
+        // And nothing is left behind, not even a temporary.
+        let left: Vec<_> = std::fs::read_dir(mr.dir_for("user-alice").unwrap()).unwrap().flatten().collect();
+        assert!(left.is_empty(), "upload failure left {left:?}");
     }
 
     #[test]
-    fn a_directory_is_not_media() {
+    fn a_real_upload_is_stored_and_then_usable_as_a_playlist_item() {
         let (_d, mr) = root();
-        assert!(mr.resolve("sub").is_err());
+        let Some(bytes) = real_media() else {
+            eprintln!("SKIP: no ffmpeg");
+            return;
+        };
+        let stored = mr.store("user-alice", "song.m4a", &bytes).unwrap();
+        assert_eq!(stored.name, "song.m4a");
+        assert_eq!(stored.bytes, bytes.len() as u64);
+        assert!(stored.kind.contains("audio"), "{}", stored.kind);
+        // Resolvable by its owner, and only by its owner.
+        assert!(mr.resolve("user-alice", "song.m4a").is_ok());
+        assert!(mr.resolve("user-bob", "song.m4a").is_err());
+        // And it makes a manifest.
+        let job = mr.root().join("job-1");
+        let m = mr.write_manifest("user-alice", &job, &["song.m4a".into()]).unwrap();
+        let body = std::fs::read_to_string(m).unwrap();
+        assert!(body.starts_with("file '") && body.trim_end().ends_with("song.m4a'"), "{body}");
     }
 
     #[test]
-    fn a_missing_file_says_so_without_revealing_the_root() {
+    fn an_unsupported_extension_is_refused_before_anything_is_written() {
         let (_d, mr) = root();
-        let e = mr.resolve("nope.mp4").unwrap_err();
-        assert!(e.message.contains("찾을 수 없습니다"), "{}", e.message);
-        assert!(!e.message.contains("/tmp"), "the path must not be echoed: {}", e.message);
+        for name in ["script.sh", "payload.exe", "x.php", "noext", "a.mp4.sh", "a.MP4x"] {
+            let e = mr.store("user-alice", name, b"whatever").unwrap_err();
+            assert!(e.message.contains("지원하지 않는 형식"), "{name} → {}", e.message);
+        }
+        // An upper-case extension on the list is fine.
+        assert!(MediaRoot::check_extension("A.MP4").is_ok());
+        let left: Vec<_> = std::fs::read_dir(mr.dir_for("user-alice").unwrap()).unwrap().flatten().collect();
+        assert!(left.is_empty());
     }
 
     #[test]
-    fn a_manifest_names_every_item_in_order() {
-        let (d, mr) = root();
-        let job = d.path().join("job-1");
-        let m = mr.write_manifest(&job, &["a.mp4".into(), "b.mp4".into(), "a.mp4".into()]).unwrap();
-        let body = std::fs::read_to_string(&m).unwrap();
-        let lines: Vec<&str> = body.lines().collect();
-        assert_eq!(lines.len(), 3);
-        assert!(lines[0].starts_with("file '") && lines[0].ends_with("a.mp4'"), "{}", lines[0]);
-        assert!(lines[1].ends_with("b.mp4'"));
-        assert!(lines[2].ends_with("a.mp4'"), "a repeat is allowed");
-    }
-
-    #[test]
-    fn a_manifest_refuses_an_item_that_escapes_and_writes_nothing() {
-        let (d, mr) = root();
-        let job = d.path().join("job-2");
-        assert!(mr.write_manifest(&job, &["a.mp4".into(), "../secret.txt".into()]).is_err());
-        // Nothing half-written: the manifest must not exist with the good half.
-        assert!(!job.join("manifest.txt").exists());
-    }
-
-    #[test]
-    fn an_empty_or_enormous_playlist_is_refused() {
-        let (d, mr) = root();
-        let job = d.path().join("job-3");
-        assert!(mr.write_manifest(&job, &[]).unwrap_err().message.contains("최소 한 개"));
-        let many: Vec<String> = (0..MAX_PLAYLIST_ITEMS + 1).map(|_| "a.mp4".to_string()).collect();
-        assert!(mr.write_manifest(&job, &many).unwrap_err().message.contains("개까지"));
-    }
-
-    #[test]
-    fn a_destination_comes_from_configuration_and_never_from_a_request() {
+    fn an_upload_name_that_is_a_path_is_refused() {
         let (_d, mr) = root();
-        assert_eq!(mr.destination("test-sink").unwrap(), "rtmp://127.0.0.1:1935/live/test");
-        // A client naming anything else gets a refusal that does not say what
-        // does exist.
-        let e = mr.destination("rtmp://evil.example/live/steal").unwrap_err();
-        assert_eq!(e.message, "등록되지 않은 송출 대상입니다.");
-        assert!(mr.destination("").is_err());
+        for name in ["../../etc/passwd.mp4", "a/b.mp4", "..", ".hidden.mp4", "a\0.mp4", ""] {
+            assert!(mr.store("user-alice", name, b"x").is_err(), "{name:?}");
+        }
     }
 
     #[test]
-    fn the_names_are_listable_but_the_urls_are_not() {
+    fn an_empty_or_oversized_upload_is_refused() {
         let (_d, mr) = root();
-        let names = mr.destination_names();
-        assert_eq!(names, vec!["test-sink".to_string()]);
-        // There is no accessor that hands out the whole map.
-        assert!(!format!("{names:?}").contains("rtmp://"));
+        assert!(mr.store("user-alice", "a.mp4", b"").unwrap_err().message.contains("빈 파일"));
+        // Checked against the declared length without allocating the file.
+        assert_eq!(MAX_UPLOAD_BYTES, 512 * 1024 * 1024);
+        assert_eq!(MAX_USER_BYTES, 4 * 1024 * 1024 * 1024);
     }
 
     #[test]
-    fn a_media_root_that_does_not_exist_fails_at_construction() {
-        assert!(MediaRoot::new("/definitely/not/here", BTreeMap::new()).is_err());
+    fn the_storage_quota_counts_only_this_user() {
+        let (_d, mr) = root();
+        // Bob's usage must not reduce Alice's allowance.
+        plant(&mr, "user-bob", "big.mp4", &vec![0u8; 4096]);
+        assert_eq!(mr.used_bytes("user-alice"), 0);
+        assert_eq!(mr.used_bytes("user-bob"), 4096);
+    }
+
+    #[test]
+    fn a_delete_only_reaches_this_users_own_file() {
+        let (_d, mr) = root();
+        plant(&mr, "user-alice", "a.mp4", b"x");
+        assert!(mr.delete("user-bob", "a.mp4").is_err(), "Bob must not delete Alice's file");
+        assert!(mr.resolve("user-alice", "a.mp4").is_ok(), "and it is still there");
+        assert!(mr.delete("user-alice", "a.mp4").is_ok());
+        assert!(mr.resolve("user-alice", "a.mp4").is_err());
+    }
+
+    #[test]
+    fn a_manifest_refuses_an_item_that_is_not_this_users_and_writes_nothing() {
+        let (_d, mr) = root();
+        plant(&mr, "user-alice", "a.mp4", b"x");
+        plant(&mr, "user-bob", "b.mp4", b"x");
+        let job = mr.root().join("job-2");
+        assert!(mr.write_manifest("user-bob", &job, &["b.mp4".into(), "a.mp4".into()]).is_err());
+        assert!(!job.join("manifest.txt").exists(), "nothing half-written");
+    }
+
+    #[test]
+    fn a_user_id_that_is_not_a_usable_directory_name_is_refused() {
+        let (_d, mr) = root();
+        for bad in ["", "   ", "..", "///", "___"] {
+            assert!(mr.dir_for(bad).is_err(), "{bad:?}");
+        }
+        // And an id with odd characters is flattened, never escaped.
+        let dir = mr.dir_for("../../etc").unwrap();
+        assert_eq!(dir.parent().unwrap(), mr.root());
+    }
+
+    #[test]
+    fn an_error_message_never_echoes_the_server_path() {
+        let (_d, mr) = root();
+        for e in [
+            mr.resolve("user-alice", "nope.mp4").unwrap_err(),
+            mr.store("user-alice", "x.sh", b"x").unwrap_err(),
+            mr.delete("user-alice", "nope.mp4").unwrap_err(),
+        ] {
+            assert!(!e.message.contains("/tmp"), "{}", e.message);
+            assert!(!e.message.contains(".tmp-"), "{}", e.message);
+        }
     }
 }

@@ -1,0 +1,134 @@
+# 247streams — live-source beta, reverse-proxy configuration
+#
+# ## WHAT THIS FILE IS
+#
+# A design and test artefact. It is **not** the production Caddyfile and
+# nothing in this repository applies it. Production's `./Caddyfile` is
+# untouched; a human copies the two blocks below into it and runs
+# `caddy reload`, which replaces the configuration in the running Caddy
+# container without restarting it and without touching the `louver` container
+# at all — so no customer broadcast is interrupted. That mechanism was checked
+# against production's compose file: the Caddyfile is a bind mount, and there
+# is no `admin` directive, so Caddy listens on its default `localhost:2019`
+# and `caddy reload` works. Do not add an `admin` directive on a random port —
+# that is what makes reload unreachable, as this config's own first draft
+# proved.
+#
+# ## VALIDATED — this has been run, not merely written
+#
+# Caddy v2.10.0, a real `live-source-api` process and a stand-in for the
+# `louver` container, all on loopback. `caddy validate` passes and every
+# numbered claim below was asserted against live traffic.
+#
+# One defect was found that way, which is why this section exists. An earlier
+# draft had
+#
+#     header_up -X-Louver-Gate
+#     header_up X-Louver-Gate {env.LOUVER_GATE_SECRET}
+#
+# on the theory that a client-supplied header should be deleted before the
+# proxy adds its own. Both lines land in **one** `HeaderOps`, and Caddy applies
+# `delete` *after* `set` — so the header reached the worker **absent** and
+# every beta request answered 403. `header_up <name> <value>` is a `set`, which
+# already replaces whatever the client sent: measured, a client sending
+# `X-Louver-Gate: CLIENT-FORGED` arrives upstream carrying the real secret
+# instead. The delete was not redundant, it was the bug.
+#
+# ## WHAT IT HAS TO GET RIGHT
+#
+#  1. `/beta/*` and `/api/live-source/*` go to the worker; everything else keeps
+#     going to `louver:8080` exactly as it does now.
+#  2. The worker receives `X-Louver-Gate`, so the worker will answer at all.
+#     Without it every request is a 403 — which is the point: the worker's port
+#     is reachable by anything that can route to it until a firewall is in
+#     place, and the gate is what makes that port useless to everyone else.
+#  3. The session cookie crosses to the worker on **one** path and is removed
+#     from every other. The worker refuses a `Cookie` header on those routes as
+#     well, so this is the outer half of a check made twice.
+#  4. An inbound gate header from a client is **overwritten**, not trusted —
+#     `header_up` is a `set`. Measured rather than assumed; see the defect
+#     note above for the version that looked more careful and did the
+#     opposite.
+#  5. **`/admin/*` is not here, and must never be added.** The worker's
+#     operator routes (revoke, restore, revoked — see REVOCATION.md §5) live
+#     under `/admin/`, which neither matcher below covers, so they fall to
+#     production's catch-all and never reach the worker from the internet.
+#     They are reachable only on the worker's own port: an operator on the
+#     VPS, over SSH, against loopback. Adding a `handle` for them would make
+#     the power to take customers off air internet-reachable behind one
+#     shared secret. The firewall is the second layer; the admin secret is
+#     the third.
+#
+# ## THE SECRET
+#
+# `{env.LOUVER_GATE_SECRET}` is read from Caddy's environment — the same value
+# the worker gets as `LOUVER_LIVE_SOURCE_GATE_SECRET`. It is not written in this
+# file, and it must not be: this file is in a git repository.
+#
+# Generate one with `openssl rand -hex 32` and give it to both processes. If
+# they disagree, every beta request is a 403 and no existing broadcast is
+# affected in any way — a misconfiguration here cannot take production down,
+# which is why this is the shape chosen.
+
+# ---------------------------------------------------------------------------
+# Block 1 — inside the existing `247streams.kr { … }` site block, BEFORE the
+# existing catch-all `reverse_proxy louver:8080`.
+# ---------------------------------------------------------------------------
+
+@live_source_session path /api/live-source/session
+@live_source_other   path /api/live-source/* /beta /beta/*
+
+# The handshake: the one request that may carry the session cookie.
+handle @live_source_session {
+	reverse_proxy live-source:9080 {
+		# A `set`, so a client-supplied value is replaced. Nothing deletes
+		# this header first: that would delete what this line sets.
+		header_up X-Louver-Gate {env.LOUVER_GATE_SECRET}
+		# `Origin` is forwarded unchanged — the worker checks it itself, and a
+		# proxy that rewrote it would be forging the thing being checked.
+	}
+}
+
+# Everything else: no cookie reaches the worker.
+handle @live_source_other {
+	reverse_proxy live-source:9080 {
+		# Deleting a header nothing else sets is fine, and this one is the
+		# whole point: the worker has no use for the session cookie here
+		# and refuses a request that carries one.
+		header_up -Cookie
+		header_up X-Louver-Gate {env.LOUVER_GATE_SECRET}
+		# An upload is up to 512MB and ffprobe runs over it before the response.
+		transport http {
+			read_timeout 10m
+			write_timeout 10m
+		}
+	}
+}
+
+# ---------------------------------------------------------------------------
+# Block 2 — the compose service, for reference. The worker shares no volume,
+# no network alias and no environment with the `louver` container beyond the
+# bridge network Caddy needs to reach it. It does NOT mount the production
+# media volume, it does NOT see cloud.db, and it holds no OAuth credential.
+# ---------------------------------------------------------------------------
+#
+#   live-source:
+#     image: louver-live-source:beta
+#     restart: unless-stopped
+#     environment:
+#       LOUVER_LIVE_SOURCE_SECRET:       ${LOUVER_LIVE_SOURCE_SECRET}
+#       LOUVER_LIVE_SOURCE_GATE_SECRET:  ${LOUVER_GATE_SECRET}
+#       LOUVER_LIVE_SOURCE_DESTINATIONS: ${LOUVER_LIVE_SOURCE_DESTINATIONS}
+#     command:
+#       - --listen=0.0.0.0:9080
+#       - --origin=https://247streams.kr
+#       - --media-dir=/srv/live-source/media
+#       - --state-dir=/var/lib/live-source
+#     volumes:
+#       - live_source_media:/srv/live-source/media
+#       - live_source_state:/var/lib/live-source
+#     # Not published to the host: only Caddy needs to reach it. With
+#     # `expose` and no `ports`, the gate is a second layer rather than the
+#     # only one.
+#     expose:
+#       - "9080"
