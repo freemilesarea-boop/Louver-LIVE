@@ -279,7 +279,23 @@ missing rather than falling back to its production default. The refusal looks
 like this, and no `복원된 작업` line follows it:
 
 ```
-[louver][live-source-api] --standalone-test 에서는 운영 호스트(247streams.kr)를 --origin 으로 쓸 수 없습니다. …
+[louver][live-source-api] --standalone-test 에서는 운영 도메인(247streams.kr) 및 그 하위 도메인을 --origin 으로 쓸 수 없습니다. (받은 호스트: 247streams.kr) …
+```
+
+The refusal cannot be slipped past by spelling: the host is case-folded, a
+trailing dot (`247streams.kr.`) is removed, an explicit `:443` is removed, and a
+trailing slash is stripped before the comparison — so `https://247STREAMS.KR.:443/`
+is refused exactly like `https://247streams.kr`. Matching is on a label
+boundary, so somebody else's `evil-247streams.kr` is **not** blocked, and
+neither is `localhost`.
+
+That normalisation is also why a legitimate test host written loosely now
+works. `--origin https://Beta-Test.Example.com:443` and `--allow-origin
+https://beta-test.example.com.` are one origin, and the banner prints the
+canonical spelling a browser actually sends:
+
+```
+[louver][live-source-api] mode=standalone-test auth-origin=https://beta-test.example.com allow-origin=https://beta-test.example.com
 ```
 
 `--standalone-test` is the only thing that turns those checks on. Without it
@@ -465,9 +481,10 @@ the header arrives **absent** and every request is 403. `caddy validate` passes
 on the broken version — this was found by running it, not by reading it.
 
 The worker side of this must be started with `--standalone-test` (§2.7). That
-flag makes `--origin` mandatory and refuses a production host, so the one way
-this arrangement could quietly fall back to production authentication is closed
-by the binary rather than by remembering to set a flag correctly.
+flag makes `--origin` mandatory and refuses the service's domain and every
+subdomain of it, so the one way this arrangement could quietly fall back to
+production authentication is closed by the binary rather than by remembering to
+configure it correctly.
 
 ```bash
 export LOUVER_GATE_SECRET=<same value as LOUVER_LIVE_SOURCE_GATE_SECRET>
@@ -505,10 +522,13 @@ Substitute `https://<TEST_HOST>` for `https://247streams.kr` everywhere in
    renewal falls inside the test window. If one would, re-open 443 for it
    deliberately.
 
-2. **Use a hostname that is not a production hostname.** A `247streams.kr`
-   subdomain is safe as far as the cookie goes (host-only, proven above), but it
-   puts a box with a stub identity under the service's own name. Prefer a
-   separate domain the tester owns.
+2. **Use a domain that is not the service's.** This is no longer advice:
+   `--standalone-test` **refuses to start** on `247streams.kr` or any subdomain
+   of it, as either `--origin` or `--allow-origin`. A subdomain was safe as far
+   as the cookie goes (host-only, proven above), but the service's DNS answers
+   for it — a wildcard or a stray `A` record makes it reachable — and a box
+   with a stub identity should not wear the service's name. Use a separate
+   domain the tester owns, or `localhost`, which is not blocked.
 
 **What §3.1 does not test.** Composition, recovery, the admin API, the
 concurrency ceilings, the media rules and the 24-hour soak are all exercised
@@ -1065,7 +1085,7 @@ Rows 1–3 and 20 read differently in the two configurations of §3; the
 | 18 | FFmpeg owned by handle, never by pid | source-scanned for `pkill`/`pgrep`/`/proc/` | tested |
 | 19 | **suspension stops a running beta job automatically** | **NOT MET** — manual §8, or a production change that interrupts customers | REVOCATION.md §6 |
 
-| 21 | standalone mode cannot authenticate against production | `--standalone-test` makes `--origin` mandatory and refuses a production host; `--allow-origin` must name the same origin | tested — unit and real-binary |
+| 21 | standalone mode cannot authenticate against production | `--standalone-test` makes `--origin` mandatory, and refuses `247streams.kr` or any subdomain — case-folded, trailing dot, `:443` and trailing slash all normalised first — as either `--origin` or `--allow-origin`, which must also name the same origin | tested — 14 unit and 11 real-binary |
 | 20 | the beta identifies a real user | **standalone: NOT MET BY DESIGN** — §3.1's `/api/me` is a stub that vouches for a fixed id and checks nothing, so the firewall is the authentication. Production (§3.2): a real cookie production vouches for | §3.1 |
 
 **Row 19 is the open blocker** for offering the beta to a customer. **Row 20 is

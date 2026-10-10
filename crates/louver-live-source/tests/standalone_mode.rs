@@ -82,7 +82,65 @@ fn standalone_mode_refuses_to_start_against_the_production_origin() {
     let r = run(&["--standalone-test", "--origin", "https://247streams.kr"]);
     assert!(!r.ok, "should have exited non-zero:\n{}", r.out);
     assert!(!started(&r), "must refuse before serving anything:\n{}", r.out);
-    assert!(r.out.contains("운영 호스트"), "{}", r.out);
+    assert!(r.out.contains("운영 도메인"), "{}", r.out);
+}
+
+#[test]
+fn standalone_mode_refuses_every_spelling_of_the_service_domain() {
+    // Normalisation bypasses, against the real binary: case, a trailing dot,
+    // the default https port, a trailing slash — and subdomains, which a
+    // wildcard DNS record would answer.
+    for bad in [
+        "https://247STREAMS.KR",
+        "https://247streams.kr.",
+        "https://247streams.kr:443",
+        "https://247streams.kr/",
+        "https://247STREAMS.KR.:443/",
+        "https://www.247streams.kr",
+        "https://api.247streams.kr",
+        "https://beta-test.247streams.kr",
+    ] {
+        let r = run(&["--standalone-test", "--origin", bad]);
+        assert!(!r.ok, "{bad} should have exited non-zero:\n{}", r.out);
+        assert!(!started(&r), "{bad} must refuse before serving:\n{}", r.out);
+        assert!(r.out.contains("운영 도메인"), "{bad}: {}", r.out);
+    }
+}
+
+#[test]
+fn standalone_mode_refuses_the_service_domain_as_the_browser_origin_too() {
+    let r =
+        run(&["--standalone-test", "--origin", TEST_HOST, "--allow-origin", "https://beta.247streams.kr"]);
+    assert!(!r.ok, "should have exited non-zero:\n{}", r.out);
+    assert!(!started(&r), "must refuse before serving anything:\n{}", r.out);
+    assert!(r.out.contains("운영 도메인"), "{}", r.out);
+    assert!(r.out.contains("--allow-origin"), "{}", r.out);
+}
+
+#[test]
+fn a_look_alike_domain_and_a_localhost_setup_still_start() {
+    // The policy must not over-block: these are not the service's domain.
+    for ok in ["https://evil-247streams.kr", "https://247streams.kr.example.test", "https://localhost:8443"] {
+        let r = run(&["--standalone-test", "--origin", ok, "--allow-origin", ok]);
+        assert!(started(&r), "{ok} should have started:\n{}", r.out);
+        assert!(r.out.contains("mode=standalone-test"), "{ok}: {}", r.out);
+    }
+}
+
+#[test]
+fn a_test_host_written_differently_still_agrees_with_itself() {
+    // `--origin` with the default port and an upper-case host, `--allow-origin`
+    // with a trailing dot: one origin, so it must start rather than be refused
+    // as a mismatch, and the banner must show the canonical spelling.
+    let r = run(&[
+        "--standalone-test",
+        "--origin",
+        "https://Beta-Test.Example.com:443",
+        "--allow-origin",
+        "https://beta-test.example.com.",
+    ]);
+    assert!(started(&r), "should have started:\n{}", r.out);
+    assert!(r.out.contains(&format!("auth-origin={TEST_HOST} allow-origin={TEST_HOST}")), "{}", r.out);
 }
 
 #[test]
@@ -121,5 +179,15 @@ fn without_the_flag_nothing_changes_for_production() {
 fn without_the_flag_the_production_origin_is_still_accepted_explicitly() {
     let r = run(&["--origin", "https://247streams.kr", "--allow-origin", "https://247streams.kr"]);
     assert!(started(&r), "the production configuration must still start:\n{}", r.out);
-    assert!(!r.out.contains("운영 호스트"), "the guard must not fire without its flag:\n{}", r.out);
+    assert!(!r.out.contains("운영 도메인"), "the guard must not fire without its flag:\n{}", r.out);
+}
+
+#[test]
+fn without_the_flag_a_subdomain_of_the_service_is_also_still_accepted() {
+    // The hardened policy belongs to the test mode only. Production operators
+    // may point these options wherever they already do.
+    let r = run(&["--origin", "https://api.247streams.kr", "--allow-origin", "https://api.247streams.kr"]);
+    assert!(started(&r), "should still start without the flag:\n{}", r.out);
+    assert!(r.out.contains("mode=production"), "{}", r.out);
+    assert!(!r.out.contains("운영 도메인"), "the guard must not fire without its flag:\n{}", r.out);
 }

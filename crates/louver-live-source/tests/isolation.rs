@@ -240,16 +240,25 @@ fn standalone_mode_cannot_reach_production_at_all() {
     assert_eq!(with_http.len(), 1, "expected one outbound HTTP call site, found {with_http:?}");
     assert!(with_http[0].ends_with("auth.rs"), "the outbound call moved to {:?}", with_http[0]);
 
-    // And on that one call site, standalone mode refuses every spelling of the
-    // production host, so the configured target cannot be the live service.
+    // And on that one call site, standalone mode refuses the service's domain
+    // and every subdomain of it, in every spelling, so the configured target
+    // cannot be the live service.
     for production in [
         "https://247streams.kr",
         "https://247streams.kr/",
         "https://247STREAMS.KR",
+        "https://247streams.kr.",
         "https://247streams.kr:443",
         "https://www.247streams.kr",
+        "https://api.247streams.kr",
+        "https://beta-test.247streams.kr.:443/",
     ] {
         assert!(standalone::check(Some(production), None).is_err(), "{production} was not refused");
+        // The same policy on the browser origin, not only the auth origin.
+        assert!(
+            standalone::check(Some("https://beta-test.example.com"), Some(production)).is_err(),
+            "{production} was not refused as --allow-origin"
+        );
     }
     // Omitting it is refused too, which is what stops the production default.
     assert!(standalone::check(None, Some("https://beta-test.example.com")).is_err());

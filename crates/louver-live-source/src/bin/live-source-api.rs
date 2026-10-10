@@ -77,9 +77,9 @@ async fn main() {
     let standalone = standalone::is_enabled(&args);
     let origin_arg = arg(&args, "--origin");
     let allow_arg = arg(&args, "--allow-origin");
-    let (origin, allow_origin, origin_warning) = if standalone {
+    let (origin, allow_origin) = if standalone {
         match standalone::check(origin_arg.as_deref(), allow_arg.as_deref()) {
-            Ok(o) => (o.auth, o.allow, o.warning),
+            Ok(o) => (o.auth, o.allow),
             Err(e) => die(&e.message),
         }
     } else {
@@ -88,7 +88,7 @@ async fn main() {
         // origin, which is also where the beta page is served from; a local
         // test adds its own with `--allow-origin`.
         let a = allow_arg.unwrap_or_else(|| o.clone());
-        (o, a, None)
+        (o, a)
     };
     let beta_dir =
         arg(&args, "--beta-dir").unwrap_or_else(|| concat!(env!("CARGO_MANIFEST_DIR"), "/beta").to_string());
@@ -206,9 +206,6 @@ async fn main() {
         "[louver][live-source-api] mode={} auth-origin={origin} allow-origin={allow_origin}",
         if standalone { "standalone-test" } else { "production" }
     );
-    if let Some(w) = &origin_warning {
-        println!("[louver][live-source-api] {w}");
-    }
     // Counts, never a name and never a URL.
     println!("[louver][live-source-api] gate=on admin=on 송출 대상 사용자 {}명", api_destination_users);
     // Counts only. Which accounts are revoked is in the state directory and
