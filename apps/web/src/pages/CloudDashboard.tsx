@@ -25,6 +25,7 @@ import {
   playlistLabel,
   providerLabel,
   scheduleLabel,
+  youtubeMismatch,
   youtubeStatusLabel,
 } from "../cloud";
 import { BroadcastForm } from "./BroadcastForm";
@@ -272,6 +273,9 @@ function BroadcastCard({
   const scheduled = !live && b.schedule.enabled;
   const status = scheduled ? "예약됨" : RUNTIME_LABELS[b.runtime_state];
   const when = scheduleLabel(b.schedule);
+  // FFmpeg's state and YouTube's are two different facts; this is what to say
+  // when they disagree. `null` on every healthy broadcast.
+  const mismatch = youtubeMismatch(b);
 
   return (
     <Card
@@ -435,6 +439,17 @@ function BroadcastCard({
               </>
             )}
           </p>
+        )}
+
+        {mismatch && (
+          <div
+            data-testid="youtube-mismatch"
+            data-kind={mismatch.kind}
+            className="mt-3 rounded border border-warn/40 bg-warn/10 px-3 py-2 text-xs text-warn"
+            role="status"
+          >
+            {mismatch.message}
+          </div>
         )}
 
         <div className="mt-4 flex flex-wrap gap-x-6 gap-y-1 border-t border-ink-800 pt-3 text-xs text-ink-500">

@@ -1012,11 +1012,18 @@ struct YoutubeWatch {
     next: std::time::Instant,
     polls: u32,
     settled: bool,
+    /// Polls made after the fast phase gave up. Only counted so the interval
+    /// can grow; it is never a reason to stop.
+    slow_polls: u32,
+    /// The mismatch has been recorded once. Recorded again on every poll it
+    /// would be noise, and noise in an event log is how a real warning gets
+    /// missed.
+    warned: bool,
 }
 
 impl Default for YoutubeWatch {
     fn default() -> Self {
-        Self { next: std::time::Instant::now(), polls: 0, settled: false }
+        Self { next: std::time::Instant::now(), polls: 0, settled: false, slow_polls: 0, warned: false }
     }
 }
 
@@ -1026,28 +1033,204 @@ impl YoutubeWatch {
     const EVERY: std::time::Duration = std::time::Duration::from_secs(10);
     const LIMIT: u32 = 30;
 
+    /// After the fast phase, keep asking — but rarely, and more rarely still.
+    ///
+    /// The old behaviour stopped dead at thirty polls, so a broadcast that
+    /// YouTube never took live kept whatever status it had at the five-minute
+    /// mark for the rest of its run: the customer saw a value that was hours
+    /// old and had no way to tell. This keeps the answer current without
+    /// turning a diagnostic into a quota problem.
+    ///
+    /// Each poll is two reads — `liveStreams.list` + `liveBroadcasts.list`, one
+    /// unit each — against a 10,000-unit daily allowance. At the capped
+    /// five-minute interval that is 576 units a day for a broadcast that never
+    /// goes live, and **zero** for one that does, because reaching `live`
+    /// settles the watch for good. The cost is paid only by the broadcasts that
+    /// are actually broken, which is the right place for it.
+    const SLOW_BACKOFF: [u64; 3] = [60, 120, 300];
+
+    /// How long FFmpeg may run without YouTube confirming `live` before the
+    /// mismatch is written where somebody can see it. The fast phase is five
+    /// minutes, so this fires just after it, with one poll's grace.
+    const MISMATCH_AFTER_POLLS: u32 = Self::LIMIT;
+
+    fn slow_interval(&self) -> std::time::Duration {
+        let i = (self.slow_polls as usize).min(Self::SLOW_BACKOFF.len() - 1);
+        std::time::Duration::from_secs(Self::SLOW_BACKOFF[i])
+    }
+
+    /// Is the watch in its fast phase, where `poll_status` may also start a
+    /// broadcast that does not start itself?
+    fn fast(&self) -> bool {
+        self.polls < Self::LIMIT
+    }
+
     fn maybe_poll(&mut self, yt: &Arc<crate::youtube::Youtube>, db: &CloudDb, broadcast_id: &str) {
-        if self.settled || self.polls >= Self::LIMIT || std::time::Instant::now() < self.next {
+        if self.settled || std::time::Instant::now() < self.next {
             return;
         }
-        self.next = std::time::Instant::now() + Self::EVERY;
-        self.polls += 1;
-        match yt.poll_status(broadcast_id) {
+        let fast = self.fast();
+        if fast {
+            self.next = std::time::Instant::now() + Self::EVERY;
+            self.polls += 1;
+        } else {
+            self.next = std::time::Instant::now() + self.slow_interval();
+            self.slow_polls += 1;
+        }
+        // The fast phase keeps the original call, which may transition a
+        // broadcast that will not start itself. The slow phase is read-only on
+        // purpose: see `Youtube::observe_status`.
+        let result = if fast { yt.poll_status(broadcast_id) } else { yt.observe_status(broadcast_id) };
+        match result {
             // Not a YouTube broadcast at all: never ask again.
             Ok(None) => self.settled = true,
             Ok(Some(status)) => {
-                if status == crate::youtube::LIVE || status == crate::youtube::COMPLETE {
+                if crate::youtube::is_settled(&status) {
                     self.settled = true;
+                } else {
+                    self.note_mismatch(db, broadcast_id, &status);
                 }
             }
             Err(e) => {
                 let _ =
                     db.append_event(broadcast_id, EventLevel::Warn, &format!("YouTube 상태 확인 실패: {e}"));
-                if self.polls >= Self::LIMIT {
-                    self.settled = true;
-                }
+                // Deliberately NOT settled: a transient API failure, a refused
+                // token or an exhausted quota all look like this, and all of
+                // them clear on their own. Backing off and asking again later
+                // is the difference between a stale status and a wrong one.
             }
         }
+    }
+
+    /// Record, once, that FFmpeg is sending while YouTube has not gone live.
+    ///
+    /// This writes an event and nothing else. It does not transition the
+    /// broadcast, restart FFmpeg or touch the stream — the cause is not
+    /// established yet, and a repair aimed at the wrong cause on a paying
+    /// customer's broadcast is worse than an accurate warning.
+    fn note_mismatch(&mut self, db: &CloudDb, broadcast_id: &str, status: &str) {
+        if !self.should_warn() {
+            return;
+        }
+        self.warned = true;
+        let _ = db.append_event(broadcast_id, EventLevel::Warn, &Self::mismatch_message(status));
+    }
+
+    /// Is the mismatch worth writing down yet, and not already written?
+    ///
+    /// Split out so the gating is testable without a database: the fast phase
+    /// has to finish first, because a broadcast three polls old is simply
+    /// starting up and not yet a fault.
+    fn should_warn(&self) -> bool {
+        !self.warned && self.polls >= Self::MISMATCH_AFTER_POLLS
+    }
+
+    /// What to write. Pure, so the wording is covered by a test rather than by
+    /// somebody happening to read it.
+    fn mismatch_message(status: &str) -> String {
+        let label = match status {
+            crate::youtube::READY => "YouTube가 신호는 받고 있지만 라이브로 전환하지 않았습니다",
+            crate::youtube::WAITING => "YouTube가 아직 신호를 받지 못했습니다",
+            other => other,
+        };
+        format!(
+            "송출은 정상이지만 YouTube 라이브가 확인되지 않습니다 ({status}). {label}. YouTube Studio에서 방송 상태를 확인해 주세요."
+        )
+    }
+}
+
+#[cfg(test)]
+mod youtube_watch_tests {
+    use super::*;
+
+    /// The reported fault: 247streams said 송출 중 while the channel said 예정.
+    /// The watch used to stop after thirty polls whatever the answer, so the
+    /// status the customer saw was frozen at the five-minute mark for the rest
+    /// of the run. These cover the schedule that replaced it.
+    fn watch(polls: u32, slow_polls: u32, warned: bool) -> YoutubeWatch {
+        YoutubeWatch { next: std::time::Instant::now(), polls, settled: false, slow_polls, warned }
+    }
+
+    #[test]
+    fn the_fast_phase_is_unchanged_in_length() {
+        // Ten seconds, thirty times. Anything a healthy broadcast does is
+        // decided here and must behave exactly as it did before.
+        assert_eq!(YoutubeWatch::EVERY, std::time::Duration::from_secs(10));
+        assert_eq!(YoutubeWatch::LIMIT, 30);
+        assert!(watch(0, 0, false).fast());
+        assert!(watch(29, 0, false).fast());
+        // The thirtieth poll is the last fast one, so at thirty we are past it.
+        assert!(!watch(30, 0, false).fast());
+    }
+
+    #[test]
+    fn the_slow_phase_backs_off_and_then_holds() {
+        // Increasing, then capped — a broadcast that will never go live must
+        // not be polled at the same rate all day.
+        let secs = |s: u32| watch(30, s, false).slow_interval().as_secs();
+        assert_eq!(secs(0), 60);
+        assert_eq!(secs(1), 120);
+        assert_eq!(secs(2), 300);
+        // And it stays there rather than growing without bound or resetting.
+        assert_eq!(secs(3), 300);
+        assert_eq!(secs(50), 300);
+        assert_eq!(secs(10_000), 300);
+    }
+
+    #[test]
+    fn the_capped_interval_fits_the_daily_api_allowance() {
+        // Each poll is two reads, one unit each, against 10,000 units a day.
+        // This is the arithmetic that justifies polling at all, so it is a test
+        // rather than a comment: three broadcasts that never go live must stay
+        // a fraction of the allowance.
+        let cap = *YoutubeWatch::SLOW_BACKOFF.last().unwrap();
+        let polls_a_day = 24 * 60 * 60 / cap;
+        let units_a_day = polls_a_day * 2;
+        assert_eq!(units_a_day, 576);
+        assert!(units_a_day * 3 < louver_core::youtube::quota::FREE_DAILY_UNITS as u64 / 2);
+    }
+
+    #[test]
+    fn the_mismatch_is_not_reported_while_the_broadcast_is_merely_starting() {
+        // YouTube usually takes about twenty seconds to notice an ingest. A
+        // warning in that window would fire on every healthy start.
+        assert!(!watch(0, 0, false).should_warn());
+        assert!(!watch(1, 0, false).should_warn());
+        assert!(!watch(29, 0, false).should_warn());
+    }
+
+    #[test]
+    fn the_mismatch_is_reported_once_the_fast_phase_has_passed_and_only_once() {
+        assert!(watch(30, 0, false).should_warn());
+        assert!(watch(30, 7, false).should_warn());
+        // Already said. Repeating it on every poll would bury it.
+        assert!(!watch(30, 7, true).should_warn());
+    }
+
+    #[test]
+    fn the_message_names_the_youtube_state_and_what_to_do() {
+        let ready = YoutubeWatch::mismatch_message(crate::youtube::READY);
+        assert!(ready.contains(crate::youtube::READY), "{ready}");
+        assert!(ready.contains("라이브로 전환하지 않았습니다"), "{ready}");
+        assert!(ready.contains("YouTube Studio"), "{ready}");
+
+        let waiting = YoutubeWatch::mismatch_message(crate::youtube::WAITING);
+        assert!(waiting.contains("신호를 받지 못했습니다"), "{waiting}");
+
+        // An unfamiliar status is passed through rather than guessed at.
+        let odd = YoutubeWatch::mismatch_message("testStarting");
+        assert!(odd.contains("testStarting"), "{odd}");
+    }
+
+    #[test]
+    fn only_live_and_complete_end_the_watch() {
+        // The old code settled on these two as well, and that part is right:
+        // there is nothing left to learn. Everything else keeps being asked.
+        assert!(crate::youtube::is_settled(crate::youtube::LIVE));
+        assert!(crate::youtube::is_settled(crate::youtube::COMPLETE));
+        assert!(!crate::youtube::is_settled(crate::youtube::READY));
+        assert!(!crate::youtube::is_settled(crate::youtube::WAITING));
+        assert!(!crate::youtube::is_settled(crate::youtube::ERRORED));
     }
 }
 

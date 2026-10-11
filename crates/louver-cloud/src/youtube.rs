@@ -67,6 +67,31 @@ pub const LIVE: &str = "live";
 pub const COMPLETE: &str = "complete";
 pub const ERRORED: &str = "error";
 
+/// What YouTube's two answers imply about a broadcast, as one pure decision.
+///
+/// Extracted so the mapping can be tested without a network and so the two
+/// callers — the polling one that may start a broadcast and the read-only one
+/// that never does — cannot drift apart. The order matters: `live` and
+/// `complete` are what YouTube itself says, and only when it says neither does
+/// the ingest state decide between "signal arriving" and "nothing yet".
+pub fn status_for(life_cycle_status: &str, stream_active: bool) -> &'static str {
+    match life_cycle_status {
+        "live" => LIVE,
+        "complete" => COMPLETE,
+        _ if stream_active => READY,
+        _ => WAITING,
+    }
+}
+
+/// Is this a status a running broadcast should have settled into?
+///
+/// `live` is the goal and `complete` means YouTube has ended it; anything else
+/// on a broadcast whose FFmpeg is running is the mismatch this module exists to
+/// surface rather than to hide.
+pub fn is_settled(status: &str) -> bool {
+    status == LIVE || status == COMPLETE
+}
+
 /// Where the sealed credentials for one connected account live.
 pub fn refresh_account(account_id: &str) -> String {
     format!("youtube:{account_id}:refresh")
@@ -520,6 +545,35 @@ impl Youtube {
         Ok(())
     }
 
+    /// Ask YouTube what it makes of the stream **without ever changing it**.
+    ///
+    /// Same two reads as [`Self::poll_status`] and the same mapping, minus the
+    /// `liveBroadcasts.transition` branch. It exists so that the long tail of
+    /// status watching (`manager.rs`, the slow phase) cannot attempt a start:
+    /// re-checking a broadcast hours into its run is a diagnostic, and a
+    /// diagnostic that might take a channel live is not one.
+    ///
+    /// Returns `Ok(None)` for a broadcast with no YouTube resources, exactly as
+    /// `poll_status` does, so a caller can stop asking.
+    pub fn observe_status(&self, broadcast_id: &str) -> Result<Option<String>> {
+        let b = self.db.broadcast(broadcast_id)?;
+        let (Some(account_id), Some(yt_id), Some(stream_id)) =
+            (b.youtube.account_id.clone(), b.youtube.broadcast_id.clone(), b.youtube.stream_id.clone())
+        else {
+            return Ok(None);
+        };
+        let stream = self.call_api(broadcast_id, &account_id, ApiMethod::LiveStreamsList, |api, token| {
+            api.stream_by_id(token, &stream_id)
+        })?;
+        let broadcast =
+            self.call_api(broadcast_id, &account_id, ApiMethod::LiveBroadcastsList, |api, token| {
+                api.broadcast_by_id(token, &yt_id)
+            })?;
+        let status = status_for(&broadcast.life_cycle_status, stream.is_active());
+        self.db.set_youtube_status(broadcast_id, status)?;
+        Ok(Some(status.to_string()))
+    }
+
     /// Ask YouTube what it makes of the stream, once. §8: bounded, and called
     /// on a tick rather than in a loop of its own.
     pub fn poll_status(&self, broadcast_id: &str) -> Result<Option<String>> {
@@ -537,12 +591,7 @@ impl Youtube {
                 api.broadcast_by_id(token, &yt_id)
             })?;
 
-        let status = match broadcast.life_cycle_status.as_str() {
-            "live" => LIVE,
-            "complete" => COMPLETE,
-            _ if stream.is_active() => READY,
-            _ => WAITING,
-        };
+        let status = status_for(&broadcast.life_cycle_status, stream.is_active());
         self.db.set_youtube_status(broadcast_id, status)?;
 
         // A broadcast that will not start itself has to be told to. Only once

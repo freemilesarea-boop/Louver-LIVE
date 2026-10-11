@@ -573,6 +573,71 @@ export function youtubeStatusLabel(b: Broadcast): string | null {
   return YOUTUBE_STATUS_LABELS[s] ?? s;
 }
 
+/**
+ * How long FFmpeg may send before YouTube not being live is worth saying.
+ *
+ * Matches the server's fast watch phase (ten seconds, thirty times), because
+ * warning earlier would fire on every healthy start — YouTube usually takes
+ * about twenty seconds to notice an ingest, and sometimes a minute or two.
+ */
+export const YOUTUBE_LIVE_GRACE_MS = 5 * 60 * 1000;
+
+export type YoutubeMismatch = {
+  /** Which disagreement this is, for the test and for the icon. */
+  kind: "not_started" | "no_ingest" | "ended_early";
+  message: string;
+};
+
+/**
+ * FFmpeg says it is sending; YouTube says the broadcast is not live.
+ *
+ * This is the reported fault: 247streams showed `송출 중` while the channel
+ * still said `예정`. `runtime_state` and `youtube.status` are two different
+ * facts and neither may stand in for the other, so rather than quietly
+ * trusting FFmpeg this returns the disagreement for the card to show.
+ *
+ * Returns `null` when there is nothing to report — which includes every
+ * healthy broadcast, every pasted-key broadcast (no YouTube to disagree with)
+ * and the first few minutes of any start.
+ */
+export function youtubeMismatch(b: Broadcast, now: number = Date.now()): YoutubeMismatch | null {
+  // Only an account-connected broadcast has a YouTube state of its own.
+  if (!b.youtube?.account_id) return null;
+  if (b.runtime_state !== "RUNNING") return null;
+
+  const status = b.youtube.status;
+  if (!status || status === "live") return null;
+
+  // YouTube has ended it while we are still sending. No grace period: this one
+  // is unambiguous and the viewer is already seeing nothing.
+  if (status === "complete") {
+    return {
+      kind: "ended_early",
+      message: "YouTube에서 방송이 종료됐지만 송출은 계속되고 있습니다. 방송을 정지한 뒤 다시 시작해 주세요.",
+    };
+  }
+
+  // `error` already shows through `youtube.last_error`; leave that message as
+  // the specific one rather than covering it with a generic warning.
+  if (status === "error") return null;
+
+  const startedAt = b.started_at ? Date.parse(b.started_at) : NaN;
+  if (!Number.isFinite(startedAt)) return null;
+  if (now - startedAt < YOUTUBE_LIVE_GRACE_MS) return null;
+
+  if (status === "ready") {
+    return {
+      kind: "not_started",
+      message:
+        "YouTube가 신호는 받고 있지만 아직 라이브로 전환하지 않았습니다. YouTube Studio에서 방송을 시작해 주세요.",
+    };
+  }
+  return {
+    kind: "no_ingest",
+    message: "YouTube가 아직 신호를 받지 못했습니다. YouTube Studio에서 방송 상태를 확인해 주세요.",
+  };
+}
+
 /** Which provider is sending this broadcast, for the card. §12. */
 export function providerLabel(b: Broadcast): string {
   return b.youtube?.account_id ? "YouTube 계정" : "수동 RTMPS";

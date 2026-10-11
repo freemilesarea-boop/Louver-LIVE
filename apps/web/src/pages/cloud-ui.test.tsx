@@ -19,7 +19,12 @@ import { Pricing } from "./Pricing";
 import { BillingComplete, BillingPanel, isBillingComplete } from "./Billing";
 import { LegalPage, legalPageFor } from "./Legal";
 import { MediaLibrary } from "./MediaLibrary";
-import { AUTO_SETTINGS, emptySchedule } from "../cloud";
+import {
+  AUTO_SETTINGS,
+  YOUTUBE_LIVE_GRACE_MS,
+  emptySchedule,
+  youtubeMismatch,
+} from "../cloud";
 import type {
   Broadcast,
   BroadcastDetail,
@@ -2091,5 +2096,113 @@ describe("the subscription panel", () => {
     expect(await screen.findByText("결제 실패")).toBeInTheDocument();
     expect(screen.getByText(/기존 이용은 계속 유지됩니다/)).toBeInTheDocument();
     expect(screen.getByText("Pro")).toBeInTheDocument();
+  });
+});
+
+
+describe("247streams RUNNING vs YouTube LIVE", () => {
+  // The reported fault: the dashboard said 송출 중 while the channel said
+  // 예정. `runtime_state` is FFmpeg's fact and `youtube.status` is YouTube's;
+  // when they disagree the customer has to be told, not reassured.
+  const START = Date.parse("2026-10-11T00:00:00Z");
+  const LATER = START + YOUTUBE_LIVE_GRACE_MS + 1000;
+
+  function sending(status: string | null, over: Partial<Broadcast> = {}): Broadcast {
+    return broadcast({
+      desired_state: "running",
+      runtime_state: "RUNNING",
+      started_at: "2026-10-11T00:00:00Z",
+      youtube: { account_id: "acc-1", broadcast_id: "bcast-1", stream_id: "s-1", status },
+      ...over,
+    });
+  }
+
+  it("says nothing when YouTube agrees the broadcast is live", () => {
+    expect(youtubeMismatch(sending("live"), LATER)).toBeNull();
+  });
+
+  it("reports a broadcast YouTube is receiving but has not started", () => {
+    const m = youtubeMismatch(sending("ready"), LATER);
+    expect(m?.kind).toBe("not_started");
+    expect(m?.message).toContain("라이브로 전환하지 않았습니다");
+  });
+
+  it("reports a broadcast whose ingest YouTube has not seen", () => {
+    const m = youtubeMismatch(sending("waiting_for_ingest"), LATER);
+    expect(m?.kind).toBe("no_ingest");
+    expect(m?.message).toContain("신호를 받지 못했습니다");
+  });
+
+  it("reports a broadcast YouTube has ended while FFmpeg keeps sending", () => {
+    // No grace period for this one: the viewer is already seeing nothing.
+    const m = youtubeMismatch(sending("complete"), START + 1000);
+    expect(m?.kind).toBe("ended_early");
+    expect(m?.message).toContain("종료됐지만");
+  });
+
+  it("stays quiet for the first few minutes of any start", () => {
+    // YouTube takes about twenty seconds to notice an ingest, sometimes a
+    // minute or two. Warning inside that window would fire on every start.
+    expect(youtubeMismatch(sending("waiting_for_ingest"), START + 1000)).toBeNull();
+    expect(youtubeMismatch(sending("ready"), START + YOUTUBE_LIVE_GRACE_MS - 1)).toBeNull();
+    expect(youtubeMismatch(sending("ready"), START + YOUTUBE_LIVE_GRACE_MS)).not.toBeNull();
+  });
+
+  it("says nothing about a broadcast that is not sending", () => {
+    // A stopped or scheduled broadcast is not expected to be live.
+    for (const state of ["CREATED", "STOPPED", "PREPARING", "STARTING", "FAILED"] as const) {
+      expect(youtubeMismatch(sending("ready", { runtime_state: state }), LATER)).toBeNull();
+    }
+  });
+
+  it("says nothing about a pasted-key broadcast", () => {
+    // No connected account means no YouTube state to disagree with.
+    const b = sending("ready", { youtube: { status: "ready" } });
+    expect(youtubeMismatch(b, LATER)).toBeNull();
+  });
+
+  it("leaves an explicit YouTube error to its own message", () => {
+    // `youtube.last_error` already says something specific; covering it with a
+    // generic warning would lose the detail.
+    expect(youtubeMismatch(sending("error"), LATER)).toBeNull();
+  });
+
+  it("says nothing when there is no start time to measure from", () => {
+    expect(youtubeMismatch(sending("ready", { started_at: null }), LATER)).toBeNull();
+    expect(youtubeMismatch(sending("ready", { started_at: "not a date" }), LATER)).toBeNull();
+  });
+
+  it("judges several broadcasts independently", () => {
+    // One customer's fault must not label another's healthy broadcast, and the
+    // other way round.
+    const live = sending("live", { id: "b1" });
+    const stuck = sending("ready", { id: "b2" });
+    expect(youtubeMismatch(live, LATER)).toBeNull();
+    expect(youtubeMismatch(stuck, LATER)?.kind).toBe("not_started");
+  });
+
+  it("shows the warning on the card of the broadcast it belongs to", async () => {
+    // Real timers: the component reads `Date.now()`, so the fixture simply
+    // started an hour ago. Faking the clock here would stop the async queries.
+    const anHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const t = fake({
+      dashboard: vi.fn().mockResolvedValue({
+        plan_label: "Business",
+        active: 2,
+        allowed: 3,
+        broadcasts: [
+          sending("live", { id: "b1", started_at: anHourAgo }),
+          sending("ready", { id: "b2", name: "낮 라디오", started_at: anHourAgo }),
+        ],
+      } satisfies Dashboard),
+    });
+    show(<CloudDashboard />, t);
+
+    const warnings = await screen.findAllByTestId("youtube-mismatch");
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toHaveAttribute("data-kind", "not_started");
+    expect(warnings[0]).toHaveTextContent("YouTube Studio");
+    // The headline state is still FFmpeg's, and still truthful.
+    expect(screen.getAllByTestId("broadcast-row")).toHaveLength(2);
   });
 });
