@@ -874,6 +874,68 @@ fn p2_a_broadcast_that_starts_itself_is_not_transitioned() {
     );
 }
 
+#[test]
+fn p3_observing_the_status_never_transitions_even_when_polling_would() {
+    // The safety property the slow watch phase depends on. This is the exact
+    // configuration in which `poll_status` DOES transition — stream active,
+    // `enableAutoStart` false — so if `observe_status` transitioned too, this
+    // would catch it. Re-checking a customer's broadcast hours into its run
+    // must read and nothing else.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.auto_start.lock().unwrap() = false;
+    *e.api.stream_status.lock().unwrap() = "active".into();
+
+    assert_eq!(e.yt.observe_status(&id).unwrap().as_deref(), Some("ready"));
+    assert!(
+        e.api.matching("broadcastStatus=live").is_empty(),
+        "observe_status must never ask YouTube to go live"
+    );
+    // Called again and again, as the slow phase will for hours: still no
+    // transition, and still the truthful status.
+    for _ in 0..5 {
+        assert_eq!(e.yt.observe_status(&id).unwrap().as_deref(), Some("ready"));
+    }
+    assert!(e.api.matching("broadcastStatus=live").is_empty(), "not on any later poll either");
+    assert_eq!(e.db.broadcast_owned(&e.user, &id).unwrap().youtube.status.as_deref(), Some("ready"));
+}
+
+#[test]
+fn p4_observing_reports_every_state_youtube_can_be_in() {
+    // The four combinations the dashboard has to tell apart. `ready` is the
+    // reported fault: the ingest is arriving and YouTube has not gone live.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+
+    assert_eq!(e.yt.observe_status(&id).unwrap().as_deref(), Some("waiting_for_ingest"));
+
+    *e.api.stream_status.lock().unwrap() = "active".into();
+    *e.api.auto_start.lock().unwrap() = true;
+    assert_eq!(e.yt.observe_status(&id).unwrap().as_deref(), Some("ready"));
+
+    *e.api.lifecycle.lock().unwrap() = "live".into();
+    assert_eq!(e.yt.observe_status(&id).unwrap().as_deref(), Some("live"));
+
+    // YouTube ended it while FFmpeg is still sending: a mismatch of its own.
+    *e.api.lifecycle.lock().unwrap() = "complete".into();
+    assert_eq!(e.yt.observe_status(&id).unwrap().as_deref(), Some("complete"));
+}
+
+#[test]
+fn p5_observing_a_broadcast_with_no_youtube_resources_asks_nothing() {
+    // A pasted stream key. There is no YouTube state to disagree with, and the
+    // watch has to be able to stop asking.
+    let e = env();
+    let calls_before = e.api.calls().len();
+    let (id, _) = e.manual_broadcast("수동 방송");
+    assert_eq!(e.yt.observe_status(&id).unwrap(), None);
+    assert_eq!(e.api.calls().len(), calls_before, "no API call for a broadcast YouTube does not know about");
+}
+
 // --- Q: stopping -----------------------------------------------------------
 
 #[test]
