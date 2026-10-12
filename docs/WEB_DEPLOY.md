@@ -67,8 +67,18 @@ Dockerfile:  COPY --from=web /app/apps/web/dist /srv/louver/web
 
 컨테이너에 마운트를 추가하는 것이므로 **`caddy` 컨테이너는 이때 한 번
 재생성됩니다.** `louver` 는 건드리지 않습니다 — `--no-deps` 가 그것을 보장합니다.
-HTTPS 리스너가 1~2초 내려가지만 송출은 영향받지 않습니다. RTMP 는 서버가 YouTube
-로 직접 내보내는 것이고, Caddy 는 그 경로에 없습니다.
+
+재생성 중 HTTPS 프런트 도어가 내려가는 시간은 **최대 10초쯤**입니다. Caddy 는
+SIGTERM 에서 graceful 하게 멈추며 **열려 있는 응답을 끊지 않습니다**(실측: SIGTERM
+이후에도 SSE 가 계속 흘렀습니다). 그래서 Docker 는 stop grace period 를 다
+기다린 뒤 SIGKILL 하고, 그 다음에 새 컨테이너를 띄웁니다. `docker-compose.yml`
+에 `stop_grace_period` 가 없으므로 기본 10초입니다.
+
+**송출은 영향받지 않습니다.** RTMP 는 louver 안의 FFmpeg 가 YouTube 로 직접
+내보내는 outbound 이고, Caddy 는 그 경로에 없습니다. louver 의 `:8080` 포트
+매핑도 그대로이므로 관리 경로는 유지됩니다. 열려 있던 대시보드의 SSE 는 SIGKILL
+시점에 끊기고, 브라우저의 `EventSource` 가 스스로 다시 연결합니다(그리고
+`transport.ts` 에 3초 폴링 폴백이 있습니다).
 
 ```bash
 # 1) 호스트에 공간을 만든다
@@ -83,33 +93,62 @@ docker cp louver-web-copy:/srv/louver/web /tmp/web-current
 docker rm louver-web-copy > /dev/null
 scripts/deploy-web.sh release /tmp/web-current --root /srv/louver/web
 
-# 3) 확인: current 가 상대 링크이고 index.html 이 있어야 한다
-scripts/deploy-web.sh list --root /srv/louver/web
-readlink /srv/louver/web/current
+# 3) .env 에 한 줄 추가한다. 이것이 없으면 다음 scripts/deploy-vps.sh 가
+#    분리 구조를 조용히 되돌린다 (아래 5번 F1 참고).
+echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.web.yml' >> .env
 
-# 4) Caddy 만 새 설정으로 올린다. --no-deps 를 빼면 안 된다.
+# 4) 전환 전 점검. 아무것도 바꾸지 않는 읽기 전용 검사이며,
+#    실패하면 전환하지 않는다.
+scripts/web-split-preflight.sh
+
+# 5) Caddy 만 새 설정으로 올린다. --no-deps 를 빼면 안 된다.
+#    (3번을 했다면 -f 두 개는 생략해도 된다 — COMPOSE_FILE 이 대신한다.)
 docker compose -f docker-compose.yml -f docker-compose.web.yml \
     --profile https up -d --no-deps caddy
 
-# 5) 즉시 확인
-curl -sI https://247streams.kr/ | grep -i cache-control        # no-cache
-curl -s https://247streams.kr/api/health                        # 서버가 답해야 한다
-curl -s -o /dev/null -w '%{http_code}\n' https://247streams.kr/assets/nope.js   # 404
-docker compose ps                                               # louver 의 생성 시각이 그대로여야 한다
+# 6) 합격 판정
+docker compose -f docker-compose.yml ps          # louver 의 CREATED 가 그대로여야 한다
+scripts/web-split-verify.sh https://247streams.kr # ARMED 가 나와야 한다
 ```
 
-5번의 마지막 줄이 이 작업의 합격 기준입니다. `louver` 컨테이너의 `CREATED` 가
+6번의 두 줄이 이 작업의 합격 기준입니다. `louver` 컨테이너의 `CREATED` 가
 바뀌지 않았다면 방송은 한 번도 끊기지 않았습니다.
+
+`web-split-preflight.sh` 가 보는 것 (전부 읽기 전용 — `config`, `ps`,
+`up --dry-run` 뿐이고 파일에 플래그 없는 `up` 은 존재하지 않습니다):
+
+1. `deploy-web.sh check` — 릴리스가 준비되어 있는지. **실패하면 전환 금지**
+2. 오버레이가 `louver` 서비스를 바꾸지 않는지 — resolve 된 정의를 바이트 비교
+3. `up --dry-run` 이 `caddy` 만 언급하는지
+4. 지금 `louver` 컨테이너의 생성 시각 — 적용 후 비교용
+5. `.env` 의 `COMPOSE_FILE` 유무 — 없으면 F1 경고
+
+### 왜 `check` 를 통과해야 하는가
+
+릴리스 없이 Caddy 를 이 디렉터리로 돌리면 **아무것도 시끄럽게 실패하지
+않습니다.** 실측한 결과:
+
+```
+/ 404   /dashboard 404   /pricing/ 404   /assets/...js 404   /robots.txt 404
+/api/health 200   /health 200
+```
+
+Caddy 는 정상 기동하고 API 는 계속 답합니다. 즉 **방송과 API 는 무사한 채 대시보드만
+백지**가 되고, 겉보기에는 Caddy 설정 오류처럼 보입니다. `deploy-web.sh check` 는
+그 상태를 만들 수 있는 모든 조건을 미리 거부합니다 — 릴리스 없음, 스테이징만 됨,
+끊어진 링크, 절대 경로 링크, `index.html` 없음, 빈 `assets/`.
 
 ### 되돌리기
 
 ```bash
+sed -i '/^COMPOSE_FILE=/d' .env                        # 먼저 핀을 뺀다
 docker compose --profile https up -d --no-deps caddy    # 원래 Caddyfile 로
 ```
 
 오버레이를 빼면 Caddy 는 다시 전부 `louver:8080` 으로 넘깁니다. 서버 이미지 안의
 번들이 그대로 남아 있으므로 화면도 그대로 나옵니다. 되돌리는 쪽도 `louver` 를
-건드리지 않습니다.
+건드리지 않습니다. `.env` 의 핀을 먼저 지우지 않으면 이 명령도 오버레이를
+적용합니다.
 
 ## 4. 평소의 화면 배포
 
@@ -141,6 +180,30 @@ scripts/deploy-web.sh prune --keep 5 --root /srv/louver/web
 그래서 롤백도 즉시 보입니다. 되돌린 `index.html` 은 다음 요청에서 재검증되고,
 그것이 가리키는 이전 해시 파일은 여전히 디스크에 있습니다.
 
+### 이전 빌드의 파일은 계속 제공된다
+
+교체 직전에, **나가는 릴리스의 `assets/` 를 들어오는 릴리스로 하드링크로
+넘깁니다.** 오래 열어둔 탭이 이전 빌드의 `index.html` 에 적힌 해시 파일을
+요청할 때 404 가 나지 않도록 하기 위한 것입니다. 404 가 나면 브라우저는 모듈
+자리에서 HTML 을 받아 "HTML 에 문법 오류" 를 보고하고, 화면은 백지가 됩니다.
+
+- 해시 파일명은 내용이 같으면 이름도 같으므로 **합집합이 항상 잘 정의됩니다.**
+- `-n` 이므로 들어오는 릴리스가 자기 이름으로 제공하는 것은 **절대 덮어쓰지
+  않습니다.**
+- 하드링크이므로 **바이트는 디스크에 한 번만** 존재합니다. 몇 세대가 참조해도
+  같습니다 (실측: 3세대 보관 시 64K).
+- **롤백에도 같은 방향으로 동작합니다** — 교체되는 쪽이 자기 파일을 넘기므로,
+  v2 를 보고 있던 사람도 v1 로 되돌린 뒤에 깨지지 않습니다.
+- `prune` 이 원본 릴리스 디렉터리를 지워도 **바이트는 남습니다.** 최신 릴리스가
+  같은 inode 를 가리키고 있기 때문입니다 (실측).
+
+끄려면 `--no-carry` 를 줍니다. 그러면 다른 빌드의 청크는 다시 404 가 됩니다 —
+`scripts/web-split-check.sh` 가 그 사실을 양방향으로 확인합니다.
+
+지금 번들에는 코드 스플리팅이 없어서(빌드된 JS 에 `import(` 0건) 이미 로드된
+탭은 추가 자산을 요청하지 않습니다. 그래도 넘겨두는 이유는, 라우트 단위 lazy
+import 를 켜는 날 이 보호 장치가 **먼저** 있어야 하기 때문입니다.
+
 ## 5. 위험과 그 대비
 
 | 위험 | 왜 생기는가 | 대비 |
@@ -153,6 +216,10 @@ scripts/deploy-web.sh prune --keep 5 --root /srv/louver/web
 | `louver` 가 같이 재생성됨 | `--no-deps` 를 빼먹음 | 위 명령에 포함. 적용 후 `docker compose ps` 의 `CREATED` 로 확인 |
 | 버전이 쌓여 디스크를 먹음 | 릴리스마다 번들 하나 | `prune --keep 5`. 번들 하나는 수 MB 수준 |
 | Caddy 설정이 두 파일로 갈림 | 루트 `Caddyfile` 과 `deploy/web/Caddyfile` | 루트 쪽은 건드리지 않고 둠. 오버레이를 쓰는 동안은 `deploy/web/Caddyfile` 만 읽힌다 |
+| **기존 배포가 분리 구조를 조용히 해제 (F1)** | `scripts/deploy-vps.sh` 가 맨몸 `docker compose --profile https up -d --build` 로 끝난다 → 오버레이 없이 Caddy 재생성. 화면은 이미지 번들로 계속 나오므로 **아무도 눈치채지 못한다** | `.env` 에 `COMPOSE_FILE=docker-compose.yml:docker-compose.web.yml`. `.env` 는 배포 tar 에서 제외되고 `set_env` 는 `LOUVER_*` 만 고치므로 재배포를 견딘다. 배포 직후 `web-split-verify.sh` 로 확인 |
+| **릴리스 없이 전환 (F2)** | 순서를 건너뜀 | `deploy-web.sh check` / `web-split-preflight.sh` 가 거부. 통과 전에는 전환하지 않는다 |
+| **이전 빌드 해시 404 (F3)** | 해시 번들 배포의 일반 성질. 지금 구조에서도 같다 | 교체 직전 하드링크 이관(위 4절). `--no-carry` 로만 끌 수 있다 |
+| `/pricing` 과 `/pricing/` 이 둘 다 200 | 지금 서버는 `/pricing` 에 307 로 답한다. Caddy 는 바로 200 으로 답한다 | 프리렌더 페이지 전부가 `rel="canonical"` 로 슬래시 버전을 가리키고 `sitemap.xml` 도 슬래시만 싣는다. 리다이렉트를 원하면 Caddy 에 한 줄 추가 — 별도 승인 사항 |
 
 ## 6. 손대기 전에 확인하는 방법
 
@@ -162,10 +229,29 @@ CADDY_BIN=$(command -v caddy) scripts/web-split-check.sh
 
 실제 Caddy 를 띄워 `deploy/web/Caddyfile` **그 파일을** 검사합니다. 파일 안의
 주소가 모두 환경 변수인 이유가 이것입니다 — 배포될 설정과 검사된 설정이 같은
-파일이어야 합니다. 45개 항목을 봅니다: 화면, `/api/*`, `/health`, 세션 쿠키,
-열려 있는 SSE, v1→v2, v2→v1, 없는 파일의 404, SPA 새로고침, 캐시 헤더, 그리고
+파일이어야 합니다. 60개 항목을 봅니다: 화면, `/api/*`, `/health`, 세션 쿠키,
+열려 있는 SSE, v1→v2, v2→v1, 이전 빌드의 JS/CSS 가 계속 제공되는지, 없는 파일의
+404, SPA 새로고침, 공개 페이지(슬래시 포함), 캐시 헤더, `check` 가 막아야 할
+상태를 실제로 막는지, 실패한 배포가 살아 있는 릴리스를 건드리지 않는지, 그리고
 돌고 있는 FFmpeg 가 같은 PID 로 살아 있는지. `docker` 와 `systemctl` 은 PATH 에서
 가로채 두므로, 호출되기만 해도 실패합니다.
+
+운영에서 쓰는 두 개:
+
+```bash
+scripts/web-split-preflight.sh                      # 전환 전, 읽기 전용
+scripts/web-split-verify.sh https://247streams.kr   # 전환 후 / 배포 후, 읽기 전용
+```
+
+`web-split-verify.sh` 는 **존재할 수 없는 해시 파일** 을 하나 요청해서 판정합니다.
+분리 구조가 앞에 있으면 404 이고(`handle /assets/*` 에 fallback 이 없으므로),
+없으면 서버의 `ServeDir::new(dir).fallback(ServeFile::new(index))` 가 **200 과
+HTML** 을 돌려줍니다. 실제 `louver-server` 를 띄워 확인한 동작입니다:
+
+```
+/assets/__web_split_probe__1.js   →  200  text/html   (오늘의 경로)
+                                  →  404             (분리 구조가 앞에 있을 때)
+```
 
 릴리스 스크립트 자체의 단위 테스트는 CI 에서 돕니다:
 

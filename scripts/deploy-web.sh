@@ -2,6 +2,7 @@
 # Release the web dashboard without touching the server that is broadcasting.
 #
 #   scripts/deploy-web.sh release apps/web/dist      # publish + activate
+#   scripts/deploy-web.sh check                      # is a release ready to serve?
 #   scripts/deploy-web.sh list
 #   scripts/deploy-web.sh rollback
 #   scripts/deploy-web.sh prune --keep 5
@@ -17,6 +18,17 @@
 # points at nothing, no file is ever edited in place, and Caddy resolves the
 # link per request — so no reload, no signal, no restart.
 #
+# THE OTHER BUILD'S FILES STAY REACHABLE
+#
+# Before the swap, the outgoing release's `assets/` is hard-linked into the
+# incoming one. A browser still holding the other build's `index.html` names a
+# hashed chunk that this release never built; without the carry-forward that is
+# a 404 and a blank screen. Hashed filenames cannot collide, so the union is
+# always well defined, and a hard link means the bytes exist once on disk
+# however many releases reference them. It runs on a rollback too, in the same
+# direction — whichever release is being replaced hands its files over — so the
+# union grows in both directions and no browser is left without its chunk.
+#
 # WHAT THIS SCRIPT DELIBERATELY CANNOT DO
 #
 # It runs no container command, sends no signal and opens no database. The whole
@@ -30,11 +42,31 @@ ROOT="${LOUVER_WEB_RELEASES:-/srv/louver/web}"
 VERSION=""
 KEEP=5
 FORCE=0
+CARRY=1
 CMD="${1:-}"
 [ $# -gt 0 ] && shift
 
 usage() {
-  sed -n '2,28p' "$0" | sed 's/^# \{0,1\}//'
+  cat <<'USAGE'
+Release the web dashboard without touching the server that is broadcasting.
+
+  deploy-web.sh release <dist>    publish a bundle and make it live
+  deploy-web.sh publish <dist>    stage a bundle without serving it
+  deploy-web.sh activate <ver>    make a staged release live
+  deploy-web.sh rollback          go back to the release before this one
+  deploy-web.sh check             refuse-to-proceed check: is a release ready?
+  deploy-web.sh list              what is on disk, and what is live
+  deploy-web.sh prune --keep N    delete all but the newest N releases
+
+  --root DIR     the releases directory   (default: $LOUVER_WEB_RELEASES or /srv/louver/web)
+  --version V    name this release        (default: a UTC timestamp and the git sha)
+  --force        replace an existing release of the same name
+  --no-carry     do not hand the outgoing release's assets to the incoming one
+  --keep N       how many releases prune leaves behind (minimum 2)
+
+Activation is one rename of a symlink: no reload, no signal, no restart, and
+nothing here can reach the container that holds the FFmpeg processes.
+USAGE
   exit "${1:-1}"
 }
 
@@ -50,6 +82,7 @@ while [ $# -gt 0 ]; do
     --version) VERSION="${2:?--version needs a name}"; shift 2 ;;
     --keep) KEEP="${2:?--keep needs a number}"; shift 2 ;;
     --force) FORCE=1; shift ;;
+    --no-carry) CARRY=0; shift ;;
     -h|--help) usage 0 ;;
     -*) die "unknown option $1" ;;
     *) ARGS+=("$1"); shift ;;
@@ -124,6 +157,25 @@ cmd_publish() {
   printf '%s\n' "$v"
 }
 
+# Hand the outgoing release's hashed files to the incoming one, so a browser
+# that is still holding the other build's `index.html` can still fetch the chunk
+# it names. `-l` hard-links (the bytes exist once, whatever references them),
+# `-n` never overwrites, and a hashed name cannot mean two different files — so
+# this cannot change what the incoming release serves under its own names. On a
+# filesystem that refuses the link (a different device), it copies instead.
+carry_assets() { # carry_assets <from-version> <to-version>
+  local from="$(releases_dir)/$1/assets" to="$(releases_dir)/$2/assets"
+  [ -d "$from" ] && [ -d "$to" ] || return 0
+  local before after
+  before="$(find "$to" -type f | wc -l)"
+  cp -aln "$from/." "$to/" 2>/dev/null || cp -an "$from/." "$to/" 2>/dev/null || {
+    say "WARNING: could not carry $1's assets into $2 — a browser on the old build may 404"
+    return 0
+  }
+  after="$(find "$to" -type f | wc -l)"
+  say "carried $((after - before)) file(s) from $1 so its pages keep working"
+}
+
 cmd_activate() {
   local v="${ARGS[0]:-$VERSION}"
   [ -n "$v" ] || die "activate needs a version (see: $0 list)"
@@ -131,6 +183,9 @@ cmd_activate() {
   check_bundle "$(releases_dir)/$v"
   local now; now="$(link_target current)"
   if [ "$now" = "$v" ]; then say "$v is already current"; return 0; fi
+  # Before the swap, not after: the release has to be complete at the instant it
+  # becomes reachable.
+  if [ -n "$now" ] && [ "$CARRY" = 1 ]; then carry_assets "$now" "$v"; fi
   if [ -n "$now" ]; then
     ln -sfn "releases/$now" "$ROOT/.previous.new"
     mv -T "$ROOT/.previous.new" "$ROOT/previous"
@@ -140,6 +195,57 @@ cmd_activate() {
   ln -sfn "releases/$v" "$ROOT/.current.new"
   mv -T "$ROOT/.current.new" "$ROOT/current"
   say "current -> releases/$v${now:+  (previous: $now)}"
+}
+
+# The gate in front of the Caddy switch.
+#
+# Pointing Caddy at this directory when no release is live does not fail loudly:
+# Caddy starts, `/api/*` and `/health` keep answering, and every single static
+# path returns 404 — a blank dashboard that looks like a Caddy fault. Measured,
+# not assumed. So the switch is only ever made after this exits 0.
+cmd_check() {
+  local bad=0
+  ok() { printf '  ok    %s\n' "$1"; }
+  # Failures go to stderr, so that a caller piping this into a log still sees
+  # the reason it refused — and so an operator who pipes stdout away cannot miss
+  # the one line that matters.
+  nope() { printf '  FAIL  %s\n' "$1" >&2; bad=1; }
+
+  if [ -d "$(releases_dir)" ]; then ok "releases/ exists under $ROOT"
+  else nope "no releases/ under $ROOT — nothing has been published"; fi
+
+  if [ -L "$ROOT/current" ]; then
+    local target; target="$(readlink "$ROOT/current")"
+    ok "current is a symlink -> $target"
+    case "$target" in
+      /*) nope "current is an ABSOLUTE link; it will not resolve inside the container's /srv/web" ;;
+      *)  ok "the link is relative, so it resolves on the host and under /srv/web" ;;
+    esac
+    if [ -d "$ROOT/current/" ]; then
+      ok "it resolves to a directory that exists"
+      if [ -f "$ROOT/current/index.html" ]; then ok "index.html is there"
+      else nope "no index.html — every page would 404"; fi
+      local n; n="$(find "$ROOT/current/assets" -type f 2>/dev/null | wc -l)"
+      if [ "$n" -gt 0 ]; then ok "assets/ holds $n file(s)"
+      else nope "assets/ is empty or missing — the dashboard would load no code"; fi
+    else
+      nope "the link is dangling — its release is gone from disk"
+    fi
+  elif [ -e "$ROOT/current" ]; then
+    nope "current exists but is not a symlink; activate/rollback cannot swap it"
+  else
+    nope "no current link — publish and activate a release BEFORE pointing Caddy here"
+  fi
+
+  if [ -L "$ROOT/previous" ]; then
+    if [ -d "$ROOT/previous/" ]; then ok "previous resolves, so rollback has somewhere to go"
+    else nope "previous is dangling — rollback would fail"; fi
+  else
+    printf '  note  no previous release yet; rollback has nowhere to go until the next release\n'
+  fi
+
+  [ "$bad" = 0 ] || { printf '\n  NOT READY — do not switch Caddy to this directory.\n' >&2; return 1; }
+  printf '\n  ready: %s\n' "$(readlink "$ROOT/current")"
 }
 
 cmd_release() {
@@ -195,6 +301,7 @@ case "$CMD" in
   activate) cmd_activate ;;
   release) cmd_release ;;
   rollback) cmd_rollback ;;
+  check) cmd_check ;;
   list) cmd_list ;;
   prune) cmd_prune ;;
   ''|-h|--help|help) usage 0 ;;

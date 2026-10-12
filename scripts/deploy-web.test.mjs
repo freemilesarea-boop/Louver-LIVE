@@ -6,7 +6,7 @@
 // prune from taking the release the site is serving.
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readlinkSync, readdirSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readlinkSync, readdirSync, statSync, symlinkSync, renameSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
@@ -171,6 +171,105 @@ host('prune', () => {
 
   it('refuses a keep count that would leave no rollback target', () => {
     expect(() => run('prune', '--keep', '1')).toThrow(/at least 2/)
+  })
+})
+
+
+host('carrying the other build forward', () => {
+  // A browser still holding the outgoing build's index.html asks for a chunk
+  // this release never built. Without the hand-over that is a 404 and a blank
+  // screen, which is the one failure a hashed-asset deploy cannot recover from
+  // on its own.
+  it('hands the outgoing release its files, as hard links', () => {
+    run('release', bundle('a'), '--version', 'v1')
+    run('release', bundle('b'), '--version', 'v2')
+    const carried = join(root, 'releases/v2/assets/app-a.js')
+    expect(existsSync(carried)).toBe(true)
+    // A hard link: the bytes exist once however many releases reference them.
+    expect(statSync(carried).nlink).toBeGreaterThanOrEqual(2)
+    // And it did not touch what this release serves under its own names.
+    expect(readFileSync(join(root, 'releases/v2/index.html'), 'utf8')).toContain('b')
+  })
+
+  it('carries in the other direction on a rollback', () => {
+    run('release', bundle('a'), '--version', 'v1')
+    run('release', bundle('b'), '--version', 'v2')
+    run('rollback')
+    // Whoever loaded v2 a second before the rollback keeps working.
+    expect(existsSync(join(root, 'releases/v1/assets/app-b.js'))).toBe(true)
+  })
+
+  it('accumulates, so three builds all stay reachable', () => {
+    run('release', bundle('a'), '--version', 'v1')
+    run('release', bundle('b'), '--version', 'v2')
+    run('release', bundle('c'), '--version', 'v3')
+    expect(readdirSync(join(root, 'releases/v3/assets')).sort()).toEqual([
+      'app-a.js',
+      'app-b.js',
+      'app-c.js',
+    ])
+  })
+
+  it('keeps the bytes when the release they came from is pruned away', () => {
+    run('release', bundle('a'), '--version', '20260101T000000Z')
+    run('release', bundle('b'), '--version', '20260102T000000Z')
+    run('release', bundle('c'), '--version', '20260103T000000Z')
+    run('prune', '--keep', '2')
+    expect(existsSync(join(root, 'releases/20260101T000000Z'))).toBe(false)
+    // The oldest release directory is gone; its file is still served, because
+    // the newest release holds a link to the same inode.
+    const carried = join(root, 'releases/20260103T000000Z/assets/app-a.js')
+    expect(existsSync(carried)).toBe(true)
+    expect(readFileSync(carried, 'utf8')).toContain('a')
+  })
+
+  it('can be turned off, and then the other build 404s', () => {
+    run('release', bundle('a'), '--version', 'v1')
+    run('publish', bundle('b'), '--version', 'v2')
+    run('activate', 'v2', '--no-carry')
+    expect(existsSync(join(root, 'releases/v2/assets/app-a.js'))).toBe(false)
+  })
+})
+
+host('check — the gate in front of the Caddy switch', () => {
+  // Pointing Caddy at this directory with no release live does not fail loudly:
+  // Caddy starts, the API keeps answering, and every static path returns 404.
+  // So the switch is only ever made after this exits 0.
+  const check = () => execFileSync('bash', [script, 'check', '--root', root], { encoding: 'utf8' })
+
+  it('refuses an empty releases directory', () => {
+    expect(check).toThrow(/NOT READY/)
+  })
+
+  it('refuses a release that is staged but not live', () => {
+    run('publish', bundle('a'), '--version', 'v1')
+    expect(check).toThrow(/no current link/)
+  })
+
+  it('passes once a release is live', () => {
+    run('release', bundle('a'), '--version', 'v1')
+    const out = check()
+    expect(out).toContain('ready: releases/v1')
+    expect(out).not.toContain('FAIL')
+  })
+
+  it('refuses a dangling current', () => {
+    run('release', bundle('a'), '--version', 'v1')
+    rmSync(join(root, 'releases/v1'), { recursive: true })
+    expect(check).toThrow(/dangling/)
+  })
+
+  it('refuses an absolute current, which would not resolve inside the container', () => {
+    run('release', bundle('a'), '--version', 'v1')
+    const tmp = join(root, '.abs')
+    symlinkSync(join(root, 'releases/v1'), tmp)
+    renameSync(tmp, join(root, 'current'))
+    expect(check).toThrow(/ABSOLUTE/)
+  })
+
+  it('says when there is no rollback target yet, without failing', () => {
+    run('release', bundle('a'), '--version', 'v1')
+    expect(check()).toContain('rollback has nowhere to go')
   })
 })
 

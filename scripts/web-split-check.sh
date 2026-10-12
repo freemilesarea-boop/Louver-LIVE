@@ -127,6 +127,10 @@ if curl -s "$BASE/" | grep -q 'build v1'; then pass "GET / is the v1 bundle"; el
 want "the hashed chunk is 200" 200 "$(code "/assets/app-$V1_HASH.js")"
 want "the hashed stylesheet is 200" 200 "$(code "/assets/app-$V1_HASH.css")"
 want "a prerendered public page is 200" 200 "$(code /pricing)"
+# The built pages link to `/pricing/`, with the slash — that is the URL a real
+# visitor follows, and a directory is not a `try_files` match, so it is the one
+# that can regress.
+want "and with the trailing slash the pages actually link to" 200 "$(code /pricing/)"
 want "robots.txt is 200" 200 "$(code /robots.txt)"
 
 echo
@@ -165,15 +169,21 @@ echo "T4  v1 -> v2"
 "$HERE/scripts/deploy-web.sh" activate v2 --root "$RELEASES"
 if curl -s "$BASE/" | grep -q 'build v2'; then pass "GET / is the v2 bundle, with no reload"; else fail "GET / is the v2 bundle" "$(curl -s "$BASE/" | grep -o 'build v.')"; fi
 want "the v2 chunk is 200" 200 "$(code "/assets/app-$V2_HASH.js")"
-want "the v1 chunk is gone (404)" 404 "$(code "/assets/app-$V1_HASH.js")"
+# The point of the carry-forward: a browser still holding v1's index.html names
+# v1's chunk, and this release never built it. Without the hand-over that is a
+# 404 and a blank screen.
+want "v1's chunk is STILL served after the deploy" 200 "$(code "/assets/app-$V1_HASH.js")"
+want "v1's stylesheet too" 200 "$(code "/assets/app-$V1_HASH.css")"
 want "current points at v2" "releases/v2" "$(readlink "$RELEASES/current")"
 
 echo
 echo "T5  v2 -> v1 rollback"
 "$HERE/scripts/deploy-web.sh" rollback --root "$RELEASES"
 if curl -s "$BASE/" | grep -q 'build v1'; then pass "GET / is the v1 bundle again"; else fail "rollback restored v1" "$(curl -s "$BASE/" | grep -o 'build v.')"; fi
-want "the v1 chunk is back" 200 "$(code "/assets/app-$V1_HASH.js")"
-want "the v2 chunk is gone" 404 "$(code "/assets/app-$V2_HASH.js")"
+want "the v1 chunk is served" 200 "$(code "/assets/app-$V1_HASH.js")"
+# And the same in the other direction: whoever loaded v2 a second ago keeps
+# working after the rollback.
+want "v2's chunk survives the rollback as well" 200 "$(code "/assets/app-$V2_HASH.js")"
 want "current points at v1" "$V1_DIR" "$(readlink "$RELEASES/current")"
 want "the release directories both survived the swap" "v1 v2" "$(ls "$RELEASES/releases" | sort | tr '\n' ' ' | sed 's/ $//')"
 
@@ -238,6 +248,84 @@ else
   pass "deploy-web.sh contains no container, service or signal command at all"
 fi
 if [ "$(code /api/health)" = "200" ] && [ "$(code /) " != " " ]; then pass "the app was still answering at the end of the run"; fi
+
+echo
+echo "T11 the carry-forward is what keeps the other build alive"
+# Prove it by taking it away: a release activated with --no-carry goes back to
+# answering the other build's chunk with 404.
+"$HERE/scripts/deploy-web.sh" activate v2 --root "$RELEASES" --no-carry > /dev/null 2>&1
+rm -f "$RELEASES/releases/v2/assets/app-$V1_HASH.js" "$RELEASES/releases/v2/assets/app-$V1_HASH.css"
+want "with --no-carry, v1's chunk is 404 again" 404 "$(code "/assets/app-$V1_HASH.js")"
+"$HERE/scripts/deploy-web.sh" activate v1 --root "$RELEASES" > /dev/null 2>&1
+"$HERE/scripts/deploy-web.sh" activate v2 --root "$RELEASES" > /dev/null 2>&1
+want "carrying again restores it, with no reload" 200 "$(code "/assets/app-$V1_HASH.js")"
+if [ "$(stat -c %h "$RELEASES/releases/v2/assets/app-$V1_HASH.js")" -ge 2 ]; then
+  pass "it is a hard link, so the bytes exist once however many releases hold them"
+else
+  fail "the carried file is a hard link" "link count is 1; it was copied, not linked"
+fi
+"$HERE/scripts/deploy-web.sh" rollback --root "$RELEASES" > /dev/null 2>&1
+
+echo
+echo "T12 the gate in front of the Caddy switch"
+EMPTY="$WORK/empty-root"
+if "$HERE/scripts/deploy-web.sh" check --root "$EMPTY" > /dev/null 2>&1; then
+  fail "check refuses an empty releases directory" "it passed, so nothing would stop a switch that blanks the dashboard"
+else
+  pass "check refuses an empty releases directory"
+fi
+"$HERE/scripts/deploy-web.sh" publish "$WORK/dist-v1" --root "$EMPTY" --version only > /dev/null 2>&1
+if "$HERE/scripts/deploy-web.sh" check --root "$EMPTY" > /dev/null 2>&1; then
+  fail "check refuses a release that is staged but not live" "it passed"
+else
+  pass "check refuses a release that is staged but not live"
+fi
+"$HERE/scripts/deploy-web.sh" activate only --root "$EMPTY" > /dev/null 2>&1
+if "$HERE/scripts/deploy-web.sh" check --root "$EMPTY" > /dev/null 2>&1; then
+  pass "check passes once a release is live"
+else
+  fail "check passes once a release is live" "$("$HERE/scripts/deploy-web.sh" check --root "$EMPTY" 2>&1 | tail -3)"
+fi
+# And the state it is there to prevent: measured, not assumed.
+ln -sfn releases/gone "$EMPTY/.x" && mv -T "$EMPTY/.x" "$EMPTY/current"
+if "$HERE/scripts/deploy-web.sh" check --root "$EMPTY" > /dev/null 2>&1; then
+  fail "check refuses a dangling current" "it passed"
+else
+  pass "check refuses a dangling current"
+fi
+
+echo
+echo "T13 a failed deployment leaves the live release alone"
+LIVE_BEFORE="$(readlink "$RELEASES/current")"
+BROKEN="$WORK/broken-bundle"; mkdir -p "$BROKEN"
+echo '<!doctype html>' > "$BROKEN/index.html"   # no assets/ at all
+if "$HERE/scripts/deploy-web.sh" release "$BROKEN" --root "$RELEASES" --version bad > /dev/null 2>&1; then
+  fail "a bundle with no assets/ is refused" "it was published and activated"
+else
+  pass "a bundle with no assets/ is refused"
+fi
+want "the live release did not move" "$LIVE_BEFORE" "$(readlink "$RELEASES/current")"
+want "and the site is still serving" 200 "$(code /)"
+if [ -e "$RELEASES/releases/bad" ]; then
+  fail "nothing half-made was left behind" "releases/bad exists"
+else
+  pass "nothing half-made was left behind"
+fi
+
+echo
+echo "T14 the armed/not-armed probe agrees with reality"
+if "$HERE/scripts/web-split-verify.sh" "$BASE" > "$WORK/verify.out" 2>&1; then
+  pass "web-split-verify.sh says ARMED while the split is in front"
+else
+  fail "web-split-verify.sh says ARMED" "$(tail -4 "$WORK/verify.out")"
+fi
+# Point it at the API alone, which is what a reverted Caddy looks like from
+# outside: the probe path falls through to something that answers 200.
+if "$HERE/scripts/web-split-verify.sh" "http://127.0.0.1:$API_PORT" > "$WORK/verify-off.out" 2>&1; then
+  fail "the probe notices when the split is NOT in front" "it reported ARMED against a bare API"
+else
+  pass "the probe notices when the split is NOT in front"
+fi
 
 echo
 printf '%s\n' "----"
