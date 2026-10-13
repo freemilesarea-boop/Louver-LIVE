@@ -63,7 +63,128 @@ Dockerfile:  COPY --from=web /app/apps/web/dist /srv/louver/web
 `/srv/louver/web/current`, 컨테이너 안에서는 `/srv/web/current` 로 같은 링크를
 읽기 때문입니다.
 
-## 3. 한 번만 하는 준비 (승인 필요)
+## 3. 파일을 서버로 가져오기
+
+운영 디렉터리는 git 저장소가 아닙니다 — `scripts/deploy-vps.sh:65` 가 tar 에서
+`./.git` 을 제외합니다. 그래서 `git pull` 로 가져올 수 없고, 디렉터리 전체를
+덮어쓰는 것도 안 됩니다. 아래가 **신규 파일 6개만** 놓는 경로입니다.
+
+### 무엇을 보내는가
+
+| 모드 | 대상 경로 |
+| --- | --- |
+| 644 | `deploy/web/Caddyfile` |
+| 644 | `docker-compose.web.yml` |
+| 644 | `docs/WEB_DEPLOY.md` |
+| 755 | `scripts/deploy-web.sh` |
+| 755 | `scripts/web-split-preflight.sh` |
+| 755 | `scripts/web-split-verify.sh` |
+
+**SHA-256 은 여기 적지 않습니다.** 이 문서 자신이 그 목록에 들어 있어서, 해시를
+여기 쓰면 문서를 고칠 때마다 자기 자신에 대한 값이 틀어집니다. 권위 있는 목록은
+`scripts/install-web-split.sh` 의 `SHAS` 블록 하나이고, 그것이 설치할 내용의
+정의입니다. 확인은:
+
+```bash
+sed -n '/^SHAS=/,/"$/p' scripts/install-web-split.sh
+```
+
+`scripts/deploy-web.test.mjs` 가 그 블록이 실제 파일과 일치하는지 CI 에서
+확인하므로, 파일을 고치고 매니페스트를 잊으면 빌드가 깨집니다.
+
+**제외한 것**: `.env.example` 과 `docs/OPERATIONS.md` 는 기존 파일 수정이고
+런타임에 필요하지 않으므로 보내지 않습니다 — 덕분에 "기존 파일 변경 0건" 이
+절대적입니다. `web-split-check.sh`, `web-split-stub-api.mjs`,
+`deploy-web.test.mjs` 는 로컬 테스트 하네스이고 서버에서 실행할 것이 아닙니다.
+`install-web-split.sh` 자체도 설치되지 않습니다 — `/tmp` 에서 돌리는 도구입니다.
+
+### 작업용 PC에서
+
+```bash
+cd <Louver-LIVE 저장소>
+git fetch origin claude/frontend-independent-deploy
+
+# 커밋에서 바로 만든다. 두 번 만들면 바이트까지 같은 tar 가 나오므로,
+# 같은 아카이브인지 누구나 다시 만들어 대조할 수 있다.
+git archive --format=tar -o /tmp/louver-web-split.tar <커밋> -- \
+  docker-compose.web.yml deploy/web/Caddyfile scripts/deploy-web.sh \
+  scripts/web-split-preflight.sh scripts/web-split-verify.sh docs/WEB_DEPLOY.md
+
+sha256sum /tmp/louver-web-split.tar          # 서버에서 대조할 값
+tar -tvf  /tmp/louver-web-split.tar          # 6개 파일 + 디렉터리 3개. 눈으로 확인
+sha256sum scripts/install-web-split.sh       # 설치 도구 자체의 값
+
+scp /tmp/louver-web-split.tar scripts/install-web-split.sh <user>@<server>:/tmp/
+```
+
+### 서버에서
+
+```bash
+cd ~/louver-live && ls docker-compose.yml        # 여기가 맞는지 먼저
+sha256sum /tmp/louver-web-split.tar              # 위에서 받은 값과 대조
+sha256sum /tmp/install-web-split.sh              # 설치 도구도 대조
+
+STAGE=$(mktemp -d) && mkdir -p "$STAGE/tree"
+tar -xpf /tmp/louver-web-split.tar -C "$STAGE/tree"   # 스테이징에만 전개
+
+bash /tmp/install-web-split.sh preflight "$STAGE/tree" ~/louver-live   # ← 통과해야 다음
+bash /tmp/install-web-split.sh install   "$STAGE/tree" ~/louver-live
+bash /tmp/install-web-split.sh verify                  ~/louver-live
+```
+
+전개는 스테이징에만 하므로, 전송이 잘려도 운영 디렉터리에는 닿지 않습니다.
+`preflight` 가 거부하는 것: 아카이브 내용이 매니페스트와 다름, 대상에 다른 내용의
+파일이 있음, 대상 경로가 심볼릭 링크이거나 디렉터리 밖으로 나감, 쓸 수 없는
+디렉터리, 디스크 부족, 읽을 수 없는 저널.
+
+### 실패했을 때
+
+```bash
+bash /tmp/install-web-split.sh status  ~/louver-live    # 저널과 디스크가 맞는지
+bash /tmp/install-web-split.sh recover ~/louver-live    # 이 설치가 만든 것만 되돌림
+```
+
+**파일 6개를 한 번에 원자적으로 설치할 수는 없습니다.** 개별 파일은 원자적입니다
+— 같은 디렉터리에 임시 이름으로 복사한 뒤 rename 하므로 반쯤 쓰인 파일을 누구도
+보지 못합니다. 하지만 집합은 아니어서, 실패하면 0~5개가 설치된 상태로 남습니다.
+저널이 그 범위를 사실로 기록하고 `recover` 가 정확히 그만큼만 되돌립니다.
+
+저널은 **먼저 쓰고 나중에 확인하는** 방식입니다. 운영 디렉터리 밖
+(`~/louver-web-split-install.journal`)에 두 줄씩 남습니다:
+
+```
+PLAN <경로> <받아야 할 해시>     복사 전
+FILE <경로> <받은 해시>          rename 후
+```
+
+두 줄인 이유는 강제 종료가 어디든 떨어질 수 있고 **양쪽 모두 복구 가능해야**
+하기 때문입니다:
+
+| 죽은 지점 | 디스크 상태 | recover |
+| --- | --- | --- |
+| PLAN 쓴 뒤, rename 전 | 그 파일 없음 | 되돌릴 것 없음 |
+| rename 뒤, FILE 쓰기 전 | 파일 있음, 저널엔 PLAN 만 | PLAN 의 해시와 같으면 **우리 것이 증명되므로** 제거 |
+| 위와 같으나 내용이 다름 | 제3자가 쓴 것 | **남기고 보고**, 0 이 아닌 코드로 종료 |
+
+각 줄은 다음 단계 전에 `sync` 로 플러시되므로 저널이 디스크보다 뒤처질 수
+없습니다.
+
+**recover 가 하지 않는 것**: 설치 당시 바이트와 다른 파일은 지우지 않고 이름을
+들어 보고하고 0 이 아닌 코드로 끝냅니다. 디렉터리는 `rmdir` 로만 지우므로 남은
+파일이 있으면 그 부모도 남습니다. 자기가 만들지 않은 파일은 건드리지 않습니다.
+저널을 읽을 수 없으면 **추측하지 않고 멈춥니다** — 그때는 위 표의 해시로 6개
+경로를 사람이 대조해야 합니다. 저널이 유실되면 역시 거부하고, `verify` 로
+매니페스트 일치만 확인할 수 있습니다.
+
+설치와 복구는 `flock` 으로 한 번에 하나만 돕니다. 동시에 두 번 실행하면 두 번째가
+거부됩니다. 강제 종료는 lock 을 남기지 않습니다(파일 서술자가 닫히며 해제).
+
+### 되돌리기
+
+전달한 6개는 전부 신규 파일이므로, 되돌리기는 `recover` 하나입니다. 기존 파일을
+건드린 적이 없으므로 백업 복원이 필요 없습니다.
+
+## 4. 한 번만 하는 준비 (승인 필요)
 
 컨테이너에 마운트를 추가하는 것이므로 **`caddy` 컨테이너는 이때 한 번
 재생성됩니다.** `louver` 는 건드리지 않습니다 — `--no-deps` 가 그것을 보장합니다.
@@ -94,7 +215,7 @@ docker rm louver-web-copy > /dev/null
 scripts/deploy-web.sh release /tmp/web-current --root /srv/louver/web
 
 # 3) .env 에 한 줄 추가한다. 이것이 없으면 다음 scripts/deploy-vps.sh 가
-#    분리 구조를 조용히 되돌린다 (아래 5번 F1 참고).
+#    분리 구조를 조용히 되돌린다 (아래 6번 F1 참고).
 echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.web.yml' >> .env
 
 # 4) 전환 전 점검. 아무것도 바꾸지 않는 읽기 전용 검사이며,
@@ -150,7 +271,7 @@ docker compose --profile https up -d --no-deps caddy    # 원래 Caddyfile 로
 건드리지 않습니다. `.env` 의 핀을 먼저 지우지 않으면 이 명령도 오버레이를
 적용합니다.
 
-## 4. 평소의 화면 배포
+## 5. 평소의 화면 배포
 
 ```bash
 npm run build:cloud                                     # apps/web/dist
@@ -204,7 +325,7 @@ scripts/deploy-web.sh prune --keep 5 --root /srv/louver/web
 탭은 추가 자산을 요청하지 않습니다. 그래도 넘겨두는 이유는, 라우트 단위 lazy
 import 를 켜는 날 이 보호 장치가 **먼저** 있어야 하기 때문입니다.
 
-## 5. 위험과 그 대비
+## 6. 위험과 그 대비
 
 | 위험 | 왜 생기는가 | 대비 |
 | --- | --- | --- |
@@ -221,7 +342,7 @@ import 를 켜는 날 이 보호 장치가 **먼저** 있어야 하기 때문입
 | **이전 빌드 해시 404 (F3)** | 해시 번들 배포의 일반 성질. 지금 구조에서도 같다 | 교체 직전 하드링크 이관(위 4절). `--no-carry` 로만 끌 수 있다 |
 | `/pricing` 과 `/pricing/` 이 둘 다 200 | 지금 서버는 `/pricing` 에 307 로 답한다. Caddy 는 바로 200 으로 답한다 | 프리렌더 페이지 전부가 `rel="canonical"` 로 슬래시 버전을 가리키고 `sitemap.xml` 도 슬래시만 싣는다. 리다이렉트를 원하면 Caddy 에 한 줄 추가 — 별도 승인 사항 |
 
-## 6. 손대기 전에 확인하는 방법
+## 7. 손대기 전에 확인하는 방법
 
 ```bash
 CADDY_BIN=$(command -v caddy) scripts/web-split-check.sh
@@ -259,7 +380,7 @@ HTML** 을 돌려줍니다. 실제 `louver-server` 를 띄워 확인한 동작�
 npx vitest run --config vitest.tooling.config.ts scripts/deploy-web.test.mjs
 ```
 
-## 7. 아직 하지 않은 것
+## 8. 아직 하지 않은 것
 
 이 구조는 **화면만** 서버에서 떼어냅니다. Rust 서버를 무중단으로 배포하는 것은
 별개의 문제이고, FFmpeg 가 서버 프로세스의 자식인 한 해결되지 않습니다. 워커를

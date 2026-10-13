@@ -6,6 +6,7 @@
 // prune from taking the release the site is serving.
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, readlinkSync, readdirSync, statSync, symlinkSync, renameSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -270,6 +271,73 @@ host('check — the gate in front of the Caddy switch', () => {
   it('says when there is no rollback target yet, without failing', () => {
     run('release', bundle('a'), '--version', 'v1')
     expect(check()).toContain('rollback has nowhere to go')
+  })
+})
+
+
+
+describe('the delivery manifest', () => {
+  // The installer refuses a staging tree whose bytes do not match its own SHAS
+  // block, which makes that block the definition of what gets installed — and
+  // makes it silently wrong the moment one of those files is edited without it.
+  // docs/WEB_DEPLOY.md is itself in the list, so this is not a hypothetical.
+  it('matches the files it claims to install', () => {
+    const installer = readFileSync(resolve(import.meta.dirname, 'install-web-split.sh'), 'utf8')
+    const block = installer.match(/SHAS="([^"]*)"/)
+    expect(block, 'no SHAS block in install-web-split.sh').toBeTruthy()
+    const rows = block[1]
+      .trim()
+      .split('\n')
+      .map((line) => line.trim().split(/\s+/))
+    expect(rows.length).toBe(6)
+    const repo = resolve(import.meta.dirname, '..')
+    for (const [want, file] of rows) {
+      const actual = createHash('sha256').update(readFileSync(resolve(repo, file))).digest('hex')
+      expect(actual, `${file} changed without updating the SHAS block in scripts/install-web-split.sh`).toBe(want)
+    }
+  })
+})
+
+describe('install-web-split.sh — what it is not allowed to do', () => {
+  const installer = resolve(import.meta.dirname, 'install-web-split.sh')
+  const code = () =>
+    readFileSync(installer, 'utf8')
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('#'))
+      .join('\n')
+
+  it('invokes no container, service or signal command', () => {
+    // It names `docker-compose.yml` — that is the file it checks for to make
+    // sure it was pointed at a deployment directory — so the assertion is about
+    // invocations, not the word.
+    const src = code()
+    expect(src).not.toMatch(/\bdocker\s+(compose|run|exec|start|stop|restart|rm|kill|build)\b/)
+    for (const forbidden of ['systemctl', 'pkill', 'killall', 'kill -', 'sqlite', 'ffmpeg']) {
+      expect(src).not.toContain(forbidden)
+    }
+  })
+
+  it('guards every path it removes against an empty variable', () => {
+    // `rm -f -- "$a/$b"` becomes `rm -f -- /` when both are unset. Every
+    // removal in a recovery tool has to say `${a:?}` so the shell stops
+    // instead.
+    for (const line of code().split('\n')) {
+      if (!/^\s*(rm|rmdir)\s/.test(line)) continue
+      expect(line, `unguarded removal: ${line.trim()}`).toMatch(/\$\{[A-Za-z_][A-Za-z0-9_]*:\?\}/)
+    }
+  })
+
+  it('writes the journal ahead of the filesystem, and flushes it', () => {
+    // A crash between the two has to be decidable, which needs the intent line
+    // (PLAN) before the copy and the fact line (FILE) after the rename.
+    const src = code()
+    expect(src).toMatch(/journal "PLAN /)
+    expect(src).toMatch(/journal "FILE /)
+    expect(src).toMatch(/sync "\$JOURNAL"/)
+  })
+
+  it.skipIf(!onHost)('refuses an unknown subcommand', () => {
+    expect(() => execFileSync('bash', [installer, 'deploy'], { encoding: 'utf8' })).toThrow(/usage/)
   })
 })
 
