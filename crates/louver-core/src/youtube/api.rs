@@ -55,6 +55,11 @@ pub struct LiveBroadcast {
     /// the ingestion stream starts and stops.
     pub enable_auto_start: bool,
     pub enable_auto_stop: bool,
+    /// `contentDetails.monitorStream.enableMonitorStream`, which decides whether
+    /// an ingest stops at `testing` instead of going live. Read rather than
+    /// assumed, because a broadcast created by an older build has it on and the
+    /// only way to tell is to ask.
+    pub enable_monitor_stream: bool,
 }
 
 /// An ingestion endpoint this service just created.
@@ -93,6 +98,13 @@ pub struct LiveStream {
     pub title: String,
     /// `active` / `inactive` / `ready` / `error`.
     pub stream_status: String,
+    /// `good` / `ok` / `bad` / `noData`. An ingest can be `active` and still be
+    /// unusable, and the difference is the first thing to look at when a stream
+    /// arrives but nothing plays.
+    pub health_status: String,
+    /// `status.healthStatus.configurationIssues[].reason`, in YouTube's own
+    /// words. Reasons only — never the description, which can quote the stream.
+    pub configuration_issues: Vec<String>,
     ingestion_key: String,
 }
 
@@ -103,6 +115,8 @@ impl std::fmt::Debug for LiveStream {
             .field("id", &self.id)
             .field("title", &self.title)
             .field("stream_status", &self.stream_status)
+            .field("health_status", &self.health_status)
+            .field("configuration_issues", &self.configuration_issues)
             .field("ingestion_key", &"<redacted>")
             .finish()
     }
@@ -125,6 +139,19 @@ impl LiveStream {
 impl LiveBroadcast {
     pub fn is_live(&self) -> bool {
         self.life_cycle_status == "live"
+    }
+
+    /// In the monitor stream's private preview. YouTube is receiving video and
+    /// the public watch page still has nothing: the state this service used to
+    /// report as "송출 중".
+    pub fn is_testing(&self) -> bool {
+        self.life_cycle_status == "testing"
+    }
+
+    /// Will an ingest that starts now carry this broadcast all the way to
+    /// `live` on its own? Both have to hold, which is the whole bug.
+    pub fn starts_itself(&self) -> bool {
+        self.enable_auto_start && !self.enable_monitor_stream
     }
 }
 
@@ -313,6 +340,21 @@ impl<'a> YoutubeApi<'a> {
                 "enableAutoStop": auto_start_stop,
                 "enableDvr": true,
                 "recordFromStart": true,
+                // THE reason a broadcast used to sit at "예정 중" for ever while
+                // Studio showed the stream arriving.
+                //
+                // `enableMonitorStream` defaults to TRUE. With a monitor stream,
+                // an ingest that starts takes the broadcast to `testing` — the
+                // private preview — and `enableAutoStart` does not carry it past
+                // that. The public watch page has nothing to play, so the
+                // customer sees a scheduled broadcast that never begins, and
+                // 247streams says RUNNING because FFmpeg is fine.
+                //
+                // Autostart only means "go live on ingest" when there is no
+                // monitor phase to stop at, so the two have to be set together.
+                // An unattended 24/7 service has nobody to press Go Live in
+                // Studio, which is what the monitor stream is for.
+                "monitorStream": { "enableMonitorStream": !auto_start_stop },
             },
         });
         let v =
@@ -642,6 +684,12 @@ fn parse_broadcast(item: &serde_json::Value) -> LiveBroadcast {
         scheduled_start_time: text(&item["snippet"]["scheduledStartTime"]),
         enable_auto_start: item["contentDetails"]["enableAutoStart"].as_bool().unwrap_or(false),
         enable_auto_stop: item["contentDetails"]["enableAutoStop"].as_bool().unwrap_or(false),
+        // YouTube's own default is true, so an absent field means ON — the
+        // pessimistic reading, and the correct one for a broadcast made before
+        // this was set explicitly.
+        enable_monitor_stream: item["contentDetails"]["monitorStream"]["enableMonitorStream"]
+            .as_bool()
+            .unwrap_or(true),
     }
 }
 
@@ -657,6 +705,11 @@ fn parse_stream(item: &serde_json::Value) -> LiveStream {
         id: item["id"].as_str().unwrap_or_default().to_string(),
         title: item["snippet"]["title"].as_str().unwrap_or_default().to_string(),
         stream_status: item["status"]["streamStatus"].as_str().unwrap_or_default().to_string(),
+        health_status: item["status"]["healthStatus"]["status"].as_str().unwrap_or_default().to_string(),
+        configuration_issues: item["status"]["healthStatus"]["configurationIssues"]
+            .as_array()
+            .map(|xs| xs.iter().filter_map(|x| x["reason"].as_str()).map(str::to_string).collect())
+            .unwrap_or_default(),
         ingestion_key: item["cdn"]["ingestionInfo"]["streamName"].as_str().unwrap_or_default().to_string(),
     }
 }

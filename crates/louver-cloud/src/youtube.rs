@@ -63,9 +63,122 @@ pub struct YoutubeLink {
 /// YouTube's own view of a broadcast, kept apart from FFmpeg's. §8.
 pub const WAITING: &str = "waiting_for_ingest";
 pub const READY: &str = "ready";
+/// YouTube is receiving video into the monitor stream's private preview and the
+/// public watch page has nothing to play. Its own state, because collapsing it
+/// into `ready` is what made the fault invisible: a broadcast in `testing` is
+/// not waiting for anything, it is waiting for a transition that nobody sends.
+pub const TESTING: &str = "testing";
 pub const LIVE: &str = "live";
 pub const COMPLETE: &str = "complete";
 pub const ERRORED: &str = "error";
+
+/// What still has to happen before YouTube is actually live.
+///
+/// A plain function of what YouTube reported, so the decision can be tested
+/// without a network and read without following four call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextStep {
+    /// Live, or finished. Nothing left to do.
+    Settled,
+    /// YouTube has not noticed the ingest yet.
+    AwaitIngest,
+    /// YouTube will take it live by itself once it notices. Wait.
+    AwaitAutoStart,
+    /// It will not start by itself, whatever we wait for.
+    NeedsTransition(Stuck),
+}
+
+/// Why a broadcast cannot start itself. The two cases need different words to
+/// the customer, so they are not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stuck {
+    /// The monitor stream is on, so the ingest lands in `testing` and stops
+    /// there. Every broadcast this service created before the fix is like this.
+    MonitorStream,
+    /// `enableAutoStart` is off on this broadcast.
+    AutoStartOff,
+}
+
+impl Stuck {
+    /// What to tell the customer, and what they or the operator can do.
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::MonitorStream => {
+                "YouTube가 영상을 받고 있지만 '미리보기(testing)' 단계에 머물러 있어 시청 페이지에서는 아직 방송이 시작되지 않았습니다. 이 방송은 미리보기가 켜진 상태로 만들어졌기 때문에 스스로 시작하지 못합니다. YouTube 스튜디오에서 '실시간 시작'을 누르면 즉시 공개됩니다."
+            }
+            Self::AutoStartOff => {
+                "YouTube가 영상을 받고 있지만 이 방송은 자동 시작이 꺼져 있어 스스로 시작하지 못합니다. YouTube 스튜디오에서 '실시간 시작'을 누르면 즉시 공개됩니다."
+            }
+        }
+    }
+}
+
+/// Read YouTube's answer and say what it means. Pure.
+pub fn next_step(
+    life_cycle_status: &str,
+    stream_active: bool,
+    starts_itself: bool,
+    monitor: bool,
+) -> NextStep {
+    match life_cycle_status {
+        "live" | "complete" => NextStep::Settled,
+        // Receiving video, parked in the preview. Only a transition leaves it,
+        // and autostart does not send one.
+        "testing" => NextStep::NeedsTransition(Stuck::MonitorStream),
+        _ if !stream_active => NextStep::AwaitIngest,
+        // The ingest is up and YouTube has not moved the broadcast. Whether
+        // that is going to change on its own is exactly what these two say.
+        _ if starts_itself => NextStep::AwaitAutoStart,
+        _ if monitor => NextStep::NeedsTransition(Stuck::MonitorStream),
+        _ => NextStep::NeedsTransition(Stuck::AutoStartOff),
+    }
+}
+
+/// The status to store for what YouTube reported.
+pub fn status_for(life_cycle_status: &str, stream_active: bool) -> &'static str {
+    match life_cycle_status {
+        "live" => LIVE,
+        "complete" => COMPLETE,
+        "testing" => TESTING,
+        _ if stream_active => READY,
+        _ => WAITING,
+    }
+}
+
+/// One answer from YouTube, and what it means.
+#[derive(Debug, Clone, Copy)]
+pub struct Observed {
+    /// What was stored on the broadcast row.
+    pub status: &'static str,
+    pub step: NextStep,
+    /// True when this poll sent a transition and YouTube accepted it.
+    pub transitioned: bool,
+}
+
+impl Observed {
+    /// Nothing more will change by waiting.
+    pub fn settled(&self) -> bool {
+        self.status == LIVE || self.status == COMPLETE
+    }
+}
+
+/// Is this service allowed to send `liveBroadcasts.transition` by itself?
+///
+/// Off unless the operator turns it on. A transition is a write against a
+/// customer's channel, and one sent at the wrong moment ends a broadcast that
+/// was working. With it off the fault is still detected and explained; with it
+/// on a broadcast stuck in the preview is rescued without anyone opening Studio.
+/// Broadcasts created after the monitor-stream fix do not need it either way.
+pub fn auto_transition_enabled() -> bool {
+    matches!(
+        std::env::var("LOUVER_YOUTUBE_AUTO_TRANSITION")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
 
 /// Where the sealed credentials for one connected account live.
 pub fn refresh_account(account_id: &str) -> String {
@@ -159,6 +272,11 @@ pub struct Youtube {
     http: Arc<dyn HttpClient>,
     tokens: Arc<dyn TokenEndpoint>,
     config: Config,
+    /// May this service send `liveBroadcasts.transition` by itself? A field
+    /// rather than an `std::env::var` at the point of use, so a test can set it
+    /// without `set_var` — which is process-global and has already raced two of
+    /// this repository's test threads once.
+    auto_transition: bool,
 }
 
 impl std::fmt::Debug for Youtube {
@@ -175,6 +293,7 @@ impl Clone for Youtube {
             http: Arc::clone(&self.http),
             tokens: Arc::clone(&self.tokens),
             config: self.config.clone(),
+            auto_transition: self.auto_transition,
         }
     }
 }
@@ -187,7 +306,14 @@ impl Youtube {
         tokens: Arc<dyn TokenEndpoint>,
         config: Config,
     ) -> Self {
-        Self { db, keys, http, tokens, config }
+        Self { db, keys, http, tokens, config, auto_transition: auto_transition_enabled() }
+    }
+
+    /// Override the transition policy. For tests and for a caller that has its
+    /// own reason; the default comes from the environment.
+    pub fn with_auto_transition(mut self, on: bool) -> Self {
+        self.auto_transition = on;
+        self
     }
 
     /// The exact URI Google has to have registered. Not a secret; the single
@@ -516,13 +642,29 @@ impl Youtube {
                 })?;
             }
         }
+        // A broadcast made before the monitor stream was disabled at insert
+        // will park in `testing` the moment FFmpeg connects, and no amount of
+        // waiting changes that. Said here, at the start, rather than discovered
+        // five minutes later — and said without stopping the start, because the
+        // video does reach YouTube and the customer can finish it in Studio.
+        if !broadcast.starts_itself() {
+            let why =
+                if broadcast.enable_monitor_stream { Stuck::MonitorStream } else { Stuck::AutoStartOff };
+            self.note(broadcast_id, why.explain());
+        }
+
         self.db.set_youtube_status(broadcast_id, WAITING)?;
         Ok(())
     }
 
     /// Ask YouTube what it makes of the stream, once. §8: bounded, and called
     /// on a tick rather than in a loop of its own.
-    pub fn poll_status(&self, broadcast_id: &str) -> Result<Option<String>> {
+    ///
+    /// Reports what YouTube said and what still has to happen, and sends a
+    /// transition only when YouTube's own state makes one both necessary and
+    /// legal — and only when the operator has turned that on. FFmpeg being
+    /// healthy is not evidence about any of it.
+    pub fn poll_status(&self, broadcast_id: &str) -> Result<Option<Observed>> {
         let b = self.db.broadcast(broadcast_id)?;
         let (Some(account_id), Some(yt_id), Some(stream_id)) =
             (b.youtube.account_id.clone(), b.youtube.broadcast_id.clone(), b.youtube.stream_id.clone())
@@ -537,32 +679,71 @@ impl Youtube {
                 api.broadcast_by_id(token, &yt_id)
             })?;
 
-        let status = match broadcast.life_cycle_status.as_str() {
-            "live" => LIVE,
-            "complete" => COMPLETE,
-            _ if stream.is_active() => READY,
-            _ => WAITING,
-        };
-        self.db.set_youtube_status(broadcast_id, status)?;
-
-        // A broadcast that will not start itself has to be told to. Only once
-        // the stream is actually active, because YouTube refuses otherwise and
-        // the refusal reads like a permissions problem.
-        if status == READY && !broadcast.enable_auto_start {
-            match self.call_api(
-                broadcast_id,
-                &account_id,
-                ApiMethod::LiveBroadcastsTransition,
-                |api, token| api.transition_broadcast(token, &yt_id, "live"),
-            ) {
-                Ok(_) => {
-                    self.db.set_youtube_status(broadcast_id, LIVE)?;
-                    return Ok(Some(LIVE.to_string()));
-                }
-                Err(e) => self.note(broadcast_id, &format!("YouTube 라이브 전환 실패: {e}")),
+        // What YouTube is actually bound to. A broadcast whose stream is not the
+        // one being sent to never goes live, and before this the only symptom
+        // was silence.
+        if let Some(bound) = broadcast.bound_stream_id.as_deref() {
+            if bound != stream_id {
+                self.note(
+                    broadcast_id,
+                    "YouTube 방송이 다른 스트림에 연결되어 있습니다. 송출 중인 스트림과 공개 방송이 서로 다른 대상입니다.",
+                );
             }
         }
-        Ok(Some(status.to_string()))
+
+        let active = stream.is_active();
+        let status = status_for(&broadcast.life_cycle_status, active);
+        self.db.set_youtube_status(broadcast_id, status)?;
+        let step = next_step(
+            &broadcast.life_cycle_status,
+            active,
+            broadcast.starts_itself(),
+            broadcast.enable_monitor_stream,
+        );
+
+        // An ingest YouTube calls active but cannot use looks exactly like one
+        // that is fine, from here. Its own words, because "bad" and "noData"
+        // need different answers.
+        if active
+            && matches!(stream.health_status.as_str(), "bad" | "noData")
+            && !stream.configuration_issues.is_empty()
+        {
+            self.note(
+                broadcast_id,
+                &format!(
+                    "YouTube가 수신 품질을 {}로 보고했습니다: {}",
+                    stream.health_status,
+                    stream.configuration_issues.join(", ")
+                ),
+            );
+        }
+
+        // Detected either way. Acted on only when the operator allows it; the
+        // caller is what decides when to say it out loud, so that a poll every
+        // ten seconds does not become a log entry every ten seconds.
+        let mut transitioned = false;
+        if matches!(step, NextStep::NeedsTransition(_)) {
+            if self.auto_transition {
+                match self.call_api(
+                    broadcast_id,
+                    &account_id,
+                    ApiMethod::LiveBroadcastsTransition,
+                    |api, token| api.transition_broadcast(token, &yt_id, "live"),
+                ) {
+                    Ok(_) => {
+                        self.db.set_youtube_status(broadcast_id, LIVE)?;
+                        self.note(broadcast_id, "YouTube 방송을 실시간으로 전환했습니다");
+                        transitioned = true;
+                    }
+                    // Not fatal, and deliberately not a reason to stop sending:
+                    // the encoder is fine and the customer's video is still
+                    // arriving at YouTube.
+                    Err(e) => self.note(broadcast_id, &format!("YouTube 라이브 전환 실패: {e}")),
+                }
+            }
+        }
+
+        Ok(Some(Observed { status: if transitioned { LIVE } else { status }, step, transitioned }))
     }
 
     /// End the YouTube side of a broadcast the user stopped. §9.

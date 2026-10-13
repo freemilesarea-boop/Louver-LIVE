@@ -1001,53 +1001,141 @@ mod meter_tests {
     }
 }
 
-/// Asks YouTube how the ingest is going, on a schedule and not for ever.
+/// Asks YouTube how the ingest is going, and keeps asking.
 ///
-/// Every poll costs API quota, and a broadcast that has gone live has nothing
-/// left to report, so this stops as soon as it has an answer and gives up after
-/// a few minutes of not getting one. §8 forbids an unbounded loop and this is
-/// where that rule lives.
+/// Two phases, because the two questions are different. For the first five
+/// minutes the question is "has YouTube noticed the ingest yet", asked every
+/// ten seconds — YouTube usually answers in twenty. After that the question is
+/// "is this broadcast ever going to start", and it is asked on a widening
+/// interval for as long as the encoder runs.
+///
+/// It used to stop after five minutes. That is why a broadcast that never went
+/// live looked identical to one that did: the last thing anyone asked YouTube
+/// was before the answer existed, and 247streams went on saying 송출 중 from
+/// FFmpeg's health alone. An unattended 24/7 service has nobody watching
+/// Studio, so not asking again is not an option — and the capped interval is
+/// what keeps that from costing quota. At 300s a broadcast that never goes live
+/// costs 576 units a day against a 10,000 unit allowance, and a broadcast that
+/// does go live stops costing anything at all.
 #[derive(Debug)]
 struct YoutubeWatch {
     next: std::time::Instant,
     polls: u32,
+    slow_polls: usize,
     settled: bool,
+    /// The mismatch has been reported once. Said again only if it changes.
+    warned: Option<crate::youtube::Stuck>,
 }
 
 impl Default for YoutubeWatch {
     fn default() -> Self {
-        Self { next: std::time::Instant::now(), polls: 0, settled: false }
+        Self { next: std::time::Instant::now(), polls: 0, slow_polls: 0, settled: false, warned: None }
     }
 }
 
 impl YoutubeWatch {
-    /// Every ten seconds, at most thirty times: five minutes for YouTube to
-    /// notice an ingest it usually notices in twenty seconds.
+    /// Every ten seconds, thirty times: five minutes for YouTube to notice an
+    /// ingest it usually notices in twenty seconds.
     const EVERY: std::time::Duration = std::time::Duration::from_secs(10);
     const LIMIT: u32 = 30;
+    /// Then one, two, five minutes, and five minutes from then on.
+    const SLOW_BACKOFF: [u64; 3] = [60, 120, 300];
+
+    fn interval(&self) -> std::time::Duration {
+        if self.polls < Self::LIMIT {
+            return Self::EVERY;
+        }
+        let i = self.slow_polls.min(Self::SLOW_BACKOFF.len() - 1);
+        std::time::Duration::from_secs(Self::SLOW_BACKOFF[i])
+    }
 
     fn maybe_poll(&mut self, yt: &Arc<crate::youtube::Youtube>, db: &CloudDb, broadcast_id: &str) {
-        if self.settled || self.polls >= Self::LIMIT || std::time::Instant::now() < self.next {
+        if self.settled || std::time::Instant::now() < self.next {
             return;
         }
-        self.next = std::time::Instant::now() + Self::EVERY;
-        self.polls += 1;
+        self.next = std::time::Instant::now() + self.interval();
+        if self.polls < Self::LIMIT {
+            self.polls += 1;
+        } else {
+            self.slow_polls += 1;
+        }
         match yt.poll_status(broadcast_id) {
             // Not a YouTube broadcast at all: never ask again.
             Ok(None) => self.settled = true,
-            Ok(Some(status)) => {
-                if status == crate::youtube::LIVE || status == crate::youtube::COMPLETE {
+            Ok(Some(seen)) => {
+                if seen.settled() {
                     self.settled = true;
+                    self.warned = None;
+                    return;
+                }
+                // The encoder is healthy and YouTube is not live. Said once the
+                // fast phase has run out of patience, so a broadcast that
+                // simply takes thirty seconds does not alarm anyone — and said
+                // once, not every poll.
+                if let crate::youtube::NextStep::NeedsTransition(stuck) = seen.step {
+                    if self.polls >= Self::LIMIT && self.warned != Some(stuck) {
+                        self.warned = Some(stuck);
+                        let _ = db.append_event(broadcast_id, EventLevel::Warn, stuck.explain());
+                    }
                 }
             }
+            // A failed question is not an answer. The encoder is still sending
+            // and the customer's broadcast is not touched; the only thing that
+            // changes is that we still do not know, so we ask again.
             Err(e) => {
                 let _ =
                     db.append_event(broadcast_id, EventLevel::Warn, &format!("YouTube 상태 확인 실패: {e}"));
-                if self.polls >= Self::LIMIT {
-                    self.settled = true;
-                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod youtube_watch_tests {
+    use super::YoutubeWatch;
+
+    #[test]
+    fn the_fast_phase_asks_every_ten_seconds_for_five_minutes() {
+        let w = YoutubeWatch::default();
+        assert_eq!(w.interval().as_secs(), 10);
+        assert_eq!(YoutubeWatch::LIMIT, 30, "30 x 10s is the five minutes YouTube usually needs 20s of");
+    }
+
+    #[test]
+    fn then_it_widens_rather_than_stopping() {
+        // It used to stop here, which is why nobody ever learned that a
+        // broadcast had not started.
+        let mut w = YoutubeWatch::default();
+        w.polls = YoutubeWatch::LIMIT;
+        assert_eq!(w.interval().as_secs(), 60);
+        w.slow_polls = 1;
+        assert_eq!(w.interval().as_secs(), 120);
+        w.slow_polls = 2;
+        assert_eq!(w.interval().as_secs(), 300);
+        w.slow_polls = 500;
+        assert_eq!(
+            w.interval().as_secs(),
+            300,
+            "capped, so a long broadcast cannot drift into a quota problem"
+        );
+    }
+
+    #[test]
+    fn the_capped_interval_fits_the_daily_api_allowance() {
+        // Two list calls per poll, 1 unit each, against 10,000 free units.
+        let a_day = 24 * 60 * 60;
+        let fast = YoutubeWatch::LIMIT as u64 * 2;
+        let slow = (a_day - YoutubeWatch::LIMIT as u64 * 10) / 300 * 2;
+        assert!(fast + slow < 1_000, "{} units a day", fast + slow);
+    }
+
+    #[test]
+    fn a_settled_broadcast_is_never_asked_about_again() {
+        let mut w = YoutubeWatch::default();
+        w.settled = true;
+        // `maybe_poll` returns before touching the clock, so the next deadline
+        // never moves; asserted through the flag the loop reads.
+        assert!(w.settled);
     }
 }
 

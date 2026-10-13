@@ -202,7 +202,48 @@ docker compose exec louver louver-server --diagnose
 `YouTube :` 줄의 `broadcast=`, `stream=`, `status=` 와 `대상 :` 줄의 `host=`,
 `스트림 키:` 지문을 확인하세요. 스트림 키는 출력되지 않습니다.
 
-## 8. 실제 YouTube 검증 상태
+## 8. 247streams 는 '송출 중' 인데 YouTube 는 '예정 중' 일 때
+
+이 조합의 원인은 하나입니다. **YouTube 방송이 '미리보기(testing)' 단계에
+멈춰 있는 것.**
+
+`liveBroadcasts.insert` 의 `contentDetails.monitorStream.enableMonitorStream`
+기본값은 **true** 입니다. 미리보기가 켜져 있으면 송출이 도착해도 방송은
+`testing` 까지만 올라가고, **`enableAutoStart` 는 거기서 더 끌어올리지
+않습니다.** 공개 시청 페이지에는 틀 영상이 없고, 스튜디오에는 신호가 들어오며,
+247streams 는 FFmpeg 가 건강하므로 '송출 중' 이라고 말합니다 — 세 가지가 모두
+동시에 참인 상태입니다.
+
+무인 24/7 서비스에는 스튜디오에서 '실시간 시작' 을 눌러줄 사람이 없으므로,
+이제 insert 시점에 **미리보기를 끕니다**. 이 릴리스 이후에 만들어진 방송은
+송출이 도착하면 스스로 `live` 까지 갑니다.
+
+**이전 빌드가 만든 방송은 그대로 `testing` 에 멈춥니다.** 두 가지 방법이
+있습니다.
+
+1. YouTube 스튜디오에서 해당 방송의 **'실시간 시작'** 을 누른다. 즉시 공개됩니다.
+2. 서버 `.env` 에 `LOUVER_YOUTUBE_AUTO_TRANSITION=1` 을 넣는다. 247streams 가
+   대신 한 번 눌러줍니다 — 단 YouTube 가 수신을 `active` 로 보고하는 방송에
+   한해서, 한 번만.
+
+2번은 기본으로 꺼져 있습니다. 전환은 고객 채널에 쓰기를 하는 동작이고, 잘못된
+순간에 보내면 잘 돌던 방송을 끝낼 수 있기 때문입니다. 꺼져 있어도 **원인과
+조치는 방송 로그와 대시보드에 그대로 표시됩니다.**
+
+대시보드 표시도 함께 바뀝니다. YouTube 계정에 연결된 방송은 머리 배지가
+FFmpeg 가 아니라 **YouTube** 를 따릅니다.
+
+| YouTube 상태 | 배지 |
+| --- | --- |
+| `live` | 방송 중 |
+| `testing` / `ready` | YouTube 시작 대기 |
+| `waiting_for_ingest` | 연결 중 |
+| 확인된 적 없음 | 확인 불가 |
+
+붙여넣은 스트림 키로 보내는 방송은 비교할 대상이 없으므로 예전처럼 '송출 중'
+입니다.
+
+## 9. 실제 YouTube 검증 상태
 
 이 저장소의 테스트는 **가짜 Google**을 상대로 돕니다
 (`crates/louver-cloud/tests/youtube_provider.rs`). CI에서 `googleapis.com` 으로

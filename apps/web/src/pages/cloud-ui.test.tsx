@@ -1187,12 +1187,58 @@ describe("what the dashboard says about YouTube", () => {
       }),
     );
 
-    // FFmpeg's state and YouTube's state, side by side and not interchangeable.
-    expect(await screen.findByText("송출 중")).toBeInTheDocument();
+    // This used to read 송출 중, from FFmpeg alone, which is the whole fault:
+    // the customer saw a success here while YouTube showed 예정 중. The
+    // headline now follows the thing being sent to, and still says what the
+    // encoder is doing — side by side, neither standing in for the other.
+    expect(await screen.findByText("연결 중")).toBeInTheDocument();
+    expect(screen.queryByText("송출 중")).not.toBeInTheDocument();
     expect(screen.getByTestId("youtube-status")).toHaveTextContent(
       "YouTube 연결 대기",
     );
     expect(screen.queryByText("YouTube 라이브")).not.toBeInTheDocument();
+  });
+
+  it("says YouTube 시작 대기 for a broadcast parked in the monitor preview", async () => {
+    // The state the reported fault actually lands in: YouTube has the video,
+    // the watch page has nothing, and nobody is going to press Go Live.
+    show(
+      <CloudDashboard />,
+      running({
+        account_id: "y1",
+        broadcast_id: "bcast-1",
+        stream_id: "stream-1",
+        status: "testing",
+      }),
+    );
+
+    expect(await screen.findByText("YouTube 시작 대기")).toBeInTheDocument();
+    expect(screen.queryByText("송출 중")).not.toBeInTheDocument();
+    expect(screen.getByTestId("youtube-status")).toHaveTextContent(
+      "YouTube 미리보기 (시작 대기)",
+    );
+  });
+
+  it("says 확인 불가 rather than a success when YouTube has not answered", async () => {
+    show(
+      <CloudDashboard />,
+      running({
+        account_id: "y1",
+        broadcast_id: "bcast-1",
+        stream_id: "stream-1",
+      }),
+    );
+
+    expect(await screen.findByText("확인 불가")).toBeInTheDocument();
+    expect(screen.queryByText("송출 중")).not.toBeInTheDocument();
+  });
+
+  it("still says 송출 중 for a pasted key, where FFmpeg is the only truth there is", async () => {
+    // No connected channel to ask, so the encoder's state is the answer. The
+    // fix must not make a working pasted-key broadcast look uncertain.
+    show(<CloudDashboard />, running({}));
+
+    expect(await screen.findByText("송출 중")).toBeInTheDocument();
   });
 
   it("says 라이브 only when YouTube says so", async () => {

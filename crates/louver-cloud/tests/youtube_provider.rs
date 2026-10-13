@@ -38,8 +38,15 @@ struct Google {
     stream_status: Mutex<String>,
     /// Does the broadcast report `enableAutoStart`?
     auto_start: Mutex<bool>,
+    /// `contentDetails.monitorStream.enableMonitorStream`. YouTube's default is
+    /// true, and so is this one: a broadcast made before the fix has the
+    /// monitor stream on, which is what parks an ingest in `testing`.
+    monitor: Mutex<bool>,
     /// Does `liveBroadcasts?…&id=` report a bound stream?
     bound: Mutex<bool>,
+    /// Which stream it reports as bound. A different id is the mis-binding that
+    /// makes a broadcast that can never show what is being sent.
+    bound_stream_id: Mutex<String>,
     /// Access tokens this fake will refuse with a 401 before accepting one.
     stale: Mutex<Vec<String>>,
     /// A canned failure for the next matching request: (url fragment, status, body).
@@ -55,7 +62,9 @@ impl Google {
             lifecycle: Mutex::new("ready".into()),
             stream_status: Mutex::new("inactive".into()),
             auto_start: Mutex::new(false),
+            monitor: Mutex::new(true),
             bound: Mutex::new(true),
+            bound_stream_id: Mutex::new("stream-1".into()),
             ..Default::default()
         })
     }
@@ -73,9 +82,10 @@ impl Google {
         let mut content = serde_json::json!({
             "enableAutoStart": *self.auto_start.lock().unwrap(),
             "enableAutoStop": *self.auto_start.lock().unwrap(),
+            "monitorStream": { "enableMonitorStream": *self.monitor.lock().unwrap() },
         });
         if *self.bound.lock().unwrap() {
-            content["boundStreamId"] = serde_json::json!("stream-1");
+            content["boundStreamId"] = serde_json::json!(*self.bound_stream_id.lock().unwrap());
         }
         serde_json::json!({
             "id": "bcast-1",
@@ -159,6 +169,9 @@ impl HttpClient for Google {
             })
         } else if url.contains("/liveBroadcasts/bind") {
             *self.bound.lock().unwrap() = true;
+            if let Some(sid) = url.split("streamId=").nth(1).and_then(|x| x.split('&').next()) {
+                *self.bound_stream_id.lock().unwrap() = sid.to_string();
+            }
             self.broadcast_json()
         } else if url.contains("/liveBroadcasts/transition") {
             let to = url.split("broadcastStatus=").nth(1).unwrap_or("").split('&').next().unwrap_or("");
@@ -275,12 +288,21 @@ fn env() -> Env {
         Arc::clone(&api) as Arc<dyn HttpClient>,
         Arc::clone(&tokens) as Arc<dyn TokenEndpoint>,
         config,
-    );
+    )
+    // Pinned rather than inherited: the default a deployment gets is off, and a
+    // test must not read the machine it happens to run on.
+    .with_auto_transition(false);
     let user = db.create_user("dj@example.com", "hash", "business").unwrap().id;
     Env { dir, db, keys, api, tokens, yt, user }
 }
 
 impl Env {
+    /// The same environment with the operator's rescue switch on.
+    fn with_auto_transition(mut self) -> Self {
+        self.yt = self.yt.clone().with_auto_transition(true);
+        self
+    }
+
     /// A connected account, the way a user who finished consent has one.
     fn connect(&self) -> String {
         let url = self.yt.consent_url(&self.user).unwrap();
@@ -756,7 +778,7 @@ fn n2_a_pasted_key_broadcast_causes_no_api_call_at_all() {
     // one that has no connected account.
     e.yt.sync_metadata(&e.user, &id).unwrap();
     e.yt.before_start(&id).unwrap();
-    assert_eq!(e.yt.poll_status(&id).unwrap(), None);
+    assert!(e.yt.poll_status(&id).unwrap().is_none());
     e.yt.after_stop(&id);
 
     assert_eq!(e.api.calls().len(), calls_before, "manual RTMPS must not reach the YouTube API");
@@ -840,38 +862,225 @@ fn o2_a_lost_binding_is_restored_before_the_worker_starts() {
 }
 
 // --- P: YouTube's state, not FFmpeg's ------------------------------------
+//
+// The fault these cover: a broadcast created with `enableAutoStart` but with
+// the monitor stream left on lands in `testing` when the ingest starts, and
+// stops there for ever. YouTube Studio shows the stream arriving, the public
+// watch page has nothing, and 247streams said 송출 중 because FFmpeg was fine.
 
 #[test]
-fn p_the_status_follows_youtube_and_transitions_only_when_it_has_to() {
+fn p_insert_disables_the_monitor_stream_so_autostart_can_actually_start() {
     let e = env();
     let account = e.connect();
     let id = e.broadcast(&account, "밤의 플레이리스트");
     e.yt.provision(&e.user, &id, &account).unwrap();
 
-    // Nothing arriving yet.
-    assert_eq!(e.yt.poll_status(&id).unwrap().as_deref(), Some("waiting_for_ingest"));
-
-    // Video is arriving, and this broadcast will not start itself.
-    *e.api.stream_status.lock().unwrap() = "active".into();
-    assert_eq!(e.yt.poll_status(&id).unwrap().as_deref(), Some("live"));
-    assert_eq!(e.api.matching("broadcastStatus=live").len(), 1, "one transition, not one per poll");
-    assert_eq!(e.db.broadcast_owned(&e.user, &id).unwrap().youtube.status.as_deref(), Some("live"));
+    let insert = e.api.matching("/liveBroadcasts?part=").into_iter().find(|c| c.method == "POST").unwrap();
+    let content = &insert.body.as_ref().unwrap()["contentDetails"];
+    assert_eq!(content["enableAutoStart"], serde_json::json!(true));
+    // The half that was missing. Without it YouTube's default takes over and
+    // autostart carries the broadcast only as far as the preview.
+    assert_eq!(
+        content["monitorStream"]["enableMonitorStream"],
+        serde_json::json!(false),
+        "autostart only means 'go live on ingest' when there is no monitor phase to stop at"
+    );
 }
 
 #[test]
-fn p2_a_broadcast_that_starts_itself_is_not_transitioned() {
+fn p2_a_broadcast_that_really_starts_itself_is_not_transitioned() {
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    // Both halves, which is what "starts itself" means.
+    *e.api.auto_start.lock().unwrap() = true;
+    *e.api.monitor.lock().unwrap() = false;
+    *e.api.stream_status.lock().unwrap() = "active".into();
+
+    let seen = e.yt.poll_status(&id).unwrap().unwrap();
+    assert_eq!(seen.status, "ready");
+    assert_eq!(seen.step, louver_cloud::youtube::NextStep::AwaitAutoStart);
+    assert!(
+        e.api.matching("broadcastStatus=live").is_empty(),
+        "YouTube does this itself; asking anyway reads as a permissions error"
+    );
+}
+
+#[test]
+fn p3_autostart_with_the_monitor_stream_on_does_not_count_as_starting_itself() {
+    // The exact shape of every broadcast created before the fix.
     let e = env();
     let account = e.connect();
     let id = e.broadcast(&account, "밤의 플레이리스트");
     e.yt.provision(&e.user, &id, &account).unwrap();
     *e.api.auto_start.lock().unwrap() = true;
+    *e.api.monitor.lock().unwrap() = true;
     *e.api.stream_status.lock().unwrap() = "active".into();
 
-    assert_eq!(e.yt.poll_status(&id).unwrap().as_deref(), Some("ready"));
-    assert!(
-        e.api.matching("broadcastStatus=live").is_empty(),
-        "enableAutoStart means YouTube does this itself; asking anyway reads as a permissions error"
+    let seen = e.yt.poll_status(&id).unwrap().unwrap();
+    assert_eq!(
+        seen.step,
+        louver_cloud::youtube::NextStep::NeedsTransition(louver_cloud::youtube::Stuck::MonitorStream),
+        "enableAutoStart alone was taken as proof it would start, and it is not"
     );
+    assert_ne!(seen.status, "live", "nothing may report live until YouTube says live");
+}
+
+#[test]
+fn p4_a_broadcast_parked_in_testing_is_named_as_such_and_not_called_ready() {
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.stream_status.lock().unwrap() = "active".into();
+    *e.api.lifecycle.lock().unwrap() = "testing".into();
+
+    let seen = e.yt.poll_status(&id).unwrap().unwrap();
+    assert_eq!(seen.status, "testing", "collapsing this into `ready` is what hid the fault");
+    assert_eq!(
+        seen.step,
+        louver_cloud::youtube::NextStep::NeedsTransition(louver_cloud::youtube::Stuck::MonitorStream)
+    );
+    assert_eq!(e.db.broadcast_owned(&e.user, &id).unwrap().youtube.status.as_deref(), Some("testing"));
+}
+
+#[test]
+fn p5_without_the_operator_switch_nothing_is_written_to_youtube() {
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.stream_status.lock().unwrap() = "active".into();
+    *e.api.lifecycle.lock().unwrap() = "testing".into();
+
+    let seen = e.yt.poll_status(&id).unwrap().unwrap();
+    assert!(!seen.transitioned);
+    assert!(
+        e.api.matching("broadcastStatus=").is_empty(),
+        "a transition is a write on a customer's channel; it waits for the operator to allow it"
+    );
+    // And the diagnosis is still available, which is the point of detecting
+    // without acting.
+    match seen.step {
+        louver_cloud::youtube::NextStep::NeedsTransition(stuck) => {
+            assert!(stuck.explain().contains("실시간 시작"), "the message has to say what to press");
+        }
+        other => panic!("expected a stuck broadcast, got {other:?}"),
+    }
+}
+
+#[test]
+fn p6_with_the_switch_on_a_parked_broadcast_is_rescued_once() {
+    let e = env().with_auto_transition();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.stream_status.lock().unwrap() = "active".into();
+    *e.api.lifecycle.lock().unwrap() = "testing".into();
+
+    let seen = e.yt.poll_status(&id).unwrap().unwrap();
+    assert!(seen.transitioned);
+    assert_eq!(seen.status, "live");
+    assert_eq!(e.api.matching("broadcastStatus=live").len(), 1, "one transition, not one per poll");
+    assert_eq!(e.db.broadcast_owned(&e.user, &id).unwrap().youtube.status.as_deref(), Some("live"));
+
+    // Settled, so the next poll asks for nothing.
+    let again = e.yt.poll_status(&id).unwrap().unwrap();
+    assert!(again.settled());
+    assert_eq!(e.api.matching("broadcastStatus=live").len(), 1);
+}
+
+#[test]
+fn p7_an_ingest_that_has_not_arrived_is_not_a_stuck_broadcast() {
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+
+    let seen = e.yt.poll_status(&id).unwrap().unwrap();
+    assert_eq!(seen.status, "waiting_for_ingest");
+    assert_eq!(seen.step, louver_cloud::youtube::NextStep::AwaitIngest);
+    assert!(e.api.matching("broadcastStatus=").is_empty());
+}
+
+#[test]
+fn p8_a_live_broadcast_is_left_entirely_alone() {
+    let e = env().with_auto_transition();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.stream_status.lock().unwrap() = "active".into();
+    *e.api.lifecycle.lock().unwrap() = "live".into();
+
+    let seen = e.yt.poll_status(&id).unwrap().unwrap();
+    assert_eq!(seen.status, "live");
+    assert!(seen.settled());
+    assert!(
+        e.api.matching("broadcastStatus=").is_empty(),
+        "a working broadcast must not be transitioned again, even with the switch on"
+    );
+}
+
+#[test]
+fn p9_a_stream_bound_elsewhere_is_reported_rather_than_hidden() {
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    // YouTube says this broadcast is bound to a different ingest than the one
+    // being sent to: the public page can never show what FFmpeg is sending.
+    *e.api.bound_stream_id.lock().unwrap() = "stream-OTHER".into();
+    *e.api.stream_status.lock().unwrap() = "active".into();
+
+    e.yt.poll_status(&id).unwrap().unwrap();
+    let logs = e.db.events_for(&id, 50).unwrap();
+    assert!(
+        logs.iter().any(|l| l.message.contains("다른 스트림에 연결")),
+        "a mis-bound broadcast used to be silent; logs were {:?}",
+        logs.iter().map(|l| l.message.clone()).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn p10_an_api_failure_does_not_become_a_live_claim_or_a_stop() {
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.stream_status.lock().unwrap() = "active".into();
+    *e.api.fail.lock().unwrap() = Some((
+        "/liveBroadcasts?part".into(),
+        403,
+        r#"{"error":{"code":403,"message":"quotaExceeded","errors":[{"reason":"quotaExceeded"}]}}"#.into(),
+    ));
+
+    let err = e.yt.poll_status(&id).unwrap_err();
+    assert!(format!("{err}").contains("quota") || format!("{err}").contains("403"), "got {err}");
+    // The status is whatever was last actually observed — not `live`, and not a
+    // failure that would end a broadcast that is still sending.
+    let after = e.db.broadcast_owned(&e.user, &id).unwrap().youtube.status;
+    assert_ne!(after.as_deref(), Some("live"));
+}
+
+#[test]
+fn p11_the_decision_is_a_function_anyone_can_read() {
+    use louver_cloud::youtube::{next_step, NextStep, Stuck};
+    // live / complete: nothing to do.
+    assert_eq!(next_step("live", true, false, true), NextStep::Settled);
+    assert_eq!(next_step("complete", false, true, false), NextStep::Settled);
+    // the preview, whatever else is set
+    assert_eq!(next_step("testing", true, true, false), NextStep::NeedsTransition(Stuck::MonitorStream));
+    // nothing arriving yet
+    assert_eq!(next_step("ready", false, true, false), NextStep::AwaitIngest);
+    // arriving, and it really will start on its own
+    assert_eq!(next_step("ready", true, true, false), NextStep::AwaitAutoStart);
+    // arriving, autostart on but the monitor stream will park it
+    assert_eq!(next_step("ready", true, false, true), NextStep::NeedsTransition(Stuck::MonitorStream));
+    // arriving, autostart simply off
+    assert_eq!(next_step("ready", true, false, false), NextStep::NeedsTransition(Stuck::AutoStartOff));
+    // the two reasons do not share wording
+    assert_ne!(Stuck::MonitorStream.explain(), Stuck::AutoStartOff.explain());
 }
 
 // --- Q: stopping -----------------------------------------------------------
@@ -1171,4 +1380,48 @@ fn u2_a_failure_without_detail_reads_exactly_as_it_did_before() {
     assert!(text.contains("Google 인증 갱신에 실패했습니다"), "{text}");
     // No empty parentheses, no "(None)" — the message and nothing else.
     assert!(!text.contains('('), "a detail-less failure must not grow brackets: {text}");
+}
+
+// --- V: starting twice ------------------------------------------------------
+
+#[test]
+fn v_two_starts_in_a_row_do_not_make_two_youtube_broadcasts() {
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    let inserts =
+        || e.api.matching("/liveBroadcasts?part=").into_iter().filter(|c| c.method == "POST").count();
+    let after_provision = inserts();
+
+    // A double click, or a retry: the hook runs twice for a broadcast that is
+    // perfectly fine.
+    e.yt.before_start(&id).unwrap();
+    e.yt.before_start(&id).unwrap();
+    assert_eq!(inserts(), after_provision, "a healthy broadcast must not be replaced by starting it");
+
+    let kept = e.db.broadcast_owned(&e.user, &id).unwrap();
+    assert_eq!(kept.youtube.broadcast_id.as_deref(), Some("bcast-1"), "the id the customer's URL points at");
+}
+
+#[test]
+fn v2_a_completed_broadcast_is_renewed_once_per_start_not_once_per_check() {
+    // `renew` is the one path that changes the id the customer's URL points at,
+    // so how often it can run matters. YouTube answers `complete` until the
+    // fresh broadcast replaces it, and the second check must see the new one.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    let before = e.api.matching("/liveBroadcasts?part=").into_iter().filter(|c| c.method == "POST").count();
+
+    *e.api.lifecycle.lock().unwrap() = "complete".into();
+    e.yt.before_start(&id).unwrap();
+    // The fake now reports the renewed broadcast as `ready` again, which is
+    // what YouTube does once a new one exists.
+    *e.api.lifecycle.lock().unwrap() = "ready".into();
+    e.yt.before_start(&id).unwrap();
+
+    let after = e.api.matching("/liveBroadcasts?part=").into_iter().filter(|c| c.method == "POST").count();
+    assert_eq!(after - before, 1, "one renewal, not one per call");
 }

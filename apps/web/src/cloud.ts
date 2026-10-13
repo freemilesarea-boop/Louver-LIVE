@@ -562,10 +562,66 @@ export const PRIVACY_LABELS: Record<Privacy, string> = {
 export const YOUTUBE_STATUS_LABELS: Record<string, string> = {
   waiting_for_ingest: "연결 대기",
   ready: "신호 수신",
+  // YouTube is receiving video into the monitor stream's private preview and
+  // the public watch page has nothing to play. Its own label, because this is
+  // the state customers were seeing as "예정 중" while we said 송출 중.
+  testing: "미리보기 (시작 대기)",
   live: "라이브",
   complete: "종료",
   error: "오류",
 };
+
+/**
+ * What the headline badge is allowed to say.
+ *
+ * FFmpeg running means bytes are leaving this server. For a pasted-key
+ * destination that is the whole truth available, so RUNNING still reads 송출 중.
+ * For a YouTube-connected broadcast it is not: the broadcast can be parked in
+ * the preview, or waiting for a start nobody will press, and saying 송출 중 for
+ * that is the fault this fixes. So the headline follows YouTube once YouTube is
+ * the thing being sent to, and says plainly when it does not know.
+ */
+export function liveLabel(b: Broadcast): string {
+  const runtime = RUNTIME_LABELS[b.runtime_state];
+  if (b.runtime_state !== "RUNNING") return runtime;
+  if (!b.youtube?.account_id) return runtime; // nothing to check it against
+  switch (b.youtube?.status) {
+    case "live":
+      return "방송 중";
+    case "testing":
+    case "ready":
+      return "YouTube 시작 대기";
+    case "waiting_for_ingest":
+      return "연결 중";
+    case "complete":
+      return "YouTube 방송 종료";
+    case "error":
+      return "YouTube 오류";
+    default:
+      // Never observed, or not observed recently enough to say. Honest, and
+      // not a success.
+      return "확인 불가";
+  }
+}
+
+/** The tone for {@link liveLabel}. Only a confirmed live broadcast reads ok. */
+export function liveTone(b: Broadcast): "default" | "ok" | "warn" | "live" {
+  if (b.runtime_state === "FAILED") return "live";
+  if (b.runtime_state !== "RUNNING") return "default";
+  if (!b.youtube?.account_id) return "ok";
+  switch (b.youtube?.status) {
+    case "live":
+      return "ok";
+    case "error":
+      return "live";
+    case "testing":
+    case "ready":
+    case "complete":
+      return "warn";
+    default:
+      return "default";
+  }
+}
 
 export function youtubeStatusLabel(b: Broadcast): string | null {
   const s = b.youtube?.status;
