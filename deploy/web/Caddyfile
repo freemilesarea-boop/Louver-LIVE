@@ -1,0 +1,95 @@
+# Caddy in front, serving the web bundle itself.
+#
+# WHY THIS FILE EXISTS
+#
+# The root `Caddyfile` proxies *everything* to `louver:8080`, and the bundle it
+# answers with is baked into the server image (`COPY --from=web … /srv/louver/web`).
+# Shipping a dashboard change therefore means rebuilding that image and
+# recreating the container — which kills every FFmpeg child it spawned, i.e.
+# every live broadcast. This file moves the static half out in front, so a
+# dashboard release is a symlink swap on disk and the server process is never
+# signalled.
+#
+# It is opt-in. Nothing reads it unless you pass the override:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.web.yml \
+#       --profile https up -d --no-deps caddy
+#
+# The `--no-deps` is not decoration: without it Compose would also act on
+# `louver`, which is the one container that must not be touched.
+#
+# EVERY SETTING IS AN ENVIRONMENT VARIABLE ON PURPOSE
+#
+# so that this exact file — not a paraphrase of it — is what the local test
+# harness (`scripts/web-split-check.sh`) exercises:
+#
+#   LOUVER_DOMAIN=:9700  LOUVER_UPSTREAM=127.0.0.1:9703  LOUVER_WEB_ROOT=/tmp/…/current
+
+{
+	email {$LOUVER_TLS_EMAIL}
+}
+
+{$LOUVER_DOMAIN} {
+	encode zstd gzip
+
+	# `/health` is the one application route that is not under `/api`
+	# (apps/server/src/lib.rs). Leaving it out of this matcher would hand it
+	# to the SPA fallback and answer an uptime check with 200 and a page of
+	# HTML — a monitor that can never fail.
+	@app path /api/* /health
+
+	# Vite writes every JS and CSS chunk here with a content hash in its name
+	# (`assets/index-_NHwvSbQ.js`), so a name is tied to its bytes forever.
+	@hashed path /assets/*
+
+	# Anything that looks like an asset but is not under `/assets` — the
+	# favicon, robots.txt, sitemap.xml, a stale URL from a cached page.
+	# These must 404 when missing, never fall back: a browser asked for a
+	# module and given `index.html` reports a syntax error in HTML, which is
+	# the hardest kind of release bug to read.
+	@file path_regexp \.(js|mjs|cjs|css|map|json|xml|txt|svg|png|jpg|jpeg|gif|webp|avif|ico|webmanifest|woff|woff2|ttf|eot)$
+
+	handle @app {
+		reverse_proxy {$LOUVER_UPSTREAM:louver:8080} {
+			# The dashboard's live updates are one long server-sent-events
+			# response. Buffering it would make the page look frozen for as
+			# long as the buffer takes to fill, so nothing here is buffered.
+			flush_interval -1
+		}
+	}
+
+	handle @hashed {
+		root * {$LOUVER_WEB_ROOT:/srv/web/current}
+		# Immutable by construction: a new build gets a new filename. A year
+		# is the longest value the spec allows and `immutable` stops the
+		# revalidation request a reload would otherwise still send.
+		header Cache-Control "public, max-age=31536000, immutable"
+		# No `try_files` and no fallback. A missing hashed file is a broken
+		# deployment and says so with 404.
+		file_server
+	}
+
+	handle @file {
+		root * {$LOUVER_WEB_ROOT:/srv/web/current}
+		header Cache-Control "no-cache"
+		file_server
+	}
+
+	# The SPA, and the prerendered public pages (`pricing/index.html` and the
+	# rest — see docs/SEO.md). The `{path}/index.html` candidate is what keeps
+	# those pages: a directory is NOT a `try_files` match, so without it
+	# `/pricing` falls through to the shell and the page Google was given
+	# disappears behind client-side rendering. Measured, not assumed — the
+	# check in scripts/web-split-check.sh caught exactly that.
+	handle {
+		root * {$LOUVER_WEB_ROOT:/srv/web/current}
+		# `no-cache` does not mean "do not cache": it means revalidate before
+		# reuse. The browser keeps the copy and gets a 304 when nothing
+		# changed, so the entry document is at most one conditional request
+		# stale — which is what makes a new `assets/index-<hash>.js` visible
+		# the next time the tab is opened.
+		header Cache-Control "no-cache"
+		try_files {path} {path}/index.html /index.html
+		file_server
+	}
+}
