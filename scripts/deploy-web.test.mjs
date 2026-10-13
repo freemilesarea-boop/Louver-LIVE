@@ -281,6 +281,16 @@ describe('the delivery manifest', () => {
   // block, which makes that block the definition of what gets installed — and
   // makes it silently wrong the moment one of those files is edited without it.
   // docs/WEB_DEPLOY.md is itself in the list, so this is not a hypothetical.
+  // The manifest records the bytes these files have on the Linux server they are
+  // deployed to, which is to say LF line endings. A Windows checkout converts
+  // them (`core.autocrlf` is on by default on GitHub's Windows runners), so
+  // hashing the file as it sits on disk there gives a different digest for
+  // identical content — which is what broke this suite on windows-latest the
+  // first time it ran. Normalising first is what makes the check about content
+  // rather than about which machine checked the repository out.
+  const canonical = (path) =>
+    createHash('sha256').update(readFileSync(path, 'utf8').replace(/\r\n/g, '\n'), 'utf8').digest('hex')
+
   it('matches the files it claims to install', () => {
     const installer = readFileSync(resolve(import.meta.dirname, 'install-web-split.sh'), 'utf8')
     const block = installer.match(/SHAS="([^"]*)"/)
@@ -292,8 +302,26 @@ describe('the delivery manifest', () => {
     expect(rows.length).toBe(6)
     const repo = resolve(import.meta.dirname, '..')
     for (const [want, file] of rows) {
-      const actual = createHash('sha256').update(readFileSync(resolve(repo, file))).digest('hex')
-      expect(actual, `${file} changed without updating the SHAS block in scripts/install-web-split.sh`).toBe(want)
+      expect(
+        canonical(resolve(repo, file)),
+        `${file} changed without updating the SHAS block in scripts/install-web-split.sh`,
+      ).toBe(want)
+    }
+  })
+
+  it('is not fooled by a Windows checkout', () => {
+    // The same content with CRLF endings has to come out at the same digest,
+    // or this suite reports a drift that does not exist on the server.
+    const dir = mkdtempSync(join(tmpdir(), 'crlf-'))
+    try {
+      const lf = join(dir, 'lf')
+      const crlf = join(dir, 'crlf')
+      const body = '{\n\temail x@example.invalid\n}\n'
+      writeFileSync(lf, body)
+      writeFileSync(crlf, body.replace(/\n/g, '\r\n'))
+      expect(canonical(crlf)).toBe(canonical(lf))
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
     }
   })
 })
