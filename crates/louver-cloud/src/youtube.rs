@@ -722,24 +722,22 @@ impl Youtube {
         // caller is what decides when to say it out loud, so that a poll every
         // ten seconds does not become a log entry every ten seconds.
         let mut transitioned = false;
-        if matches!(step, NextStep::NeedsTransition(_)) {
-            if self.auto_transition {
-                match self.call_api(
-                    broadcast_id,
-                    &account_id,
-                    ApiMethod::LiveBroadcastsTransition,
-                    |api, token| api.transition_broadcast(token, &yt_id, "live"),
-                ) {
-                    Ok(_) => {
-                        self.db.set_youtube_status(broadcast_id, LIVE)?;
-                        self.note(broadcast_id, "YouTube 방송을 실시간으로 전환했습니다");
-                        transitioned = true;
-                    }
-                    // Not fatal, and deliberately not a reason to stop sending:
-                    // the encoder is fine and the customer's video is still
-                    // arriving at YouTube.
-                    Err(e) => self.note(broadcast_id, &format!("YouTube 라이브 전환 실패: {e}")),
+        if matches!(step, NextStep::NeedsTransition(_)) && self.auto_transition {
+            match self.call_api(
+                broadcast_id,
+                &account_id,
+                ApiMethod::LiveBroadcastsTransition,
+                |api, token| api.transition_broadcast(token, &yt_id, "live"),
+            ) {
+                Ok(_) => {
+                    self.db.set_youtube_status(broadcast_id, LIVE)?;
+                    self.note(broadcast_id, "YouTube 방송을 실시간으로 전환했습니다");
+                    transitioned = true;
                 }
+                // Not fatal, and deliberately not a reason to stop sending: the
+                // encoder is fine and the customer's video is still arriving at
+                // YouTube.
+                Err(e) => self.note(broadcast_id, &format!("YouTube 라이브 전환 실패: {e}")),
             }
         }
 

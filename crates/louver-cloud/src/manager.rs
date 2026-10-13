@@ -1105,8 +1105,7 @@ mod youtube_watch_tests {
     fn then_it_widens_rather_than_stopping() {
         // It used to stop here, which is why nobody ever learned that a
         // broadcast had not started.
-        let mut w = YoutubeWatch::default();
-        w.polls = YoutubeWatch::LIMIT;
+        let mut w = YoutubeWatch { polls: YoutubeWatch::LIMIT, ..Default::default() };
         assert_eq!(w.interval().as_secs(), 60);
         w.slow_polls = 1;
         assert_eq!(w.interval().as_secs(), 120);
@@ -1131,8 +1130,7 @@ mod youtube_watch_tests {
 
     #[test]
     fn a_settled_broadcast_is_never_asked_about_again() {
-        let mut w = YoutubeWatch::default();
-        w.settled = true;
+        let w = YoutubeWatch { settled: true, ..Default::default() };
         // `maybe_poll` returns before touching the clock, so the next deadline
         // never moves; asserted through the flag the loop reads.
         assert!(w.settled);
