@@ -832,6 +832,30 @@ async fn main() -> std::process::ExitCode {
         return louver_server::youtube_audit::run(&args);
     }
 
+    // One writer per data directory, before anything is opened for writing.
+    //
+    // Taken here rather than inside `App::boot` because `App` is cloned into
+    // every request handler and a lease must not be: it is released when the
+    // last copy drops, and the point is that it is held for the life of the
+    // process. Held in `_lease` to the end of `main`.
+    //
+    // After the read-only subcommands above on purpose — a diagnosis has to be
+    // able to run while the server holds the lease, which is the whole reason
+    // it opens the database read-only.
+    let data = std::path::PathBuf::from(
+        std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()),
+    );
+    let _lease = match louver_cloud::lease::Lease::acquire(&data) {
+        Ok(l) => {
+            println!("[louver] 데이터 디렉터리 점유: {}", l.path().display());
+            l
+        }
+        Err(e) => {
+            eprintln!("[louver] {e}");
+            std::process::exit(1);
+        }
+    };
+
     let app = match App::boot() {
         Ok(a) => a,
         Err(e) => {

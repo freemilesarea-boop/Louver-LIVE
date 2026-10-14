@@ -21,6 +21,7 @@ pub mod db;
 pub mod entitlement;
 pub mod grants;
 pub mod ingest;
+pub mod lease;
 pub mod manager;
 pub mod media_audit;
 pub mod models;
