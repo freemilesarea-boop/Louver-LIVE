@@ -181,6 +181,10 @@ mod tests {
             scheduled_start_time: scheduled.map(str::to_string),
             enable_auto_start: false,
             enable_auto_stop: false,
+            // YouTube's own default, and the one that parks an ingest in
+            // `testing`. These tests are about picking a broadcast, not about
+            // starting one, so the pessimistic value is the honest fixture.
+            enable_monitor_stream: true,
         }
     }
 
