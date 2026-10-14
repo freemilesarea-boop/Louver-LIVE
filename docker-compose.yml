@@ -10,6 +10,18 @@ services:
     # A broadcast must survive a restart of the host, and the server brings back
     # whatever was still meant to be running.
     restart: unless-stopped
+    # Long enough for the server to stop every broadcast properly.
+    #
+    # Docker's default is 10 seconds, and it was not enough. On `docker stop`
+    # the server asks each FFmpeg to finish and gives it three seconds to flush
+    # its FLV trailer; the waits now overlap, so the whole shutdown is about
+    # three seconds whatever the broadcast count, but the HTTP server also has
+    # to drain and an SSE client can hold a connection. At ten seconds a slow
+    # shutdown was cut short by SIGKILL, which is exactly the trailer-less kill
+    # the graceful path exists to avoid.
+    #
+    # It costs nothing when shutdown is quick: this is a ceiling, not a wait.
+    stop_grace_period: 45s
     ports:
       - '${LOUVER_PORT:-8080}:8080'
     # Optional so that a missing .env fails with the message below — "set

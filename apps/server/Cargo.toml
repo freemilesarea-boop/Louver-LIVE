@@ -31,4 +31,6 @@ sysinfo.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# For asserting on a database the audit must not have migrated.
+rusqlite.workspace = true
 tower = { version = "0.5", features = ["util"] }

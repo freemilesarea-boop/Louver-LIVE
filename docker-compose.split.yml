@@ -1,0 +1,67 @@
+# The API and the FFmpeg runner as two containers, so the web side can be
+# deployed without stopping a broadcast.
+#
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.split.yml
+#   docker compose up -d louver-runner      # once; then leave it alone
+#   docker compose up -d --build louver     # as often as you like
+#
+# NOT ENABLED BY DEFAULT and not yet applied anywhere. Overlaying this file
+# changes which process owns every customer's FFmpeg, so it belongs behind a
+# maintenance window and a review — see docs/FFMPEG_LIFECYCLE.md.
+#
+# What it buys: `louver` holds no FFmpeg, so recreating it costs a few seconds
+# of HTTP and nothing else. What it does not buy: deploying `louver-runner`
+# still stops every broadcast, because that is the process the encoders are
+# children of. There is no arrangement in which replacing the parent of a
+# process leaves the process running.
+
+services:
+  # The web and API side. Replaceable.
+  #
+  # Inherits everything from docker-compose.yml and changes one thing: it no
+  # longer owns workers. It keeps the published port, the volume (it still
+  # reads and writes the database and serves uploads) and the environment.
+  louver:
+    environment:
+      LOUVER_ROLE: api
+    depends_on:
+      # Ordering only. The API starts and serves pages whether or not the
+      # runner is there; a start request fails with a sentence naming the
+      # socket, and a broadcast already running is untouched. `depends_on`
+      # without a condition does not wait for health, which is what we want:
+      # the web side must not be held hostage by the runner.
+      - louver-runner
+
+  # The side that owns FFmpeg. Long-lived.
+  louver-runner:
+    build: .
+    restart: unless-stopped
+    # Same reasoning as the single-container service, and it matters more here:
+    # this is the process that has to stop every broadcast properly when it is
+    # finally restarted.
+    stop_grace_period: 45s
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      LOUVER_ROLE: runner
+      LOUVER_MASTER_KEY: ${LOUVER_MASTER_KEY:?set LOUVER_MASTER_KEY in .env}
+      LOUVER_DEFAULT_PLAN: ${LOUVER_DEFAULT_PLAN:-basic}
+      LOUVER_ENCODER: ${LOUVER_ENCODER:-libx264}
+    volumes:
+      # The same volume, because the control socket lives in it beside the
+      # database — and because the runner reads the prepared media.
+      - louver-data:/var/lib/louver
+    # No port. It speaks over a Unix socket in the volume, so there is nothing
+    # to expose and nothing to firewall.
+    #
+    # No healthcheck either: `PING` over the socket is the liveness check, and
+    # the only thing that could run it is the API, which already reports an
+    # unreachable runner on every start attempt. A `docker` healthcheck that
+    # restarted this container on a hiccup would stop every broadcast — the one
+    # outcome this whole arrangement exists to avoid.
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '5'

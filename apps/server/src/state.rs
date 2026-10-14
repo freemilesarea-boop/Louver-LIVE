@@ -102,6 +102,17 @@ impl App {
             Some(yt) => mgr.with_youtube(yt.clone()),
             None => mgr,
         };
+        // In the `api` role the FFmpeg processes live in another container, so
+        // this manager asks rather than spawns. `Role::All` — the default and
+        // every deployment today — leaves this `None` and behaves exactly as
+        // it did before the split existed.
+        let role = louver_cloud::runner::Role::from_env();
+        let mgr = if role.owns_workers() {
+            mgr
+        } else {
+            println!("[louver] 역할 api: 방송 실행은 runner 에게 맡깁니다");
+            mgr.with_runner(louver_cloud::runner::Client::new(&data))
+        };
 
         let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools.clone(), encoder);
 
@@ -175,6 +186,9 @@ fn build_youtube(db: &CloudDb, keys: &Arc<dyn SecretStore>) -> Option<louver_clo
     };
     let transport = Arc::new(louver_core::youtube::http::UreqClient {
         token_endpoint: std::env::var("YOUTUBE_TOKEN_ENDPOINT").ok().filter(|s| !s.trim().is_empty()),
+        // The running server keeps its transport log: it is how a redirect or
+        // a 401 at 03:00 gets diagnosed at all.
+        quiet: false,
     });
     Some(louver_cloud::youtube::Youtube::new(
         db.clone(),

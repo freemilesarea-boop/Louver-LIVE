@@ -2357,6 +2357,7 @@ dependencies = [
  "chrono",
  "louver-cloud",
  "louver-core",
+ "rusqlite",
  "serde",
  "serde_json",
  "sysinfo",
