@@ -874,7 +874,7 @@ async fn main() -> std::process::ExitCode {
     let service =
         with_web_ui(router(app.clone())).into_make_service_with_connect_info::<std::net::SocketAddr>();
     let shutdown = async move {
-        let _ = tokio::signal::ctrl_c().await;
+        wait_for_stop().await;
         println!("[louver] 종료 신호를 받았습니다. 방송을 정리합니다");
     };
     if let Err(e) = axum::serve(listener, service).with_graceful_shutdown(shutdown).await {
@@ -885,4 +885,58 @@ async fn main() -> std::process::ExitCode {
     // brings these same broadcasts back.
     app.mgr.shutdown();
     std::process::ExitCode::SUCCESS
+}
+
+/// Wait for whichever signal means "stop", and return once one arrives.
+///
+/// `ctrl_c` on its own was a real gap rather than an omission of taste.
+/// `docker stop` sends SIGTERM, this process is PID 1 in its container (the
+/// image has a bare `CMD` and compose sets no init), and the kernel does not
+/// deliver a default-action signal to PID 1 at all. So SIGTERM was *ignored*:
+/// every `docker stop` waited out the full grace period and then SIGKILLed the
+/// container, which kills every FFmpeg mid-frame with no FLV trailer written
+/// and never runs `BroadcastManager::shutdown`.
+///
+/// With a handler installed the signal is delivered, the graceful path that
+/// was already here runs, and each FFmpeg gets its three seconds to close its
+/// stream properly.
+///
+/// SIGINT is kept for a terminal, and SIGQUIT is included because that is what
+/// some supervisors send when SIGTERM has not worked — which, before this, it
+/// never had.
+async fn wait_for_stop() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // A failure to install a handler must not become a server that cannot
+        // be stopped, so each is optional and `ctrl_c` is always armed.
+        let mut term = signal(SignalKind::terminate()).ok();
+        let mut quit = signal(SignalKind::quit()).ok();
+        let term = async {
+            match term.as_mut() {
+                Some(s) => {
+                    s.recv().await;
+                }
+                // Nothing to wait for; never completes, so `select!` ignores it.
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let quit = async {
+            match quit.as_mut() {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => println!("[louver] SIGINT"),
+            _ = term => println!("[louver] SIGTERM"),
+            _ = quit => println!("[louver] SIGQUIT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }

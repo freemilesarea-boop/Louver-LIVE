@@ -559,9 +559,28 @@ impl BroadcastManager {
     /// alone so recovery restarts these, and YouTube is not told anything —
     /// the broadcast is not ending, this process is.
     pub fn shutdown(&self) {
-        let ids: Vec<String> = self.running_ids();
-        for id in ids {
-            self.halt_worker(&id);
+        // Two passes, and the order is the point.
+        //
+        // Every worker is told to stop first, and only then are they waited
+        // for. Halting them one at a time cost the sum of their shutdowns:
+        // `ProcessHandle::terminate` gives FFmpeg three seconds to flush its
+        // FLV trailer before resorting to SIGKILL, so five broadcasts took up
+        // to fifteen seconds — past Docker's ten-second grace period, at which
+        // point the whole container is killed and the trailers are lost
+        // anyway. Signalling first makes the total three seconds whatever the
+        // count, because the waits overlap.
+        let workers: Vec<(String, Worker)> = {
+            let mut held = self.workers.lock().unwrap();
+            let ids: Vec<String> = held.keys().cloned().collect();
+            ids.into_iter().filter_map(|id| held.remove(&id).map(|w| (id, w))).collect()
+        };
+        for (_, w) in &workers {
+            w.stop.store(true, Ordering::SeqCst);
+        }
+        for (_, mut w) in workers {
+            if let Some(h) = w.handle.take() {
+                let _ = h.join();
+            }
         }
     }
 
