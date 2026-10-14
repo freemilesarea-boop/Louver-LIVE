@@ -24,6 +24,15 @@ const WWW_AUTH_MAX_CHARS: usize = 200;
 pub struct UreqClient {
     /// Overridden by tests to reach a local fake token endpoint.
     pub token_endpoint: Option<String>,
+    /// Suppress the per-request transport line.
+    ///
+    /// Default `false`, so the server logs exactly as it always has. The
+    /// read-only audit sets it: that line carries the request path *with its
+    /// query*, which is where the YouTube broadcast id lives, and the audit
+    /// promises to mask customer identifiers unless asked for them. Suppressed
+    /// rather than masked because the line is a transport diagnosis for a
+    /// running server, and a one-shot audit has its own output for that.
+    pub quiet: bool,
 }
 
 impl UreqClient {
@@ -119,10 +128,20 @@ impl HttpClient for UreqClient {
                 // to two owned values here so no uri outlives this statement.
                 let (redirects, redirect_host) = redirect_summary(resp.get_redirect_history());
                 let text = resp.body_mut().read_to_string().unwrap_or_default();
-                println!(
-                    "{}",
-                    exchange_line(method, url, status, &text, challenge.as_deref(), redirects, redirect_host,)
-                );
+                if !self.quiet {
+                    println!(
+                        "{}",
+                        exchange_line(
+                            method,
+                            url,
+                            status,
+                            &text,
+                            challenge.as_deref(),
+                            redirects,
+                            redirect_host,
+                        )
+                    );
+                }
                 Ok((status, text))
             }
             // Kept as a belt-and-braces path: with `http_status_as_error`

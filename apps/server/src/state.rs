@@ -175,6 +175,9 @@ fn build_youtube(db: &CloudDb, keys: &Arc<dyn SecretStore>) -> Option<louver_clo
     };
     let transport = Arc::new(louver_core::youtube::http::UreqClient {
         token_endpoint: std::env::var("YOUTUBE_TOKEN_ENDPOINT").ok().filter(|s| !s.trim().is_empty()),
+        // The running server keeps its transport log: it is how a redirect or
+        // a 401 at 03:00 gets diagnosed at all.
+        quiet: false,
     });
     Some(louver_cloud::youtube::Youtube::new(
         db.clone(),

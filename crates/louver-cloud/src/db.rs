@@ -11,7 +11,7 @@
 use crate::models::*;
 use crate::{CloudError, Result};
 use louver_core::database::models::EventLevel;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -481,6 +481,32 @@ impl CloudDb {
 
     pub fn open_in_memory() -> Result<Self> {
         Self::from_connection(Connection::open_in_memory()?)
+    }
+
+    /// Open an existing database without writing a single byte to it.
+    ///
+    /// [`Self::open`] is not a read: it runs `SCHEMA`, calls `ensure_column`
+    /// for every column added since the first release, and sets
+    /// `journal_mode=WAL`, which rewrites the file header. All three are
+    /// correct for a server taking ownership of its own database and all three
+    /// are writes, which makes `open` unusable for looking at a live
+    /// production database — the reason the diagnosis path needed this.
+    ///
+    /// So: `SQLITE_OPEN_READ_ONLY`, no `create_dir_all`, no DDL, and no
+    /// `journal_mode` change. A missing file is an error rather than a new
+    /// empty database. `foreign_keys` is a connection setting rather than a
+    /// file one, and is left alone because nothing here writes.
+    ///
+    /// The cost is that a reader of an older database sees the older schema, so
+    /// a caller must treat a missing column as missing rather than assume the
+    /// migration has run.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)?;
+        // The manager writes a heartbeat while this reads. WAL lets the two
+        // coexist; the timeout is for the moment a checkpoint takes the lock.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
     }
 
     fn from_connection(conn: Connection) -> Result<Self> {

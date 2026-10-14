@@ -819,8 +819,17 @@ async fn main() -> std::process::ExitCode {
         return audit_billing(&args);
     }
     // What is running, where it is sending, and what FFmpeg has said about it.
+    //
+    // Not safe against a live production database: `CloudDb::open` runs the
+    // schema and every `ensure_column`, so this *writes*. Use
+    // `--youtube-audit` there instead.
     if args.iter().any(|a| a == "--diagnose") {
         return louver_server::diagnose::run();
+    }
+    // What YouTube says about each broadcast, read without writing anything.
+    // Safe to run while customers are broadcasting.
+    if args.iter().any(|a| a == "--youtube-audit") {
+        return louver_server::youtube_audit::run(&args);
     }
 
     let app = match App::boot() {

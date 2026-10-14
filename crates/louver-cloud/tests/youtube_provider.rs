@@ -303,6 +303,13 @@ impl Env {
         self
     }
 
+    /// The audit's view: reads only, and allowed to refresh because the fake
+    /// Google's token has no bearing on a customer's real grant.
+    fn read_only(mut self) -> Self {
+        self.yt = self.yt.clone().read_only().read_only_may_refresh(true);
+        self
+    }
+
     /// A connected account, the way a user who finished consent has one.
     fn connect(&self) -> String {
         let url = self.yt.consent_url(&self.user).unwrap();
@@ -1334,7 +1341,7 @@ fn u_a_refused_refresh_keeps_googles_own_reason_all_the_way_up() {
 
     // The real HTTP token endpoint, pointed at the local server. Everything
     // else — the database, the key store, the config — is the harness's.
-    let real = Arc::new(louver_core::youtube::http::UreqClient { token_endpoint: Some(url) });
+    let real = Arc::new(louver_core::youtube::http::UreqClient { token_endpoint: Some(url), quiet: false });
     let yt = Youtube::new(
         e.db.clone(),
         Arc::clone(&e.keys),
@@ -1467,4 +1474,156 @@ fn v2_a_completed_broadcast_is_renewed_once_per_start_not_once_per_check() {
 
     let after = e.api.matching("/liveBroadcasts?part=").into_iter().filter(|c| c.method == "POST").count();
     assert_eq!(after - before, 1, "one renewal, not one per call");
+}
+
+// --- the read-only audit (§3 of the P0 follow-up) -----------------------
+//
+// `observe` is what an operator runs against a live production database, so
+// these cover both halves of the promise: the verdict is right, and nothing
+// was written on the way to it.
+
+/// Every row of `broadcasts` and `broadcast_events`, to compare across a call.
+fn db_fingerprint(e: &Env) -> (String, i64) {
+    let b = e.db.all_broadcasts().unwrap();
+    let rows = b
+        .iter()
+        .map(|x| {
+            format!(
+                "{}|{}|{:?}|{:?}|{:?}",
+                x.id,
+                x.runtime_state.id(),
+                x.youtube.status,
+                x.youtube.checked_at,
+                x.youtube.broadcast_id
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";");
+    let events: i64 =
+        b.iter().map(|x| e.db.events_for(&x.id, 500).map(|v| v.len() as i64).unwrap_or(0)).sum();
+    (rows, events)
+}
+
+#[test]
+fn w_the_audit_names_the_p0_state_and_writes_nothing() {
+    let e = env().read_only();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    // The outage, exactly: ingest arriving, broadcast parked in the preview.
+    *e.api.stream_status.lock().unwrap() = "active".into();
+    *e.api.lifecycle.lock().unwrap() = "testing".into();
+    *e.api.monitor.lock().unwrap() = true;
+
+    let before = db_fingerprint(&e);
+    let seen = e.yt.observe(&id);
+    let f = seen.finding(Some("stream-1"), true);
+
+    assert_eq!(f.verdict.label(), "STUCK TESTING");
+    assert_eq!(f.stuck, Some(louver_cloud::youtube::Stuck::MonitorStream));
+    assert_eq!(db_fingerprint(&e), before, "a read changed the database");
+    assert!(
+        e.api.matching("broadcastStatus=").is_empty(),
+        "a read must never transition a customer's broadcast"
+    );
+}
+
+#[test]
+fn w2_the_audit_confirms_a_working_broadcast() {
+    let e = env().read_only();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.stream_status.lock().unwrap() = "active".into();
+    *e.api.lifecycle.lock().unwrap() = "live".into();
+
+    let before = db_fingerprint(&e);
+    let f = e.yt.observe(&id).finding(Some("stream-1"), true);
+    assert_eq!(f.verdict.label(), "CONFIRMED LIVE");
+    assert!(!f.verdict.needs_attention());
+    assert_eq!(db_fingerprint(&e), before);
+}
+
+#[test]
+fn w3_the_audit_reports_a_stream_bound_somewhere_else() {
+    let e = env().read_only();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.lifecycle.lock().unwrap() = "live".into();
+    *e.api.bound_stream_id.lock().unwrap() = "someone-elses-stream".into();
+
+    let f = e.yt.observe(&id).finding(Some("stream-1"), true);
+    assert_eq!(f.verdict.label(), "BROADCAST MISMATCH");
+}
+
+#[test]
+fn w4_an_expired_token_is_reported_rather_than_refreshed_behind_the_operators_back() {
+    // The safety default: refreshing can rotate a refresh token that a
+    // read-only process cannot store, which would disconnect the customer's
+    // channel. So an expired token is a verdict, not a silent refresh.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.lifecycle.lock().unwrap() = "live".into();
+    e.db.set_youtube_token_expiry(&account, -60).unwrap();
+
+    // Read-only, and *not* allowed to refresh — the production default.
+    let audit = e.yt.clone().read_only();
+    let calls_before = e.api.calls().len();
+    let seen = audit.observe(&id);
+    let f = seen.finding(Some("stream-1"), true);
+
+    assert_eq!(f.verdict.label(), "AUTH ERROR");
+    assert!(
+        seen.error.as_deref().unwrap_or_default().contains("갱신하지 않습니다"),
+        "the operator is told why, not just that it failed: {:?}",
+        seen.error
+    );
+    assert_eq!(e.api.calls().len(), calls_before, "and Google was never called");
+    assert!(e.tokens.refreshes.lock().unwrap().is_empty(), "nor the token endpoint");
+}
+
+#[test]
+fn w7_a_401_from_youtube_is_an_auth_verdict_with_googles_own_reason() {
+    // A normal environment, so the token the server cached is the one the
+    // audit will use — and the one this fake is told to refuse.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.lifecycle.lock().unwrap() = "live".into();
+    e.api.stale.lock().unwrap().push("access-1".into());
+
+    // Read-only and not allowed to refresh, so there is no second attempt to
+    // paper over the refusal: the audit reports what it met.
+    let seen = e.yt.clone().read_only().observe(&id);
+    let f = seen.finding(Some("stream-1"), true);
+    assert_eq!(f.verdict.label(), "AUTH ERROR");
+    assert!(seen.error.is_some(), "the operator gets Google's own reason");
+}
+
+#[test]
+fn w5_an_ingest_that_has_not_arrived_is_reported_as_such() {
+    let e = env().read_only();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.lifecycle.lock().unwrap() = "ready".into();
+    *e.api.stream_status.lock().unwrap() = "inactive".into();
+
+    let f = e.yt.observe(&id).finding(Some("stream-1"), true);
+    assert_eq!(f.verdict.label(), "INGEST NOT ACTIVE");
+}
+
+#[test]
+fn w6_a_pasted_key_broadcast_is_not_audited_as_a_youtube_one() {
+    let e = env().read_only();
+    let (id, _dest) = e.manual_broadcast("수동 송출");
+
+    let seen = e.yt.observe(&id);
+    let f = seen.finding(None, true);
+    assert_eq!(f.verdict.label(), "UNKNOWN", "there is no YouTube side to judge");
+    assert!(e.api.calls().is_empty(), "and nothing was asked of Google");
 }
