@@ -56,6 +56,9 @@ pub struct YoutubeLink {
     /// `waiting_for_ingest` / `ready` / `live` / `complete` / `error`, as last
     /// seen from YouTube — never inferred from FFmpeg being alive.
     pub status: Option<String>,
+    /// When `status` was last confirmed with YouTube, explicit-UTC. `None` means
+    /// nobody has ever managed to ask — not that the answer was no.
+    pub checked_at: Option<String>,
     pub watch_url: Option<String>,
     pub last_error: Option<String>,
 }
@@ -156,9 +159,16 @@ pub struct Observed {
 }
 
 impl Observed {
-    /// Nothing more will change by waiting.
+    /// Nothing more will change by waiting, so the watch can stop asking.
+    ///
+    /// Only `complete`. `live` used to be in here, and it was the same mistake
+    /// as the one this change is about: a broadcast that YouTube ends by itself
+    /// — `enableAutoStop`, an operator in Studio, a strike — leaves 247streams
+    /// saying 방송 중 for ever, because the one thing that could notice had
+    /// already stopped looking. A live broadcast stays in the slow phase and is
+    /// re-confirmed for as long as the encoder runs.
     pub fn settled(&self) -> bool {
-        self.status == LIVE || self.status == COMPLETE
+        self.status == COMPLETE
     }
 }
 

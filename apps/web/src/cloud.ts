@@ -450,6 +450,8 @@ export interface YoutubeLink {
   broadcast_id?: string | null;
   stream_id?: string | null;
   status?: YoutubeStatus | string | null;
+  /** When `status` was last confirmed with YouTube (explicit-UTC, `...Z`). */
+  checked_at?: string | null;
   watch_url?: string | null;
   last_error?: string | null;
 }
@@ -581,10 +583,46 @@ export const YOUTUBE_STATUS_LABELS: Record<string, string> = {
  * that is the fault this fixes. So the headline follows YouTube once YouTube is
  * the thing being sent to, and says plainly when it does not know.
  */
-export function liveLabel(b: Broadcast): string {
+/**
+ * How long a confirmation from YouTube is worth repeating.
+ *
+ * The watch asks every ten seconds at first and settles to one ask every five
+ * minutes, so three missed confirmations in a row is the first point at which
+ * silence means something. Shorter than this and a single slow poll would cry
+ * wolf; longer and a dead API could keep a stale 방송 중 on screen for half an
+ * hour.
+ */
+export const STATUS_STALE_AFTER_MS = 15 * 60 * 1000;
+
+/**
+ * Is the stored YouTube status still worth stating as fact?
+ *
+ * A status with no time behind it is not — that is a row from before this
+ * column existed, or one nobody has managed to confirm yet. Unparseable is
+ * treated the same way: this decides whether to make a confident claim, so
+ * anything it cannot read means "do not".
+ */
+export function statusConfirmedRecently(
+  b: Broadcast,
+  now: number = Date.now(),
+): boolean {
+  const at = b.youtube?.checked_at;
+  if (!at) return false;
+  const t = Date.parse(at);
+  if (Number.isNaN(t)) return false;
+  return now - t < STATUS_STALE_AFTER_MS;
+}
+
+export function liveLabel(b: Broadcast, now: number = Date.now()): string {
   const runtime = RUNTIME_LABELS[b.runtime_state];
   if (b.runtime_state !== "RUNNING") return runtime;
   if (!b.youtube?.account_id) return runtime; // nothing to check it against
+  // A status we cannot vouch for any more is not a status. Deliberately not an
+  // error and deliberately not a stop (§5-2): the encoder is still sending and
+  // the broadcast is probably fine — we just stopped being able to ask, and
+  // saying 방송 중 on the strength of an answer from an hour ago is the same
+  // lie this change exists to remove, one step removed.
+  if (!statusConfirmedRecently(b, now)) return "확인 불가";
   switch (b.youtube?.status) {
     case "live":
       return "방송 중";
@@ -598,17 +636,22 @@ export function liveLabel(b: Broadcast): string {
     case "error":
       return "YouTube 오류";
     default:
-      // Never observed, or not observed recently enough to say. Honest, and
-      // not a success.
+      // Observed recently, but YouTube said something this build has no word
+      // for. Honest, and not a success.
       return "확인 불가";
   }
 }
 
 /** The tone for {@link liveLabel}. Only a confirmed live broadcast reads ok. */
-export function liveTone(b: Broadcast): "default" | "ok" | "warn" | "live" {
+export function liveTone(
+  b: Broadcast,
+  now: number = Date.now(),
+): "default" | "ok" | "warn" | "live" {
   if (b.runtime_state === "FAILED") return "live";
   if (b.runtime_state !== "RUNNING") return "default";
   if (!b.youtube?.account_id) return "ok";
+  // Uncertainty, not failure: warn, never the red a stopped broadcast gets.
+  if (!statusConfirmedRecently(b, now)) return "warn";
   switch (b.youtube?.status) {
     case "live":
       return "ok";

@@ -1025,11 +1025,21 @@ struct YoutubeWatch {
     settled: bool,
     /// The mismatch has been reported once. Said again only if it changes.
     warned: Option<crate::youtube::Stuck>,
+    /// Asking YouTube is currently failing, and that has been said once.
+    /// Cleared by the next answer, so a second outage is reported again.
+    failing: bool,
 }
 
 impl Default for YoutubeWatch {
     fn default() -> Self {
-        Self { next: std::time::Instant::now(), polls: 0, slow_polls: 0, settled: false, warned: None }
+        Self {
+            next: std::time::Instant::now(),
+            polls: 0,
+            slow_polls: 0,
+            settled: false,
+            warned: None,
+            failing: false,
+        }
     }
 }
 
@@ -1049,6 +1059,25 @@ impl YoutubeWatch {
         std::time::Duration::from_secs(Self::SLOW_BACKOFF[i])
     }
 
+    /// A question just failed. Is this the first failure of this outage?
+    ///
+    /// Separated out so the rule can be read and tested on its own: once per
+    /// outage, not once per poll. At the fast cadence an unreachable API would
+    /// otherwise write an event every ten seconds and bury the line that
+    /// explains the fault.
+    fn open_outage(&mut self) -> bool {
+        let first = !self.failing;
+        self.failing = true;
+        first
+    }
+
+    /// An answer arrived. Was it the end of an outage worth reporting?
+    fn close_outage(&mut self) -> bool {
+        let recovered = self.failing;
+        self.failing = false;
+        recovered
+    }
+
     fn maybe_poll(&mut self, yt: &Arc<crate::youtube::Youtube>, db: &CloudDb, broadcast_id: &str) {
         if self.settled || std::time::Instant::now() < self.next {
             return;
@@ -1063,6 +1092,12 @@ impl YoutubeWatch {
             // Not a YouTube broadcast at all: never ask again.
             Ok(None) => self.settled = true,
             Ok(Some(seen)) => {
+                // An answer, so a reported outage is over and the next one is
+                // worth saying out loud again.
+                if self.close_outage() {
+                    let _ =
+                        db.append_event(broadcast_id, EventLevel::Info, "YouTube 상태 확인이 복구되었습니다");
+                }
                 if seen.settled() {
                     self.settled = true;
                     self.warned = None;
@@ -1082,9 +1117,21 @@ impl YoutubeWatch {
             // A failed question is not an answer. The encoder is still sending
             // and the customer's broadcast is not touched; the only thing that
             // changes is that we still do not know, so we ask again.
+            //
+            // Said once per outage, not once per poll: at the fast cadence an
+            // unreachable API would otherwise write an event every ten seconds
+            // and bury the line that explains the fault. The row's
+            // `youtube_status_at` stops advancing meanwhile, which is what the
+            // dashboard reads to stop claiming a status it can no longer
+            // confirm.
             Err(e) => {
-                let _ =
-                    db.append_event(broadcast_id, EventLevel::Warn, &format!("YouTube 상태 확인 실패: {e}"));
+                if self.open_outage() {
+                    let _ = db.append_event(
+                        broadcast_id,
+                        EventLevel::Warn,
+                        &format!("YouTube 상태 확인 실패: {e}"),
+                    );
+                }
             }
         }
     }
@@ -1122,10 +1169,45 @@ mod youtube_watch_tests {
     #[test]
     fn the_capped_interval_fits_the_daily_api_allowance() {
         // Two list calls per poll, 1 unit each, against 10,000 free units.
+        //
+        // This is now the cost of a broadcast that runs all day, because a live
+        // one keeps being re-confirmed rather than being written off as
+        // finished. Worth the units: the alternative is 송출 중 standing for
+        // ever after YouTube has ended the broadcast, which is the fault this
+        // change exists to remove.
         let a_day = 24 * 60 * 60;
         let fast = YoutubeWatch::LIMIT as u64 * 2;
         let slow = (a_day - YoutubeWatch::LIMIT as u64 * 10) / 300 * 2;
-        assert!(fast + slow < 1_000, "{} units a day", fast + slow);
+        let per_broadcast = fast + slow;
+        assert!(per_broadcast < 1_000, "{per_broadcast} units a day");
+        // And the ceiling that follows, stated here so it is found before a
+        // customer finds it: one quota project, 10,000 units a day.
+        assert!(
+            10_000 / per_broadcast >= 14,
+            "only {} round-the-clock broadcasts fit on one project's quota",
+            10_000 / per_broadcast
+        );
+    }
+
+    #[test]
+    fn an_outage_is_reported_once_however_many_polls_it_spans() {
+        // Thirty failures in five minutes used to be thirty warnings, which
+        // buried the one line that said what was actually wrong.
+        let mut w = YoutubeWatch::default();
+        assert!(w.open_outage(), "the first failure is news");
+        for _ in 0..40 {
+            assert!(!w.open_outage(), "the rest is the same news");
+        }
+    }
+
+    #[test]
+    fn recovery_is_reported_once_and_re_arms_the_next_outage() {
+        let mut w = YoutubeWatch::default();
+        assert!(!w.close_outage(), "nothing to recover from before anything broke");
+        w.open_outage();
+        assert!(w.close_outage(), "coming back is worth saying");
+        assert!(!w.close_outage(), "but only once");
+        assert!(w.open_outage(), "and a second outage is news again");
     }
 
     #[test]

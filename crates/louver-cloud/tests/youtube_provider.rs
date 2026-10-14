@@ -985,9 +985,12 @@ fn p6_with_the_switch_on_a_parked_broadcast_is_rescued_once() {
     assert_eq!(e.api.matching("broadcastStatus=live").len(), 1, "one transition, not one per poll");
     assert_eq!(e.db.broadcast_owned(&e.user, &id).unwrap().youtube.status.as_deref(), Some("live"));
 
-    // Settled, so the next poll asks for nothing.
+    // Rescued once. The next poll still looks — a live broadcast is not a
+    // finished one — but it writes nothing, because it is already live.
     let again = e.yt.poll_status(&id).unwrap().unwrap();
-    assert!(again.settled());
+    assert_eq!(again.status, "live");
+    assert!(!again.transitioned);
+    assert!(!again.settled(), "only a completed broadcast stops being watched");
     assert_eq!(e.api.matching("broadcastStatus=live").len(), 1);
 }
 
@@ -1015,11 +1018,51 @@ fn p8_a_live_broadcast_is_left_entirely_alone() {
 
     let seen = e.yt.poll_status(&id).unwrap().unwrap();
     assert_eq!(seen.status, "live");
-    assert!(seen.settled());
     assert!(
         e.api.matching("broadcastStatus=").is_empty(),
         "a working broadcast must not be transitioned again, even with the switch on"
     );
+    // Left alone is not the same as forgotten. YouTube can end a broadcast by
+    // itself — `enableAutoStop`, an operator in Studio, a strike — and the
+    // watch is the only thing that could notice, so it keeps asking.
+    assert!(!seen.settled(), "a live broadcast is still worth re-confirming");
+}
+
+#[test]
+fn p12_a_completed_broadcast_is_the_only_one_the_watch_stops_asking_about() {
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+    *e.api.stream_status.lock().unwrap() = "inactive".into();
+    *e.api.lifecycle.lock().unwrap() = "complete".into();
+
+    let seen = e.yt.poll_status(&id).unwrap().unwrap();
+    assert_eq!(seen.status, "complete");
+    assert!(seen.settled(), "nothing changes after complete, so stop asking");
+}
+
+#[test]
+fn p13_a_confirmed_status_carries_the_time_it_was_confirmed() {
+    // Without this a status read an hour ago is indistinguishable from one read
+    // a second ago, and the dashboard cannot tell a live broadcast from one it
+    // merely used to be able to confirm.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.yt.provision(&e.user, &id, &account).unwrap();
+
+    let before = e.db.broadcast_owned(&e.user, &id).unwrap();
+    assert!(before.youtube.checked_at.is_some(), "provisioning is itself an answer from YouTube");
+
+    *e.api.stream_status.lock().unwrap() = "active".into();
+    *e.api.lifecycle.lock().unwrap() = "live".into();
+    e.yt.poll_status(&id).unwrap().unwrap();
+
+    let after = e.db.broadcast_owned(&e.user, &id).unwrap();
+    let at = after.youtube.checked_at.expect("a poll records when it got its answer");
+    assert!(at.ends_with('Z'), "explicit UTC, or a browser reads it as local time: {at}");
+    assert_eq!(after.youtube.status.as_deref(), Some("live"));
 }
 
 #[test]

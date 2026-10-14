@@ -1157,7 +1157,20 @@ describe("connecting a YouTube account", () => {
 });
 
 describe("what the dashboard says about YouTube", () => {
+  /** A status confirmed just now, which is what every case below assumes. */
+  function justNow() {
+    return new Date().toISOString();
+  }
+
   function running(youtube: Record<string, unknown>) {
+    // A status is only worth stating while it is fresh, so a fixture that sets
+    // one and no time is describing a row nobody could confirm. Every case
+    // that means "YouTube says this, now" gets a current time; the staleness
+    // cases below override it on purpose.
+    const yt =
+      youtube.status !== undefined && youtube.checked_at === undefined
+        ? { ...youtube, checked_at: justNow() }
+        : youtube;
     return fake({
       dashboard: vi.fn().mockResolvedValue({
         plan_label: "Business",
@@ -1169,7 +1182,7 @@ describe("what the dashboard says about YouTube", () => {
             runtime_state: "RUNNING",
             uptime_secs: 60,
             bytes_sent: 1_000_000,
-            youtube,
+            youtube: yt,
           }),
         ],
       } satisfies Dashboard),
@@ -1231,6 +1244,61 @@ describe("what the dashboard says about YouTube", () => {
 
     expect(await screen.findByText("확인 불가")).toBeInTheDocument();
     expect(screen.queryByText("송출 중")).not.toBeInTheDocument();
+  });
+
+  it("stops claiming 방송 중 once the live answer is too old to vouch for", async () => {
+    // YouTube said live, and then nothing could reach YouTube again. The
+    // encoder is still sending, so this must not read as a failure — but it
+    // must stop reading as a confirmed broadcast, which is the same lie as the
+    // original fault one step removed.
+    show(
+      <CloudDashboard />,
+      running({
+        account_id: "y1",
+        broadcast_id: "bcast-1",
+        stream_id: "stream-1",
+        status: "live",
+        checked_at: new Date(Date.now() - 40 * 60 * 1000).toISOString(),
+      }),
+    );
+
+    expect(await screen.findByText("확인 불가")).toBeInTheDocument();
+    expect(screen.queryByText("방송 중")).not.toBeInTheDocument();
+    expect(screen.queryByText("송출 중")).not.toBeInTheDocument();
+  });
+
+  it("keeps saying 방송 중 while the live answer is still fresh", async () => {
+    // The other half of the same rule: a working broadcast must not be made to
+    // look doubtful by a watch that is simply between polls.
+    show(
+      <CloudDashboard />,
+      running({
+        account_id: "y1",
+        broadcast_id: "bcast-1",
+        stream_id: "stream-1",
+        status: "live",
+        checked_at: new Date(Date.now() - 4 * 60 * 1000).toISOString(),
+      }),
+    );
+
+    expect(await screen.findByText("방송 중")).toBeInTheDocument();
+    expect(screen.queryByText("확인 불가")).not.toBeInTheDocument();
+  });
+
+  it("does not vouch for a status that arrived with no time behind it", async () => {
+    // A row written by a build from before the status was timestamped.
+    show(
+      <CloudDashboard />,
+      running({
+        account_id: "y1",
+        broadcast_id: "bcast-1",
+        stream_id: "stream-1",
+        status: "live",
+        checked_at: null,
+      }),
+    );
+
+    expect(await screen.findByText("확인 불가")).toBeInTheDocument();
   });
 
   it("still says 송출 중 for a pasted key, where FFmpeg is the only truth there is", async () => {
