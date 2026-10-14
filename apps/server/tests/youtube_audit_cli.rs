@@ -150,6 +150,55 @@ fn audit(dir: &Path, port: u16, extra: &[&str]) -> std::process::Output {
     cmd.output().unwrap()
 }
 
+/// Seed a database with a pasted-key broadcast that a runner can actually
+/// start, for driving the API/runner split by hand.
+///
+/// `#[ignore]` for the same reason as the generator below.
+#[test]
+#[ignore = "fixture generator; run with LOUVER_SPLIT_SEED_DIR set"]
+fn seed_a_startable_broadcast_for_the_split() {
+    let dir = std::env::var("LOUVER_SPLIT_SEED_DIR").expect("set LOUVER_SPLIT_SEED_DIR");
+    let dir = Path::new(&dir);
+    std::fs::create_dir_all(dir).unwrap();
+
+    let db = CloudDb::open(&dir.join("cloud.db")).unwrap();
+    let keys: Arc<dyn SecretStore> = Arc::new(CredentialStore::new(db.raw(), hex_master()));
+    let user = db.create_user("dj@example.com", "hash", "business").unwrap().id;
+
+    // A real file, because the manager localises it and FFmpeg opens it.
+    let store = louver_cloud::storage::LocalStorage::new(dir.join("media"));
+    // Real video when `LOUVER_SPLIT_SEED_VIDEO` points at one, so a by-hand
+    // run can watch an actual FFmpeg child survive an API replacement.
+    let src = dir.join("one.mp4");
+    match std::env::var("LOUVER_SPLIT_SEED_VIDEO") {
+        Ok(v) if !v.trim().is_empty() => std::fs::copy(&v, &src).map(|_| ()).unwrap(),
+        _ => std::fs::write(&src, b"not video; enough to exercise the process tree").unwrap(),
+    }
+    let key = {
+        use louver_cloud::storage::Storage;
+        store.put_file(&user, "one.mp4", &src).unwrap()
+    };
+    let m = db.create_media(&user, "one.mp4", 64, &key).unwrap();
+    db.record_media_prepared(&m.id, &key, 60.0, 0, 64).unwrap();
+
+    let url =
+        std::env::var("LOUVER_SPLIT_SEED_URL").unwrap_or_else(|_| "rtmp://127.0.0.1:1/live2".to_string());
+    let stream_key =
+        std::env::var("LOUVER_SPLIT_SEED_KEY").unwrap_or_else(|_| "aaaa-bbbb-cccc-dddd".to_string());
+    let dest = db.create_destination(&user, "손으로 넣은 키", &url, "••••").unwrap();
+    keys.set(&louver_cloud::credentials::destination_account(&dest.id), &stream_key).unwrap();
+
+    let b = db.create_broadcast(&user, "분리 테스트", &m.id, &dest.id, true).unwrap();
+    db.replace_items(
+        &user,
+        &b.id,
+        &[louver_cloud::db::NewItem { media_id: m.id.clone(), enabled: true, repeat_count: 1 }],
+    )
+    .unwrap();
+    db.claim_stream_slot(&user, &b.id).unwrap();
+    println!("SEEDED {}", b.id);
+}
+
 /// Seed a database wherever `LOUVER_AUDIT_SEED_DIR` points, for driving
 /// `scripts/youtube-audit.sh` by hand against a real file.
 ///

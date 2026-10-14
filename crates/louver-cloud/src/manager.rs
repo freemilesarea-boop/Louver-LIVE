@@ -236,6 +236,16 @@ pub struct BroadcastManager {
     /// Set only when this server has YouTube connecting configured. `None`
     /// means every broadcast is a pasted stream key, exactly as before.
     youtube: Option<Arc<crate::youtube::Youtube>>,
+    /// Where the FFmpeg processes actually live.
+    ///
+    /// `None` is this process, which is what every deployment does today. With
+    /// a client, the three operations that touch a process — spawn, halt, and
+    /// "what is running" — go to the runner instead, and nothing else about
+    /// `start`/`stop`/`restart` changes: the validation, the entitlement
+    /// claim, the YouTube calls and the database writes all still happen here.
+    /// That is deliberate, because it is what keeps a refused start a sentence
+    /// in front of the user rather than an event they have to go looking for.
+    remote: Option<crate::runner::Client>,
 }
 
 impl std::fmt::Debug for BroadcastManager {
@@ -264,7 +274,23 @@ impl BroadcastManager {
             launchers,
             workers: Arc::new(Mutex::new(HashMap::new())),
             youtube: None,
+            remote: None,
         }
+    }
+
+    /// Send worker operations to a runner process instead of doing them here.
+    ///
+    /// For [`crate::runner::Role::Api`]. A manager with this set spawns no
+    /// FFmpeg, so the process holding it can be replaced without stopping a
+    /// broadcast — the whole point of the split.
+    pub fn with_runner(mut self, client: crate::runner::Client) -> Self {
+        self.remote = Some(client);
+        self
+    }
+
+    /// Does this manager own its workers, or ask someone else?
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
     }
 
     /// Give this manager a YouTube provider.
@@ -290,7 +316,49 @@ impl BroadcastManager {
     }
 
     /// Broadcast ids with a live worker thread.
+    ///
+    /// With a runner, this is the runner's answer. If it cannot be reached the
+    /// database's own record is used instead — `record_runtime` keeps
+    /// `runtime_state` and a heartbeat — because a dashboard that says
+    /// "nothing is running" when the runner is merely unreachable is the same
+    /// class of lie as saying a broadcast is live when YouTube has not started
+    /// it. The fallback is marked in the log rather than hidden.
     pub fn running_ids(&self) -> Vec<String> {
+        if let Some(client) = &self.remote {
+            match client.call(&crate::runner::Command::Running) {
+                Ok(crate::runner::Reply::Ids(ids)) => return ids,
+                Ok(other) => {
+                    say("-", "runner", &format!("RUNNING 에 예상치 못한 응답: {}", other.encode()));
+                }
+                Err(e) => {
+                    say("-", "runner", &format!("RUNNING 실패, DB 기록으로 대체합니다: {e}"));
+                }
+            }
+            return self
+                .db
+                .broadcasts_wanting_to_run()
+                .map(|v| {
+                    // Everything the database says is up or on its way up, not
+                    // only `Running`. A broadcast that is preparing or
+                    // reconnecting has a worker, and reporting it as not
+                    // running would be wrong in the direction that matters:
+                    // the caller uses this list to decide what is already
+                    // going.
+                    v.into_iter()
+                        .filter(|b| {
+                            matches!(
+                                b.runtime_state,
+                                RuntimeState::Preparing
+                                    | RuntimeState::Starting
+                                    | RuntimeState::Running
+                                    | RuntimeState::Reconnecting
+                            )
+                        })
+                        .map(|b| b.id)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
         self.workers.lock().unwrap().keys().cloned().collect()
     }
 
@@ -375,12 +443,41 @@ impl BroadcastManager {
         self.start(user_id, broadcast_id)
     }
 
+    /// Spawn a worker because a runner was asked to.
+    ///
+    /// The API has already validated, claimed the slot and done YouTube's
+    /// pre-start; this is the half it cannot do. The subscription is checked
+    /// again anyway, for the same reason [`Self::recover_all`] checks it again:
+    /// this path does not go through `start`, and the one thing that must never
+    /// happen is a broadcast running for an account with no plan. It is cheap,
+    /// and it means a bug on the HTTP side cannot turn into a free broadcast.
+    pub fn start_worker(&self, broadcast_id: &str) -> Result<()> {
+        let b = self.db.broadcast(broadcast_id)?;
+        self.db.require_active_subscription(&b.user_id)?;
+        self.spawn_worker(broadcast_id)
+    }
+
+    /// Stop a worker because a runner was asked to, and wait for it.
+    ///
+    /// Takes no view on intent: `desired_state`, the entitlement slot and
+    /// YouTube's side are the API's business and it has already dealt with
+    /// them. This is the process, and nothing else.
+    pub fn stop_worker(&self, broadcast_id: &str) {
+        self.halt_worker(broadcast_id);
+    }
+
     /// Bring back everything that was meant to be running. §6.
     ///
     /// Reads `desired_state` alone. A broadcast the user stopped before the
     /// restart has `desired_state = stopped` and is left alone, which is the
     /// same rule the supervisor applies to a crash.
     pub fn recover_all(&self) -> Result<usize> {
+        // The runner recovers; an API process doing it too would be the
+        // double-start this split exists to make impossible.
+        if self.remote.is_some() {
+            say("-", "runner", "복구는 runner 가 수행합니다");
+            return Ok(0);
+        }
         let wanted = self.db.broadcasts_wanting_to_run()?;
         let mut started = 0;
         for b in wanted {
@@ -440,9 +537,21 @@ impl BroadcastManager {
     /// testable without a thread at all.
     pub fn spawn_scheduler(&self) -> std::thread::JoinHandle<()> {
         let mgr = self.clone();
-        std::thread::spawn(move || loop {
-            mgr.run_schedules(chrono::Utc::now());
-            std::thread::sleep(SCHEDULE_TICK);
+        std::thread::spawn(move || {
+            // The clock is watched by whoever owns the workers, and by nobody
+            // else. Two schedulers on one database would each decide the same
+            // window had opened and each act on it — the API through the
+            // socket, the runner directly — which is a double start dressed up
+            // as a feature. The runner is the one with the workers, so the
+            // runner is the one with the clock.
+            if mgr.remote.is_some() {
+                say("-", "scheduler", "예약은 runner 가 처리합니다");
+                return;
+            }
+            loop {
+                mgr.run_schedules(chrono::Utc::now());
+                std::thread::sleep(SCHEDULE_TICK);
+            }
         })
     }
 
@@ -559,6 +668,11 @@ impl BroadcastManager {
     /// alone so recovery restarts these, and YouTube is not told anything —
     /// the broadcast is not ending, this process is.
     pub fn shutdown(&self) {
+        // An API process has no workers to stop, and must not ask the runner to
+        // stop any: the whole point is that the runner outlives it.
+        if self.remote.is_some() {
+            return;
+        }
         // Two passes, and the order is the point.
         //
         // Every worker is told to stop first, and only then are they waited
@@ -585,6 +699,17 @@ impl BroadcastManager {
     }
 
     fn halt_worker(&self, broadcast_id: &str) {
+        // Synchronous across the socket: the caller goes on to end the YouTube
+        // broadcast, and doing that while FFmpeg is still pushing would leave
+        // the encoder sending into a completed broadcast. A failure here is
+        // logged rather than returned, matching what this function has always
+        // done — it is called on paths that must finish.
+        if let Some(client) = &self.remote {
+            if let Err(e) = client.call(&crate::runner::Command::Halt(broadcast_id.to_string())) {
+                say(broadcast_id, "runner", &format!("HALT 실패: {e}"));
+            }
+            return;
+        }
         let worker = self.workers.lock().unwrap().remove(broadcast_id);
         if let Some(mut w) = worker {
             w.stop.store(true, Ordering::SeqCst);
@@ -596,6 +721,13 @@ impl BroadcastManager {
 
     /// Build the working directory, then run the engine on its own thread.
     fn spawn_worker(&self, broadcast_id: &str) -> Result<()> {
+        // With a runner, the process that owns FFmpeg does this. The error it
+        // returns is passed through whole, so a refusal still reaches the user
+        // as a sentence rather than as a generic failure.
+        if let Some(client) = &self.remote {
+            client.call(&crate::runner::Command::Start(broadcast_id.to_string()))?;
+            return Ok(());
+        }
         if self.workers.lock().unwrap().contains_key(broadcast_id) {
             return Ok(()); // already running; starting twice is not an error
         }

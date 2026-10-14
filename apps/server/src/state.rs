@@ -102,6 +102,17 @@ impl App {
             Some(yt) => mgr.with_youtube(yt.clone()),
             None => mgr,
         };
+        // In the `api` role the FFmpeg processes live in another container, so
+        // this manager asks rather than spawns. `Role::All` — the default and
+        // every deployment today — leaves this `None` and behaves exactly as
+        // it did before the split existed.
+        let role = louver_cloud::runner::Role::from_env();
+        let mgr = if role.owns_workers() {
+            mgr
+        } else {
+            println!("[louver] 역할 api: 방송 실행은 runner 에게 맡깁니다");
+            mgr.with_runner(louver_cloud::runner::Client::new(&data))
+        };
 
         let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools.clone(), encoder);
 

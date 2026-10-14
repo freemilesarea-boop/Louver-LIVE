@@ -25,6 +25,7 @@ pub mod lease;
 pub mod manager;
 pub mod media_audit;
 pub mod models;
+pub mod runner;
 pub mod schedule;
 pub mod storage;
 pub mod youtube;

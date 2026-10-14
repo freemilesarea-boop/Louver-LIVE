@@ -845,15 +845,25 @@ async fn main() -> std::process::ExitCode {
     let data = std::path::PathBuf::from(
         std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()),
     );
-    let _lease = match louver_cloud::lease::Lease::acquire(&data) {
-        Ok(l) => {
-            println!("[louver] 데이터 디렉터리 점유: {}", l.path().display());
-            l
+    let role = louver_cloud::runner::Role::from_env();
+    println!("[louver] 역할: {}", role.name());
+
+    // Whoever owns the workers owns the data directory. An API process takes
+    // no lease, so a rolling API deployment may overlap for a moment without
+    // either half refusing to start.
+    let _lease = if role.takes_the_lease() {
+        match louver_cloud::lease::Lease::acquire(&data) {
+            Ok(l) => {
+                println!("[louver] 데이터 디렉터리 점유: {}", l.path().display());
+                Some(l)
+            }
+            Err(e) => {
+                eprintln!("[louver] {e}");
+                std::process::exit(1);
+            }
         }
-        Err(e) => {
-            eprintln!("[louver] {e}");
-            std::process::exit(1);
-        }
+    } else {
+        None
     };
 
     let app = match App::boot() {
@@ -875,6 +885,35 @@ async fn main() -> std::process::ExitCode {
     // §8: the clock is watched by the server, not by a browser. It holds no
     // state, so it needs nothing from recovery.
     let _scheduler = app.mgr.spawn_scheduler();
+
+    // The runner serves commands instead of HTTP, and that is its whole job:
+    // it is the process that must outlive an API deployment, so it binds no
+    // port and nothing about it changes when the web side is replaced.
+    if !role.serves_http() {
+        let server = match louver_cloud::runner::Server::bind(&data) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[louver] runner 소켓을 열 수 없습니다: {e}");
+                std::process::exit(1);
+            }
+        };
+        println!("[louver] runner 대기 중: {}", server.socket().display());
+        // The signal handler runs on its own thread so a SIGTERM during a
+        // blocking `accept` still stops every broadcast properly.
+        let mgr = app.mgr.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+            if let Ok(rt) = rt {
+                rt.block_on(wait_for_stop());
+            }
+            println!("[louver] 종료 신호를 받았습니다. 방송을 정리합니다");
+            mgr.shutdown();
+            std::process::exit(0);
+        });
+        let mgr = app.mgr.clone();
+        server.serve(|cmd| serve_runner_command(&mgr, cmd));
+        return std::process::ExitCode::SUCCESS;
+    }
 
     let addr = std::env::var("LOUVER_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -962,5 +1001,32 @@ async fn wait_for_stop() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// One command from an API process, carried out.
+///
+/// Deliberately thin: the policy — who may start what, which slot it takes,
+/// what YouTube has to be told — stays on the HTTP side where the user is
+/// waiting for an answer. What is here is the part that can only be done by
+/// the process that owns the FFmpeg children.
+fn serve_runner_command(
+    mgr: &louver_cloud::manager::BroadcastManager,
+    cmd: louver_cloud::runner::Command,
+) -> louver_cloud::runner::Reply {
+    use louver_cloud::runner::{Command, Reply};
+    match cmd {
+        Command::Ping => Reply::Ok,
+        Command::Running => Reply::Ids(mgr.running_ids()),
+        Command::Start(id) => match mgr.start_worker(&id) {
+            Ok(()) => Reply::Ok,
+            // The sentence travels back whole, so a refused start is still a
+            // refused start in front of the user rather than a generic error.
+            Err(e) => Reply::Err(e.to_string()),
+        },
+        Command::Halt(id) => {
+            mgr.stop_worker(&id);
+            Reply::Ok
+        }
     }
 }
