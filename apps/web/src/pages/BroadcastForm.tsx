@@ -88,6 +88,15 @@ export function BroadcastForm({
   );
   const [cctvUrl, setCctvUrl] = useState(editing?.cctv_url ?? "");
   const [cctvCheck, setCctvCheck] = useState<CctvCheck | null>(null);
+  /**
+   * The URL the result in `cctvCheck` is about.
+   *
+   * Kept separately so that editing the address after a successful test
+   * invalidates the result. Without this, testing a working camera and then
+   * pasting a different address would save the second one on the first one's
+   * evidence.
+   */
+  const [cctvCheckedUrl, setCctvCheckedUrl] = useState<string | null>(null);
   const [cctvTesting, setCctvTesting] = useState(false);
   const [cctvError, setCctvError] = useState<string | null>(null);
   const [settings, setSettings] = useState<StreamSettings>(
@@ -174,11 +183,17 @@ export function BroadcastForm({
    * result with `ok: false`.
    */
   async function testCctv() {
+    const tried = cctvUrl.trim();
     setCctvTesting(true);
     setCctvError(null);
     setCctvCheck(null);
+    setCctvCheckedUrl(null);
     try {
-      setCctvCheck(await t.testCctv(cctvUrl.trim()));
+      const got = await t.testCctv(tried);
+      setCctvCheck(got);
+      // The address this verdict is about, not whatever is in the box by the
+      // time the answer arrives.
+      setCctvCheckedUrl(tried);
     } catch (e) {
       setCctvError(e instanceof Error ? e.message : "확인할 수 없습니다.");
     } finally {
@@ -188,6 +203,42 @@ export function BroadcastForm({
 
   /** An empty string clears a stored URL; `playlist` means there is none. */
   const cctvToSave = videoSource === "traffic_cctv" ? cctvUrl.trim() : "";
+
+  /**
+   * Has this exact address been opened by the server and found to carry video?
+   *
+   * The reason this gates saving: the address is only checked for shape and
+   * for where it points when it is stored. Whether anything readable is *at*
+   * it is a different question, and the only thing that can answer it is the
+   * probe. A broadcast saved with an unreadable address does not fail at save
+   * time — it fails when it starts, and then the supervisor retries it every
+   * sixty seconds for ever while the dashboard shows a broadcast that is
+   * trying. Far better to answer the question while the field is still on
+   * screen.
+   */
+  const cctvProven =
+    videoSource !== "traffic_cctv" ||
+    (cctvCheck?.ok === true && cctvCheckedUrl === cctvToSave);
+
+  /**
+   * Why saving is blocked, in the words the person needs.
+   *
+   * Ordered most specific first, because each of these is a different problem
+   * with a different next move.
+   */
+  const cctvBlocker = (): string | null => {
+    if (videoSource !== "traffic_cctv" || cctvProven) return null;
+    if (cctvToSave.length === 0) return "CCTV 주소를 입력해 주세요.";
+    // The request itself failed, or the server refused the address outright.
+    if (cctvError) return "연결 테스트가 실패했습니다. 주소를 확인해 주세요.";
+    // Opened, and there is nothing usable at it.
+    if (cctvCheck && cctvCheckedUrl === cctvToSave)
+      return "이 주소로는 송출할 수 없습니다. 위의 실패 이유를 확인해 주세요.";
+    // Tested, then edited: the evidence belongs to a different address.
+    if (cctvCheckedUrl !== null)
+      return "주소가 바뀌었습니다. 연결 테스트를 다시 실행해 주세요.";
+    return "저장하기 전에 연결 테스트를 실행해 주세요.";
+  };
 
   async function save() {
     setBusy(true);
@@ -261,7 +312,8 @@ export function BroadcastForm({
           <Button
             variant="primary"
             onClick={save}
-            disabled={busy || rows.length === 0 || !chosen}
+            disabled={busy || rows.length === 0 || !chosen || !cctvProven}
+            title={cctvBlocker() ?? undefined}
           >
             {busy ? "저장 중…" : editing ? "저장" : "방송 만들기"}
           </Button>
@@ -564,10 +616,25 @@ export function BroadcastForm({
               </div>
             )}
 
+            {/* Why the save button is off, where the field is. A `title` only
+                appears on hover, and the person who needs this sentence is
+                the one wondering why nothing happens when they click. */}
+            {cctvBlocker() && (
+              <p role="status" className="text-xs text-warn">
+                {cctvBlocker()}
+              </p>
+            )}
+
             <p className="text-xs text-ink-500">
               CCTV 원본 오디오는 송출하지 않습니다. 소리는 위 플레이리스트의
               음악만 나갑니다. 테스트 기능이므로 CCTV가 끊기면 이 방송만 재연결을
               시도합니다.
+            </p>
+            <p className="text-xs text-ink-500">
+              YouTube·Twitch·치지직 등의 <strong>시청 페이지 링크는 사용할 수
+              없습니다</strong>. 그 주소는 영상이 아니라 웹페이지라서 송출기가
+              영상을 찾지 못합니다. CCTV·카메라가 직접 제공하는 HLS(.m3u8) 주소가
+              필요합니다.
             </p>
             {rows.length === 0 && (
               <p className="text-xs text-warn">

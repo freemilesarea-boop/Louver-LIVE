@@ -44,10 +44,17 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// The protocols FFmpeg may use for this input, and nothing else.
 ///
-/// `crypto` is here because an AES-128 HLS playlist needs it; `file` is
+/// `crypto` is there because an AES-128 HLS playlist needs it; `file` is
 /// deliberately absent, so a playlist that points at a local path fails instead
 /// of reading the server's disk.
-pub const PROTOCOL_WHITELIST: &str = "http,https,tcp,tls,crypto";
+///
+/// Re-exported from the core rather than written out again. It used to be a
+/// second copy of the same string with a comment on each asking to be kept in
+/// step, and nothing enforcing it. The two uses are the probe behind
+/// `연결 테스트` and the broadcast itself, so a list that drifted would mean a
+/// URL that tests fine and then fails on air — or worse, one the probe refuses
+/// while the broadcast opens it.
+pub use louver_core::streaming::ffmpeg::LIVE_SOURCE_PROTOCOLS as PROTOCOL_WHITELIST;
 
 /// A URL that has passed [`validate`].
 ///
@@ -114,6 +121,13 @@ pub fn validate(raw: &str) -> Result<LiveVideoUrl> {
     if is_metadata_host(&host) {
         return Err(CloudError::Invalid("내부 메타데이터 주소는 사용할 수 없습니다.".into()));
     }
+    if let Some(site) = watch_page_site(&host) {
+        return Err(CloudError::Invalid(format!(
+            "{site} 링크는 사용할 수 없습니다. {site} 주소는 영상이 아니라 웹페이지라서, \
+             FFmpeg가 열면 영상 트랙을 찾지 못합니다. CCTV·카메라가 직접 제공하는 \
+             HLS(.m3u8) 등의 스트림 주소를 입력해 주세요."
+        )));
+    }
 
     let port = port.unwrap_or(if scheme == "https" { 443 } else { 80 });
     for ip in resolve(&host, port)? {
@@ -151,6 +165,46 @@ fn parse_port(raw: &str) -> Result<u16> {
         .ok()
         .filter(|p| *p > 0)
         .ok_or_else(|| CloudError::Invalid(format!("포트 번호가 올바르지 않습니다: {raw}")))
+}
+
+/// Sites whose URLs are web pages rather than streams.
+///
+/// FFmpeg opens a URL and expects a container. A `youtube.com/watch?v=…`
+/// address is HTML, so FFmpeg answers `Invalid data found when processing
+/// input` — which is true and tells the customer nothing. Worse, that only
+/// happens at *start* time: the address saves cleanly, the broadcast then
+/// fails, and the supervisor retries it every sixty seconds for ever.
+///
+/// Extracting a playable stream from one of these pages needs a separate tool
+/// (`yt-dlp` and the like), which this service does not ship and which these
+/// sites' terms do not generally permit. So the answer is no, and the place to
+/// say no is here, where the customer is still looking at the field.
+///
+/// Matched on the page hosts only. `googlevideo.com` and the other CDN hosts
+/// are deliberately absent: a signed media URL from one of them is a real
+/// stream that FFmpeg can read, and refusing it would be wrong.
+fn watch_page_site(host: &str) -> Option<&'static str> {
+    const SITES: &[(&str, &str)] = &[
+        ("youtube.com", "YouTube"),
+        ("youtu.be", "YouTube"),
+        ("youtube-nocookie.com", "YouTube"),
+        ("twitch.tv", "Twitch"),
+        ("vimeo.com", "Vimeo"),
+        ("tiktok.com", "TikTok"),
+        ("instagram.com", "Instagram"),
+        ("facebook.com", "Facebook"),
+        ("fb.watch", "Facebook"),
+        ("chzzk.naver.com", "치지직"),
+        ("tv.naver.com", "네이버 TV"),
+        ("tv.kakao.com", "카카오 TV"),
+        ("afreecatv.com", "아프리카TV"),
+        ("sooplive.co.kr", "SOOP"),
+    ];
+    SITES.iter().find_map(|(domain, name)| {
+        // `youtube.com` and `www.youtube.com` and `m.youtube.com`, but not
+        // `notyoutube.com` — the dot is what makes it a subdomain.
+        (host == *domain || host.ends_with(&format!(".{domain}"))).then_some(*name)
+    })
 }
 
 /// Host names that name an internal service whatever they resolve to.
@@ -517,6 +571,67 @@ mod tests {
     fn a_public_https_stream_is_accepted() {
         assert_eq!(validate(PUBLIC).unwrap().as_str(), PUBLIC);
         assert!(validate("http://93.184.216.34:8080/hls/cam1.m3u8").is_ok());
+    }
+
+    #[test]
+    fn a_youtube_link_is_refused_where_the_customer_can_still_see_the_field() {
+        // The reported case. It used to save cleanly and then fail at start
+        // time, every sixty seconds, for ever.
+        for url in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtube.com/live/abc123",
+            "https://m.youtube.com/watch?v=x",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://www.youtube-nocookie.com/embed/x",
+        ] {
+            let e = refused(url);
+            assert!(e.contains("YouTube"), "the site is named: {e}");
+            assert!(e.contains("웹페이지"), "the reason is given: {e}");
+            assert!(e.contains("m3u8"), "and what to use instead: {e}");
+        }
+    }
+
+    #[test]
+    fn the_other_watch_page_sites_are_refused_by_their_own_names() {
+        for (url, name) in [
+            ("https://www.twitch.tv/somechannel", "Twitch"),
+            ("https://vimeo.com/123456", "Vimeo"),
+            ("https://chzzk.naver.com/live/abc", "치지직"),
+            ("https://play.sooplive.co.kr/abc", "SOOP"),
+        ] {
+            let e = refused(url);
+            assert!(e.contains(name), "expected {name} in: {e}");
+        }
+    }
+
+    #[test]
+    fn a_hostname_that_merely_ends_in_a_site_name_is_not_that_site() {
+        // `notyoutube.com` is somebody else's domain, and a camera could live
+        // on it. Only the domain itself and its subdomains are refused.
+        let e = refused("https://notyoutube.com/live.m3u8");
+        assert!(!e.contains("YouTube"), "matched too greedily: {e}");
+        let e = refused("https://myyoutu.be/live.m3u8");
+        assert!(!e.contains("YouTube"), "matched too greedily: {e}");
+    }
+
+    #[test]
+    fn a_signed_cdn_url_is_still_allowed() {
+        // `googlevideo.com` serves real media that FFmpeg can read. Refusing
+        // the page hosts must not sweep up the CDN.
+        assert!(watch_page_site("rr3---sn-abc.googlevideo.com").is_none());
+        assert!(watch_page_site("video-cdn.example.com").is_none());
+    }
+
+    #[test]
+    fn the_probe_and_the_broadcast_are_given_the_same_protocol_list() {
+        // Two copies of this string used to exist, each with a comment asking
+        // to be kept in step with the other. A list that drifted would mean a
+        // URL that passes 연결 테스트 and then fails on air.
+        assert_eq!(PROTOCOL_WHITELIST, louver_core::streaming::ffmpeg::LIVE_SOURCE_PROTOCOLS);
+        assert!(!PROTOCOL_WHITELIST.split(',').any(|p| p == "file"), "file must never be on it");
+        let args = probe_args("https://cam.example/s.m3u8", PROBE_TIMEOUT);
+        let i = args.iter().position(|a| a == "-protocol_whitelist").expect("the probe sets it");
+        assert_eq!(args[i + 1], louver_core::streaming::ffmpeg::LIVE_SOURCE_PROTOCOLS);
     }
 
     #[test]

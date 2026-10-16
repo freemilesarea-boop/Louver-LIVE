@@ -13,7 +13,11 @@ use std::process::{Command, Stdio};
 
 /// The protocols a live video source may use. No `file`: an HLS playlist names
 /// its own segment URLs, and a playlist from the internet must not be able to
-/// name a path on this server. Kept in step with `louver_cloud::cctv`.
+/// name a path on this server.
+///
+/// The single definition: `louver_cloud::cctv::PROTOCOL_WHITELIST` re-exports
+/// this one, so the probe behind `연결 테스트` and the broadcast cannot be given
+/// different lists.
 pub const LIVE_SOURCE_PROTOCOLS: &str = "http,https,tcp,tls,crypto";
 
 /// How long a live source may stall before FFmpeg gives up, in microseconds.
