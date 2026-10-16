@@ -606,12 +606,23 @@ mod tests {
 
     #[test]
     fn a_hostname_that_merely_ends_in_a_site_name_is_not_that_site() {
-        // `notyoutube.com` is somebody else's domain, and a camera could live
-        // on it. Only the domain itself and its subdomains are refused.
-        let e = refused("https://notyoutube.com/live.m3u8");
-        assert!(!e.contains("YouTube"), "matched too greedily: {e}");
-        let e = refused("https://myyoutu.be/live.m3u8");
-        assert!(!e.contains("YouTube"), "matched too greedily: {e}");
+        // `notyoutube.com` is somebody else's domain and a camera could live
+        // on it; only the domain itself and its subdomains are refused.
+        //
+        // Asserted against `watch_page_site` and not through `validate`,
+        // because `validate` resolves the host. Going through it made this a
+        // test of whichever DNS the machine happens to have: in a sandbox with
+        // no resolver the address is refused for being unresolvable and the
+        // assertion passes for the wrong reason, while on a runner with real
+        // DNS `notyoutube.com` resolves to a public address, `validate`
+        // returns `Ok`, and the test fails. It did exactly that.
+        for host in ["notyoutube.com", "myyoutu.be", "youtube.com.example.org", "fakeyoutu.be"] {
+            assert!(watch_page_site(host).is_none(), "matched too greedily: {host}");
+        }
+        // And the ones that are the site, including subdomains.
+        for host in ["youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"] {
+            assert_eq!(watch_page_site(host), Some("YouTube"), "missed: {host}");
+        }
     }
 
     #[test]
