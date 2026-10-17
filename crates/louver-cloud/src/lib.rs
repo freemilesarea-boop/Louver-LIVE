@@ -99,6 +99,17 @@ pub enum CloudError {
     /// No subscription, or one that is no longer active.
     #[error("방송을 시작하려면 활성화된 요금제가 필요합니다")]
     NoSubscription,
+    /// The machine's encoder is full. Nothing to do with the plan.
+    ///
+    /// Separate from [`CloudError::ConcurrencyReached`] because paying more
+    /// would not help: this is the server's CPU, and the person who can change
+    /// it is the operator. Separate from [`CloudError::OutOfSpace`] because it
+    /// clears on its own as soon as a broadcast stops, so the answer really is
+    /// "try again shortly" rather than "someone has to go and fix something".
+    #[error(
+        "서버가 동시에 인코딩할 수 있는 방송은 {allowed}개이고, 지금 {running}개가 송출 중입니다.          CCTV 영상을 쓰는 방송은 실시간 인코딩이 필요해 일반 방송보다 서버 자원을 많이 씁니다.          진행 중인 CCTV 방송이 끝난 뒤 다시 시도해 주세요."
+    )]
+    EncoderBusy { running: i64, allowed: i64 },
     /// The server's own disk, not the user's plan. Separate from
     /// `LimitReached` because paying more would not help and the operator is
     /// the one who has to act.

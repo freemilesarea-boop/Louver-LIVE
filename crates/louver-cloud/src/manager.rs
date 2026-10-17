@@ -236,6 +236,13 @@ pub struct BroadcastManager {
     /// Set only when this server has YouTube connecting configured. `None`
     /// means every broadcast is a pasted stream key, exactly as before.
     youtube: Option<Arc<crate::youtube::Youtube>>,
+    /// How many broadcasts this machine will encode at once.
+    ///
+    /// A field defaulted from the environment rather than an `std::env::var` at
+    /// the point of use, so a test can pin it without `set_var` — which is
+    /// process-global and has already raced two of this repository's test
+    /// threads once.
+    encode_budget: i64,
     /// Where the FFmpeg processes actually live.
     ///
     /// `None` is this process, which is what every deployment does today. With
@@ -275,7 +282,15 @@ impl BroadcastManager {
             workers: Arc::new(Mutex::new(HashMap::new())),
             youtube: None,
             remote: None,
+            encode_budget: crate::entitlement::encoding_budget(),
         }
+    }
+
+    /// Pin the machine's encoder ceiling. For tests and for a caller with its
+    /// own reason; the default comes from the environment.
+    pub fn with_encoding_budget(mut self, n: i64) -> Self {
+        self.encode_budget = n;
+        self
     }
 
     /// Send worker operations to a runner process instead of doing them here.
@@ -384,7 +399,7 @@ impl BroadcastManager {
         if let Some(yt) = &self.youtube {
             yt.before_start(broadcast_id)?;
         }
-        self.db.claim_stream_slot(user_id, broadcast_id)?;
+        self.db.claim_stream_slot_within(user_id, broadcast_id, self.encode_budget)?;
         match self.spawn_worker(broadcast_id) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -479,8 +494,34 @@ impl BroadcastManager {
             return Ok(0);
         }
         let wanted = self.db.broadcasts_wanting_to_run()?;
+        // The machine's encoder ceiling applies to a boot as much as to a
+        // click. Recovery does not go through `claim_stream_slot`, so without
+        // this a restart would revive every live-source broadcast at once and
+        // put the box over its budget — which is worse than a click doing it,
+        // because nobody is watching and every one of them stutters.
+        //
+        // Counted here rather than per broadcast so the limit is the machine's
+        // and not each account's.
+        let encode_budget = self.encode_budget;
+        let mut encodes_started = 0i64;
         let mut started = 0;
         for b in wanted {
+            let encodes = b.cctv_url.as_deref().map(str::trim).is_some_and(|u| !u.is_empty());
+            if encodes && encodes_started >= encode_budget {
+                // `desired_state` is left alone, exactly as it is for an
+                // expired subscription: the broadcast is still meant to run,
+                // and it will start when there is room for it.
+                let _ = self.db.append_event(
+                    &b.id,
+                    EventLevel::Warn,
+                    &format!(
+                        "서버가 동시에 인코딩할 수 있는 방송 수({encode_budget}개)에 도달해 \
+                         이 CCTV 방송은 복구하지 않았습니다. 다른 CCTV 방송이 끝나면 시작할 수 있습니다"
+                    ),
+                );
+                say(&b.id, "warn", &format!("인코딩 예산 {encode_budget}개 초과로 복구 보류 (CCTV)"));
+                continue;
+            }
             // Recovery spawns workers directly rather than going through
             // `start`, so the subscription gate has to be repeated here. Without
             // it, a restart would revive the broadcasts of an account whose
@@ -520,7 +561,12 @@ impl BroadcastManager {
                 }
             }
             match self.spawn_worker(&b.id) {
-                Ok(()) => started += 1,
+                Ok(()) => {
+                    started += 1;
+                    if encodes {
+                        encodes_started += 1;
+                    }
+                }
                 Err(e) => {
                     let _ = self.db.record_failure(&b.id, &format!("복구 실패: {e}"));
                 }

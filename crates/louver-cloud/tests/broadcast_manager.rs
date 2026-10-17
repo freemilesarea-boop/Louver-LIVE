@@ -1074,3 +1074,108 @@ fn shutting_down_an_idle_manager_does_nothing_and_does_not_hang() {
     h.mgr.shutdown();
     assert!(h.mgr.running_ids().is_empty());
 }
+
+// --- the machine's encoder ceiling across a restart -----------------------
+//
+// `recover_all` does not go through `claim_stream_slot`, so without a check of
+// its own a restart would revive every live-source broadcast at once and put
+// the box over its budget. That is worse than a click doing it: nobody is
+// watching a boot, and every one of them stutters.
+
+/// A manager as a boot builds one, with the machine's encoder ceiling pinned.
+///
+/// Its own secret store, so the destination keys have to be put there too —
+/// `build_manager` makes a fresh `MemorySecretStore` each time, which is what
+/// a real restart does to an in-memory store and exactly why this helper
+/// exists rather than reusing the harness's manager.
+fn booted_manager(h: &Harness, encode_budget: i64) -> BroadcastManager {
+    let mgr = build_manager(&h.db, h.path.parent().unwrap(), &h.fleet).with_encoding_budget(encode_budget);
+    for d in h.db.destinations_for(&h.user).unwrap() {
+        mgr.secret_store()
+            .set(&louver_cloud::credentials::destination_account(&d.id), "aaaa-aaaa-aaaa-aaaa")
+            .unwrap();
+    }
+    mgr
+}
+
+/// Point a broadcast at a live video source, which is what makes it an encode.
+fn make_it_a_cctv_broadcast(h: &Harness, id: &str) {
+    let patch = louver_cloud::BroadcastPatch {
+        cctv_url: Some("https://93.184.216.34/live/stream.m3u8".to_string()),
+        ..Default::default()
+    };
+    h.db.update_broadcast_owned(&h.user, id, &patch).unwrap();
+}
+
+#[test]
+fn a_restart_recovers_encodes_up_to_the_budget_and_no_further() {
+    let h = harness("business", 3);
+    give_every_destination_a_key(&h);
+    let b = ids(&h);
+    for id in &b {
+        make_it_a_cctv_broadcast(&h, id);
+    }
+    // All three were meant to be running when the server went down.
+    for id in &b {
+        h.db.claim_stream_slot_within(&h.user, id, 3).unwrap();
+    }
+
+    // A fresh manager, as a boot builds one, with room for one encode.
+    let fresh = booted_manager(&h, 1);
+    let started = fresh.recover_all().unwrap();
+
+    assert_eq!(started, 1, "only one encode fits on this machine");
+    let running: Vec<&String> = b.iter().filter(|id| h.fleet.launches(id) == 1).collect();
+    assert_eq!(running.len(), 1, "exactly one was launched: {running:?}");
+
+    // The other two are not discarded — they still want to run, so they come
+    // back when there is room. Rewriting the intent would lose it silently.
+    for id in &b {
+        assert_eq!(
+            h.db.desired_state(id).unwrap(),
+            louver_cloud::DesiredState::Running,
+            "{id} lost its intent"
+        );
+    }
+    fresh.shutdown();
+}
+
+#[test]
+fn a_restart_recovers_every_stream_copy_whatever_the_encode_budget_is() {
+    // The ceiling is about encoding. Ordinary broadcasts cost almost nothing
+    // and must all come back.
+    let h = harness("business", 3);
+    give_every_destination_a_key(&h);
+    let b = ids(&h);
+    for id in &b {
+        h.db.claim_stream_slot_within(&h.user, id, 3).unwrap();
+    }
+
+    let fresh = booted_manager(&h, 1);
+    assert_eq!(fresh.recover_all().unwrap(), 3, "a copy is not an encode");
+    eventually("all three came back", || b.iter().all(|id| h.fleet.launches(id) == 1));
+    fresh.shutdown();
+}
+
+#[test]
+fn the_held_back_broadcast_is_told_why_in_its_own_log() {
+    // An operator reading one broadcast's events has to be able to see that it
+    // was the machine and not the customer's plan.
+    let h = harness("business", 2);
+    give_every_destination_a_key(&h);
+    let b = ids(&h);
+    for id in &b {
+        make_it_a_cctv_broadcast(&h, id);
+        h.db.claim_stream_slot_within(&h.user, id, 2).unwrap();
+    }
+
+    let fresh = booted_manager(&h, 1);
+    fresh.recover_all().unwrap();
+
+    let held = b.iter().find(|id| h.fleet.launches(id) == 0).expect("one was held back");
+    let said =
+        h.db.events_for(held, 50).unwrap().into_iter().map(|e| e.message).collect::<Vec<_>>().join("\n");
+    assert!(said.contains("인코딩"), "the reason is not in the log: {said}");
+    assert!(said.contains("CCTV"), "nor which kind of broadcast: {said}");
+    fresh.shutdown();
+}

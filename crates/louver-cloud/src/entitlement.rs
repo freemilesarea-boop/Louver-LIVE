@@ -26,6 +26,79 @@ pub const MAX_STORAGE_BYTES: &str = "max_storage_bytes";
 pub const MAX_UPLOAD_BYTES: &str = "max_upload_bytes";
 pub const SCHEDULING_ENABLED: &str = "scheduling_enabled";
 
+/// Overrides how many broadcasts this machine will encode at once.
+pub const ENCODING_BUDGET_ENV: &str = "LOUVER_MAX_ENCODING_STREAMS";
+
+/// How many broadcasts this machine will encode in real time at once.
+///
+/// # Why there is a second ceiling at all
+///
+/// A plan's `max_concurrent_streams` counts broadcasts, and until the live
+/// video source arrived every broadcast cost the same: the media was
+/// normalised at upload, so sending it is `-c copy` — a file read and a socket
+/// write, no encoding. Three of those on two cores is nothing.
+///
+/// A broadcast with a live video source cannot work that way. Its picture and
+/// its sound come from two unrelated inputs, which cannot be muxed by copying
+/// packets, so FFmpeg encodes H.264 in real time for as long as the broadcast
+/// runs. That is a different order of cost, and the plan limit cannot see it:
+/// a Business plan allows three concurrent broadcasts whether they are three
+/// stream copies or three 1080p encodes.
+///
+/// Measured on two cores with the product's own argv and a 1080p30 source: one
+/// encode held `speed=1.01x`, and two together fell to `0.957x` and `0.938x`.
+/// Below 1.0x the encoder never catches up, the muxer's queue grows, and
+/// YouTube reports the stream as unstable — for *both* customers, because the
+/// cost is shared. Refusing the second start is the kinder failure: one
+/// broadcast that works beats two that stutter.
+///
+/// # The number
+///
+/// Half the usable cores, at least one. `available_parallelism` honours CPU
+/// affinity and the container's cgroup quota, so this is the machine's real
+/// allowance rather than the hypervisor's core count — on a 2-vCPU box it is
+/// 1, on a 4-core box 2. Half and not all, because the API, the OS and
+/// FFmpeg's own I/O threads need the rest.
+///
+/// It is deliberately conservative and deliberately overridable. The
+/// measurement above used `testsrc2`, which is synthetic high-entropy video
+/// and harder to encode than a traffic camera, so an operator who has measured
+/// their own cameras should raise it. `0` switches encoding broadcasts off
+/// altogether, which is the honest way to say "not on this box". An
+/// unparseable or negative value falls back to the derived default rather than
+/// failing a boot.
+pub fn encoding_budget() -> i64 {
+    encoding_budget_detail().value
+}
+
+/// The budget and where it came from.
+///
+/// The source is carried rather than re-derived by whoever logs it: a value
+/// that was set but unusable falls back to the derived default, and a line
+/// saying "set by environment variable" about that number would be a lie to
+/// the one person trying to work out why a start was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodingBudget {
+    pub value: i64,
+    /// True only when the environment variable both existed and parsed.
+    pub from_env: bool,
+}
+
+pub fn encoding_budget_detail() -> EncodingBudget {
+    match std::env::var(ENCODING_BUDGET_ENV) {
+        Ok(raw) => match raw.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => EncodingBudget { value: n, from_env: true },
+            _ => EncodingBudget { value: derived_encoding_budget(), from_env: false },
+        },
+        Err(_) => EncodingBudget { value: derived_encoding_budget(), from_env: false },
+    }
+}
+
+fn derived_encoding_budget() -> i64 {
+    let cores = std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(1);
+    (cores / 2).max(1)
+}
+
 impl CloudDb {
     /// One limit for one user.
     ///
@@ -74,6 +147,22 @@ impl CloudDb {
     /// Idempotent: a broadcast already marked running keeps its slot instead of
     /// being counted twice, so a repeated click cannot consume two.
     pub fn claim_stream_slot(&self, user_id: &str, broadcast_id: &str) -> Result<()> {
+        self.claim_stream_slot_within(user_id, broadcast_id, encoding_budget())
+    }
+
+    /// [`Self::claim_stream_slot`] with the machine's encoder ceiling given
+    /// rather than read from the environment.
+    ///
+    /// An argument and not an `std::env::var` at the point of use, for the same
+    /// reason `Youtube::with_auto_transition` is a field: `set_var` is
+    /// process-global and has already raced two of this repository's test
+    /// threads once. A test that needs a budget of one says so.
+    pub fn claim_stream_slot_within(
+        &self,
+        user_id: &str,
+        broadcast_id: &str,
+        encode_budget: i64,
+    ) -> Result<()> {
         // No subscription, no slot. Asked first so the answer is "요금제가
         // 필요합니다" rather than a concurrency ceiling of zero, which reads like
         // a bug to whoever hits it.
@@ -92,8 +181,13 @@ impl CloudDb {
             _ => {}
         }
 
-        let already: String =
-            tx.query_row("SELECT desired_state FROM broadcasts WHERE id=?1", [broadcast_id], |r| r.get(0))?;
+        let (already, encodes): (String, bool) = tx.query_row(
+            // `cctv_url` is what makes a broadcast an encode rather than a
+            // copy: two unrelated inputs cannot be muxed by copying packets.
+            "SELECT desired_state, COALESCE(TRIM(cctv_url), '') <> '' FROM broadcasts WHERE id=?1",
+            [broadcast_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         if already == DesiredState::Running.id() {
             return Ok(()); // already holds the slot
         }
@@ -105,6 +199,28 @@ impl CloudDb {
         )?;
         if used >= allowed {
             return Err(CloudError::ConcurrencyReached { plan_label, used, allowed });
+        }
+
+        // The machine's ceiling, after the plan's. Counted across every
+        // account, because the CPU is not divided between them, and inside
+        // this same transaction so that two starts arriving together cannot
+        // both be told there is room for the last one — the same hole the plan
+        // check closes, one level up.
+        //
+        // Only encoding broadcasts are counted and only an encoding broadcast
+        // is refused. A stream copy costs almost nothing and must not be held
+        // up by a camera somebody else is sending.
+        if encodes {
+            let allowed_encodes = encode_budget;
+            let running = tx.query_row(
+                "SELECT COUNT(*) FROM broadcasts
+                 WHERE desired_state='running' AND COALESCE(TRIM(cctv_url), '') <> ''",
+                [],
+                |r| r.get::<_, i64>(0),
+            )?;
+            if running >= allowed_encodes {
+                return Err(CloudError::EncoderBusy { running, allowed: allowed_encodes });
+            }
         }
 
         tx.execute(

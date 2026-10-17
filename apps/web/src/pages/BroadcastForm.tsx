@@ -631,6 +631,12 @@ export function BroadcastForm({
               시도합니다.
             </p>
             <p className="text-xs text-ink-500">
+              CCTV 방송은 화면과 소리를 실시간으로 합쳐야 해서 일반 방송보다 서버
+              자원을 훨씬 많이 씁니다. 그래서 서버가 동시에 처리할 수 있는 CCTV
+              방송 수에는 요금제와 별도인 한도가 있고, 한도에 도달하면 다른 CCTV
+              방송이 끝날 때까지 시작이 거절됩니다.
+            </p>
+            <p className="text-xs text-ink-500">
               YouTube·Twitch·치지직 등의 <strong>시청 페이지 링크는 사용할 수
               없습니다</strong>. 그 주소는 영상이 아니라 웹페이지라서 송출기가
               영상을 찾지 못합니다. CCTV·카메라가 직접 제공하는 HLS(.m3u8) 주소가

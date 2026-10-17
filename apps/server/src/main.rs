@@ -874,6 +874,23 @@ async fn main() -> std::process::ExitCode {
         }
     };
 
+    // The machine's encoder ceiling, printed because it is the one limit that
+    // is not in the database and not in a plan: an operator who has not seen
+    // this line has no way to know why a CCTV start was refused.
+    if role.owns_workers() {
+        let budget = louver_cloud::entitlement::encoding_budget_detail();
+        println!(
+            "[louver] 동시 인코딩 한도: {}개 ({}; {} 로 변경)",
+            budget.value,
+            if budget.from_env { "환경변수 지정" } else { "사용 가능 코어 수에서 계산" },
+            louver_cloud::entitlement::ENCODING_BUDGET_ENV
+        );
+        let budget = budget.value;
+        if budget == 0 {
+            println!("[louver] 경고: 0 이므로 CCTV 영상을 쓰는 방송은 시작되지 않습니다");
+        }
+    }
+
     // §6: whatever was meant to be running, runs again. A broadcast the user
     // stopped stays stopped, because the decision is read from desired_state.
     match app.mgr.recover_all() {

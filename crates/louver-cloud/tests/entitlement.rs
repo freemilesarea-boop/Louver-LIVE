@@ -679,3 +679,180 @@ fn an_account_over_the_new_ceiling_keeps_everything_and_can_still_broadcast() {
     db.claim_stream_slot(&uid, &b[0]).expect("an over-quota account was refused a broadcast");
     assert_eq!(db.active_stream_count(&uid).unwrap(), 1);
 }
+
+// --- the machine's encoder ceiling ----------------------------------------
+//
+// A plan counts broadcasts. Until the live video source arrived every
+// broadcast cost the same, because the media is normalised at upload and
+// sending it is `-c copy`. A broadcast with a live source cannot work that
+// way: two unrelated inputs cannot be muxed by copying packets, so FFmpeg
+// encodes in real time for as long as it runs. Measured on two cores, one
+// 1080p30 encode held `speed=1.01x` and two together fell to 0.957x and
+// 0.938x — below 1.0x nothing ever catches up, for both customers at once.
+
+/// Point a broadcast at a live video source, which is what makes it an encode.
+fn make_it_a_cctv_broadcast(db: &CloudDb, user_id: &str, id: &str) {
+    let patch = louver_cloud::BroadcastPatch {
+        cctv_url: Some("https://93.184.216.34/live/stream.m3u8".to_string()),
+        ..Default::default()
+    };
+    db.update_broadcast_owned(user_id, id, &patch).unwrap();
+}
+
+#[test]
+fn the_budget_is_half_the_usable_cores_and_never_zero_by_accident() {
+    // `available_parallelism` honours CPU affinity and the container's cgroup
+    // quota, so this is the machine's real allowance rather than the
+    // hypervisor's core count.
+    let cores = std::thread::available_parallelism().map(|n| n.get() as i64).unwrap_or(1);
+    let got = encoding_budget();
+
+    if std::env::var(ENCODING_BUDGET_ENV).is_ok() {
+        // An operator has pinned it; the formula is not what is under test.
+        assert!(got >= 0, "a pinned budget is still a number");
+        return;
+    }
+    assert_eq!(got, (cores / 2).max(1), "half the cores, at least one");
+    assert!(got >= 1, "a machine must be able to encode at least one broadcast");
+    assert!(got < cores.max(2), "half, so the API and the OS keep the rest");
+}
+
+#[test]
+fn a_second_encoding_broadcast_is_refused_when_the_budget_is_one() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let (uid, b) = user_with_broadcasts(&db, "cctv@x.com", "business", 3);
+    make_it_a_cctv_broadcast(&db, &uid, &b[0]);
+    make_it_a_cctv_broadcast(&db, &uid, &b[1]);
+
+    db.claim_stream_slot_within(&uid, &b[0], 1).expect("the first encode fits");
+    match db.claim_stream_slot_within(&uid, &b[1], 1) {
+        Err(CloudError::EncoderBusy { running, allowed }) => {
+            assert_eq!((running, allowed), (1, 1));
+        }
+        other => panic!("the second encode must be refused, got {other:?}"),
+    }
+    // The plan would have allowed three; the machine is what refused.
+    assert_eq!(db.active_stream_count(&uid).unwrap(), 1);
+}
+
+#[test]
+fn the_ceiling_is_the_machines_and_not_each_accounts() {
+    // Two customers share one CPU. A limit counted per account would let each
+    // of them start one encode on a box that can only do one.
+    let db = CloudDb::open_in_memory().unwrap();
+    let (a_id, a) = user_with_broadcasts(&db, "a@x.com", "business", 1);
+    let (b_id, b) = user_with_broadcasts(&db, "b@x.com", "business", 1);
+    make_it_a_cctv_broadcast(&db, &a_id, &a[0]);
+    make_it_a_cctv_broadcast(&db, &b_id, &b[0]);
+
+    db.claim_stream_slot_within(&a_id, &a[0], 1).expect("the first customer fits");
+    let second = db.claim_stream_slot_within(&b_id, &b[0], 1);
+    assert!(
+        matches!(second, Err(CloudError::EncoderBusy { .. })),
+        "a second account's encode must meet the same ceiling, got {second:?}"
+    );
+}
+
+#[test]
+fn a_stream_copy_is_never_held_up_by_somebody_elses_camera() {
+    // The whole point of counting only encodes: an ordinary broadcast costs
+    // almost nothing and must not be refused because a camera is busy.
+    let db = CloudDb::open_in_memory().unwrap();
+    let (a_id, a) = user_with_broadcasts(&db, "cam@x.com", "business", 1);
+    let (b_id, b) = user_with_broadcasts(&db, "music@x.com", "business", 3);
+    make_it_a_cctv_broadcast(&db, &a_id, &a[0]);
+
+    db.claim_stream_slot_within(&a_id, &a[0], 1).unwrap();
+    for id in &b {
+        db.claim_stream_slot_within(&b_id, id, 1)
+            .unwrap_or_else(|e| panic!("a copy must not be refused by the encoder ceiling: {e:?}"));
+    }
+    assert_eq!(db.active_stream_count(&b_id).unwrap(), 3);
+}
+
+#[test]
+fn re_claiming_the_same_encode_does_not_consume_a_second_budget_slot() {
+    // A repeated click, a retried request, two tabs.
+    let db = CloudDb::open_in_memory().unwrap();
+    let (uid, b) = user_with_broadcasts(&db, "double@x.com", "business", 2);
+    make_it_a_cctv_broadcast(&db, &uid, &b[0]);
+
+    db.claim_stream_slot_within(&uid, &b[0], 1).unwrap();
+    for _ in 0..5 {
+        db.claim_stream_slot_within(&uid, &b[0], 1).expect("already holds its slot");
+    }
+    assert_eq!(db.active_stream_count(&uid).unwrap(), 1);
+}
+
+#[test]
+fn a_stopped_encode_gives_its_budget_back() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let (uid, b) = user_with_broadcasts(&db, "cycle@x.com", "business", 2);
+    make_it_a_cctv_broadcast(&db, &uid, &b[0]);
+    make_it_a_cctv_broadcast(&db, &uid, &b[1]);
+
+    db.claim_stream_slot_within(&uid, &b[0], 1).unwrap();
+    assert!(db.claim_stream_slot_within(&uid, &b[1], 1).is_err());
+    db.release_stream_slot(&uid, &b[0]).unwrap();
+    db.claim_stream_slot_within(&uid, &b[1], 1).expect("the budget clears as soon as a broadcast stops");
+}
+
+#[test]
+fn a_budget_of_zero_switches_encoding_broadcasts_off() {
+    // The honest way for an operator to say "not on this box".
+    let db = CloudDb::open_in_memory().unwrap();
+    let (uid, b) = user_with_broadcasts(&db, "off@x.com", "business", 2);
+    make_it_a_cctv_broadcast(&db, &uid, &b[0]);
+
+    match db.claim_stream_slot_within(&uid, &b[0], 0) {
+        Err(CloudError::EncoderBusy { running, allowed }) => assert_eq!((running, allowed), (0, 0)),
+        other => panic!("zero must refuse every encode, got {other:?}"),
+    }
+    // And an ordinary broadcast still works, because zero is about encoding.
+    db.claim_stream_slot_within(&uid, &b[1], 0).expect("a copy is unaffected");
+}
+
+#[test]
+fn two_simultaneous_encode_starts_cannot_both_take_the_last_slot() {
+    // The same race the plan check closes, one level up: counting and writing
+    // are one `BEGIN IMMEDIATE` transaction.
+    let db = CloudDb::open_in_memory().unwrap();
+    let (uid, b) = user_with_broadcasts(&db, "race@x.com", "business", 2);
+    make_it_a_cctv_broadcast(&db, &uid, &b[0]);
+    make_it_a_cctv_broadcast(&db, &uid, &b[1]);
+
+    let gate = Arc::new(Barrier::new(2));
+    let outcomes: Vec<bool> = std::thread::scope(|s| {
+        let hands: Vec<_> = b
+            .iter()
+            .map(|id| {
+                let (db, uid, id, gate) = (db.clone(), uid.clone(), id.clone(), Arc::clone(&gate));
+                s.spawn(move || {
+                    gate.wait();
+                    db.claim_stream_slot_within(&uid, &id, 1).is_ok()
+                })
+            })
+            .collect();
+        hands.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+
+    assert_eq!(
+        outcomes.iter().filter(|ok| **ok).count(),
+        1,
+        "exactly one of two simultaneous encode starts may win: {outcomes:?}"
+    );
+    assert_eq!(db.active_stream_count(&uid).unwrap(), 1);
+}
+
+#[test]
+fn an_unusable_budget_setting_does_not_claim_to_have_been_set() {
+    // The boot log names the source, and a value that fell back to the derived
+    // default must not be reported as "set by environment variable" — that
+    // line is read by the one person working out why a start was refused.
+    let detail = encoding_budget_detail();
+    if !detail.from_env {
+        assert_eq!(detail.value, encoding_budget(), "the two entry points must agree");
+    }
+    // Whatever the machine says, the pair is self-consistent.
+    assert_eq!(detail.value, encoding_budget());
+}
