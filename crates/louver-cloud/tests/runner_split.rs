@@ -10,6 +10,10 @@
 //! and neither of those involves a real encoder. The by-hand runs recorded in
 //! `docs/FFMPEG_LIFECYCLE.md` cover the real FFmpeg case.
 
+// `runner::Server` is a Unix socket, so there is nothing here to compile
+// anywhere else. The split itself is a Linux deployment shape.
+#![cfg(unix)]
+
 use louver_cloud::manager::{BroadcastManager, LauncherFactory};
 use louver_cloud::runner::{Client, Command, Reply, Role, Server};
 use louver_cloud::storage::{LocalStorage, Storage};

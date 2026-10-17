@@ -907,29 +907,40 @@ async fn main() -> std::process::ExitCode {
     // it is the process that must outlive an API deployment, so it binds no
     // port and nothing about it changes when the web side is replaced.
     if !role.serves_http() {
-        let server = match louver_cloud::runner::Server::bind(&data) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("[louver] runner 소켓을 열 수 없습니다: {e}");
-                std::process::exit(1);
-            }
-        };
-        println!("[louver] runner 대기 중: {}", server.socket().display());
-        // The signal handler runs on its own thread so a SIGTERM during a
-        // blocking `accept` still stops every broadcast properly.
-        let mgr = app.mgr.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
-            if let Ok(rt) = rt {
-                rt.block_on(wait_for_stop());
-            }
-            println!("[louver] 종료 신호를 받았습니다. 방송을 정리합니다");
-            mgr.shutdown();
-            std::process::exit(0);
-        });
-        let mgr = app.mgr.clone();
-        server.serve(|cmd| serve_runner_command(&mgr, cmd));
-        return std::process::ExitCode::SUCCESS;
+        #[cfg(unix)]
+        {
+            let server = match louver_cloud::runner::Server::bind(&data) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[louver] runner 소켓을 열 수 없습니다: {e}");
+                    std::process::exit(1);
+                }
+            };
+            println!("[louver] runner 대기 중: {}", server.socket().display());
+            // The signal handler runs on its own thread so a SIGTERM during a
+            // blocking `accept` still stops every broadcast properly.
+            let mgr = app.mgr.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+                if let Ok(rt) = rt {
+                    rt.block_on(wait_for_stop());
+                }
+                println!("[louver] 종료 신호를 받았습니다. 방송을 정리합니다");
+                mgr.shutdown();
+                std::process::exit(0);
+            });
+            let mgr = app.mgr.clone();
+            server.serve(|cmd| serve_runner_command(&mgr, cmd));
+            return std::process::ExitCode::SUCCESS;
+        }
+        // The socket the two halves speak over is a Unix socket, and the
+        // split only ever runs in the Linux container. Saying so is better
+        // than a Windows build that pretends to have a runner role.
+        #[cfg(not(unix))]
+        {
+            eprintln!("[louver] runner 역할은 Unix 에서만 동작합니다 (LOUVER_ROLE)");
+            std::process::exit(1);
+        }
     }
 
     let addr = std::env::var("LOUVER_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
@@ -1027,6 +1038,7 @@ async fn wait_for_stop() {
 /// what YouTube has to be told — stays on the HTTP side where the user is
 /// waiting for an answer. What is here is the part that can only be done by
 /// the process that owns the FFmpeg children.
+#[cfg(unix)]
 fn serve_runner_command(
     mgr: &louver_cloud::manager::BroadcastManager,
     cmd: louver_cloud::runner::Command,
