@@ -75,7 +75,13 @@ fn music(tools: &FfmpegTools, dir: &Path, name: &str, tone_hz: u32, colour: &str
 /// An HLS stream that stands in for the camera: a moving pattern, a 1 kHz tone,
 /// and a size nothing else in this test uses.
 fn hls_camera(tools: &FfmpegTools, dir: &Path) -> PathBuf {
+    hls_camera_sized(tools, dir, "640x360")
+}
+
+/// The same camera at a chosen size, for the cap.
+fn hls_camera_sized(tools: &FfmpegTools, dir: &Path, size: &str) -> PathBuf {
     let playlist = dir.join("cam.m3u8");
+    let source = format!("testsrc2=size={size}:rate=30:duration=20");
     let args = [
         "-hide_banner",
         "-loglevel",
@@ -84,7 +90,7 @@ fn hls_camera(tools: &FfmpegTools, dir: &Path) -> PathBuf {
         "-f",
         "lavfi",
         "-i",
-        "testsrc2=size=640x360:rate=30:duration=20",
+        &source,
         "-f",
         "lavfi",
         "-i",
@@ -343,4 +349,90 @@ fn louver_cloud_cctv_classify(stderr: &str) -> &'static str {
     } else {
         "failed"
     }
+}
+
+/// A camera bigger than the profile is brought down to it, and the sound is
+/// still the playlist's.
+///
+/// This is the case that made the cap necessary. A camera picks its own size
+/// and this path encodes in real time, so a 4K source was encoded at 4K:
+/// measured on two cores, `speed=0.481x` — less than half real time, which
+/// means the broadcast falls further behind every second it runs. With the cap
+/// the same source held `1.02x`.
+///
+/// 2560x1440 rather than 3840x2160 so the test does not spend a minute of CI
+/// encoding; it is above 1080p in both dimensions, which is what matters.
+#[test]
+fn a_camera_larger_than_the_profile_is_brought_down_to_it() {
+    let tools = require_ffmpeg!();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    let a = music(&tools, root, "music-a.mp4", 440, "blue");
+    let manifest = root.join("manifest.txt");
+    std::fs::write(&manifest, format!("file '{}'\n", a.to_string_lossy())).expect("manifest");
+
+    let cam_dir = root.join("cam");
+    std::fs::create_dir_all(&cam_dir).expect("cam dir");
+    hls_camera_sized(&tools, &cam_dir, "2560x1440");
+    let server = FileServer::serve(cam_dir);
+    let cam_url = server.url("cam.m3u8");
+
+    let out = root.join("out.flv");
+    let builder = common::builder(tools.clone(), OutputProfile::P1080p30);
+    let mut args = builder.build_live_video_stream_args(&manifest, &cam_url, &out.to_string_lossy(), true);
+    let sink = args.len() - 1;
+    args.insert(sink, "6".into());
+    args.insert(sink, "-t".into());
+
+    let (code, err) = common::run_ffmpeg(&tools, &args);
+    assert_eq!(code, 0, "the live pipeline failed:\n{err}\nargv: {args:?}");
+
+    // Capped at the profile, with the aspect ratio kept (16:9 in, 16:9 out).
+    assert_eq!(common::stream_field(&tools, &out, "v:0", "width"), "1920");
+    assert_eq!(common::stream_field(&tools, &out, "v:0", "height"), "1080");
+
+    // And the cap did not cost us the thing the whole feature is for.
+    let playlist_tone = band_db(&tools, &out, 440);
+    let camera_tone = band_db(&tools, &out, 1000);
+    assert!(
+        playlist_tone - camera_tone > 15.0,
+        "the sound is not the playlist's: 440 Hz {playlist_tone} dB, 1 kHz {camera_tone} dB"
+    );
+}
+
+/// A camera smaller than the profile is left exactly as it is.
+///
+/// `min(iw, W)` and not a plain `W`: upscaling a 640x360 traffic camera to
+/// 1080p would cost the encoder about three times as much for no more picture,
+/// and there is no per-account resolution setting to turn it back down with —
+/// `StreamSettings::resolution` is stored and validated but never read, and
+/// the cloud builds every broadcast at `P1080p30`.
+#[test]
+fn a_camera_smaller_than_the_profile_is_not_stretched_up_to_it() {
+    let tools = require_ffmpeg!();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+
+    let a = music(&tools, root, "music-a.mp4", 440, "blue");
+    let manifest = root.join("manifest.txt");
+    std::fs::write(&manifest, format!("file '{}'\n", a.to_string_lossy())).expect("manifest");
+
+    let cam_dir = root.join("cam");
+    std::fs::create_dir_all(&cam_dir).expect("cam dir");
+    hls_camera_sized(&tools, &cam_dir, "320x240");
+    let server = FileServer::serve(cam_dir);
+    let cam_url = server.url("cam.m3u8");
+
+    let out = root.join("out.flv");
+    let builder = common::builder(tools.clone(), OutputProfile::P1080p30);
+    let mut args = builder.build_live_video_stream_args(&manifest, &cam_url, &out.to_string_lossy(), true);
+    let sink = args.len() - 1;
+    args.insert(sink, "5".into());
+    args.insert(sink, "-t".into());
+
+    let (code, err) = common::run_ffmpeg(&tools, &args);
+    assert_eq!(code, 0, "the live pipeline failed:\n{err}\nargv: {args:?}");
+    assert_eq!(common::stream_field(&tools, &out, "v:0", "width"), "320");
+    assert_eq!(common::stream_field(&tools, &out, "v:0", "height"), "240");
 }
