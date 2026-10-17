@@ -26,7 +26,9 @@
 //! `louver-core/src/streaming/supervisor.rs` — directly, rather than by taking
 //! a dependency for two constants and one call.
 
-use crate::{CloudError, Result};
+#[cfg(unix)]
+use crate::CloudError;
+use crate::Result;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -148,6 +150,8 @@ fn role_hint() -> String {
 mod tests {
     use super::*;
 
+    // `flock` is what refuses the second one, so this is a Unix property.
+    #[cfg(unix)]
     #[test]
     fn the_second_process_is_refused_rather_than_left_to_collide() {
         let dir = tempfile::tempdir().unwrap();
@@ -162,6 +166,8 @@ mod tests {
         drop(first);
     }
 
+    // `flock` is what refuses the second one, so this is a Unix property.
+    #[cfg(unix)]
     #[test]
     fn the_refusal_names_the_holder() {
         let dir = tempfile::tempdir().unwrap();

@@ -32,6 +32,7 @@
 //! already running — the runner holds those, and it is the one that is absent.
 
 use crate::{CloudError, Result};
+#[cfg(unix)]
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
@@ -46,6 +47,7 @@ pub const SOCKET_FILE: &str = "runner.sock";
 /// Generous, because `HALT` legitimately takes seconds: it waits for FFmpeg to
 /// flush its FLV trailer. Still bounded, so a wedged runner becomes an error
 /// in the dashboard rather than a request that never returns.
+#[cfg(unix)]
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Which part of the system this process is.
