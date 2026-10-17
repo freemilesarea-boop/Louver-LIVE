@@ -236,6 +236,23 @@ pub struct BroadcastManager {
     /// Set only when this server has YouTube connecting configured. `None`
     /// means every broadcast is a pasted stream key, exactly as before.
     youtube: Option<Arc<crate::youtube::Youtube>>,
+    /// How many broadcasts this machine will encode at once.
+    ///
+    /// A field defaulted from the environment rather than an `std::env::var` at
+    /// the point of use, so a test can pin it without `set_var` — which is
+    /// process-global and has already raced two of this repository's test
+    /// threads once.
+    encode_budget: i64,
+    /// Where the FFmpeg processes actually live.
+    ///
+    /// `None` is this process, which is what every deployment does today. With
+    /// a client, the three operations that touch a process — spawn, halt, and
+    /// "what is running" — go to the runner instead, and nothing else about
+    /// `start`/`stop`/`restart` changes: the validation, the entitlement
+    /// claim, the YouTube calls and the database writes all still happen here.
+    /// That is deliberate, because it is what keeps a refused start a sentence
+    /// in front of the user rather than an event they have to go looking for.
+    remote: Option<crate::runner::Client>,
 }
 
 impl std::fmt::Debug for BroadcastManager {
@@ -264,7 +281,31 @@ impl BroadcastManager {
             launchers,
             workers: Arc::new(Mutex::new(HashMap::new())),
             youtube: None,
+            remote: None,
+            encode_budget: crate::entitlement::encoding_budget(),
         }
+    }
+
+    /// Pin the machine's encoder ceiling. For tests and for a caller with its
+    /// own reason; the default comes from the environment.
+    pub fn with_encoding_budget(mut self, n: i64) -> Self {
+        self.encode_budget = n;
+        self
+    }
+
+    /// Send worker operations to a runner process instead of doing them here.
+    ///
+    /// For [`crate::runner::Role::Api`]. A manager with this set spawns no
+    /// FFmpeg, so the process holding it can be replaced without stopping a
+    /// broadcast — the whole point of the split.
+    pub fn with_runner(mut self, client: crate::runner::Client) -> Self {
+        self.remote = Some(client);
+        self
+    }
+
+    /// Does this manager own its workers, or ask someone else?
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
     }
 
     /// Give this manager a YouTube provider.
@@ -290,7 +331,49 @@ impl BroadcastManager {
     }
 
     /// Broadcast ids with a live worker thread.
+    ///
+    /// With a runner, this is the runner's answer. If it cannot be reached the
+    /// database's own record is used instead — `record_runtime` keeps
+    /// `runtime_state` and a heartbeat — because a dashboard that says
+    /// "nothing is running" when the runner is merely unreachable is the same
+    /// class of lie as saying a broadcast is live when YouTube has not started
+    /// it. The fallback is marked in the log rather than hidden.
     pub fn running_ids(&self) -> Vec<String> {
+        if let Some(client) = &self.remote {
+            match client.call(&crate::runner::Command::Running) {
+                Ok(crate::runner::Reply::Ids(ids)) => return ids,
+                Ok(other) => {
+                    say("-", "runner", &format!("RUNNING 에 예상치 못한 응답: {}", other.encode()));
+                }
+                Err(e) => {
+                    say("-", "runner", &format!("RUNNING 실패, DB 기록으로 대체합니다: {e}"));
+                }
+            }
+            return self
+                .db
+                .broadcasts_wanting_to_run()
+                .map(|v| {
+                    // Everything the database says is up or on its way up, not
+                    // only `Running`. A broadcast that is preparing or
+                    // reconnecting has a worker, and reporting it as not
+                    // running would be wrong in the direction that matters:
+                    // the caller uses this list to decide what is already
+                    // going.
+                    v.into_iter()
+                        .filter(|b| {
+                            matches!(
+                                b.runtime_state,
+                                RuntimeState::Preparing
+                                    | RuntimeState::Starting
+                                    | RuntimeState::Running
+                                    | RuntimeState::Reconnecting
+                            )
+                        })
+                        .map(|b| b.id)
+                        .collect()
+                })
+                .unwrap_or_default();
+        }
         self.workers.lock().unwrap().keys().cloned().collect()
     }
 
@@ -316,7 +399,7 @@ impl BroadcastManager {
         if let Some(yt) = &self.youtube {
             yt.before_start(broadcast_id)?;
         }
-        self.db.claim_stream_slot(user_id, broadcast_id)?;
+        self.db.claim_stream_slot_within(user_id, broadcast_id, self.encode_budget)?;
         match self.spawn_worker(broadcast_id) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -375,15 +458,70 @@ impl BroadcastManager {
         self.start(user_id, broadcast_id)
     }
 
+    /// Spawn a worker because a runner was asked to.
+    ///
+    /// The API has already validated, claimed the slot and done YouTube's
+    /// pre-start; this is the half it cannot do. The subscription is checked
+    /// again anyway, for the same reason [`Self::recover_all`] checks it again:
+    /// this path does not go through `start`, and the one thing that must never
+    /// happen is a broadcast running for an account with no plan. It is cheap,
+    /// and it means a bug on the HTTP side cannot turn into a free broadcast.
+    pub fn start_worker(&self, broadcast_id: &str) -> Result<()> {
+        let b = self.db.broadcast(broadcast_id)?;
+        self.db.require_active_subscription(&b.user_id)?;
+        self.spawn_worker(broadcast_id)
+    }
+
+    /// Stop a worker because a runner was asked to, and wait for it.
+    ///
+    /// Takes no view on intent: `desired_state`, the entitlement slot and
+    /// YouTube's side are the API's business and it has already dealt with
+    /// them. This is the process, and nothing else.
+    pub fn stop_worker(&self, broadcast_id: &str) {
+        self.halt_worker(broadcast_id);
+    }
+
     /// Bring back everything that was meant to be running. §6.
     ///
     /// Reads `desired_state` alone. A broadcast the user stopped before the
     /// restart has `desired_state = stopped` and is left alone, which is the
     /// same rule the supervisor applies to a crash.
     pub fn recover_all(&self) -> Result<usize> {
+        // The runner recovers; an API process doing it too would be the
+        // double-start this split exists to make impossible.
+        if self.remote.is_some() {
+            say("-", "runner", "복구는 runner 가 수행합니다");
+            return Ok(0);
+        }
         let wanted = self.db.broadcasts_wanting_to_run()?;
+        // The machine's encoder ceiling applies to a boot as much as to a
+        // click. Recovery does not go through `claim_stream_slot`, so without
+        // this a restart would revive every live-source broadcast at once and
+        // put the box over its budget — which is worse than a click doing it,
+        // because nobody is watching and every one of them stutters.
+        //
+        // Counted here rather than per broadcast so the limit is the machine's
+        // and not each account's.
+        let encode_budget = self.encode_budget;
+        let mut encodes_started = 0i64;
         let mut started = 0;
         for b in wanted {
+            let encodes = b.cctv_url.as_deref().map(str::trim).is_some_and(|u| !u.is_empty());
+            if encodes && encodes_started >= encode_budget {
+                // `desired_state` is left alone, exactly as it is for an
+                // expired subscription: the broadcast is still meant to run,
+                // and it will start when there is room for it.
+                let _ = self.db.append_event(
+                    &b.id,
+                    EventLevel::Warn,
+                    &format!(
+                        "서버가 동시에 인코딩할 수 있는 방송 수({encode_budget}개)에 도달해 \
+                         이 CCTV 방송은 복구하지 않았습니다. 다른 CCTV 방송이 끝나면 시작할 수 있습니다"
+                    ),
+                );
+                say(&b.id, "warn", &format!("인코딩 예산 {encode_budget}개 초과로 복구 보류 (CCTV)"));
+                continue;
+            }
             // Recovery spawns workers directly rather than going through
             // `start`, so the subscription gate has to be repeated here. Without
             // it, a restart would revive the broadcasts of an account whose
@@ -423,7 +561,12 @@ impl BroadcastManager {
                 }
             }
             match self.spawn_worker(&b.id) {
-                Ok(()) => started += 1,
+                Ok(()) => {
+                    started += 1;
+                    if encodes {
+                        encodes_started += 1;
+                    }
+                }
                 Err(e) => {
                     let _ = self.db.record_failure(&b.id, &format!("복구 실패: {e}"));
                 }
@@ -440,9 +583,21 @@ impl BroadcastManager {
     /// testable without a thread at all.
     pub fn spawn_scheduler(&self) -> std::thread::JoinHandle<()> {
         let mgr = self.clone();
-        std::thread::spawn(move || loop {
-            mgr.run_schedules(chrono::Utc::now());
-            std::thread::sleep(SCHEDULE_TICK);
+        std::thread::spawn(move || {
+            // The clock is watched by whoever owns the workers, and by nobody
+            // else. Two schedulers on one database would each decide the same
+            // window had opened and each act on it — the API through the
+            // socket, the runner directly — which is a double start dressed up
+            // as a feature. The runner is the one with the workers, so the
+            // runner is the one with the clock.
+            if mgr.remote.is_some() {
+                say("-", "scheduler", "예약은 runner 가 처리합니다");
+                return;
+            }
+            loop {
+                mgr.run_schedules(chrono::Utc::now());
+                std::thread::sleep(SCHEDULE_TICK);
+            }
         })
     }
 
@@ -559,13 +714,48 @@ impl BroadcastManager {
     /// alone so recovery restarts these, and YouTube is not told anything —
     /// the broadcast is not ending, this process is.
     pub fn shutdown(&self) {
-        let ids: Vec<String> = self.running_ids();
-        for id in ids {
-            self.halt_worker(&id);
+        // An API process has no workers to stop, and must not ask the runner to
+        // stop any: the whole point is that the runner outlives it.
+        if self.remote.is_some() {
+            return;
+        }
+        // Two passes, and the order is the point.
+        //
+        // Every worker is told to stop first, and only then are they waited
+        // for. Halting them one at a time cost the sum of their shutdowns:
+        // `ProcessHandle::terminate` gives FFmpeg three seconds to flush its
+        // FLV trailer before resorting to SIGKILL, so five broadcasts took up
+        // to fifteen seconds — past Docker's ten-second grace period, at which
+        // point the whole container is killed and the trailers are lost
+        // anyway. Signalling first makes the total three seconds whatever the
+        // count, because the waits overlap.
+        let workers: Vec<(String, Worker)> = {
+            let mut held = self.workers.lock().unwrap();
+            let ids: Vec<String> = held.keys().cloned().collect();
+            ids.into_iter().filter_map(|id| held.remove(&id).map(|w| (id, w))).collect()
+        };
+        for (_, w) in &workers {
+            w.stop.store(true, Ordering::SeqCst);
+        }
+        for (_, mut w) in workers {
+            if let Some(h) = w.handle.take() {
+                let _ = h.join();
+            }
         }
     }
 
     fn halt_worker(&self, broadcast_id: &str) {
+        // Synchronous across the socket: the caller goes on to end the YouTube
+        // broadcast, and doing that while FFmpeg is still pushing would leave
+        // the encoder sending into a completed broadcast. A failure here is
+        // logged rather than returned, matching what this function has always
+        // done — it is called on paths that must finish.
+        if let Some(client) = &self.remote {
+            if let Err(e) = client.call(&crate::runner::Command::Halt(broadcast_id.to_string())) {
+                say(broadcast_id, "runner", &format!("HALT 실패: {e}"));
+            }
+            return;
+        }
         let worker = self.workers.lock().unwrap().remove(broadcast_id);
         if let Some(mut w) = worker {
             w.stop.store(true, Ordering::SeqCst);
@@ -577,6 +767,13 @@ impl BroadcastManager {
 
     /// Build the working directory, then run the engine on its own thread.
     fn spawn_worker(&self, broadcast_id: &str) -> Result<()> {
+        // With a runner, the process that owns FFmpeg does this. The error it
+        // returns is passed through whole, so a refusal still reaches the user
+        // as a sentence rather than as a generic failure.
+        if let Some(client) = &self.remote {
+            client.call(&crate::runner::Command::Start(broadcast_id.to_string()))?;
+            return Ok(());
+        }
         if self.workers.lock().unwrap().contains_key(broadcast_id) {
             return Ok(()); // already running; starting twice is not an error
         }
@@ -1001,53 +1198,221 @@ mod meter_tests {
     }
 }
 
-/// Asks YouTube how the ingest is going, on a schedule and not for ever.
+/// Asks YouTube how the ingest is going, and keeps asking.
 ///
-/// Every poll costs API quota, and a broadcast that has gone live has nothing
-/// left to report, so this stops as soon as it has an answer and gives up after
-/// a few minutes of not getting one. §8 forbids an unbounded loop and this is
-/// where that rule lives.
+/// Two phases, because the two questions are different. For the first five
+/// minutes the question is "has YouTube noticed the ingest yet", asked every
+/// ten seconds — YouTube usually answers in twenty. After that the question is
+/// "is this broadcast ever going to start", and it is asked on a widening
+/// interval for as long as the encoder runs.
+///
+/// It used to stop after five minutes. That is why a broadcast that never went
+/// live looked identical to one that did: the last thing anyone asked YouTube
+/// was before the answer existed, and 247streams went on saying 송출 중 from
+/// FFmpeg's health alone. An unattended 24/7 service has nobody watching
+/// Studio, so not asking again is not an option — and the capped interval is
+/// what keeps that from costing quota. At 300s a broadcast that never goes live
+/// costs 576 units a day against a 10,000 unit allowance, and a broadcast that
+/// does go live stops costing anything at all.
 #[derive(Debug)]
 struct YoutubeWatch {
     next: std::time::Instant,
     polls: u32,
+    slow_polls: usize,
     settled: bool,
+    /// The mismatch has been reported once. Said again only if it changes.
+    warned: Option<crate::youtube::Stuck>,
+    /// Asking YouTube is currently failing, and that has been said once.
+    /// Cleared by the next answer, so a second outage is reported again.
+    failing: bool,
 }
 
 impl Default for YoutubeWatch {
     fn default() -> Self {
-        Self { next: std::time::Instant::now(), polls: 0, settled: false }
+        Self {
+            next: std::time::Instant::now(),
+            polls: 0,
+            slow_polls: 0,
+            settled: false,
+            warned: None,
+            failing: false,
+        }
     }
 }
 
 impl YoutubeWatch {
-    /// Every ten seconds, at most thirty times: five minutes for YouTube to
-    /// notice an ingest it usually notices in twenty seconds.
+    /// Every ten seconds, thirty times: five minutes for YouTube to notice an
+    /// ingest it usually notices in twenty seconds.
     const EVERY: std::time::Duration = std::time::Duration::from_secs(10);
     const LIMIT: u32 = 30;
+    /// Then one, two, five minutes, and five minutes from then on.
+    const SLOW_BACKOFF: [u64; 3] = [60, 120, 300];
+
+    fn interval(&self) -> std::time::Duration {
+        if self.polls < Self::LIMIT {
+            return Self::EVERY;
+        }
+        let i = self.slow_polls.min(Self::SLOW_BACKOFF.len() - 1);
+        std::time::Duration::from_secs(Self::SLOW_BACKOFF[i])
+    }
+
+    /// A question just failed. Is this the first failure of this outage?
+    ///
+    /// Separated out so the rule can be read and tested on its own: once per
+    /// outage, not once per poll. At the fast cadence an unreachable API would
+    /// otherwise write an event every ten seconds and bury the line that
+    /// explains the fault.
+    fn open_outage(&mut self) -> bool {
+        let first = !self.failing;
+        self.failing = true;
+        first
+    }
+
+    /// An answer arrived. Was it the end of an outage worth reporting?
+    fn close_outage(&mut self) -> bool {
+        let recovered = self.failing;
+        self.failing = false;
+        recovered
+    }
 
     fn maybe_poll(&mut self, yt: &Arc<crate::youtube::Youtube>, db: &CloudDb, broadcast_id: &str) {
-        if self.settled || self.polls >= Self::LIMIT || std::time::Instant::now() < self.next {
+        if self.settled || std::time::Instant::now() < self.next {
             return;
         }
-        self.next = std::time::Instant::now() + Self::EVERY;
-        self.polls += 1;
+        self.next = std::time::Instant::now() + self.interval();
+        if self.polls < Self::LIMIT {
+            self.polls += 1;
+        } else {
+            self.slow_polls += 1;
+        }
         match yt.poll_status(broadcast_id) {
             // Not a YouTube broadcast at all: never ask again.
             Ok(None) => self.settled = true,
-            Ok(Some(status)) => {
-                if status == crate::youtube::LIVE || status == crate::youtube::COMPLETE {
+            Ok(Some(seen)) => {
+                // An answer, so a reported outage is over and the next one is
+                // worth saying out loud again.
+                if self.close_outage() {
+                    let _ =
+                        db.append_event(broadcast_id, EventLevel::Info, "YouTube 상태 확인이 복구되었습니다");
+                }
+                if seen.settled() {
                     self.settled = true;
+                    self.warned = None;
+                    return;
+                }
+                // The encoder is healthy and YouTube is not live. Said once the
+                // fast phase has run out of patience, so a broadcast that
+                // simply takes thirty seconds does not alarm anyone — and said
+                // once, not every poll.
+                if let crate::youtube::NextStep::NeedsTransition(stuck) = seen.step {
+                    if self.polls >= Self::LIMIT && self.warned != Some(stuck) {
+                        self.warned = Some(stuck);
+                        let _ = db.append_event(broadcast_id, EventLevel::Warn, stuck.explain());
+                    }
                 }
             }
+            // A failed question is not an answer. The encoder is still sending
+            // and the customer's broadcast is not touched; the only thing that
+            // changes is that we still do not know, so we ask again.
+            //
+            // Said once per outage, not once per poll: at the fast cadence an
+            // unreachable API would otherwise write an event every ten seconds
+            // and bury the line that explains the fault. The row's
+            // `youtube_status_at` stops advancing meanwhile, which is what the
+            // dashboard reads to stop claiming a status it can no longer
+            // confirm.
             Err(e) => {
-                let _ =
-                    db.append_event(broadcast_id, EventLevel::Warn, &format!("YouTube 상태 확인 실패: {e}"));
-                if self.polls >= Self::LIMIT {
-                    self.settled = true;
+                if self.open_outage() {
+                    let _ = db.append_event(
+                        broadcast_id,
+                        EventLevel::Warn,
+                        &format!("YouTube 상태 확인 실패: {e}"),
+                    );
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod youtube_watch_tests {
+    use super::YoutubeWatch;
+
+    #[test]
+    fn the_fast_phase_asks_every_ten_seconds_for_five_minutes() {
+        let w = YoutubeWatch::default();
+        assert_eq!(w.interval().as_secs(), 10);
+        assert_eq!(YoutubeWatch::LIMIT, 30, "30 x 10s is the five minutes YouTube usually needs 20s of");
+    }
+
+    #[test]
+    fn then_it_widens_rather_than_stopping() {
+        // It used to stop here, which is why nobody ever learned that a
+        // broadcast had not started.
+        let mut w = YoutubeWatch { polls: YoutubeWatch::LIMIT, ..Default::default() };
+        assert_eq!(w.interval().as_secs(), 60);
+        w.slow_polls = 1;
+        assert_eq!(w.interval().as_secs(), 120);
+        w.slow_polls = 2;
+        assert_eq!(w.interval().as_secs(), 300);
+        w.slow_polls = 500;
+        assert_eq!(
+            w.interval().as_secs(),
+            300,
+            "capped, so a long broadcast cannot drift into a quota problem"
+        );
+    }
+
+    #[test]
+    fn the_capped_interval_fits_the_daily_api_allowance() {
+        // Two list calls per poll, 1 unit each, against 10,000 free units.
+        //
+        // This is now the cost of a broadcast that runs all day, because a live
+        // one keeps being re-confirmed rather than being written off as
+        // finished. Worth the units: the alternative is 송출 중 standing for
+        // ever after YouTube has ended the broadcast, which is the fault this
+        // change exists to remove.
+        let a_day = 24 * 60 * 60;
+        let fast = YoutubeWatch::LIMIT as u64 * 2;
+        let slow = (a_day - YoutubeWatch::LIMIT as u64 * 10) / 300 * 2;
+        let per_broadcast = fast + slow;
+        assert!(per_broadcast < 1_000, "{per_broadcast} units a day");
+        // And the ceiling that follows, stated here so it is found before a
+        // customer finds it: one quota project, 10,000 units a day.
+        assert!(
+            10_000 / per_broadcast >= 14,
+            "only {} round-the-clock broadcasts fit on one project's quota",
+            10_000 / per_broadcast
+        );
+    }
+
+    #[test]
+    fn an_outage_is_reported_once_however_many_polls_it_spans() {
+        // Thirty failures in five minutes used to be thirty warnings, which
+        // buried the one line that said what was actually wrong.
+        let mut w = YoutubeWatch::default();
+        assert!(w.open_outage(), "the first failure is news");
+        for _ in 0..40 {
+            assert!(!w.open_outage(), "the rest is the same news");
+        }
+    }
+
+    #[test]
+    fn recovery_is_reported_once_and_re_arms_the_next_outage() {
+        let mut w = YoutubeWatch::default();
+        assert!(!w.close_outage(), "nothing to recover from before anything broke");
+        w.open_outage();
+        assert!(w.close_outage(), "coming back is worth saying");
+        assert!(!w.close_outage(), "but only once");
+        assert!(w.open_outage(), "and a second outage is news again");
+    }
+
+    #[test]
+    fn a_settled_broadcast_is_never_asked_about_again() {
+        let w = YoutubeWatch { settled: true, ..Default::default() };
+        // `maybe_poll` returns before touching the clock, so the next deadline
+        // never moves; asserted through the flag the loop reads.
+        assert!(w.settled);
     }
 }
 

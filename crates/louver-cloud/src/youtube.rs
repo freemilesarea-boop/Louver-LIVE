@@ -56,6 +56,9 @@ pub struct YoutubeLink {
     /// `waiting_for_ingest` / `ready` / `live` / `complete` / `error`, as last
     /// seen from YouTube — never inferred from FFmpeg being alive.
     pub status: Option<String>,
+    /// When `status` was last confirmed with YouTube, explicit-UTC. `None` means
+    /// nobody has ever managed to ask — not that the answer was no.
+    pub checked_at: Option<String>,
     pub watch_url: Option<String>,
     pub last_error: Option<String>,
 }
@@ -63,9 +66,129 @@ pub struct YoutubeLink {
 /// YouTube's own view of a broadcast, kept apart from FFmpeg's. §8.
 pub const WAITING: &str = "waiting_for_ingest";
 pub const READY: &str = "ready";
+/// YouTube is receiving video into the monitor stream's private preview and the
+/// public watch page has nothing to play. Its own state, because collapsing it
+/// into `ready` is what made the fault invisible: a broadcast in `testing` is
+/// not waiting for anything, it is waiting for a transition that nobody sends.
+pub const TESTING: &str = "testing";
 pub const LIVE: &str = "live";
 pub const COMPLETE: &str = "complete";
 pub const ERRORED: &str = "error";
+
+/// What still has to happen before YouTube is actually live.
+///
+/// A plain function of what YouTube reported, so the decision can be tested
+/// without a network and read without following four call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextStep {
+    /// Live, or finished. Nothing left to do.
+    Settled,
+    /// YouTube has not noticed the ingest yet.
+    AwaitIngest,
+    /// YouTube will take it live by itself once it notices. Wait.
+    AwaitAutoStart,
+    /// It will not start by itself, whatever we wait for.
+    NeedsTransition(Stuck),
+}
+
+/// Why a broadcast cannot start itself. The two cases need different words to
+/// the customer, so they are not one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stuck {
+    /// The monitor stream is on, so the ingest lands in `testing` and stops
+    /// there. Every broadcast this service created before the fix is like this.
+    MonitorStream,
+    /// `enableAutoStart` is off on this broadcast.
+    AutoStartOff,
+}
+
+impl Stuck {
+    /// What to tell the customer, and what they or the operator can do.
+    pub fn explain(self) -> &'static str {
+        match self {
+            Self::MonitorStream => {
+                "YouTube가 영상을 받고 있지만 '미리보기(testing)' 단계에 머물러 있어 시청 페이지에서는 아직 방송이 시작되지 않았습니다. 이 방송은 미리보기가 켜진 상태로 만들어졌기 때문에 스스로 시작하지 못합니다. YouTube 스튜디오에서 '실시간 시작'을 누르면 즉시 공개됩니다."
+            }
+            Self::AutoStartOff => {
+                "YouTube가 영상을 받고 있지만 이 방송은 자동 시작이 꺼져 있어 스스로 시작하지 못합니다. YouTube 스튜디오에서 '실시간 시작'을 누르면 즉시 공개됩니다."
+            }
+        }
+    }
+}
+
+/// Read YouTube's answer and say what it means. Pure.
+pub fn next_step(
+    life_cycle_status: &str,
+    stream_active: bool,
+    starts_itself: bool,
+    monitor: bool,
+) -> NextStep {
+    match life_cycle_status {
+        "live" | "complete" => NextStep::Settled,
+        // Receiving video, parked in the preview. Only a transition leaves it,
+        // and autostart does not send one.
+        "testing" => NextStep::NeedsTransition(Stuck::MonitorStream),
+        _ if !stream_active => NextStep::AwaitIngest,
+        // The ingest is up and YouTube has not moved the broadcast. Whether
+        // that is going to change on its own is exactly what these two say.
+        _ if starts_itself => NextStep::AwaitAutoStart,
+        _ if monitor => NextStep::NeedsTransition(Stuck::MonitorStream),
+        _ => NextStep::NeedsTransition(Stuck::AutoStartOff),
+    }
+}
+
+/// The status to store for what YouTube reported.
+pub fn status_for(life_cycle_status: &str, stream_active: bool) -> &'static str {
+    match life_cycle_status {
+        "live" => LIVE,
+        "complete" => COMPLETE,
+        "testing" => TESTING,
+        _ if stream_active => READY,
+        _ => WAITING,
+    }
+}
+
+/// One answer from YouTube, and what it means.
+#[derive(Debug, Clone, Copy)]
+pub struct Observed {
+    /// What was stored on the broadcast row.
+    pub status: &'static str,
+    pub step: NextStep,
+    /// True when this poll sent a transition and YouTube accepted it.
+    pub transitioned: bool,
+}
+
+impl Observed {
+    /// Nothing more will change by waiting, so the watch can stop asking.
+    ///
+    /// Only `complete`. `live` used to be in here, and it was the same mistake
+    /// as the one this change is about: a broadcast that YouTube ends by itself
+    /// — `enableAutoStop`, an operator in Studio, a strike — leaves 247streams
+    /// saying 방송 중 for ever, because the one thing that could notice had
+    /// already stopped looking. A live broadcast stays in the slow phase and is
+    /// re-confirmed for as long as the encoder runs.
+    pub fn settled(&self) -> bool {
+        self.status == COMPLETE
+    }
+}
+
+/// Is this service allowed to send `liveBroadcasts.transition` by itself?
+///
+/// Off unless the operator turns it on. A transition is a write against a
+/// customer's channel, and one sent at the wrong moment ends a broadcast that
+/// was working. With it off the fault is still detected and explained; with it
+/// on a broadcast stuck in the preview is rescued without anyone opening Studio.
+/// Broadcasts created after the monitor-stream fix do not need it either way.
+pub fn auto_transition_enabled() -> bool {
+    matches!(
+        std::env::var("LOUVER_YOUTUBE_AUTO_TRANSITION")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
 
 /// Where the sealed credentials for one connected account live.
 pub fn refresh_account(account_id: &str) -> String {
@@ -159,6 +282,30 @@ pub struct Youtube {
     http: Arc<dyn HttpClient>,
     tokens: Arc<dyn TokenEndpoint>,
     config: Config,
+    /// May this service send `liveBroadcasts.transition` by itself? A field
+    /// rather than an `std::env::var` at the point of use, so a test can set it
+    /// without `set_var` — which is process-global and has already raced two of
+    /// this repository's test threads once.
+    auto_transition: bool,
+    /// Opened against a database that refuses writes, for the audit.
+    ///
+    /// The only thing it changes is that caching a refreshed access token is
+    /// allowed to fail: the cache is a convenience, the token works in memory
+    /// regardless, and an hourly expiry would otherwise make a read-only
+    /// diagnosis fail for every account. It is set by the audit entry point
+    /// and by nothing else — deliberately not an environment variable, so a
+    /// running server can never be talked into swallowing a write failure.
+    read_only: bool,
+    /// May a read-only audit call Google's token endpoint?
+    ///
+    /// Off by default, and the reason is not caution for its own sake. A
+    /// refresh can come back with a *rotated* refresh token, and on a
+    /// read-only database the rotation cannot be stored — which would leave
+    /// the customer's channel connected to a token nobody has. Google rarely
+    /// rotates, but "rarely" is not a risk to take on a live account without
+    /// being asked. So the default audit uses the cached token the running
+    /// server keeps fresh, and says so plainly when it has expired.
+    read_only_may_refresh: bool,
 }
 
 impl std::fmt::Debug for Youtube {
@@ -175,6 +322,9 @@ impl Clone for Youtube {
             http: Arc::clone(&self.http),
             tokens: Arc::clone(&self.tokens),
             config: self.config.clone(),
+            auto_transition: self.auto_transition,
+            read_only: self.read_only,
+            read_only_may_refresh: self.read_only_may_refresh,
         }
     }
 }
@@ -187,7 +337,41 @@ impl Youtube {
         tokens: Arc<dyn TokenEndpoint>,
         config: Config,
     ) -> Self {
-        Self { db, keys, http, tokens, config }
+        Self {
+            db,
+            keys,
+            http,
+            tokens,
+            config,
+            auto_transition: auto_transition_enabled(),
+            read_only: false,
+            read_only_may_refresh: false,
+        }
+    }
+
+    /// For a diagnosis reading a database it must not write to.
+    ///
+    /// Also forces the transition policy off: a read-only audit has no business
+    /// writing to a customer's channel whatever the operator switch says.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self.auto_transition = false;
+        self
+    }
+
+    /// Let a read-only audit refresh an expired access token.
+    ///
+    /// The operator's decision, not a default: see `read_only_may_refresh`.
+    pub fn read_only_may_refresh(mut self, on: bool) -> Self {
+        self.read_only_may_refresh = on;
+        self
+    }
+
+    /// Override the transition policy. For tests and for a caller that has its
+    /// own reason; the default comes from the environment.
+    pub fn with_auto_transition(mut self, on: bool) -> Self {
+        self.auto_transition = on;
+        self
     }
 
     /// The exact URI Google has to have registered. Not a secret; the single
@@ -299,6 +483,17 @@ impl Youtube {
     }
 
     fn cache_access_token(&self, account_id: &str, tokens: &TokenResponse) -> Result<()> {
+        if self.read_only {
+            // Nothing to cache into, and nothing lost: the caller already has
+            // the token it needs. Said out loud so an operator reading the
+            // audit knows why the next run will refresh again.
+            crate::manager::say(
+                account_id,
+                "youtube",
+                "읽기 전용 모드이므로 access token 을 저장하지 않았습니다",
+            );
+            return Ok(());
+        }
         self.seal(&access_account(account_id), &tokens.access_token)?;
         let seconds = tokens.expires_in.unwrap_or(3600).min(24 * 3600) as i64;
         // A minute of margin, so a call started just before expiry does not
@@ -314,6 +509,13 @@ impl Youtube {
                     return Ok(cached);
                 }
             }
+        }
+        if self.read_only && !self.read_only_may_refresh {
+            // Not a failure of the audit so much as its honesty: refreshing
+            // here could rotate a refresh token this process cannot store.
+            return Err(CloudError::Invalid(
+                "저장된 access token 이 만료되었습니다. 읽기 전용 점검은 토큰을 갱신하지 않습니다".into(),
+            ));
         }
         self.refresh_access_token(account_id)
     }
@@ -344,7 +546,18 @@ impl Youtube {
         // writing the absent one would disconnect the account for good.
         if let Some(new_refresh) = tokens.refresh_token.as_deref() {
             if !new_refresh.trim().is_empty() && new_refresh != refresh {
-                self.seal(&refresh_account(account_id), new_refresh)?;
+                if self.read_only {
+                    // The rotation already happened at Google's end; the only
+                    // thing left is to say so, because the stored token may no
+                    // longer work and only a reconnect fixes that.
+                    crate::manager::say(
+                        account_id,
+                        "youtube",
+                        "경고: Google이 refresh token 을 교체했고 읽기 전용 모드라 저장할 수 없었습니다.                          이 채널은 다시 연결해야 할 수 있습니다",
+                    );
+                } else {
+                    self.seal(&refresh_account(account_id), new_refresh)?;
+                }
             }
         }
         self.cache_access_token(account_id, &tokens)?;
@@ -516,13 +729,102 @@ impl Youtube {
                 })?;
             }
         }
+        // A broadcast made before the monitor stream was disabled at insert
+        // will park in `testing` the moment FFmpeg connects, and no amount of
+        // waiting changes that. Said here, at the start, rather than discovered
+        // five minutes later — and said without stopping the start, because the
+        // video does reach YouTube and the customer can finish it in Studio.
+        if !broadcast.starts_itself() {
+            let why =
+                if broadcast.enable_monitor_stream { Stuck::MonitorStream } else { Stuck::AutoStartOff };
+            self.note(broadcast_id, why.explain());
+        }
+
         self.db.set_youtube_status(broadcast_id, WAITING)?;
         Ok(())
     }
 
+    /// Look at a broadcast on YouTube and write nothing anywhere. §3 of the
+    /// P0 follow-up: the diagnosis half, which has to be usable against a live
+    /// production database.
+    ///
+    /// Two `list` calls and no more. It does not touch `broadcasts`, does not
+    /// append an event, does not transition, and does not store a token — the
+    /// difference between this and [`Self::poll_status`], which does the first
+    /// three because it is the running server's own view.
+    ///
+    /// Never returns `Err`: a failure to ask is itself one of the things the
+    /// audit reports, so it comes back as a [`crate::audit::Seen`] with the
+    /// reach that failed. The caller gets a verdict either way, which is what
+    /// stops a broken question from reading as a healthy broadcast.
+    pub fn observe(&self, broadcast_id: &str) -> crate::audit::Seen {
+        use crate::audit::{Reach, Seen};
+
+        let Ok(b) = self.db.broadcast(broadcast_id) else {
+            return Seen {
+                reach: Reach::Unreachable,
+                error: Some("방송 행을 읽을 수 없습니다".into()),
+                ..Seen::default()
+            };
+        };
+        let (Some(account_id), Some(yt_id)) = (b.youtube.account_id.clone(), b.youtube.broadcast_id.clone())
+        else {
+            return Seen {
+                reach: Reach::Unreachable,
+                error: Some("YouTube 계정에 연결된 방송이 아닙니다".into()),
+                ..Seen::default()
+            };
+        };
+
+        let api = self.api();
+        let token = match self.access_token(&account_id) {
+            Ok(t) => t,
+            // A token that cannot be obtained is an auth problem by
+            // construction, whichever step of the dance refused.
+            Err(e) => return Seen { reach: Reach::Refused, error: Some(e.to_string()), ..Seen::default() },
+        };
+
+        let broadcast = match api.broadcast_by_id(&token, &yt_id) {
+            Ok(v) => v,
+            Err(e) => return Seen { error: Some(e.message.clone()), ..reach_of(&e) },
+        };
+
+        let mut seen = Seen {
+            reach: Reach::Answered,
+            life_cycle_status: broadcast.life_cycle_status.clone(),
+            bound_stream_id: broadcast.bound_stream_id.clone(),
+            enable_auto_start: broadcast.enable_auto_start,
+            enable_monitor_stream: broadcast.enable_monitor_stream,
+            ..Seen::default()
+        };
+
+        // The stream is a second question, and a broadcast with no stream to
+        // ask about is still worth a verdict — `classify` has one for it.
+        if let Some(stream_id) = b.youtube.stream_id.as_deref() {
+            match api.stream_by_id(&token, stream_id) {
+                Ok(stream) => {
+                    seen.stream_status = stream.stream_status.clone();
+                    seen.health_status = stream.health_status.clone();
+                    seen.configuration_issues = stream.configuration_issues.clone();
+                }
+                Err(e) => {
+                    // The broadcast answered and the stream did not. Say so
+                    // without throwing away the half that worked.
+                    seen.error = Some(format!("스트림 조회 실패: {}", e.message));
+                }
+            }
+        }
+        seen
+    }
+
     /// Ask YouTube what it makes of the stream, once. §8: bounded, and called
     /// on a tick rather than in a loop of its own.
-    pub fn poll_status(&self, broadcast_id: &str) -> Result<Option<String>> {
+    ///
+    /// Reports what YouTube said and what still has to happen, and sends a
+    /// transition only when YouTube's own state makes one both necessary and
+    /// legal — and only when the operator has turned that on. FFmpeg being
+    /// healthy is not evidence about any of it.
+    pub fn poll_status(&self, broadcast_id: &str) -> Result<Option<Observed>> {
         let b = self.db.broadcast(broadcast_id)?;
         let (Some(account_id), Some(yt_id), Some(stream_id)) =
             (b.youtube.account_id.clone(), b.youtube.broadcast_id.clone(), b.youtube.stream_id.clone())
@@ -537,18 +839,50 @@ impl Youtube {
                 api.broadcast_by_id(token, &yt_id)
             })?;
 
-        let status = match broadcast.life_cycle_status.as_str() {
-            "live" => LIVE,
-            "complete" => COMPLETE,
-            _ if stream.is_active() => READY,
-            _ => WAITING,
-        };
-        self.db.set_youtube_status(broadcast_id, status)?;
+        // What YouTube is actually bound to. A broadcast whose stream is not the
+        // one being sent to never goes live, and before this the only symptom
+        // was silence.
+        if let Some(bound) = broadcast.bound_stream_id.as_deref() {
+            if bound != stream_id {
+                self.note(
+                    broadcast_id,
+                    "YouTube 방송이 다른 스트림에 연결되어 있습니다. 송출 중인 스트림과 공개 방송이 서로 다른 대상입니다.",
+                );
+            }
+        }
 
-        // A broadcast that will not start itself has to be told to. Only once
-        // the stream is actually active, because YouTube refuses otherwise and
-        // the refusal reads like a permissions problem.
-        if status == READY && !broadcast.enable_auto_start {
+        let active = stream.is_active();
+        let status = status_for(&broadcast.life_cycle_status, active);
+        self.db.set_youtube_status(broadcast_id, status)?;
+        let step = next_step(
+            &broadcast.life_cycle_status,
+            active,
+            broadcast.starts_itself(),
+            broadcast.enable_monitor_stream,
+        );
+
+        // An ingest YouTube calls active but cannot use looks exactly like one
+        // that is fine, from here. Its own words, because "bad" and "noData"
+        // need different answers.
+        if active
+            && matches!(stream.health_status.as_str(), "bad" | "noData")
+            && !stream.configuration_issues.is_empty()
+        {
+            self.note(
+                broadcast_id,
+                &format!(
+                    "YouTube가 수신 품질을 {}로 보고했습니다: {}",
+                    stream.health_status,
+                    stream.configuration_issues.join(", ")
+                ),
+            );
+        }
+
+        // Detected either way. Acted on only when the operator allows it; the
+        // caller is what decides when to say it out loud, so that a poll every
+        // ten seconds does not become a log entry every ten seconds.
+        let mut transitioned = false;
+        if matches!(step, NextStep::NeedsTransition(_)) && self.auto_transition {
             match self.call_api(
                 broadcast_id,
                 &account_id,
@@ -557,12 +891,17 @@ impl Youtube {
             ) {
                 Ok(_) => {
                     self.db.set_youtube_status(broadcast_id, LIVE)?;
-                    return Ok(Some(LIVE.to_string()));
+                    self.note(broadcast_id, "YouTube 방송을 실시간으로 전환했습니다");
+                    transitioned = true;
                 }
+                // Not fatal, and deliberately not a reason to stop sending: the
+                // encoder is fine and the customer's video is still arriving at
+                // YouTube.
                 Err(e) => self.note(broadcast_id, &format!("YouTube 라이브 전환 실패: {e}")),
             }
         }
-        Ok(Some(status.to_string()))
+
+        Ok(Some(Observed { status: if transitioned { LIVE } else { status }, step, transitioned }))
     }
 
     /// End the YouTube side of a broadcast the user stopped. §9.
@@ -678,5 +1017,25 @@ fn scheduled_start_for(b: &crate::models::Broadcast) -> String {
     match stored {
         Some(t) if t > soon => t.to_rfc3339(),
         _ => soon.to_rfc3339(),
+    }
+}
+
+/// Which kind of "could not ask" a core error is, for the audit.
+///
+/// The codes come from one `match` in the core
+/// (`crates/louver-core/src/youtube/api.rs`), so this is a translation rather
+/// than a second opinion: a refused credential is its own verdict, a 404 means
+/// the stored broadcast is not on the channel, and everything else — a 5xx, a
+/// timeout, an exhausted quota — is simply unanswered.
+fn reach_of(e: &louver_core::error::LouverError) -> crate::audit::Seen {
+    use crate::audit::{Reach, Seen};
+    use louver_core::error::ErrorCode as C;
+    match e.code {
+        C::YoutubeAuthExpired | C::YoutubeNotConnected | C::YoutubeAuthRefreshFailed => {
+            Seen { reach: Reach::Refused, ..Seen::default() }
+        }
+        // 404: the id 247streams holds is not a broadcast on this channel.
+        C::YoutubeNoActiveBroadcast => Seen { reach: Reach::Answered, not_found: true, ..Seen::default() },
+        _ => Seen { reach: Reach::Unreachable, ..Seen::default() },
     }
 }

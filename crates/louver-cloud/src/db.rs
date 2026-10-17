@@ -11,7 +11,7 @@
 use crate::models::*;
 use crate::{CloudError, Result};
 use louver_core::database::models::EventLevel;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -483,6 +483,32 @@ impl CloudDb {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
+    /// Open an existing database without writing a single byte to it.
+    ///
+    /// [`Self::open`] is not a read: it runs `SCHEMA`, calls `ensure_column`
+    /// for every column added since the first release, and sets
+    /// `journal_mode=WAL`, which rewrites the file header. All three are
+    /// correct for a server taking ownership of its own database and all three
+    /// are writes, which makes `open` unusable for looking at a live
+    /// production database — the reason the diagnosis path needed this.
+    ///
+    /// So: `SQLITE_OPEN_READ_ONLY`, no `create_dir_all`, no DDL, and no
+    /// `journal_mode` change. A missing file is an error rather than a new
+    /// empty database. `foreign_keys` is a connection setting rather than a
+    /// file one, and is left alone because nothing here writes.
+    ///
+    /// The cost is that a reader of an older database sees the older schema, so
+    /// a caller must treat a missing column as missing rather than assume the
+    /// migration has run.
+    pub fn open_read_only(path: &Path) -> Result<Self> {
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI)?;
+        // The manager writes a heartbeat while this reads. WAL lets the two
+        // coexist; the timeout is for the moment a checkpoint takes the lock.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self { conn: Arc::new(Mutex::new(conn)) })
+    }
+
     fn from_connection(conn: Connection) -> Result<Self> {
         // WAL so a reader never blocks the manager's status writes, and
         // foreign keys on so ownership cascades actually happen.
@@ -508,7 +534,15 @@ impl CloudDb {
             ("tags", "TEXT NOT NULL DEFAULT ''"),
             ("category", "TEXT NOT NULL DEFAULT ''"),
             ("privacy", "TEXT NOT NULL DEFAULT 'private'"),
-            // §6 settings
+            // §6 settings. Nothing reads or writes these four any more: the
+            // sender has no per-broadcast resolution, frame rate or bitrate,
+            // and the form that collected them was removed rather than left
+            // promising something the encoder never did. They are still
+            // created, because `ensure_column` is what makes an older
+            // database open at all and dropping a column on a live service
+            // rewrites the table — which is not worth doing for four values
+            // nobody reads. A broadcast row from before this change keeps
+            // whatever it had.
             ("resolution", "TEXT NOT NULL DEFAULT 'auto'"),
             ("fps", "TEXT NOT NULL DEFAULT 'auto'"),
             ("video_bitrate_kbps", "INTEGER NOT NULL DEFAULT 0"),
@@ -538,6 +572,14 @@ impl CloudDb {
             ("youtube_broadcast_id", "TEXT"),
             ("youtube_stream_id", "TEXT"),
             ("youtube_status", "TEXT"),
+            // When `youtube_status` was last confirmed with YouTube, as an
+            // explicit-UTC instant. NULL on every existing row and on every
+            // pasted-key broadcast, and NULL reads as "never asked", which is
+            // the honest value for both. A status with no time behind it cannot
+            // be told apart from one confirmed a second ago, and that is the
+            // difference between "live" and "was live when we last managed to
+            // ask" — the §5-2 distinction the dashboard now draws.
+            ("youtube_status_at", "TEXT"),
             ("youtube_error", "TEXT"),
             ("current_index", "INTEGER NOT NULL DEFAULT 0"),
             ("current_item", "TEXT"),
@@ -2298,7 +2340,8 @@ impl CloudDb {
     ) -> Result<()> {
         self.raw().lock().unwrap().execute(
             "UPDATE broadcasts SET youtube_account_id = ?2, youtube_broadcast_id = ?3,
-                    youtube_stream_id = ?4, youtube_status = ?5, youtube_error = NULL
+                    youtube_stream_id = ?4, youtube_status = ?5, youtube_error = NULL,
+                    youtube_status_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?1",
             params![broadcast_id, account_id, youtube_broadcast_id, youtube_stream_id, status],
         )?;
@@ -2306,9 +2349,17 @@ impl CloudDb {
     }
 
     /// YouTube's own view of the broadcast, which is not FFmpeg's. §8.
+    ///
+    /// Every caller reaches here having just had an answer from YouTube, so the
+    /// write carries the time of that answer. `strftime` rather than
+    /// `datetime('now')`: the trailing `Z` is what stops a browser reading a
+    /// UTC instant as a local one.
     pub fn set_youtube_status(&self, broadcast_id: &str, status: &str) -> Result<()> {
         self.raw().lock().unwrap().execute(
-            "UPDATE broadcasts SET youtube_status = ?2 WHERE id = ?1",
+            "UPDATE broadcasts
+                SET youtube_status = ?2,
+                    youtube_status_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1",
             params![broadcast_id, status],
         )?;
         Ok(())
@@ -2543,10 +2594,9 @@ impl CloudDb {
 
     /// Change what a broadcast is, without touching what it is doing.
     ///
-    /// Only the fields present are written. A playlist, a destination or a
-    /// settings change takes effect at the next start — the running FFmpeg is
-    /// deliberately not interrupted, because an edit is not a reason to drop a
-    /// live stream.
+    /// Only the fields present are written. A playlist or destination change
+    /// takes effect at the next start — the running FFmpeg is deliberately not
+    /// interrupted, because an edit is not a reason to drop a live stream.
     pub fn update_broadcast_owned(
         &self,
         user_id: &str,
@@ -2554,9 +2604,6 @@ impl CloudDb {
         patch: &BroadcastPatch,
     ) -> Result<Broadcast> {
         self.broadcast_owned(user_id, id)?;
-        if let Some(s) = &patch.settings {
-            s.validate()?;
-        }
         if let Some(sc) = &patch.schedule {
             crate::schedule::validate(sc)?;
         }
@@ -2604,12 +2651,6 @@ impl CloudDb {
         }
         if let Some(v) = &patch.destination_id {
             set("destination_id = ?2", v)?;
-        }
-        if let Some(v) = &patch.settings {
-            set("resolution = ?2", &v.resolution)?;
-            set("fps = ?2", &v.fps)?;
-            set("video_bitrate_kbps = ?2", &v.video_bitrate_kbps)?;
-            set("audio_bitrate_kbps = ?2", &v.audio_bitrate_kbps)?;
         }
         if let Some(v) = &patch.cctv_url {
             // Stored as NULL rather than '' when cleared, so "no live source"
@@ -3053,12 +3094,6 @@ fn row_to_broadcast(r: &rusqlite::Row<'_>) -> rusqlite::Result<Broadcast> {
         tags: r.get("tags")?,
         category: r.get("category")?,
         privacy: Privacy::from_id(&privacy).unwrap_or(Privacy::Private),
-        settings: StreamSettings {
-            resolution: r.get("resolution")?,
-            fps: r.get("fps")?,
-            video_bitrate_kbps: r.get("video_bitrate_kbps")?,
-            audio_bitrate_kbps: r.get("audio_bitrate_kbps")?,
-        },
         schedule: Schedule {
             enabled: r.get::<_, i64>("sched_enabled")? != 0,
             start_at: r.get("sched_start_at")?,
@@ -3082,6 +3117,7 @@ fn row_to_broadcast(r: &rusqlite::Row<'_>) -> rusqlite::Result<Broadcast> {
             broadcast_id: r.get("youtube_broadcast_id")?,
             stream_id: r.get("youtube_stream_id")?,
             status: r.get("youtube_status")?,
+            checked_at: r.get("youtube_status_at")?,
             watch_url: r
                 .get::<_, Option<String>>("youtube_broadcast_id")?
                 .map(|id| format!("https://www.youtube.com/watch?v={id}")),

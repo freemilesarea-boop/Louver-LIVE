@@ -480,76 +480,6 @@ impl DestinationKind {
     }
 }
 
-/// What the sender is asked to produce. §6.
-///
-/// `Auto` everywhere is the default and the only combination a user has to
-/// understand: the server sends the prepared file as it is, which is the
-/// cheapest and most stable thing it can do. The explicit values are stored and
-/// validated so that a broadcast keeps them, and are applied by the encoder path
-/// rather than the copy path.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StreamSettings {
-    /// `auto`, `720p` or `1080p`.
-    pub resolution: String,
-    /// `auto`, `30` or `60`.
-    pub fps: String,
-    /// 0 means auto.
-    pub video_bitrate_kbps: i64,
-    /// 0 means auto.
-    pub audio_bitrate_kbps: i64,
-}
-
-impl Default for StreamSettings {
-    fn default() -> Self {
-        Self { resolution: "auto".into(), fps: "auto".into(), video_bitrate_kbps: 0, audio_bitrate_kbps: 0 }
-    }
-}
-
-impl StreamSettings {
-    pub fn is_auto(&self) -> bool {
-        self.resolution == "auto"
-            && self.fps == "auto"
-            && self.video_bitrate_kbps == 0
-            && self.audio_bitrate_kbps == 0
-    }
-
-    /// Refuse a combination that would produce a stream YouTube drops.
-    ///
-    /// The ranges are YouTube's own recommendations, widened enough not to argue
-    /// with someone who knows what they are doing.
-    pub fn validate(&self) -> crate::Result<()> {
-        use crate::CloudError::Invalid;
-        if !["auto", "720p", "1080p"].contains(&self.resolution.as_str()) {
-            return Err(Invalid("해상도는 auto, 720p, 1080p 중 하나여야 합니다".into()));
-        }
-        if !["auto", "30", "60"].contains(&self.fps.as_str()) {
-            return Err(Invalid("프레임레이트는 auto, 30, 60 중 하나여야 합니다".into()));
-        }
-        if self.video_bitrate_kbps != 0 && !(1_000..=51_000).contains(&self.video_bitrate_kbps) {
-            return Err(Invalid("영상 비트레이트는 1000~51000 kbps 범위여야 합니다".into()));
-        }
-        if self.audio_bitrate_kbps != 0 && !(64..=512).contains(&self.audio_bitrate_kbps) {
-            return Err(Invalid("음성 비트레이트는 64~512 kbps 범위여야 합니다".into()));
-        }
-        // 1080p60 at a bitrate meant for 720p30 looks worse than either. The
-        // floor is what YouTube itself asks for at that size.
-        let floor = match (self.resolution.as_str(), self.fps.as_str()) {
-            ("1080p", "60") => 4_500,
-            ("1080p", _) => 3_000,
-            ("720p", "60") => 2_250,
-            ("720p", _) => 1_500,
-            _ => 0,
-        };
-        if self.video_bitrate_kbps != 0 && floor != 0 && self.video_bitrate_kbps < floor {
-            return Err(Invalid(format!(
-                "{} {}fps 에는 최소 {floor} kbps 가 필요합니다",
-                self.resolution, self.fps
-            )));
-        }
-        Ok(())
-    }
-}
-
 /// When a broadcast should start by itself. §8.
 ///
 /// Times are stored as UTC and only ever rendered in the user's zone, because a
@@ -646,7 +576,6 @@ pub struct Broadcast {
     pub category: String,
     pub privacy: Privacy,
 
-    pub settings: StreamSettings,
     pub schedule: Schedule,
 
     // --- playlist runtime, written by the worker (§2, §10) ---------------
@@ -718,7 +647,6 @@ pub struct BroadcastPatch {
     pub privacy: Option<Privacy>,
     pub loop_forever: Option<bool>,
     pub destination_id: Option<String>,
-    pub settings: Option<StreamSettings>,
     pub schedule: Option<Schedule>,
     /// Set a live video source, or clear it with an empty string. Absent leaves
     /// whatever is stored alone, like every other field here.

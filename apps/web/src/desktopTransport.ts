@@ -11,7 +11,7 @@
  */
 import { api, listen } from "@/services/ipc";
 import type { Media, RuntimeStatus, StreamState } from "@/types";
-import { AUTO_SETTINGS, emptySchedule } from "./cloud";
+import { emptySchedule } from "./cloud";
 import type {
   Broadcast,
   BroadcastDetail,
@@ -385,7 +385,6 @@ function toBroadcast(
     tags: "",
     category: "",
     privacy: "private",
-    settings: AUTO_SETTINGS,
     schedule: emptySchedule(),
     item_count: status.item_count,
     play_count: status.item_count,

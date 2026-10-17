@@ -18,7 +18,8 @@ import {
 import { formatBytes, formatDurationKo } from "@/services/format";
 import { useTransport } from "../TransportContext";
 import {
-  RUNTIME_LABELS,
+  liveLabel,
+  liveTone,
   isSubscribed,
   holdsASlot,
   itemPercent,
@@ -61,6 +62,7 @@ function youtubeTone(b: Broadcast): "default" | "ok" | "warn" | "live" {
       return "live";
     case "waiting_for_ingest":
     case "ready":
+    case "testing":
       return "warn";
     default:
       return "default";
@@ -270,7 +272,9 @@ function BroadcastCard({
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const live = holdsASlot(b);
   const scheduled = !live && b.schedule.enabled;
-  const status = scheduled ? "예약됨" : RUNTIME_LABELS[b.runtime_state];
+  // Not RUNTIME_LABELS directly: a YouTube-connected broadcast whose channel
+  // is not live must not be badged 송출 중 just because FFmpeg is healthy.
+  const status = scheduled ? "예약됨" : liveLabel(b);
   const when = scheduleLabel(b.schedule);
 
   return (
@@ -280,7 +284,7 @@ function BroadcastCard({
           <span className="text-sm font-semibold normal-case tracking-normal text-ink-100">
             {b.name}
           </span>
-          <Badge tone={tone(b)}>{status}</Badge>
+          <Badge tone={scheduled ? tone(b) : liveTone(b)}>{status}</Badge>
           {/* §8, §12: YouTube's own state, beside FFmpeg's and never instead of
               it. A running worker means bytes are leaving this server; only this
               badge says anything about the channel. */}

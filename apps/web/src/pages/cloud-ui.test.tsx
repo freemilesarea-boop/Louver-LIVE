@@ -19,7 +19,7 @@ import { Pricing } from "./Pricing";
 import { BillingComplete, BillingPanel, isBillingComplete } from "./Billing";
 import { LegalPage, legalPageFor } from "./Legal";
 import { MediaLibrary } from "./MediaLibrary";
-import { AUTO_SETTINGS, emptySchedule } from "../cloud";
+import { emptySchedule } from "../cloud";
 import type {
   Broadcast,
   BroadcastDetail,
@@ -48,7 +48,6 @@ function broadcast(over: Partial<Broadcast> = {}): Broadcast {
     tags: "",
     category: "",
     privacy: "private",
-    settings: AUTO_SETTINGS,
     schedule: emptySchedule(),
     item_count: 1,
     play_count: 1,
@@ -757,9 +756,24 @@ describe("making a broadcast", () => {
     expect(screen.queryByLabelText("CCTV 주소")).not.toBeInTheDocument();
   });
 
+  /** A probe result for a camera that works. */
+  const WORKING_CAM = {
+    ok: true,
+    message: "연결됨 · h264 · 1280×720",
+    video_codec: "h264",
+    width: 1280,
+    height: 720,
+    fps: "30",
+    stream_type: "hls",
+    has_audio: false,
+  };
+
   it("sends the CCTV address with the broadcast, and the playlist with it", async () => {
     const created = vi.fn().mockResolvedValue({});
-    const t = withVideos({ createBroadcast: created });
+    const t = withVideos({
+      createBroadcast: created,
+      testCctv: vi.fn().mockResolvedValue(WORKING_CAM),
+    });
     show(
       <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
       t,
@@ -775,12 +789,128 @@ describe("making a broadcast", () => {
       screen.getByLabelText("CCTV 주소"),
       "https://cam.example/live/a.m3u8",
     );
+    // The address has to be opened by the server before it can be saved; an
+    // unreadable one does not fail at save time, it fails on air.
+    await userEvent.click(screen.getByRole("button", { name: "연결 테스트" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^방송 만들기$/ })).toBeEnabled(),
+    );
     await userEvent.click(screen.getByRole("button", { name: /^방송 만들기$/ }));
 
     await waitFor(() => expect(created).toHaveBeenCalled());
     const sent = created.mock.calls[0]?.[0];
     expect(sent.cctv_url).toBe("https://cam.example/live/a.m3u8");
     expect(sent.items.map((i: { media_id: string }) => i.media_id)).toEqual(["m1"]);
+  });
+
+  it("will not save a CCTV address the server has not opened", async () => {
+    // The gap this closes: an unreadable address used to save cleanly, and the
+    // broadcast then failed every sixty seconds for ever.
+    const created = vi.fn().mockResolvedValue({});
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos({ createBroadcast: created }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
+    await userEvent.selectOptions(
+      screen.getByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+    await userEvent.type(
+      screen.getByLabelText("CCTV 주소"),
+      "https://www.youtube.com/watch?v=x",
+    );
+
+    const save = screen.getByRole("button", { name: /^방송 만들기$/ });
+    expect(save).toBeDisabled();
+    expect(
+      screen.getByText("저장하기 전에 연결 테스트를 실행해 주세요."),
+    ).toBeInTheDocument();
+    await userEvent.click(save);
+    expect(created).not.toHaveBeenCalled();
+  });
+
+  it("will not save on a failed test either", async () => {
+    const created = vi.fn().mockResolvedValue({});
+    const testCctv = vi.fn().mockResolvedValue({
+      ok: false,
+      reason: "unsupported",
+      message: "읽을 수 있는 스트림 형식이 아닙니다.",
+      has_audio: false,
+    });
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos({ createBroadcast: created, testCctv }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
+    await userEvent.selectOptions(screen.getByLabelText("영상 소스"), "traffic_cctv");
+    await userEvent.type(screen.getByLabelText("CCTV 주소"), "https://cam.example/x");
+    await userEvent.click(screen.getByRole("button", { name: "연결 테스트" }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("이 주소로는 송출할 수 없습니다. 위의 실패 이유를 확인해 주세요."),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: /^방송 만들기$/ })).toBeDisabled();
+    expect(created).not.toHaveBeenCalled();
+  });
+
+  it("stops trusting a successful test once the address is edited", async () => {
+    // Otherwise a working camera's result would be the evidence for whatever
+    // address was pasted over it.
+    const created = vi.fn().mockResolvedValue({});
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos({
+        createBroadcast: created,
+        testCctv: vi.fn().mockResolvedValue(WORKING_CAM),
+      }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
+    await userEvent.selectOptions(screen.getByLabelText("영상 소스"), "traffic_cctv");
+    const field = screen.getByLabelText("CCTV 주소");
+    await userEvent.type(field, "https://cam.example/good.m3u8");
+    await userEvent.click(screen.getByRole("button", { name: "연결 테스트" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^방송 만들기$/ })).toBeEnabled(),
+    );
+
+    // One more character, and the result no longer describes this address.
+    await userEvent.type(field, "x");
+    expect(screen.getByRole("button", { name: /^방송 만들기$/ })).toBeDisabled();
+    expect(
+      screen.getByText("주소가 바뀌었습니다. 연결 테스트를 다시 실행해 주세요."),
+    ).toBeInTheDocument();
+  });
+
+  it("says plainly that a watch-page link is not a stream", async () => {
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos(),
+    );
+    await userEvent.selectOptions(
+      await screen.findByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+    // The field already explains what an acceptable address looks like; what
+    // was missing is that a watch-page link is not one of them.
+    expect(screen.getByText(/시청 페이지 링크는 사용할 수/)).toBeInTheDocument();
+    expect(screen.getByText(/YouTube·Twitch·치지직/)).toBeInTheDocument();
+  });
+
+  it("asks nothing of a playlist broadcast", async () => {
+    // The gate is for the CCTV source only; an ordinary broadcast must not
+    // suddenly need a connection test.
+    const created = vi.fn().mockResolvedValue({});
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos({ createBroadcast: created }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
+    await userEvent.click(screen.getByRole("button", { name: /^방송 만들기$/ }));
+    await waitFor(() => expect(created).toHaveBeenCalled());
+    expect(created.mock.calls[0]?.[0].cctv_url).toBe("");
   });
 
   it("shows what the server found, and leaves the judging to it", async () => {
@@ -894,7 +1024,7 @@ describe("making a broadcast", () => {
     ).toBeInTheDocument();
   });
 
-  it("hides the sending settings until asked, and defaults to auto", async () => {
+  it("offers no sending settings, because nothing reads one", async () => {
     const created = vi.fn().mockResolvedValue({});
     const t = withVideos({ createBroadcast: created });
     show(
@@ -902,25 +1032,36 @@ describe("making a broadcast", () => {
       t,
     );
 
+    // The card says what the sender actually does, which is the whole of what
+    // there is to say about it.
+    expect(await screen.findByText(/서버가 정합니다/)).toBeInTheDocument();
     expect(
-      await screen.findByText(/자동 — 서버가 영상에 맞는/),
+      screen.getByText(/다시 인코딩하지 않고 그대로/),
     ).toBeInTheDocument();
-    expect(screen.queryByLabelText("해상도")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "고급 설정" }));
-    expect(screen.getByLabelText("해상도")).toHaveValue("auto");
+    // These four were stored and validated and never read by anything, and a
+    // form that collects them is a promise the encoder does not keep. There is
+    // no "고급 설정" to open any more, and nothing behind it.
+    expect(
+      screen.queryByRole("button", { name: "고급 설정" }),
+    ).not.toBeInTheDocument();
+    for (const label of [
+      "해상도",
+      "프레임레이트",
+      "영상 비트레이트",
+      "음성 비트레이트",
+    ]) {
+      expect(screen.queryByLabelText(label)).not.toBeInTheDocument();
+    }
 
     await userEvent.click(screen.getByRole("button", { name: "+ one.mp4" }));
     await userEvent.click(
       screen.getByRole("button", { name: /^방송 만들기$/ }),
     );
     await waitFor(() => expect(created).toHaveBeenCalled());
-    expect(created.mock.calls[0]?.[0].settings).toEqual({
-      resolution: "auto",
-      fps: "auto",
-      video_bitrate_kbps: 0,
-      audio_bitrate_kbps: 0,
-    });
+    // Not "settings: auto" — no such field. An API that still accepted one
+    // would be a place for it to come back.
+    expect(created.mock.calls[0]?.[0]).not.toHaveProperty("settings");
   });
 
   it("schedules in the reader own clock and sends UTC", async () => {
@@ -1157,7 +1298,20 @@ describe("connecting a YouTube account", () => {
 });
 
 describe("what the dashboard says about YouTube", () => {
+  /** A status confirmed just now, which is what every case below assumes. */
+  function justNow() {
+    return new Date().toISOString();
+  }
+
   function running(youtube: Record<string, unknown>) {
+    // A status is only worth stating while it is fresh, so a fixture that sets
+    // one and no time is describing a row nobody could confirm. Every case
+    // that means "YouTube says this, now" gets a current time; the staleness
+    // cases below override it on purpose.
+    const yt =
+      youtube.status !== undefined && youtube.checked_at === undefined
+        ? { ...youtube, checked_at: justNow() }
+        : youtube;
     return fake({
       dashboard: vi.fn().mockResolvedValue({
         plan_label: "Business",
@@ -1169,7 +1323,7 @@ describe("what the dashboard says about YouTube", () => {
             runtime_state: "RUNNING",
             uptime_secs: 60,
             bytes_sent: 1_000_000,
-            youtube,
+            youtube: yt,
           }),
         ],
       } satisfies Dashboard),
@@ -1187,12 +1341,113 @@ describe("what the dashboard says about YouTube", () => {
       }),
     );
 
-    // FFmpeg's state and YouTube's state, side by side and not interchangeable.
-    expect(await screen.findByText("송출 중")).toBeInTheDocument();
+    // This used to read 송출 중, from FFmpeg alone, which is the whole fault:
+    // the customer saw a success here while YouTube showed 예정 중. The
+    // headline now follows the thing being sent to, and still says what the
+    // encoder is doing — side by side, neither standing in for the other.
+    expect(await screen.findByText("연결 중")).toBeInTheDocument();
+    expect(screen.queryByText("송출 중")).not.toBeInTheDocument();
     expect(screen.getByTestId("youtube-status")).toHaveTextContent(
       "YouTube 연결 대기",
     );
     expect(screen.queryByText("YouTube 라이브")).not.toBeInTheDocument();
+  });
+
+  it("says YouTube 시작 대기 for a broadcast parked in the monitor preview", async () => {
+    // The state the reported fault actually lands in: YouTube has the video,
+    // the watch page has nothing, and nobody is going to press Go Live.
+    show(
+      <CloudDashboard />,
+      running({
+        account_id: "y1",
+        broadcast_id: "bcast-1",
+        stream_id: "stream-1",
+        status: "testing",
+      }),
+    );
+
+    expect(await screen.findByText("YouTube 시작 대기")).toBeInTheDocument();
+    expect(screen.queryByText("송출 중")).not.toBeInTheDocument();
+    expect(screen.getByTestId("youtube-status")).toHaveTextContent(
+      "YouTube 미리보기 (시작 대기)",
+    );
+  });
+
+  it("says 확인 불가 rather than a success when YouTube has not answered", async () => {
+    show(
+      <CloudDashboard />,
+      running({
+        account_id: "y1",
+        broadcast_id: "bcast-1",
+        stream_id: "stream-1",
+      }),
+    );
+
+    expect(await screen.findByText("확인 불가")).toBeInTheDocument();
+    expect(screen.queryByText("송출 중")).not.toBeInTheDocument();
+  });
+
+  it("stops claiming 방송 중 once the live answer is too old to vouch for", async () => {
+    // YouTube said live, and then nothing could reach YouTube again. The
+    // encoder is still sending, so this must not read as a failure — but it
+    // must stop reading as a confirmed broadcast, which is the same lie as the
+    // original fault one step removed.
+    show(
+      <CloudDashboard />,
+      running({
+        account_id: "y1",
+        broadcast_id: "bcast-1",
+        stream_id: "stream-1",
+        status: "live",
+        checked_at: new Date(Date.now() - 40 * 60 * 1000).toISOString(),
+      }),
+    );
+
+    expect(await screen.findByText("확인 불가")).toBeInTheDocument();
+    expect(screen.queryByText("방송 중")).not.toBeInTheDocument();
+    expect(screen.queryByText("송출 중")).not.toBeInTheDocument();
+  });
+
+  it("keeps saying 방송 중 while the live answer is still fresh", async () => {
+    // The other half of the same rule: a working broadcast must not be made to
+    // look doubtful by a watch that is simply between polls.
+    show(
+      <CloudDashboard />,
+      running({
+        account_id: "y1",
+        broadcast_id: "bcast-1",
+        stream_id: "stream-1",
+        status: "live",
+        checked_at: new Date(Date.now() - 4 * 60 * 1000).toISOString(),
+      }),
+    );
+
+    expect(await screen.findByText("방송 중")).toBeInTheDocument();
+    expect(screen.queryByText("확인 불가")).not.toBeInTheDocument();
+  });
+
+  it("does not vouch for a status that arrived with no time behind it", async () => {
+    // A row written by a build from before the status was timestamped.
+    show(
+      <CloudDashboard />,
+      running({
+        account_id: "y1",
+        broadcast_id: "bcast-1",
+        stream_id: "stream-1",
+        status: "live",
+        checked_at: null,
+      }),
+    );
+
+    expect(await screen.findByText("확인 불가")).toBeInTheDocument();
+  });
+
+  it("still says 송출 중 for a pasted key, where FFmpeg is the only truth there is", async () => {
+    // No connected channel to ask, so the encoder's state is the answer. The
+    // fix must not make a working pasted-key broadcast look uncertain.
+    show(<CloudDashboard />, running({}));
+
+    expect(await screen.findByText("송출 중")).toBeInTheDocument();
   });
 
   it("says 라이브 only when YouTube says so", async () => {

@@ -13,7 +13,11 @@ use std::process::{Command, Stdio};
 
 /// The protocols a live video source may use. No `file`: an HLS playlist names
 /// its own segment URLs, and a playlist from the internet must not be able to
-/// name a path on this server. Kept in step with `louver_cloud::cctv`.
+/// name a path on this server.
+///
+/// The single definition: `louver_cloud::cctv::PROTOCOL_WHITELIST` re-exports
+/// this one, so the probe behind `연결 테스트` and the broadcast cannot be given
+/// different lists.
 pub const LIVE_SOURCE_PROTOCOLS: &str = "http,https,tcp,tls,crypto";
 
 /// How long a live source may stall before FFmpeg gives up, in microseconds.
@@ -993,6 +997,40 @@ impl FfmpegCommandBuilder {
 
         // --- what goes out --------------------------------------------------
         a.extend(["-map".into(), "1:v:0".into(), "-map".into(), "0:a:0".into()]);
+
+        // Cap the picture at the profile, because a camera chooses its own size
+        // and this path encodes in real time.
+        //
+        // Measured on two cores with a 3840x2160 source: without this,
+        // `speed=0.481x` — less than half real time, so the broadcast falls
+        // further behind every second it runs. With it, `1.02x`. That is the
+        // difference between a broadcast and a stuttering one, and it is why
+        // the encoder budget can count slots at all: a slot is now a bounded
+        // amount of work instead of however many pixels a camera sends.
+        //
+        // `min(iw, W)` and not a plain `W`, so a camera smaller than the
+        // profile is left alone. Upscaling a 640x360 traffic camera to 1080p
+        // would cost the encoder three times as much for no more picture, and
+        // there is nothing to turn it back down with: the cloud builds every
+        // broadcast at `P1080p30` and has no per-broadcast size setting.
+        //
+        // No `pad`, which is where this differs from `build_normalize_args`:
+        // padding to the full frame would reintroduce exactly the cost the cap
+        // exists to avoid. The output is therefore the camera's aspect ratio,
+        // and a mid-stream change of size needs nothing from us — FFmpeg
+        // auto-scales to the size the encoder was opened with, which was
+        // measured both with this filter and without it.
+        let (max_w, max_h) = (self.profile.width(), self.profile.height());
+        // The commas inside `min()` are quoted rather than backslash-escaped:
+        // a comma is what separates filters, and `'...'` is how the filter
+        // parser is told this one belongs to the expression. Fewer backslashes
+        // to get wrong, and it is the form that was measured.
+        a.extend([
+            "-vf".into(),
+            format!(
+                "scale=w='min(iw,{max_w})':h='min(ih,{max_h})':force_original_aspect_ratio=decrease:force_divisible_by=2:flags=bicubic,setsar=1,format=yuv420p"
+            ),
+        ]);
         a.extend(self.video_encode_args());
         a.extend([
             "-r".into(),
@@ -1228,6 +1266,58 @@ mod tests {
             assert!(at < manifest, "{flag} must apply to the playlist input");
             assert_eq!(a.iter().filter(|x| *x == flag).count(), 1, "{flag} once only");
         }
+    }
+
+    #[test]
+    fn the_live_picture_is_capped_at_the_profile_and_never_stretched_up_to_it() {
+        // A camera chooses its own size and this path encodes in real time.
+        // Measured on two cores with a 3840x2160 source: 0.481x without the
+        // cap, 1.02x with it — the difference between a broadcast and one that
+        // falls further behind every second.
+        let a = live_args();
+        let i = a.iter().position(|x| x == "-vf").expect("the live path filters its video");
+        let vf = &a[i + 1];
+
+        // Capped at the profile, which is 1080p for the cloud.
+        assert!(vf.contains("min(iw,1920)"), "no width cap: {vf}");
+        assert!(vf.contains("min(ih,1080)"), "no height cap: {vf}");
+        // `min`, so a camera smaller than the profile is left alone. Upscaling
+        // a 640x360 traffic camera would cost three times as much for no more
+        // picture, and there is no resolution setting to turn it down with.
+        assert!(!vf.contains("scale=1920:1080"), "a plain scale would upscale: {vf}");
+        // No `pad`: filling the frame would reintroduce the cost the cap
+        // exists to avoid. This is the one place it differs from normalise.
+        assert!(!vf.contains("pad="), "padding undoes the saving: {vf}");
+        assert!(vf.contains("force_original_aspect_ratio=decrease"), "aspect must hold: {vf}");
+        // yuv420p and an even size, because the encoder needs both and a
+        // camera may offer neither.
+        assert!(vf.contains("force_divisible_by=2"), "odd sizes break yuv420p: {vf}");
+        assert!(vf.contains("format=yuv420p"), "{vf}");
+
+        // It filters what the encoder is given, so it belongs after every
+        // input. (The first `-f` in this argv is `-f concat` for input 0, not
+        // the output format — which is what my first version of this assertion
+        // got wrong.)
+        let last_input = a.iter().rposition(|x| x == "-i").expect("two inputs");
+        assert!(i > last_input, "-vf must come after the inputs, not be an input option");
+    }
+
+    #[test]
+    fn a_720p_profile_caps_at_720p() {
+        // The cap is the profile's, not a constant.
+        let a = FfmpegCommandBuilder::new(
+            FfmpegTools::new("/usr/bin/ffmpeg", "/usr/bin/ffprobe"),
+            OutputProfile::P720p30,
+        )
+        .build_live_video_stream_args(
+            Path::new("/tmp/m.txt"),
+            "https://cam.example/live/stream.m3u8",
+            "rtmps://a.rtmps.youtube.com/live2/secret-key",
+            true,
+        );
+        let i = a.iter().position(|x| x == "-vf").unwrap();
+        assert!(a[i + 1].contains("min(iw,1280)"), "{}", a[i + 1]);
+        assert!(a[i + 1].contains("min(ih,720)"), "{}", a[i + 1]);
     }
 
     #[test]

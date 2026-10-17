@@ -15,6 +15,7 @@ pub mod health;
 pub mod state;
 pub mod throttle;
 pub mod youtube;
+pub mod youtube_audit;
 
 use crate::state::App;
 use axum::extract::DefaultBodyLimit;
