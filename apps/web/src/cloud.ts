@@ -232,23 +232,6 @@ export interface StreamDestination {
 export type Privacy = "public" | "unlisted" | "private";
 export type DestinationKind = "manual_rtmps" | "youtube_account";
 
-/** What the sender is asked to produce. `auto` everywhere is the default. */
-export interface StreamSettings {
-  resolution: "auto" | "720p" | "1080p";
-  fps: "auto" | "30" | "60";
-  /** 0 = auto. */
-  video_bitrate_kbps: number;
-  /** 0 = auto. */
-  audio_bitrate_kbps: number;
-}
-
-export const AUTO_SETTINGS: StreamSettings = {
-  resolution: "auto",
-  fps: "auto",
-  video_bitrate_kbps: 0,
-  audio_bitrate_kbps: 0,
-};
-
 /** When a broadcast starts by itself. Times are UTC; the UI shows local. */
 export interface Schedule {
   enabled: boolean;
@@ -322,7 +305,6 @@ export interface Broadcast {
   category: string;
   privacy: Privacy;
 
-  settings: StreamSettings;
   schedule: Schedule;
 
   /** Videos in the playlist, as the editor shows them. */
@@ -364,7 +346,6 @@ export interface BroadcastPatch {
   privacy?: Privacy;
   loop_forever?: boolean;
   destination_id?: string;
-  settings?: StreamSettings;
   schedule?: Schedule;
   /** Set a live video source, or clear it with an empty string. */
   cctv_url?: string;
@@ -383,7 +364,6 @@ export interface NewBroadcast {
   tags?: string;
   category?: string;
   privacy?: Privacy;
-  settings?: StreamSettings;
   schedule?: Schedule;
   /** A live video source. Absent is an ordinary broadcast. */
   cctv_url?: string;

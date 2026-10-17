@@ -119,7 +119,7 @@ RTMP 송출, YouTube OAuth/API, PayApp, 인증, 요금제, worker·process 관�
 
 - **`min(iw,W)`, 상수 `W` 가 아닙니다.** 프로필보다 작은 카메라는 손대지 않습니다.
   640×360 을 1080p 로 늘리면 인코더 비용은 세 배가 되고 화면 정보는 늘지 않으며,
-  낮출 계정 설정도 없습니다 (§9 참조 — `StreamSettings` 는 읽히지 않습니다).
+  낮출 계정 설정도 없습니다 (§10 참조).
 - **`pad` 없음** — normalize 와 다른 유일한 지점입니다. 프레임을 검은색으로
   채우면 상한이 아끼려던 비용이 그대로 돌아옵니다. 그래서 출력은 카메라의 화면
   비율을 따릅니다 (2560×1080 → 1920×810, 2048×1536 → 1440×1080).
@@ -270,4 +270,56 @@ E2E 테스트가 단정하는 두 가지:
 | `check_playlist_joinable` 완화 | CCTV 모드에서는 오디오만 쓰므로 비디오 규격 일치 검사가 과하지만, 완화는 기존 로직 변경이라 하지 않음 |
 | 읽을 수 없는 주소에 대한 재시도 포기(give-up) | supervisor 는 최대 60초 backoff 로 영구 재시도합니다. 카메라가 돌아올 수 있으므로 24/7 서비스에서는 그 편이 맞지만, 영구히 읽을 수 없는 주소에는 과합니다. 저장 시점 차단으로 실제 경로는 막았고, supervisor 변경은 모든 방송에 영향을 주므로 범위 밖으로 두었습니다 |
 | 업스케일 | 프로필보다 작은 카메라는 그대로 보냅니다(`min(iw,W)`). 640×360 교통 카메라를 1080p 로 늘리면 인코더 비용이 세 배가 되는데 화면 정보는 늘지 않고, 되돌릴 계정 설정도 없습니다 — 아래 참조 |
-| `StreamSettings` 가 실제로 쓰이지 않는 문제 | `resolution`·`fps`·비트레이트는 검증되고 저장되지만 **어디서도 읽히지 않습니다**. `is_auto()` 는 호출자가 없고, 클라우드는 모든 방송을 `P1080p30` 으로 만듭니다 (`manager.rs`). CCTV 경로만의 문제가 아니라 클라우드 전체의 문제이므로 별도 판단이 필요합니다 |
+| `StreamSettings` 를 **작동하게** 만드는 것 | 대신 **없앴습니다** — §10 |
+
+## 10. 읽히지 않던 송출 설정을 없앴습니다
+
+`StreamSettings` (`resolution`·`fps`·`video_bitrate_kbps`·`audio_bitrate_kbps`)
+는 검증되고 저장되었지만 **어디서도 읽히지 않았습니다.** `is_auto()` 는 호출자가
+없었고, 클라우드는 모든 방송을 `P1080p30` 으로 만듭니다 (`manager.rs`). 폼의
+"고급 설정" 은 인코더가 지키지 않는 약속이었고, 거기엔 "재인코딩 송출이 추가되면
+적용됩니다" 라는 문구까지 붙어 있었습니다.
+
+### 작동하게 만들지 않고 없앤 이유
+
+작동하게 만드는 것은 정리가 아니라 새 기능입니다. 세 가지가 막습니다.
+
+1. **60fps 프로필이 없습니다.** `OutputProfile` 에는 `P1080p30` 과 `P720p30`
+   둘뿐입니다. 폼의 `60` 은 어떤 코드로도 지킬 수 없는 값이었습니다.
+2. **비트레이트 인자가 없습니다.** 비트레이트는 프로필이 고정으로 들고 있고
+   (1080p30 = 10 Mbps, 720p30 = 4 Mbps), core 빌더에 재정의 경로가 없습니다.
+3. **복사 경로에서는 해상도를 지킬 수 없습니다.** 일반 방송은 준비된 파일을
+   `-c copy` 로 보냅니다. 720p 를 지키려면 실시간 재인코딩을 해야 하는데, 그것이
+   바로 §3 의 동시 인코딩 한도가 막으려는 비용입니다. 즉 설정을 살리면 CCTV 방송에만
+   적용되고 대다수 방송에서는 조용히 무시되는, 더 헷갈리는 제품이 됩니다.
+
+덧붙여 `liveStreams.insert` 에 우리는 이미 `cdn.resolution: "variable"`,
+`frameRate: "variable"` 을 보냅니다 (`youtube/api.rs`). 방송별 해상도 약속은
+YouTube 쪽에도 애초에 없었습니다.
+
+### 바꾼 것
+
+| 파일 | 변경 |
+| --- | --- |
+| `crates/louver-cloud/src/models.rs` | `StreamSettings` 와 `Broadcast.settings`·`BroadcastPatch.settings` 삭제 |
+| `crates/louver-cloud/src/db.rs` | 네 컬럼의 읽기·쓰기·검증 삭제. **컬럼 자체는 유지** |
+| `apps/server/src/api.rs` | `NewBroadcast.settings` 삭제 |
+| `apps/web/src/cloud.ts` | `StreamSettings`·`AUTO_SETTINGS` 와 세 군데의 필드 삭제 |
+| `apps/web/src/pages/BroadcastForm.tsx` | "고급 설정" 토글과 네 입력칸 삭제. 카드는 실제 동작을 설명 |
+| `apps/web/src/desktopTransport.ts` | 데스크톱이 채워 넣던 `AUTO_SETTINGS` 삭제 |
+
+### 컬럼을 남긴 이유
+
+`ensure_column` 이 이전 릴리스의 DB 를 여는 수단이고, 운영 중인 서비스에서
+컬럼을 DROP 하면 테이블을 다시 씁니다. 아무도 읽지 않는 네 값 때문에 할 일이
+아닙니다. 그리고 "읽지 않는다" 는 말이 정확히 그 뜻이어야 하므로, **편집이
+그 값을 덮어쓰지 않는지**를 테스트로 고정했습니다
+(`migration.rs::an_edit_does_not_overwrite_the_sending_settings_nobody_reads_any_more`).
+720p 를 골라 두었던 고객의 행은 그대로 남습니다.
+
+### 배포 순서 주의
+
+`NewBroadcast` 에는 `deny_unknown_fields` 가 없으므로, 구버전 웹 번들이
+`settings` 를 계속 보내도 400 이 아니라 무시됩니다. 반대로 API 응답에서
+`settings` 가 사라지므로, 프런트를 먼저 올리고 API 를 나중에 올리는 순서가
+안전합니다 (PR #11 의 독립 배포 구조를 쓸 때).

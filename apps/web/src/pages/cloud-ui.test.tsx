@@ -19,7 +19,7 @@ import { Pricing } from "./Pricing";
 import { BillingComplete, BillingPanel, isBillingComplete } from "./Billing";
 import { LegalPage, legalPageFor } from "./Legal";
 import { MediaLibrary } from "./MediaLibrary";
-import { AUTO_SETTINGS, emptySchedule } from "../cloud";
+import { emptySchedule } from "../cloud";
 import type {
   Broadcast,
   BroadcastDetail,
@@ -48,7 +48,6 @@ function broadcast(over: Partial<Broadcast> = {}): Broadcast {
     tags: "",
     category: "",
     privacy: "private",
-    settings: AUTO_SETTINGS,
     schedule: emptySchedule(),
     item_count: 1,
     play_count: 1,
@@ -1025,7 +1024,7 @@ describe("making a broadcast", () => {
     ).toBeInTheDocument();
   });
 
-  it("hides the sending settings until asked, and defaults to auto", async () => {
+  it("offers no sending settings, because nothing reads one", async () => {
     const created = vi.fn().mockResolvedValue({});
     const t = withVideos({ createBroadcast: created });
     show(
@@ -1033,25 +1032,36 @@ describe("making a broadcast", () => {
       t,
     );
 
+    // The card says what the sender actually does, which is the whole of what
+    // there is to say about it.
+    expect(await screen.findByText(/서버가 정합니다/)).toBeInTheDocument();
     expect(
-      await screen.findByText(/자동 — 서버가 영상에 맞는/),
+      screen.getByText(/다시 인코딩하지 않고 그대로/),
     ).toBeInTheDocument();
-    expect(screen.queryByLabelText("해상도")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "고급 설정" }));
-    expect(screen.getByLabelText("해상도")).toHaveValue("auto");
+    // These four were stored and validated and never read by anything, and a
+    // form that collects them is a promise the encoder does not keep. There is
+    // no "고급 설정" to open any more, and nothing behind it.
+    expect(
+      screen.queryByRole("button", { name: "고급 설정" }),
+    ).not.toBeInTheDocument();
+    for (const label of [
+      "해상도",
+      "프레임레이트",
+      "영상 비트레이트",
+      "음성 비트레이트",
+    ]) {
+      expect(screen.queryByLabelText(label)).not.toBeInTheDocument();
+    }
 
     await userEvent.click(screen.getByRole("button", { name: "+ one.mp4" }));
     await userEvent.click(
       screen.getByRole("button", { name: /^방송 만들기$/ }),
     );
     await waitFor(() => expect(created).toHaveBeenCalled());
-    expect(created.mock.calls[0]?.[0].settings).toEqual({
-      resolution: "auto",
-      fps: "auto",
-      video_bitrate_kbps: 0,
-      audio_bitrate_kbps: 0,
-    });
+    // Not "settings: auto" — no such field. An API that still accepted one
+    // would be a place for it to come back.
+    expect(created.mock.calls[0]?.[0]).not.toHaveProperty("settings");
   });
 
   it("schedules in the reader own clock and sends UTC", async () => {

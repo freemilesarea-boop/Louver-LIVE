@@ -1011,9 +1011,8 @@ impl FfmpegCommandBuilder {
         // `min(iw, W)` and not a plain `W`, so a camera smaller than the
         // profile is left alone. Upscaling a 640x360 traffic camera to 1080p
         // would cost the encoder three times as much for no more picture, and
-        // there is no per-account resolution setting to turn it down with —
-        // `StreamSettings::resolution` is stored and validated but never read,
-        // and the cloud builds every broadcast at `P1080p30`.
+        // there is nothing to turn it back down with: the cloud builds every
+        // broadcast at `P1080p30` and has no per-broadcast size setting.
         //
         // No `pad`, which is where this differs from `build_normalize_args`:
         // padding to the full frame would reintroduce exactly the cost the cap

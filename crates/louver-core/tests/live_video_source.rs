@@ -405,9 +405,8 @@ fn a_camera_larger_than_the_profile_is_brought_down_to_it() {
 ///
 /// `min(iw, W)` and not a plain `W`: upscaling a 640x360 traffic camera to
 /// 1080p would cost the encoder about three times as much for no more picture,
-/// and there is no per-account resolution setting to turn it back down with —
-/// `StreamSettings::resolution` is stored and validated but never read, and
-/// the cloud builds every broadcast at `P1080p30`.
+/// and there is nothing to turn it back down with — the cloud builds every
+/// broadcast at `P1080p30` and has no per-broadcast size setting.
 #[test]
 fn a_camera_smaller_than_the_profile_is_not_stretched_up_to_it() {
     let tools = require_ffmpeg!();

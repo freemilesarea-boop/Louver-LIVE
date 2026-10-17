@@ -4,8 +4,7 @@
  *
  * Sections on one page rather than a wizard of steps, because every answer is
  * short and a first-time user is better served seeing the whole shape of a
- * broadcast than being walked through it blind. Only the sending settings are
- * folded away, since their default needs no decision.
+ * broadcast than being walked through it blind.
  */
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -20,7 +19,6 @@ import {
 import { formatDurationKo } from "@/services/format";
 import { useTransport } from "../TransportContext";
 import {
-  AUTO_SETTINGS,
   DAY_NAMES,
   EVERY_DAY,
   PRIVACY_LABELS,
@@ -38,7 +36,6 @@ import type {
   Privacy,
   Schedule,
   StreamDestination,
-  StreamSettings,
   VideoSource,
   YoutubeAccount,
 } from "../cloud";
@@ -99,10 +96,6 @@ export function BroadcastForm({
   const [cctvCheckedUrl, setCctvCheckedUrl] = useState<string | null>(null);
   const [cctvTesting, setCctvTesting] = useState(false);
   const [cctvError, setCctvError] = useState<string | null>(null);
-  const [settings, setSettings] = useState<StreamSettings>(
-    editing?.settings ?? AUTO_SETTINGS,
-  );
-  const [advanced, setAdvanced] = useState(false);
   const [schedule, setSchedule] = useState<Schedule>(
     editing?.schedule ?? emptySchedule(),
   );
@@ -262,7 +255,6 @@ export function BroadcastForm({
           // pointing it elsewhere would break the binding it already has.
           destination_id:
             provider === "manual_rtmps" ? destinationId : undefined,
-          settings,
           schedule,
           cctv_url: cctvToSave,
         });
@@ -282,7 +274,6 @@ export function BroadcastForm({
           tags,
           category,
           privacy,
-          settings,
           schedule,
           cctv_url: cctvToSave,
         });
@@ -739,89 +730,20 @@ export function BroadcastForm({
       </Card>
 
       {/* 4 — how it is sent */}
-      <Card
-        title="4. 송출 설정"
-        action={
-          <Button size="sm" onClick={() => setAdvanced(!advanced)}>
-            {advanced ? "간단히" : "고급 설정"}
-          </Button>
-        }
-      >
-        {!advanced ? (
-          <p className="text-sm text-ink-400">
-            자동 — 서버가 영상에 맞는 안정적인 설정으로 송출합니다.{" "}
-            <Badge tone="ok">권장</Badge>
-          </p>
-        ) : (
-          <>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <Field label="해상도">
-                <Select
-                  aria-label="해상도"
-                  value={settings.resolution}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      resolution: e.target
-                        .value as StreamSettings["resolution"],
-                    })
-                  }
-                >
-                  <option value="auto">자동</option>
-                  <option value="720p">720p</option>
-                  <option value="1080p">1080p</option>
-                </Select>
-              </Field>
-              <Field label="프레임레이트">
-                <Select
-                  aria-label="프레임레이트"
-                  value={settings.fps}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      fps: e.target.value as StreamSettings["fps"],
-                    })
-                  }
-                >
-                  <option value="auto">자동</option>
-                  <option value="30">30</option>
-                  <option value="60">60</option>
-                </Select>
-              </Field>
-              <Field label="영상 비트레이트 (kbps)" hint="0은 자동">
-                <Input
-                  type="number"
-                  aria-label="영상 비트레이트"
-                  value={settings.video_bitrate_kbps}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      video_bitrate_kbps: Number(e.target.value) || 0,
-                    })
-                  }
-                />
-              </Field>
-              <Field label="음성 비트레이트 (kbps)" hint="0은 자동">
-                <Input
-                  type="number"
-                  aria-label="음성 비트레이트"
-                  value={settings.audio_bitrate_kbps}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      audio_bitrate_kbps: Number(e.target.value) || 0,
-                    })
-                  }
-                />
-              </Field>
-            </div>
-            <p className="mt-2 text-xs text-warn">
-              현재 송출은 업로드할 때 준비된 1080p30 파일을 그대로
-              보냅니다(스트림 복사). 자동이 아닌 값은 저장되며, 재인코딩 송출이
-              추가되면 적용됩니다.
-            </p>
-          </>
-        )}
+      <Card title="4. 송출 설정">
+        <p className="text-sm text-ink-400">
+          서버가 정합니다. 고를 것은 없습니다. <Badge tone="ok">자동</Badge>
+        </p>
+        <ul className="mt-2 space-y-1 text-xs text-ink-500">
+          <li>
+            플레이리스트 방송은 올릴 때 준비된 파일을 다시 인코딩하지 않고 그대로
+            보냅니다. 화질은 준비된 파일 그대로입니다.
+          </li>
+          <li>
+            영상 소스를 쓰는 방송은 실시간으로 인코딩합니다. 화면이 1080p 보다
+            크면 1080p 로 줄여 보내고, 더 작은 화면은 늘리지 않습니다.
+          </li>
+        </ul>
       </Card>
 
       {/* 5 — when */}
@@ -931,11 +853,11 @@ export function BroadcastForm({
             }
           />
           <Row
-            label="송출 설정"
+            label="송출 방식"
             value={
-              settings.resolution === "auto"
-                ? "자동"
-                : `${settings.resolution} ${settings.fps}fps`
+              videoSource === "traffic_cctv"
+                ? "영상 소스 실시간 인코딩 · 최대 1080p"
+                : "준비된 파일 그대로 복사"
             }
           />
         </dl>

@@ -534,7 +534,15 @@ impl CloudDb {
             ("tags", "TEXT NOT NULL DEFAULT ''"),
             ("category", "TEXT NOT NULL DEFAULT ''"),
             ("privacy", "TEXT NOT NULL DEFAULT 'private'"),
-            // §6 settings
+            // §6 settings. Nothing reads or writes these four any more: the
+            // sender has no per-broadcast resolution, frame rate or bitrate,
+            // and the form that collected them was removed rather than left
+            // promising something the encoder never did. They are still
+            // created, because `ensure_column` is what makes an older
+            // database open at all and dropping a column on a live service
+            // rewrites the table — which is not worth doing for four values
+            // nobody reads. A broadcast row from before this change keeps
+            // whatever it had.
             ("resolution", "TEXT NOT NULL DEFAULT 'auto'"),
             ("fps", "TEXT NOT NULL DEFAULT 'auto'"),
             ("video_bitrate_kbps", "INTEGER NOT NULL DEFAULT 0"),
@@ -2586,10 +2594,9 @@ impl CloudDb {
 
     /// Change what a broadcast is, without touching what it is doing.
     ///
-    /// Only the fields present are written. A playlist, a destination or a
-    /// settings change takes effect at the next start — the running FFmpeg is
-    /// deliberately not interrupted, because an edit is not a reason to drop a
-    /// live stream.
+    /// Only the fields present are written. A playlist or destination change
+    /// takes effect at the next start — the running FFmpeg is deliberately not
+    /// interrupted, because an edit is not a reason to drop a live stream.
     pub fn update_broadcast_owned(
         &self,
         user_id: &str,
@@ -2597,9 +2604,6 @@ impl CloudDb {
         patch: &BroadcastPatch,
     ) -> Result<Broadcast> {
         self.broadcast_owned(user_id, id)?;
-        if let Some(s) = &patch.settings {
-            s.validate()?;
-        }
         if let Some(sc) = &patch.schedule {
             crate::schedule::validate(sc)?;
         }
@@ -2647,12 +2651,6 @@ impl CloudDb {
         }
         if let Some(v) = &patch.destination_id {
             set("destination_id = ?2", v)?;
-        }
-        if let Some(v) = &patch.settings {
-            set("resolution = ?2", &v.resolution)?;
-            set("fps = ?2", &v.fps)?;
-            set("video_bitrate_kbps = ?2", &v.video_bitrate_kbps)?;
-            set("audio_bitrate_kbps = ?2", &v.audio_bitrate_kbps)?;
         }
         if let Some(v) = &patch.cctv_url {
             // Stored as NULL rather than '' when cleared, so "no live source"
@@ -3096,12 +3094,6 @@ fn row_to_broadcast(r: &rusqlite::Row<'_>) -> rusqlite::Result<Broadcast> {
         tags: r.get("tags")?,
         category: r.get("category")?,
         privacy: Privacy::from_id(&privacy).unwrap_or(Privacy::Private),
-        settings: StreamSettings {
-            resolution: r.get("resolution")?,
-            fps: r.get("fps")?,
-            video_bitrate_kbps: r.get("video_bitrate_kbps")?,
-            audio_bitrate_kbps: r.get("audio_bitrate_kbps")?,
-        },
         schedule: Schedule {
             enabled: r.get::<_, i64>("sched_enabled")? != 0,
             start_at: r.get("sched_start_at")?,

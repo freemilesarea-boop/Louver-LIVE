@@ -250,8 +250,6 @@ pub struct NewBroadcast {
     #[serde(default)]
     pub privacy: Option<louver_cloud::Privacy>,
     #[serde(default)]
-    pub settings: Option<louver_cloud::StreamSettings>,
-    #[serde(default)]
     pub schedule: Option<louver_cloud::Schedule>,
     /// A live video source — the traffic-CCTV test. Absent or empty is an
     /// ordinary broadcast, which is every broadcast that existed before it.
@@ -287,7 +285,7 @@ pub async fn list_broadcasts(
     Ok(Json(crate::blocking(move || app.mgr.dashboard(&uid)).await?))
 }
 
-/// Create a broadcast with its playlist, metadata, settings and schedule.
+/// Create a broadcast with its playlist, metadata and schedule.
 ///
 /// The playlist is written in the same request rather than left for a second
 /// call: a broadcast with no videos cannot be started, and leaving one in the
@@ -340,7 +338,6 @@ pub async fn create_broadcast(
             tags: b.tags.clone(),
             category: b.category.clone(),
             privacy: b.privacy,
-            settings: b.settings.clone(),
             schedule: b.schedule.clone(),
             cctv_url: b.cctv_url.clone(),
             ..Default::default()
