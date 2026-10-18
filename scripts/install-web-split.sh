@@ -64,9 +64,9 @@ scripts/web-split-verify.sh"
 # wrong commit cannot reach the deployment directory.
 SHAS="3978c73effcdd035c30948b595a8496e621629b1ec070281bcfff04d5e7820ee  deploy/web/Caddyfile
 85400efaa4d5435b893a4c379861e564cc615d20bf58d56ab4e8b66dcc60b60f  docker-compose.web.yml
-a324c410378275c578ab43aa95f8bd3c4c3d949a66e799f8df4be261ce53bab2  docs/WEB_DEPLOY.md
+3a3b6f182c71308e1f5955894d22a31df6f913779c8b554a2d0d939e5c1b0da8  docs/WEB_DEPLOY.md
 86969201d3f6f8083bf43700220e1fec5fc59e8dc2c6468482069c92868a3bc2  scripts/deploy-web.sh
-92cbcb0eee7df3a20fc4e00911ccd1ea25e0ec8dc77bc06ecbb7f3a0d75221f0  scripts/web-split-preflight.sh
+b2e0480761d0d984b655ce7d51e234e78ff5a684cd8c9d4bb4a3e9ddaab7e721  scripts/web-split-preflight.sh
 5015c9c96eaa4386e22789b3de0dd467e838bcca929fcbad1be48923fc3c79f2  scripts/web-split-verify.sh"
 
 # Directories that may have to be created. Parents first.

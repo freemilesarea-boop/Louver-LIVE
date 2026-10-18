@@ -276,6 +276,96 @@ host('check — the gate in front of the Caddy switch', () => {
 
 
 
+describe('web-split-preflight.sh — how it decides that louver was touched', () => {
+  const preflight = () =>
+    readFileSync(resolve(import.meta.dirname, 'web-split-preflight.sh'), 'utf8')
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('#'))
+      .join('\n')
+
+  // The first spelling of this test's subject was `grep \blouver\b`, which
+  // reads as "the service word, on its own". It is not: the Compose project is
+  // `louver-live`, so the caddy container is `louver-live-caddy-1`, and a word
+  // boundary sits between `louver` and the hyphen. The dry run of the
+  // caddy-only apply says `Container louver-live-caddy-1  Recreate` — which
+  // that pattern matched, so a correct apply was refused with "the dry run
+  // names louver". The check has to name the container, not the word.
+  it('matches the louver container by name rather than by the word louver', () => {
+    const code = preflight()
+    expect(code, 'the word-boundary pattern matches the caddy container too').not.toMatch(
+      /\\blouver\\b/,
+    )
+    expect(code).toMatch(/louver_container\(\)/)
+    expect(code).toMatch(/grep -F "\$LOUVER_CT"/)
+  })
+
+  it('does the matching it claims: the caddy container is not the louver one', () => {
+    const fires = (line, container) => {
+      try {
+        execFileSync(
+          'bash',
+          [
+            '-c',
+            'printf \'%s\\n\' "$1" | grep -F "$2" | grep -qiE \'recreate|stop|remove|kill\'',
+            '_',
+            line,
+            container,
+          ],
+          { stdio: 'ignore' },
+        )
+        return true
+      } catch {
+        return false
+      }
+    }
+    const ct = 'louver-live-louver-1'
+    expect(fires('DRY-RUN MODE -  Container louver-live-louver-1  Recreate', ct)).toBe(true)
+    expect(fires('DRY-RUN MODE -  Container louver-live-caddy-1  Recreate', ct)).toBe(false)
+    expect(fires('DRY-RUN MODE -  Container louver-live-caddy-1  Started', ct)).toBe(false)
+  })
+
+  // Check 3 asks what the caddy-only apply would do and is given
+  // `--no-deps caddy`, so it cannot answer the other question: whether a bare
+  // `up -d` would now recreate louver because `.env` — louver's own env_file —
+  // gained the COMPOSE_FILE pin. That one is a warning, not a refusal: the
+  // apply is still safe, and there is no way to make a running container match
+  // a changed configuration without recreating it.
+  it('asks separately what a bare up -d would do, and only warns about it', () => {
+    const code = preflight()
+    expect(code, 'no dry run without --no-deps, so nothing asks the question').toMatch(
+      /up -d --dry-run/,
+    )
+    expect(code).toMatch(/warn\(\)/)
+    expect(code).toMatch(/WARN=\$\(\(WARN \+ 1\)\)/)
+    // A warning must not turn into a refusal: `FAIL` is what gates the apply.
+    const sixth = code.slice(code.indexOf('step "6.'))
+    expect(sixth, 'check 6 must not increment FAIL').not.toMatch(/fail "/)
+  })
+
+  it('never runs an un-flagged up, and no command that could stop a broadcast', () => {
+    const code = preflight()
+    // Every `up` this script RUNS carries --dry-run; without that it could
+    // apply the thing it exists to decide about. An invocation is recognised
+    // by the `$BASE`/`$OVER` variable that carries its -f flags, which is how
+    // every compose call in the file is written. Matching `docker compose`
+    // anywhere on the line instead would also catch the warning's own prose,
+    // which quotes the bare command precisely to tell the operator not to type
+    // it — this test caught exactly that about its first version.
+    const invocations = code.split('\n').filter((line) => /docker compose \$/.test(line))
+    expect(invocations.length, 'no compose invocation found — has the style changed?')
+      .toBeGreaterThan(2)
+    for (const line of invocations) {
+      if (!/\bup\b/.test(line)) continue
+      expect(line, `an up without --dry-run: ${line.trim()}`).toMatch(/--dry-run/)
+    }
+    for (const forbidden of ['docker compose restart', 'docker compose stop', 'docker compose rm',
+      'docker compose kill', 'docker compose build', 'docker compose exec', 'docker run',
+      'systemctl', 'pkill', 'killall', 'kill -']) {
+      expect(code).not.toContain(forbidden)
+    }
+  })
+})
+
 describe('the delivery manifest', () => {
   // The installer refuses a staging tree whose bytes do not match its own SHAS
   // block, which makes that block the definition of what gets installed — and

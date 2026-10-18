@@ -240,9 +240,21 @@ scripts/web-split-verify.sh https://247streams.kr # ARMED 가 나와야 한다
 
 1. `deploy-web.sh check` — 릴리스가 준비되어 있는지. **실패하면 전환 금지**
 2. 오버레이가 `louver` 서비스를 바꾸지 않는지 — resolve 된 정의를 바이트 비교
-3. `up --dry-run` 이 `caddy` 만 언급하는지
+3. 이번 적용의 `up --dry-run` 이 `louver` 컨테이너를 건드리지 않는지
 4. 지금 `louver` 컨테이너의 생성 시각 — 적용 후 비교용
 5. `.env` 의 `COMPOSE_FILE` 유무 — 없으면 F1 경고
+6. **그 핀을 넣은 뒤 맨몸 `up -d` 가 louver 를 재생성하는지** — 아래 F4. 전환을
+   막지 않는 **경고**입니다
+
+3번과 6번은 서로 다른 질문입니다. 3번은 *이번* 적용(`--no-deps caddy`)이 무엇을
+하는지 묻고, 6번은 **그 다음에 누군가 치는 명령**이 무엇을 하는지 묻습니다. 3번의
+dry-run 에는 `--no-deps` 가 들어 있어서 louver 가 나올 수가 없으므로, 6번 없이는
+아무도 그 질문을 하지 않습니다.
+
+두 검사 모두 **서비스 이름이 아니라 컨테이너 이름으로** 판정합니다. 프로젝트가
+`louver-live` 라서 caddy 컨테이너가 `louver-live-caddy-1` 이고, `\blouver\b` 는
+그 안에서도 매치됩니다 — dry-run 이 `Container louver-live-caddy-1  Recreate` 라고
+출력하므로, 그 패턴은 **옳은 적용을 거부**했습니다.
 
 ### 왜 `check` 를 통과해야 하는가
 
@@ -338,6 +350,7 @@ import 를 켜는 날 이 보호 장치가 **먼저** 있어야 하기 때문입
 | 버전이 쌓여 디스크를 먹음 | 릴리스마다 번들 하나 | `prune --keep 5`. 번들 하나는 수 MB 수준 |
 | Caddy 설정이 두 파일로 갈림 | 루트 `Caddyfile` 과 `deploy/web/Caddyfile` | 루트 쪽은 건드리지 않고 둠. 오버레이를 쓰는 동안은 `deploy/web/Caddyfile` 만 읽힌다 |
 | **기존 배포가 분리 구조를 조용히 해제 (F1)** | `scripts/deploy-vps.sh` 가 맨몸 `docker compose --profile https up -d --build` 로 끝난다 → 오버레이 없이 Caddy 재생성. 화면은 이미지 번들로 계속 나오므로 **아무도 눈치채지 못한다** | `.env` 에 `COMPOSE_FILE=docker-compose.yml:docker-compose.web.yml`. `.env` 는 배포 tar 에서 제외되고 `set_env` 는 `LOUVER_*` 만 고치므로 재배포를 견딘다. 배포 직후 `web-split-verify.sh` 로 확인 |
+| **핀이 남기는 지뢰 (F4)** | F1 대비로 `.env` 에 `COMPOSE_FILE=` 을 넣는데, `.env` 는 louver 의 `env_file` 입니다 (`docker-compose.yml`). Compose 가 `env_file` 을 서비스 environment 로 풀면 louver 의 config hash 가 바뀌고, 그러면 **맨몸 `docker compose up -d` 가 louver 를 재생성** 합니다 — 전에는 아무 일도 안 했을 수 있는 명령이 모든 방송을 끊는 명령이 됩니다 | preflight 6번이 `up -d --dry-run` 으로 **묻습니다**(추론하지 않습니다 — env_file 이 hash 에 들어가는지는 Compose 버전에 달렸습니다). 고칠 것은 없습니다: 돌고 있는 컨테이너를 재생성 없이 바뀐 설정에 맞출 수 없고, 핀을 빼면 F1 이 돌아옵니다. 그래서 **경고**이고, 전환을 막지 않습니다. 이후 front door 만 손볼 때는 `docker compose up -d --no-deps caddy` |
 | **릴리스 없이 전환 (F2)** | 순서를 건너뜀 | `deploy-web.sh check` / `web-split-preflight.sh` 가 거부. 통과 전에는 전환하지 않는다 |
 | **이전 빌드 해시 404 (F3)** | 해시 번들 배포의 일반 성질. 지금 구조에서도 같다 | 교체 직전 하드링크 이관(위 4절). `--no-carry` 로만 끌 수 있다 |
 | `/pricing` 과 `/pricing/` 이 둘 다 200 | 지금 서버는 `/pricing` 에 307 로 답한다. Caddy 는 바로 200 으로 답한다 | 프리렌더 페이지 전부가 `rel="canonical"` 로 슬래시 버전을 가리키고 `sitemap.xml` 도 슬래시만 싣는다. 리다이렉트를 원하면 Caddy 에 한 줄 추가 — 별도 승인 사항 |
