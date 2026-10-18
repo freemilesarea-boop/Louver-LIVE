@@ -238,8 +238,18 @@ cmd_check() {
   fi
 
   if [ -L "$ROOT/previous" ]; then
-    if [ -d "$ROOT/previous/" ]; then ok "previous resolves, so rollback has somewhere to go"
-    else nope "previous is dangling — rollback would fail"; fi
+    if [ ! -d "$ROOT/previous/" ]; then
+      nope "previous is dangling — rollback would fail"
+    elif [ "$(link_target previous)" = "$(link_target current)" ]; then
+      # Not a reason to refuse the Caddy switch: what is being served is a whole
+      # release and this says nothing about it. It is a reason to know that the
+      # one command kept for an emergency is not armed.
+      printf '  note  previous and current are the same release (%s), so rollback has\n' "$(link_target current)"
+      printf '        nowhere to go — an activation was interrupted between its two\n'
+      printf '        links. Fix it before you need it:  %s activate <version>\n' "$0"
+    else
+      ok "previous resolves, so rollback has somewhere to go"
+    fi
   else
     printf '  note  no previous release yet; rollback has nowhere to go until the next release\n'
   fi
@@ -256,8 +266,27 @@ cmd_release() {
 
 cmd_rollback() {
   local prev; prev="$(link_target previous)"
+  local cur; cur="$(link_target current)"
   [ -n "$prev" ] || die "no previous release recorded — nothing to roll back to"
   [ -d "$(releases_dir)/$prev" ] || die "previous release $prev is gone from disk"
+  # `previous` and `current` naming the same release is the fingerprint of an
+  # activation that was killed between its two renames. Two symlinks cannot be
+  # replaced in one operation, so `activate` writes `previous` first on purpose:
+  # interrupted that way, a rollback does nothing, which is recoverable. The
+  # other order would leave `previous` pointing a release too far back and a
+  # rollback would silently go to the wrong one.
+  #
+  # What must not happen is this: `activate` returns early when asked for the
+  # release that is already current, so without this check a rollback would
+  # print "already current" and exit 0 — a rollback that reports success and
+  # moves nothing. Say so instead, and name the way out.
+  if [ "$prev" = "$cur" ]; then
+    die "previous and current are both $cur, so there is nothing to roll back to.
+      That is what an activation looks like when it was killed between writing
+      the two links. The releases are all still on disk; pick one by hand:
+        $0 list --root $ROOT
+        $0 activate <version> --root $ROOT"
+  fi
   ARGS=("$prev")
   cmd_activate
 }

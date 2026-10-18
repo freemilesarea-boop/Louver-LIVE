@@ -130,6 +130,36 @@ host('rollback', () => {
     run('release', bundle('a'), '--version', 'v1')
     expect(() => run('rollback')).toThrow(/nothing to roll back to/)
   })
+
+  // Two symlinks cannot be replaced in one operation, so `activate` writes
+  // `previous` and then `current`. Killed between the two, both name the same
+  // release. That order is the safe one — the other would leave `previous` a
+  // release too far back and roll back to the wrong one — but the state it
+  // leaves must not be mistaken for a working rollback: `activate` returns
+  // early for the release that is already current, so this used to print
+  // "already current" and exit 0.
+  it('refuses when an interrupted activation left previous and current equal', () => {
+    run('release', bundle('a'), '--version', 'v1')
+    run('release', bundle('b'), '--version', 'v2')
+    // What the crash window leaves behind: previous was written, current was not.
+    const tmp = join(root, '.previous.probe')
+    symlinkSync('releases/v2', tmp)
+    renameSync(tmp, join(root, 'previous'))
+
+    expect(() => run('rollback')).toThrow(/nothing to roll back to/)
+    // And it stays where it was rather than being moved somewhere wrong.
+    expect(readlinkSync(join(root, 'current'))).toBe('releases/v2')
+    // The way out is named, with the releases still on disk.
+    let said = ''
+    try {
+      run('rollback')
+    } catch (e) {
+      said = `${e.stdout ?? ''}${e.stderr ?? ''}`
+    }
+    expect(said).toMatch(/activate <version>/)
+    run('activate', 'v1')
+    expect(readlinkSync(join(root, 'current'))).toBe('releases/v1')
+  })
 })
 
 host('list', () => {
@@ -271,6 +301,22 @@ host('check — the gate in front of the Caddy switch', () => {
   it('says when there is no rollback target yet, without failing', () => {
     run('release', bundle('a'), '--version', 'v1')
     expect(check()).toContain('rollback has nowhere to go')
+  })
+
+  it('reports an interrupted activation without refusing the switch', () => {
+    run('release', bundle('a'), '--version', 'v1')
+    run('release', bundle('b'), '--version', 'v2')
+    const tmp = join(root, '.previous.probe')
+    symlinkSync('releases/v2', tmp)
+    renameSync(tmp, join(root, 'previous'))
+
+    // What is being served is a whole release, so the switch is still fine —
+    // but the one command kept for an emergency is not armed, and `check` is
+    // where that gets noticed before it is needed.
+    const out = check()
+    expect(out).toContain('previous and current are the same release')
+    expect(out).toContain('activate <version>')
+    expect(out).toContain('ready: releases/v2')
   })
 })
 

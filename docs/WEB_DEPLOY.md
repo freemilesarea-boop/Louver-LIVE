@@ -235,6 +235,21 @@ scripts/web-split-verify.sh https://247streams.kr # ARMED 가 나와야 한다
 6번의 두 줄이 이 작업의 합격 기준입니다. `louver` 컨테이너의 `CREATED` 가
 바뀌지 않았다면 방송은 한 번도 끊기지 않았습니다.
 
+### 전환 뒤에는 화면이 두 곳에서 나옵니다
+
+`:8080` 포트 매핑과 서버 이미지 안의 번들은 그대로 남습니다. 그래서:
+
+| 어디로 보는가 | 무엇이 나오는가 |
+| --- | --- |
+| `https://<도메인>` (Caddy) | **호스트 디스크의 최신 릴리스** |
+| `http://<IP>:8080` (서버 직접) | **이미지에 박힌 옛 번들** — 화면 배포를 해도 안 바뀝니다 |
+
+의도된 성질입니다. `web-split-verify.sh` 가 바로 이 차이로 ARMED 를 판정하고,
+되돌리기가 간단한 이유도 이것입니다 — 오버레이를 빼면 이미지의 번들이 그대로
+화면을 냅니다. 다만 **점검할 때 IP:8080 으로 보면 "배포가 안 됐다" 고 오해합니다.**
+화면을 확인할 때는 도메인으로 보세요. 그 두 번들이 하나가 되는 것은 다음 서버
+배포 때이고, 그것은 점검 창에서 할 일입니다(§8).
+
 `web-split-preflight.sh` 가 보는 것 (전부 읽기 전용 — `config`, `ps`,
 `up --dry-run` 뿐이고 파일에 플래그 없는 `up` 은 존재하지 않습니다):
 
@@ -303,6 +318,27 @@ scripts/deploy-web.sh prune --keep 5 --root /srv/louver/web
 `prune` 은 `--keep 1` 을 거부하고, 지금 쓰이는 버전과 롤백 대상은 순서와
 무관하게 남깁니다.
 
+#### 활성화가 중간에 끊겼다면
+
+심볼릭 링크 **두 개**를 한 번에 바꿀 수는 없습니다. `activate` 는 `previous` 를
+먼저, `current` 를 나중에 씁니다 — 그 사이에서 죽으면 둘이 같은 릴리스를 가리킵니다.
+이 순서가 안전한 쪽입니다: 반대로 하면 `previous` 가 한 세대 더 뒤를 가리켜
+**롤백이 조용히 엉뚱한 버전으로** 갑니다.
+
+다만 그 상태를 작동하는 롤백으로 착각해서는 안 됩니다. `activate` 는 이미 current
+인 릴리스를 요청받으면 그냥 돌아가므로, 예전에는 `rollback` 이 "already current" 를
+찍고 **0 으로 끝났습니다** — 성공했다고 보고하면서 아무것도 옮기지 않은 것입니다.
+지금은 거부하고 빠져나갈 길을 알려줍니다:
+
+```bash
+scripts/deploy-web.sh list --root /srv/louver/web
+scripts/deploy-web.sh activate <버전> --root /srv/louver/web
+```
+
+`deploy-web.sh check` 도 이 상태를 **note 로** 알립니다 — 전환을 막지는 않습니다.
+서비스되고 있는 것은 온전한 릴리스 하나이고, 비상용으로 남겨둔 명령 하나가 장전되지
+않았다는 뜻이기 때문입니다. 필요해지기 전에 알아야 하는 종류의 사실입니다.
+
 ### 캐시 정책
 
 | 경로 | 헤더 | 이유 |
@@ -350,6 +386,8 @@ import 를 켜는 날 이 보호 장치가 **먼저** 있어야 하기 때문입
 | 버전이 쌓여 디스크를 먹음 | 릴리스마다 번들 하나 | `prune --keep 5`. 번들 하나는 수 MB 수준 |
 | Caddy 설정이 두 파일로 갈림 | 루트 `Caddyfile` 과 `deploy/web/Caddyfile` | 루트 쪽은 건드리지 않고 둠. 오버레이를 쓰는 동안은 `deploy/web/Caddyfile` 만 읽힌다 |
 | **기존 배포가 분리 구조를 조용히 해제 (F1)** | `scripts/deploy-vps.sh` 가 맨몸 `docker compose --profile https up -d --build` 로 끝난다 → 오버레이 없이 Caddy 재생성. 화면은 이미지 번들로 계속 나오므로 **아무도 눈치채지 못한다** | `.env` 에 `COMPOSE_FILE=docker-compose.yml:docker-compose.web.yml`. `.env` 는 배포 tar 에서 제외되고 `set_env` 는 `LOUVER_*` 만 고치므로 재배포를 견딘다. 배포 직후 `web-split-verify.sh` 로 확인 |
+| 롤백이 아무것도 안 하면서 성공으로 보임 | `activate` 가 링크 두 개를 차례로 쓰므로 그 사이에 죽으면 `previous` 와 `current` 가 같아진다 | `rollback` 이 거부하고 `activate <버전>` 을 안내한다. `check` 는 note 로 알린다. 테스트 2개 — 위 5절 |
+| 전환 뒤 `:8080` 이 옛 화면을 준다 | 포트 매핑과 이미지 안 번들이 그대로 남는다 | 의도된 성질이고 `web-split-verify.sh` 의 판정 근거다. 확인은 도메인으로 — 위 4절 |
 | **핀이 남기는 지뢰 (F4)** | F1 대비로 `.env` 에 `COMPOSE_FILE=` 을 넣는데, `.env` 는 louver 의 `env_file` 입니다 (`docker-compose.yml`). Compose 가 `env_file` 을 서비스 environment 로 풀면 louver 의 config hash 가 바뀌고, 그러면 **맨몸 `docker compose up -d` 가 louver 를 재생성** 합니다 — 전에는 아무 일도 안 했을 수 있는 명령이 모든 방송을 끊는 명령이 됩니다 | preflight 6번이 `up -d --dry-run` 으로 **묻습니다**(추론하지 않습니다 — env_file 이 hash 에 들어가는지는 Compose 버전에 달렸습니다). 고칠 것은 없습니다: 돌고 있는 컨테이너를 재생성 없이 바뀐 설정에 맞출 수 없고, 핀을 빼면 F1 이 돌아옵니다. 그래서 **경고**이고, 전환을 막지 않습니다. 이후 front door 만 손볼 때는 `docker compose up -d --no-deps caddy` |
 | **릴리스 없이 전환 (F2)** | 순서를 건너뜀 | `deploy-web.sh check` / `web-split-preflight.sh` 가 거부. 통과 전에는 전환하지 않는다 |
 | **이전 빌드 해시 404 (F3)** | 해시 번들 배포의 일반 성질. 지금 구조에서도 같다 | 교체 직전 하드링크 이관(위 4절). `--no-carry` 로만 끌 수 있다 |
