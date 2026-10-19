@@ -535,6 +535,11 @@ impl BroadcastManager {
                 // marker `resume_held_back` picks up, so the two are the same
                 // fact rather than two bookkeeping schemes.
                 let _ = self.db.record_runtime_only(&b.id, RuntimeState::Stopped);
+                // The fact itself, recorded rather than inferred. It is what
+                // `resume_held_back` reads, and what stops this row from
+                // walking past the machine's encoder ceiling if somebody
+                // presses start on it (`claim_stream_slot_within`).
+                let _ = self.db.hold_back(&b.id);
                 // Said differently for a budget of zero, where "when another
                 // one finishes" is not true: there is no other one, and no
                 // amount of waiting produces a slot.
@@ -632,6 +637,7 @@ impl BroadcastManager {
             return 0;
         }
         let Ok(wanted) = self.db.broadcasts_wanting_to_run() else { return 0 };
+        let Ok(parked) = self.db.held_back_ids() else { return 0 };
         let live = self.running_ids();
         let encodes = |b: &Broadcast| b.cctv_url.as_deref().map(str::trim).is_some_and(|u| !u.is_empty());
         let busy = wanted.iter().filter(|b| encodes(b) && live.contains(&b.id)).count() as i64;
@@ -642,11 +648,12 @@ impl BroadcastManager {
 
         let mut started = 0;
         for b in wanted.iter().filter(|b| {
-            // Parked by the hold-back above: the intent says run, the runtime
-            // says nothing is running, and no worker exists here. A broadcast
-            // the user stopped is not this — its `desired_state` is `stopped`,
-            // so it never reaches this list.
-            encodes(b) && b.runtime_state == RuntimeState::Stopped && !live.contains(&b.id)
+            // Parked by the hold-back above, as recorded by `hold_back` — not
+            // guessed from `runtime_state`, which a restart also sets to
+            // `Stopped` between its stop and its start. A broadcast the user
+            // stopped is not here either: its `desired_state` is `stopped`, so
+            // it never reaches this list at all.
+            encodes(b) && parked.contains(&b.id) && !live.contains(&b.id)
         }) {
             if room <= 0 {
                 break;

@@ -1234,7 +1234,10 @@ fn the_resume_pass_leaves_alone_what_nobody_asked_to_run() {
     make_it_a_cctv_broadcast(&h, &b[1]);
     // b[0]: parked by a hold-back. b[1]: the user stopped it. b[2]: a copy.
     h.db.claim_stream_slot_within(&h.user, &b[0], 3).unwrap();
+    // Parked the way recovery parks one: the recorded fact, not a runtime
+    // state that happens to look like it.
     h.db.record_runtime_only(&b[0], louver_cloud::RuntimeState::Stopped).unwrap();
+    h.db.hold_back(&b[0]).unwrap();
     h.db.record_runtime_only(&b[1], louver_cloud::RuntimeState::Stopped).unwrap();
     h.db.claim_stream_slot_within(&h.user, &b[2], 3).unwrap();
 
@@ -1256,6 +1259,7 @@ fn an_api_role_manager_resumes_nothing_itself() {
     make_it_a_cctv_broadcast(&h, &b[0]);
     h.db.claim_stream_slot_within(&h.user, &b[0], 1).unwrap();
     h.db.record_runtime_only(&b[0], louver_cloud::RuntimeState::Stopped).unwrap();
+    h.db.hold_back(&b[0]).unwrap();
 
     let api = booted_manager(&h, 1).with_runner(louver_cloud::runner::Client::new(h.path.parent().unwrap()));
     assert_eq!(api.resume_held_back(), 0, "an api process started a worker");

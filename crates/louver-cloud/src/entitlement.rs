@@ -181,19 +181,33 @@ impl CloudDb {
             _ => {}
         }
 
-        let (already, encodes): (String, bool) = tx.query_row(
+        let (already, encodes, held_back): (String, bool, bool) = tx.query_row(
             // `cctv_url` is what makes a broadcast an encode rather than a
             // copy: two unrelated inputs cannot be muxed by copying packets.
-            "SELECT desired_state, COALESCE(TRIM(cctv_url), '') <> '' FROM broadcasts WHERE id=?1",
+            "SELECT desired_state, COALESCE(TRIM(cctv_url), '') <> '', held_back_at IS NOT NULL
+             FROM broadcasts WHERE id=?1",
             [broadcast_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        if already == DesiredState::Running.id() {
+        // Claiming again what you already hold is free. That is what makes a
+        // restart a restart, and why two clicks do not consume two slots.
+        //
+        // Unless it is held back. Recovery parks a broadcast it had no room for
+        // and leaves `desired_state='running'`, because the broadcast is still
+        // meant to run — so without the second half of this condition such a
+        // row takes this early return and walks past the machine's encoder
+        // ceiling, which is the one thing that ceiling exists to stop. It was
+        // reachable by hand: press start on a held-back broadcast.
+        if already == DesiredState::Running.id() && !held_back {
             return Ok(()); // already holds the slot
         }
 
+        // Held-back rows are left out of both counts below. They intend to run
+        // and nothing is running for them, and counting an intent as a running
+        // broadcast refuses starts that would in fact have fitted.
         let used: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM broadcasts WHERE user_id=?1 AND desired_state='running'",
+            "SELECT COUNT(*) FROM broadcasts
+             WHERE user_id=?1 AND desired_state='running' AND held_back_at IS NULL",
             [user_id],
             |r| r.get(0),
         )?;
@@ -214,7 +228,8 @@ impl CloudDb {
             let allowed_encodes = encode_budget;
             let running = tx.query_row(
                 "SELECT COUNT(*) FROM broadcasts
-                 WHERE desired_state='running' AND COALESCE(TRIM(cctv_url), '') <> ''",
+                 WHERE desired_state='running' AND COALESCE(TRIM(cctv_url), '') <> ''
+                   AND held_back_at IS NULL",
                 [],
                 |r| r.get::<_, i64>(0),
             )?;
@@ -226,7 +241,7 @@ impl CloudDb {
         tx.execute(
             "UPDATE broadcasts
              SET desired_state='running', runtime_state=?2, started_at=datetime('now'),
-                 stopped_at=NULL, last_error=NULL
+                 stopped_at=NULL, last_error=NULL, held_back_at=NULL
              WHERE id=?1",
             params![broadcast_id, RuntimeState::Preparing.id()],
         )?;

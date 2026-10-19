@@ -547,6 +547,17 @@ impl CloudDb {
             ("fps", "TEXT NOT NULL DEFAULT 'auto'"),
             ("video_bitrate_kbps", "INTEGER NOT NULL DEFAULT 0"),
             ("audio_bitrate_kbps", "INTEGER NOT NULL DEFAULT 0"),
+            // Set when recovery refused to put the box over its encoder budget,
+            // and cleared the moment the broadcast actually claims a slot.
+            //
+            // A column rather than a shape inferred from the other two, because
+            // the obvious inference — `desired_state='running'` with
+            // `runtime_state='STOPPED'` — is also what a restart looks like
+            // between its stop and its start (`stop_with` keeps the intent and
+            // the worker thread writes `Stopped` on its way out). Treating that
+            // as held back would let somebody else's start take the slot a
+            // restart is in the middle of reusing.
+            ("held_back_at", "TEXT"),
             // §8 schedule
             ("sched_enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("sched_start_at", "TEXT"),
@@ -2790,6 +2801,29 @@ impl CloudDb {
             params![id, state.id(), restart_count, uptime_secs, bytes_sent, ffmpeg_pid],
         )?;
         Ok(())
+    }
+
+    /// Mark a broadcast as one recovery had no room for.
+    ///
+    /// The intent (`desired_state`) is deliberately untouched: it is still
+    /// meant to run, and this is the record of why it is not.
+    pub fn hold_back(&self, id: &str) -> Result<()> {
+        self.raw()
+            .lock()
+            .unwrap()
+            .execute("UPDATE broadcasts SET held_back_at=datetime('now') WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    /// Which broadcasts are waiting for room. Oldest first, so the one that has
+    /// been waiting longest gets the slot.
+    pub fn held_back_ids(&self) -> Result<Vec<String>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard
+            .prepare("SELECT id FROM broadcasts WHERE held_back_at IS NOT NULL ORDER BY held_back_at, id")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn record_runtime_only(&self, id: &str, state: RuntimeState) -> Result<()> {
