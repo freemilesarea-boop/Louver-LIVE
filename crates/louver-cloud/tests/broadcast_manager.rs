@@ -1158,6 +1158,111 @@ fn a_restart_recovers_every_stream_copy_whatever_the_encode_budget_is() {
 }
 
 #[test]
+fn a_held_back_broadcast_is_not_left_looking_like_it_is_running() {
+    // The dashboard badge is read off `runtime_state` and never looks at
+    // `last_heartbeat`. Recovery used to leave whatever was there before the
+    // restart — `RUNNING`, for a broadcast that was on air — so a broadcast
+    // with no worker at all was shown as 송출 중. That is the lie this whole
+    // change exists to remove, and recovery is the worst place for it: it
+    // happens at boot, with nobody watching.
+    let h = harness("business", 2);
+    give_every_destination_a_key(&h);
+    let b = ids(&h);
+    for id in &b {
+        make_it_a_cctv_broadcast(&h, id);
+        h.db.claim_stream_slot_within(&h.user, id, 2).unwrap();
+        // What a server that went down while broadcasting leaves behind.
+        h.db.record_runtime_only(id, louver_cloud::RuntimeState::Running).unwrap();
+    }
+
+    let fresh = booted_manager(&h, 1);
+    fresh.recover_all().unwrap();
+
+    let held = b.iter().find(|id| h.fleet.launches(id) == 0).expect("one was held back");
+    assert_eq!(
+        h.db.broadcast(held).unwrap().runtime_state,
+        louver_cloud::RuntimeState::Stopped,
+        "a broadcast with no worker must not still read as running"
+    );
+    // And the intent is still there, which is what makes it resumable.
+    assert_eq!(h.db.desired_state(held).unwrap(), louver_cloud::DesiredState::Running);
+    fresh.shutdown();
+}
+
+#[test]
+fn a_held_back_broadcast_starts_itself_once_there_is_room() {
+    // The promise the hold-back's own log makes. Nothing used to keep it: the
+    // scheduler reads only `sched_enabled = 1` broadcasts, the watchdog only
+    // relaunches workers it already has, and `recover_all` runs once.
+    let h = harness("business", 2);
+    give_every_destination_a_key(&h);
+    let b = ids(&h);
+    for id in &b {
+        make_it_a_cctv_broadcast(&h, id);
+        h.db.claim_stream_slot_within(&h.user, id, 2).unwrap();
+    }
+
+    let fresh = booted_manager(&h, 1);
+    fresh.recover_all().unwrap();
+    let running = b.iter().find(|id| h.fleet.launches(id) == 1).expect("one came back").clone();
+    let held = b.iter().find(|id| h.fleet.launches(id) == 0).expect("one was held back").clone();
+
+    // While the one that fits is still on air, there is no room and the pass
+    // must not start a second encode — that is the ceiling it exists under.
+    assert_eq!(fresh.resume_held_back(), 0, "it started one over the budget");
+    assert_eq!(h.fleet.launches(&held), 0);
+
+    // The customer stops the other one. Now there is room.
+    fresh.stop(&h.user, &running).unwrap();
+    assert_eq!(fresh.resume_held_back(), 1, "nothing picked up the held-back broadcast");
+    eventually("the held-back broadcast is on air", || h.fleet.launches(&held) == 1);
+    let said =
+        h.db.events_for(&held, 50).unwrap().into_iter().map(|e| e.message).collect::<Vec<_>>().join("\n");
+    assert!(said.contains("자리가 생겨"), "it does not say why it started: {said}");
+    fresh.shutdown();
+}
+
+#[test]
+fn the_resume_pass_leaves_alone_what_nobody_asked_to_run() {
+    // Three things it must not touch: a broadcast the user stopped, a stream
+    // copy (never held back in the first place), and one that already has a
+    // worker. Without the first, a stop button could be undone by a tick.
+    let h = harness("business", 3);
+    give_every_destination_a_key(&h);
+    let b = ids(&h);
+    make_it_a_cctv_broadcast(&h, &b[0]);
+    make_it_a_cctv_broadcast(&h, &b[1]);
+    // b[0]: parked by a hold-back. b[1]: the user stopped it. b[2]: a copy.
+    h.db.claim_stream_slot_within(&h.user, &b[0], 3).unwrap();
+    h.db.record_runtime_only(&b[0], louver_cloud::RuntimeState::Stopped).unwrap();
+    h.db.record_runtime_only(&b[1], louver_cloud::RuntimeState::Stopped).unwrap();
+    h.db.claim_stream_slot_within(&h.user, &b[2], 3).unwrap();
+
+    let fresh = booted_manager(&h, 2);
+    assert_eq!(fresh.resume_held_back(), 1, "only the parked encode is resumed");
+    eventually("the parked one started", || h.fleet.launches(&b[0]) == 1);
+    assert_eq!(h.fleet.launches(&b[1]), 0, "a broadcast the user stopped was restarted by a tick");
+    assert_eq!(h.fleet.launches(&b[2]), 0, "a copy was never held back, so it is not the pass's to start");
+    fresh.shutdown();
+}
+
+#[test]
+fn an_api_role_manager_resumes_nothing_itself() {
+    // Same division as recovery and the scheduler. Two processes resuming the
+    // same broadcast is the double start the split exists to prevent.
+    let h = harness("business", 1);
+    give_every_destination_a_key(&h);
+    let b = ids(&h);
+    make_it_a_cctv_broadcast(&h, &b[0]);
+    h.db.claim_stream_slot_within(&h.user, &b[0], 1).unwrap();
+    h.db.record_runtime_only(&b[0], louver_cloud::RuntimeState::Stopped).unwrap();
+
+    let api = booted_manager(&h, 1).with_runner(louver_cloud::runner::Client::new(h.path.parent().unwrap()));
+    assert_eq!(api.resume_held_back(), 0, "an api process started a worker");
+    assert_eq!(h.fleet.launches(&b[0]), 0);
+}
+
+#[test]
 fn the_held_back_broadcast_is_told_why_in_its_own_log() {
     // An operator reading one broadcast's events has to be able to see that it
     // was the machine and not the customer's plan.

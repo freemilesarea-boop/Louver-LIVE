@@ -47,6 +47,8 @@ const TICK: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often the clock is checked. A minute's granularity is what a schedule
 /// form offers, so half of that is enough to never be late.
 const SCHEDULE_TICK: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long before a held-back broadcast that failed to start is tried again.
+const RESUME_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
 
 const MAX_RESTARTS: i64 = 10;
 
@@ -236,6 +238,14 @@ pub struct BroadcastManager {
     /// Set only when this server has YouTube connecting configured. `None`
     /// means every broadcast is a pasted stream key, exactly as before.
     youtube: Option<Arc<crate::youtube::Youtube>>,
+    /// When each held-back broadcast was last tried again, so a broadcast that
+    /// cannot start does not cost a YouTube token refresh every tick.
+    ///
+    /// In memory on purpose: a restart re-runs `recover_all`, which parks
+    /// whatever is still over budget, so there is nothing here worth keeping
+    /// across one. It lives with the workers, which is to say in the one
+    /// process that owns them.
+    resume_tried: Arc<Mutex<HashMap<String, std::time::Instant>>>,
     /// How many broadcasts this machine will encode at once.
     ///
     /// A field defaulted from the environment rather than an `std::env::var` at
@@ -280,6 +290,7 @@ impl BroadcastManager {
             keys,
             launchers,
             workers: Arc::new(Mutex::new(HashMap::new())),
+            resume_tried: Arc::new(Mutex::new(HashMap::new())),
             youtube: None,
             remote: None,
             encode_budget: crate::entitlement::encoding_budget(),
@@ -509,16 +520,36 @@ impl BroadcastManager {
             let encodes = b.cctv_url.as_deref().map(str::trim).is_some_and(|u| !u.is_empty());
             if encodes && encodes_started >= encode_budget {
                 // `desired_state` is left alone, exactly as it is for an
-                // expired subscription: the broadcast is still meant to run,
-                // and it will start when there is room for it.
-                let _ = self.db.append_event(
-                    &b.id,
-                    EventLevel::Warn,
-                    &format!(
+                // expired subscription: the broadcast is still meant to run.
+                //
+                // `runtime_state` is NOT left alone, and that is the fix for a
+                // bug this branch used to have. Whatever it held before the
+                // restart stayed — `RUNNING`, most of the time — and the
+                // dashboard's badge is read straight off it (`liveLabel`, which
+                // never looks at `last_heartbeat`). So a broadcast with no
+                // worker at all was shown as 송출 중: the exact lie this change
+                // set out to remove, reintroduced where nobody was looking,
+                // because recovery happens at boot.
+                //
+                // `Stopped` with `desired_state` still `running` is also the
+                // marker `resume_held_back` picks up, so the two are the same
+                // fact rather than two bookkeeping schemes.
+                let _ = self.db.record_runtime_only(&b.id, RuntimeState::Stopped);
+                // Said differently for a budget of zero, where "when another
+                // one finishes" is not true: there is no other one, and no
+                // amount of waiting produces a slot.
+                let why = if encode_budget == 0 {
+                    "이 서버는 CCTV 영상을 쓰는 방송을 실행하지 않도록 설정되어 있어(동시 인코딩 한도 0) \
+                     이 방송을 복구하지 않았습니다. 한도를 올려야 시작할 수 있습니다"
+                        .to_string()
+                } else {
+                    format!(
                         "서버가 동시에 인코딩할 수 있는 방송 수({encode_budget}개)에 도달해 \
-                         이 CCTV 방송은 복구하지 않았습니다. 다른 CCTV 방송이 끝나면 시작할 수 있습니다"
-                    ),
-                );
+                         이 CCTV 방송은 복구하지 않았습니다. 다른 CCTV 방송이 끝나면 \
+                         서버가 자동으로 시작합니다"
+                    )
+                };
+                let _ = self.db.append_event(&b.id, EventLevel::Warn, &why);
                 say(&b.id, "warn", &format!("인코딩 예산 {encode_budget}개 초과로 복구 보류 (CCTV)"));
                 continue;
             }
@@ -575,6 +606,94 @@ impl BroadcastManager {
         Ok(started)
     }
 
+    /// Start a broadcast that recovery held back, once there is room for it.
+    ///
+    /// `recover_all` refuses to put the box over its encoder budget and says so
+    /// in the held-back broadcast's own log. Nothing used to make that true:
+    /// `run_schedules` only reads broadcasts with `sched_enabled = 1`, the
+    /// watchdog only relaunches workers it already has, and `recover_all` runs
+    /// once at boot. A broadcast held back there stayed dark until somebody
+    /// pressed start — which, for a service whose whole premise is running
+    /// unattended around the clock, is "for ever".
+    ///
+    /// Room is counted from the workers this process actually holds, not from
+    /// `desired_state` rows. Those are two different numbers precisely when it
+    /// matters: a parked broadcast still intends to run, so it is still a
+    /// `desired_state='running'` row, and counting rows would have this pass
+    /// decide there was no room because of the very broadcasts it is trying to
+    /// start.
+    pub fn resume_held_back(&self) -> usize {
+        // Same division as recovery and the scheduler: the process with the
+        // workers is the only one that may start one.
+        if self.remote.is_some() {
+            return 0;
+        }
+        if self.encode_budget <= 0 {
+            return 0;
+        }
+        let Ok(wanted) = self.db.broadcasts_wanting_to_run() else { return 0 };
+        let live = self.running_ids();
+        let encodes = |b: &Broadcast| b.cctv_url.as_deref().map(str::trim).is_some_and(|u| !u.is_empty());
+        let busy = wanted.iter().filter(|b| encodes(b) && live.contains(&b.id)).count() as i64;
+        let mut room = self.encode_budget - busy;
+        if room <= 0 {
+            return 0;
+        }
+
+        let mut started = 0;
+        for b in wanted.iter().filter(|b| {
+            // Parked by the hold-back above: the intent says run, the runtime
+            // says nothing is running, and no worker exists here. A broadcast
+            // the user stopped is not this — its `desired_state` is `stopped`,
+            // so it never reaches this list.
+            encodes(b) && b.runtime_state == RuntimeState::Stopped && !live.contains(&b.id)
+        }) {
+            if room <= 0 {
+                break;
+            }
+            if !self.resume_due(&b.id) {
+                continue;
+            }
+            match self.start(&b.user_id, &b.id) {
+                Ok(()) => {
+                    room -= 1;
+                    started += 1;
+                    let _ = self.db.append_event(
+                        &b.id,
+                        EventLevel::Info,
+                        "인코딩할 자리가 생겨 서버가 이 방송을 시작했습니다",
+                    );
+                    say(&b.id, "info", "예산에 자리가 생겨 보류된 CCTV 방송을 시작했습니다");
+                }
+                Err(e) => {
+                    // Recorded, and the backoff above is what keeps a broadcast
+                    // that cannot start from asking YouTube every tick.
+                    let _ = self.db.record_failure(&b.id, &format!("보류 해제 실패: {e}"));
+                }
+            }
+        }
+        started
+    }
+
+    /// May this broadcast be tried again? Records the attempt when it may.
+    ///
+    /// `start` refreshes a YouTube token and makes two API calls before it
+    /// spawns anything, so a broadcast that fails for a reason waiting will not
+    /// fix — a revoked channel, a deleted playlist — must not be retried on
+    /// every tick. The daily quota is the same one `YoutubeWatch` is careful
+    /// with.
+    fn resume_due(&self, broadcast_id: &str) -> bool {
+        let mut tried = self.resume_tried.lock().unwrap();
+        let now = std::time::Instant::now();
+        match tried.get(broadcast_id) {
+            Some(at) if now.duration_since(*at) < RESUME_RETRY => false,
+            _ => {
+                tried.insert(broadcast_id.to_string(), now);
+                true
+            }
+        }
+    }
+
     /// Start the thread that watches the clock. §8.
     ///
     /// It holds nothing: every tick re-reads the schedules from the database and
@@ -596,6 +715,11 @@ impl BroadcastManager {
             }
             loop {
                 mgr.run_schedules(chrono::Utc::now());
+                // The same tick picks up what recovery had no room for. It has
+                // to be somewhere that runs again, and this is the only thread
+                // that does; a broadcast held back at boot is otherwise waiting
+                // for a human on a service that is meant not to need one.
+                mgr.resume_held_back();
                 std::thread::sleep(SCHEDULE_TICK);
             }
         })
