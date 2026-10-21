@@ -538,6 +538,14 @@ impl CloudDb {
             ("youtube_broadcast_id", "TEXT"),
             ("youtube_stream_id", "TEXT"),
             ("youtube_status", "TEXT"),
+            // When `youtube_status` was last confirmed with YouTube, as an
+            // explicit-UTC instant. NULL on every existing row and on every
+            // pasted-key broadcast, and NULL reads as "never asked", which is
+            // the honest value for both. A status with no time behind it cannot
+            // be told apart from one confirmed a second ago, and that is the
+            // difference between "live" and "was live when we last managed to
+            // ask" — the §5-2 distinction the dashboard now draws.
+            ("youtube_status_at", "TEXT"),
             ("youtube_error", "TEXT"),
             ("current_index", "INTEGER NOT NULL DEFAULT 0"),
             ("current_item", "TEXT"),
@@ -2298,7 +2306,8 @@ impl CloudDb {
     ) -> Result<()> {
         self.raw().lock().unwrap().execute(
             "UPDATE broadcasts SET youtube_account_id = ?2, youtube_broadcast_id = ?3,
-                    youtube_stream_id = ?4, youtube_status = ?5, youtube_error = NULL
+                    youtube_stream_id = ?4, youtube_status = ?5, youtube_error = NULL,
+                    youtube_status_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
              WHERE id = ?1",
             params![broadcast_id, account_id, youtube_broadcast_id, youtube_stream_id, status],
         )?;
@@ -2306,9 +2315,17 @@ impl CloudDb {
     }
 
     /// YouTube's own view of the broadcast, which is not FFmpeg's. §8.
+    ///
+    /// Every caller reaches here having just had an answer from YouTube, so the
+    /// write carries the time of that answer. `strftime` rather than
+    /// `datetime('now')`: the trailing `Z` is what stops a browser reading a
+    /// UTC instant as a local one.
     pub fn set_youtube_status(&self, broadcast_id: &str, status: &str) -> Result<()> {
         self.raw().lock().unwrap().execute(
-            "UPDATE broadcasts SET youtube_status = ?2 WHERE id = ?1",
+            "UPDATE broadcasts
+                SET youtube_status = ?2,
+                    youtube_status_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+             WHERE id = ?1",
             params![broadcast_id, status],
         )?;
         Ok(())
@@ -3082,6 +3099,7 @@ fn row_to_broadcast(r: &rusqlite::Row<'_>) -> rusqlite::Result<Broadcast> {
             broadcast_id: r.get("youtube_broadcast_id")?,
             stream_id: r.get("youtube_stream_id")?,
             status: r.get("youtube_status")?,
+            checked_at: r.get("youtube_status_at")?,
             watch_url: r
                 .get::<_, Option<String>>("youtube_broadcast_id")?
                 .map(|id| format!("https://www.youtube.com/watch?v={id}")),
