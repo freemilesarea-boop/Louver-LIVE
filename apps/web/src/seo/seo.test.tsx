@@ -457,7 +457,12 @@ describe("where the app sends each URL", () => {
       ).toBe("noindex,follow"),
     );
     // A member typing the URL is still told no — unchanged by any of this.
-    expect(screen.getByText("관리자만 열 수 있는 페이지입니다.")).toBeInTheDocument();
+    //
+    // `findByText`, not `getByText`: the robots tag above is written while the
+    // page is still loading, so waiting for it says nothing about whether the
+    // refusal has rendered. On a loaded Windows runner the assertion ran
+    // against `불러오는 중…` and the job failed on behaviour that is correct.
+    expect(await screen.findByText("관리자만 열 수 있는 페이지입니다.")).toBeInTheDocument();
   });
 
   it("does not touch the robots tag the server sent for a real page", async () => {
