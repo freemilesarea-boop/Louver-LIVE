@@ -9,6 +9,10 @@ target/
 .louver-dev/
 apps/desktop/src-tauri/binaries/ffmpeg*
 apps/desktop/src-tauri/binaries/ffprobe*
+# Written by whichever fetch ran last on this machine, for whichever target.
+# One of these was tracked, so every local fetch dirtied the tree and the
+# committed copy named a download host that has since gone away.
+apps/desktop/src-tauri/binaries/SOURCE-*.txt
 !apps/desktop/src-tauri/binaries/.gitkeep
 tests/fixtures/*.mp4
 tests/fixtures/*.mov

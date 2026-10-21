@@ -18,9 +18,9 @@
  *   node scripts/fetch-ffmpeg.mjs --target <triple>
  *   node scripts/fetch-ffmpeg.mjs --require-download   # fail instead of falling back
  *   node scripts/fetch-ffmpeg.mjs --url <u> --probe-url <u> --out <dir>
+ *   node scripts/fetch-ffmpeg.mjs --alternates '[{"url":…,"probeUrl":…}]'
  *
- * The last three override where the archives come from and where the sidecars
- * are put. They exist so the download path can be exercised against a local
+ * These override where the archives come from and where the sidecars are put. They exist so the download path can be exercised against a local
  * server — it is the part that has broken a release twice and the part no
  * offline test could reach — and for anyone mirroring the builds internally.
  */
@@ -94,7 +94,18 @@ function sleepSync(secs) {
  * and a line in the log.
  */
 function download(url, dest) {
-  const args = ['-sS', '-L', '-o', dest, '-w', '%{http_code}', '--fail', '--max-time', '300', url]
+  // `--speed-time`/`--speed-limit` is what tells a dead host from a slow one.
+  // johnvansickle.com went down answering nothing at all, and with --max-time
+  // alone each attempt sat out the full five minutes: every job spent twenty
+  // minutes reaching the conclusion it had after thirty seconds, four times a
+  // run, on every push. A transfer that is moving keeps the five minutes; one
+  // delivering under 1 kB/s for thirty seconds is given up on, which is the
+  // same verdict sooner.
+  const args = [
+    '-sS', '-L', '-o', dest, '-w', '%{http_code}', '--fail',
+    '--connect-timeout', '20', '--speed-time', '30', '--speed-limit', '1024', '--max-time', '300',
+    url,
+  ]
   try {
     execFileSync('curl', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     return { ok: true }
@@ -213,6 +224,33 @@ function install(from, target, name, out) {
   console.log(`  ${name} -> ${dest} (${(statSync(dest).size / 1e6).toFixed(1)} MB)`)
 }
 
+/**
+ * Every source to try for a target, in order: the one named first, then its
+ * `alternates`.
+ *
+ * Each is a whole source rather than a spare URL, because the thing that
+ * changes between providers is not only where ffmpeg is — it is whether
+ * ffprobe comes from the same download. The field this replaces carried a URL
+ * alone, and no source ever set it: a second provider could not have been
+ * expressed that way, so the retry loop had exactly one source to try for
+ * three years. Two of the five providers then went down in the same week.
+ */
+function candidates(spec) {
+  const alternates = (spec.alternates ?? []).map((alt) => ({
+    ...spec,
+    // Cleared before the alternate speaks, and this is the whole point of the
+    // field. `main()` has already resolved `probeUrl` to a concrete URL — for
+    // a provider that ships both tools in one archive, that URL *is* the
+    // primary's. Carrying it into an alternate fetched ffmpeg from the new
+    // source and then went back to the host we had just given up on for
+    // ffprobe, which is the exact failure a second source exists to avoid. An
+    // alternate that names no `probeUrl` holds both tools in its own download.
+    probeUrl: undefined,
+    ...alt,
+  }))
+  return [spec, ...alternates]
+}
+
 function main() {
   const args = process.argv.slice(2)
   const flag = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : null)
@@ -225,7 +263,13 @@ function main() {
   }
   const OUT = resolve(flag('--out') ?? DEFAULT_OUT)
   const urls = urlsFor(target, flag('--url'))
-  const spec = { ...base, url: urls.ffmpeg, probeUrl: flag('--probe-url') ?? urls.ffprobe }
+  const alternates = flag('--alternates')
+  const spec = {
+    ...base,
+    url: urls.ffmpeg,
+    probeUrl: flag('--probe-url') ?? urls.ffprobe,
+    ...(alternates ? { alternates: JSON.parse(alternates) } : {}),
+  }
 
   const already = TOOLS.every((n) => existsSync(join(OUT, sidecarName(n, target))))
   // What the sidecars presently there actually are. A release must ship the
@@ -258,13 +302,21 @@ function main() {
   // had served the release ninety minutes before. A wrong URL or an archive
   // that does not hold ffprobe still fails on the first try, because no amount
   // of waiting changes either.
-  for (const url of [spec.url, spec.fallbackUrl].filter(Boolean)) {
+  for (const where of candidates(spec)) {
+    if (where !== spec) console.log(`  trying the next source for ${target}`)
     for (const [attempt, wait] of BACKOFF_SECS.entries()) {
       if (wait) console.log(`  retrying in ${wait}s (attempt ${attempt + 1} of ${BACKOFF_SECS.length})`)
       sleepSync(wait)
-      const got = tryDownload(target, { ...spec, url }, tmp, OUT)
+      const got = tryDownload(target, where, tmp, OUT)
       if (got.urls) {
-        writeFileSync(join(OUT, provenanceName(target)), `${got.urls.join('\n')}\n${base.license}\n`)
+        // `where.license`, not the table's first entry. A fall-through writes
+        // the URLs it actually used, and writing the primary's licence beside
+        // them produced a provenance file that named one provider's terms over
+        // another provider's binary — in the first run that used a second
+        // source, an Intel Mac build from ffbinaries recorded as osxexperts.
+        // This file is what `ffmpeg-manifest.mjs --check` reads to say what
+        // shipped, so every line of it has to be about the same download.
+        writeFileSync(join(OUT, provenanceName(target)), `${got.urls.join('\n')}\n${where.license}\n`)
         console.log('done (downloaded)')
         return
       }
