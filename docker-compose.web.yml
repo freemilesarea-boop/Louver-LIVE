@@ -1,0 +1,39 @@
+# Serve the web bundle from Caddy instead of from inside the server process.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.web.yml \
+#       --profile https up -d --no-deps caddy
+#
+# This overlay changes the `caddy` service and nothing else. `--no-deps` keeps
+# Compose from acting on `louver`, whose container holds every running FFmpeg
+# child: recreating it ends the broadcasts. Applying this overlay recreates
+# `caddy` exactly once — a mount cannot be added to a running container — and
+# that is the only interruption, measured in the second or two that the TLS
+# listener is down. The server keeps streaming to YouTube throughout, because
+# nothing in front of it is in the broadcast path.
+#
+# Prepare the host directory first (`scripts/deploy-web.sh` does all of it):
+#
+#   /srv/louver/web/releases/<version>/   one unpacked `apps/web/dist`
+#   /srv/louver/web/current -> releases/<version>    a RELATIVE symlink
+#
+# Relative on purpose: the same link has to resolve both on the host and under
+# `/srv/web` inside the container.
+services:
+  caddy:
+    environment:
+      LOUVER_DOMAIN: ${LOUVER_DOMAIN:-}
+      LOUVER_TLS_EMAIL: ${LOUVER_TLS_EMAIL:-}
+      # Where the static half sends everything it does not serve itself.
+      LOUVER_UPSTREAM: ${LOUVER_UPSTREAM:-louver:8080}
+      # The container's view of the symlink above.
+      LOUVER_WEB_ROOT: /srv/web/current
+    # Listed in full rather than as an addition: Compose's merge rule for
+    # `volumes` has changed between versions, and an overlay that silently
+    # dropped `/data` would make Caddy ask for a new certificate on every
+    # restart and hit Let's Encrypt's rate limit.
+    volumes:
+      - ./deploy/web/Caddyfile:/etc/caddy/Caddyfile:ro
+      # Read-only: the front end can serve a release but never write one.
+      - ${LOUVER_WEB_RELEASES:-/srv/louver/web}:/srv/web:ro
+      - caddy-data:/data
+      - caddy-config:/config
