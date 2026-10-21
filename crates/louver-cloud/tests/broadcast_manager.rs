@@ -47,6 +47,22 @@ struct Gate {
 }
 
 impl Gate {
+    /// How long a caller waits for the others.
+    ///
+    /// This is headroom, not the thing being measured, and a second of it was
+    /// not enough: the macOS runner failed with "only 2 of 3 terminations
+    /// overlapped" on a commit that passed the same test everywhere else. Three
+    /// threads have to be scheduled and get through the stop path within the
+    /// window, and a loaded shared runner does not promise that in a second.
+    ///
+    /// Lengthening it does not weaken the test, which is why this is the fix
+    /// rather than a retry. A concurrent shutdown opens the gate the moment the
+    /// last caller arrives, so the correct case never waits the deadline out at
+    /// all. A serial one cannot pass however long the deadline is — each caller
+    /// waits alone and times out before the next one starts — it only takes
+    /// `want × DEADLINE` to say so, which is the whole cost of the change.
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
     fn new(want: usize) -> Arc<Self> {
         Arc::new(Self {
             want,
@@ -56,7 +72,7 @@ impl Gate {
         })
     }
 
-    /// Arrive, then wait for everyone else — or give up after a second.
+    /// Arrive, then wait for everyone else — or give up after `DEADLINE`.
     fn meet(&self) {
         let mut n = self.arrived.lock().unwrap();
         *n += 1;
@@ -65,7 +81,7 @@ impl Gate {
             self.bell.notify_all();
             return;
         }
-        let deadline = std::time::Duration::from_secs(1);
+        let deadline = Self::DEADLINE;
         let (_n, timeout) = self.bell.wait_timeout_while(n, deadline, |n| *n < self.want).unwrap();
         if !timeout.timed_out() {
             self.passed.fetch_add(1, Ordering::SeqCst);
