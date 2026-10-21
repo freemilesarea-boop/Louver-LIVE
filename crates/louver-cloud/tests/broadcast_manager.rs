@@ -22,6 +22,75 @@ use std::sync::{Arc, Mutex};
 #[derive(Default, Debug)]
 struct FakeState {
     exited: AtomicBool,
+    /// Set by a test that wants every `terminate` to meet the others.
+    ///
+    /// A rendezvous rather than a sleep: it measures concurrency directly, so
+    /// the assertion does not depend on how fast or how loaded the machine is.
+    gate: Mutex<Option<Arc<Gate>>>,
+}
+
+/// A meeting point for N callers, with a deadline so a regression fails the
+/// test instead of hanging it.
+#[derive(Debug)]
+struct Gate {
+    want: usize,
+    arrived: Mutex<usize>,
+    bell: std::sync::Condvar,
+    /// How many callers left the gate because everyone was there, rather than
+    /// because they gave up waiting.
+    ///
+    /// This is the number that distinguishes concurrent from serial, and
+    /// counting arrivals does not: a serial shutdown still sends every worker
+    /// through here eventually, one timeout at a time. Only an overlapping
+    /// shutdown lets anybody pass.
+    passed: std::sync::atomic::AtomicUsize,
+}
+
+impl Gate {
+    /// How long a caller waits for the others.
+    ///
+    /// This is headroom, not the thing being measured, and a second of it was
+    /// not enough: the macOS runner failed with "only 2 of 3 terminations
+    /// overlapped" on a commit that passed the same test everywhere else. Three
+    /// threads have to be scheduled and get through the stop path within the
+    /// window, and a loaded shared runner does not promise that in a second.
+    ///
+    /// Lengthening it does not weaken the test, which is why this is the fix
+    /// rather than a retry. A concurrent shutdown opens the gate the moment the
+    /// last caller arrives, so the correct case never waits the deadline out at
+    /// all. A serial one cannot pass however long the deadline is — each caller
+    /// waits alone and times out before the next one starts — it only takes
+    /// `want × DEADLINE` to say so, which is the whole cost of the change.
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    fn new(want: usize) -> Arc<Self> {
+        Arc::new(Self {
+            want,
+            arrived: Mutex::new(0),
+            bell: std::sync::Condvar::new(),
+            passed: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Arrive, then wait for everyone else — or give up after `DEADLINE`.
+    fn meet(&self) {
+        let mut n = self.arrived.lock().unwrap();
+        *n += 1;
+        if *n >= self.want {
+            self.passed.fetch_add(1, Ordering::SeqCst);
+            self.bell.notify_all();
+            return;
+        }
+        let deadline = Self::DEADLINE;
+        let (_n, timeout) = self.bell.wait_timeout_while(n, deadline, |n| *n < self.want).unwrap();
+        if !timeout.timed_out() {
+            self.passed.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn passed(&self) -> usize {
+        self.passed.load(Ordering::SeqCst)
+    }
 }
 
 struct FakeProcess {
@@ -35,6 +104,12 @@ impl ProcessHandle for FakeProcess {
         self.state.exited.load(Ordering::SeqCst).then_some(false)
     }
     fn terminate(&mut self) -> CoreResult<()> {
+        // Taken out of the lock before waiting, so holding the gate does not
+        // also hold this process's own mutex.
+        let gate = self.state.gate.lock().unwrap().clone();
+        if let Some(g) = gate {
+            g.meet();
+        }
         self.state.exited.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -49,6 +124,8 @@ struct Fleet {
     launches: Mutex<HashMap<String, u32>>,
     live: Mutex<HashMap<String, Arc<FakeState>>>,
     next_pid: AtomicU32,
+    /// Handed to every process this fleet launches, so a test can set it once.
+    gate: Mutex<Option<Arc<Gate>>>,
 }
 
 impl Fleet {
@@ -86,6 +163,7 @@ impl StreamLauncher for OneLauncher {
     fn launch(&self, _s: &mut StreamSupervisor, _args: &[String]) -> CoreResult<Box<dyn ProcessHandle>> {
         *self.fleet.launches.lock().unwrap().entry(self.id.clone()).or_insert(0) += 1;
         let state = Arc::new(FakeState::default());
+        *state.gate.lock().unwrap() = self.fleet.gate.lock().unwrap().clone();
         self.fleet.live.lock().unwrap().insert(self.id.clone(), Arc::clone(&state));
         let pid = self.fleet.next_pid.fetch_add(1, Ordering::SeqCst) + 1000;
         Ok(Box::new(FakeProcess { state, pid }))
@@ -963,4 +1041,52 @@ fn a_hand_granted_plan_keeps_both_the_plan_and_the_broadcast() {
     assert!(h.mgr.running_ids().contains(&h.id), "a broadcast was stopped for a plan nobody revoked");
     assert_eq!(h.api.completions(), 0);
     h.mgr.shutdown();
+}
+
+/// Shutting down tells every worker to stop before waiting on any of them.
+///
+/// It used to halt them one at a time, and each halt waits for FFmpeg to flush
+/// its FLV trailer — three seconds, in the real `ProcessHandle`. Five
+/// broadcasts therefore took up to fifteen seconds, and Docker's grace period
+/// is ten: the container was SIGKILLed partway through, losing the trailers
+/// that the careful shutdown existed to write.
+///
+/// Asserted as concurrency rather than as elapsed time: every `terminate`
+/// meets the others at a gate, which only all of them can pass if they are
+/// in flight together. A serial shutdown leaves the first one waiting there
+/// alone, and the gate's deadline turns that into a failure rather than a hang.
+#[test]
+fn shutdown_stops_every_worker_at_once_rather_than_one_after_another() {
+    let h = harness("business", 3);
+    give_every_destination_a_key(&h);
+    let b = ids(&h);
+
+    let gate = Gate::new(3);
+    *h.fleet.gate.lock().unwrap() = Some(Arc::clone(&gate));
+
+    for id in &b {
+        h.mgr.start(&h.user, id).unwrap_or_else(|e| panic!("start {id} failed: {e}"));
+    }
+    eventually("all three launched", || b.iter().all(|id| h.fleet.launches(id) == 1));
+
+    h.mgr.shutdown();
+
+    assert_eq!(
+        gate.passed(),
+        3,
+        "only {} of 3 terminations overlapped — the shutdown is serial again",
+        gate.passed()
+    );
+    assert!(h.mgr.running_ids().is_empty(), "shutdown left a worker behind");
+    for id in &b {
+        assert!(!h.fleet.is_alive(id), "broadcast {id} was not stopped");
+    }
+}
+
+/// And a shutdown with nothing running is still a shutdown.
+#[test]
+fn shutting_down_an_idle_manager_does_nothing_and_does_not_hang() {
+    let h = harness("business", 1);
+    h.mgr.shutdown();
+    assert!(h.mgr.running_ids().is_empty());
 }

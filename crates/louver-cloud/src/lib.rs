@@ -10,6 +10,7 @@
 //! it. Replacing tested code with untested code is not a port.
 
 pub mod admin;
+pub mod audit;
 pub mod billing;
 // The traffic-CCTV proof of concept: a live video source for a broadcast whose
 // sound still comes from its playlist. See `cctv.rs` for why the URL checks are
@@ -20,9 +21,11 @@ pub mod db;
 pub mod entitlement;
 pub mod grants;
 pub mod ingest;
+pub mod lease;
 pub mod manager;
 pub mod media_audit;
 pub mod models;
+pub mod runner;
 pub mod schedule;
 pub mod storage;
 pub mod youtube;

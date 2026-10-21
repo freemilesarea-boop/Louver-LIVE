@@ -287,6 +287,25 @@ pub struct Youtube {
     /// without `set_var` — which is process-global and has already raced two of
     /// this repository's test threads once.
     auto_transition: bool,
+    /// Opened against a database that refuses writes, for the audit.
+    ///
+    /// The only thing it changes is that caching a refreshed access token is
+    /// allowed to fail: the cache is a convenience, the token works in memory
+    /// regardless, and an hourly expiry would otherwise make a read-only
+    /// diagnosis fail for every account. It is set by the audit entry point
+    /// and by nothing else — deliberately not an environment variable, so a
+    /// running server can never be talked into swallowing a write failure.
+    read_only: bool,
+    /// May a read-only audit call Google's token endpoint?
+    ///
+    /// Off by default, and the reason is not caution for its own sake. A
+    /// refresh can come back with a *rotated* refresh token, and on a
+    /// read-only database the rotation cannot be stored — which would leave
+    /// the customer's channel connected to a token nobody has. Google rarely
+    /// rotates, but "rarely" is not a risk to take on a live account without
+    /// being asked. So the default audit uses the cached token the running
+    /// server keeps fresh, and says so plainly when it has expired.
+    read_only_may_refresh: bool,
 }
 
 impl std::fmt::Debug for Youtube {
@@ -304,6 +323,8 @@ impl Clone for Youtube {
             tokens: Arc::clone(&self.tokens),
             config: self.config.clone(),
             auto_transition: self.auto_transition,
+            read_only: self.read_only,
+            read_only_may_refresh: self.read_only_may_refresh,
         }
     }
 }
@@ -316,7 +337,34 @@ impl Youtube {
         tokens: Arc<dyn TokenEndpoint>,
         config: Config,
     ) -> Self {
-        Self { db, keys, http, tokens, config, auto_transition: auto_transition_enabled() }
+        Self {
+            db,
+            keys,
+            http,
+            tokens,
+            config,
+            auto_transition: auto_transition_enabled(),
+            read_only: false,
+            read_only_may_refresh: false,
+        }
+    }
+
+    /// For a diagnosis reading a database it must not write to.
+    ///
+    /// Also forces the transition policy off: a read-only audit has no business
+    /// writing to a customer's channel whatever the operator switch says.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self.auto_transition = false;
+        self
+    }
+
+    /// Let a read-only audit refresh an expired access token.
+    ///
+    /// The operator's decision, not a default: see `read_only_may_refresh`.
+    pub fn read_only_may_refresh(mut self, on: bool) -> Self {
+        self.read_only_may_refresh = on;
+        self
     }
 
     /// Override the transition policy. For tests and for a caller that has its
@@ -435,6 +483,17 @@ impl Youtube {
     }
 
     fn cache_access_token(&self, account_id: &str, tokens: &TokenResponse) -> Result<()> {
+        if self.read_only {
+            // Nothing to cache into, and nothing lost: the caller already has
+            // the token it needs. Said out loud so an operator reading the
+            // audit knows why the next run will refresh again.
+            crate::manager::say(
+                account_id,
+                "youtube",
+                "읽기 전용 모드이므로 access token 을 저장하지 않았습니다",
+            );
+            return Ok(());
+        }
         self.seal(&access_account(account_id), &tokens.access_token)?;
         let seconds = tokens.expires_in.unwrap_or(3600).min(24 * 3600) as i64;
         // A minute of margin, so a call started just before expiry does not
@@ -450,6 +509,13 @@ impl Youtube {
                     return Ok(cached);
                 }
             }
+        }
+        if self.read_only && !self.read_only_may_refresh {
+            // Not a failure of the audit so much as its honesty: refreshing
+            // here could rotate a refresh token this process cannot store.
+            return Err(CloudError::Invalid(
+                "저장된 access token 이 만료되었습니다. 읽기 전용 점검은 토큰을 갱신하지 않습니다".into(),
+            ));
         }
         self.refresh_access_token(account_id)
     }
@@ -480,7 +546,18 @@ impl Youtube {
         // writing the absent one would disconnect the account for good.
         if let Some(new_refresh) = tokens.refresh_token.as_deref() {
             if !new_refresh.trim().is_empty() && new_refresh != refresh {
-                self.seal(&refresh_account(account_id), new_refresh)?;
+                if self.read_only {
+                    // The rotation already happened at Google's end; the only
+                    // thing left is to say so, because the stored token may no
+                    // longer work and only a reconnect fixes that.
+                    crate::manager::say(
+                        account_id,
+                        "youtube",
+                        "경고: Google이 refresh token 을 교체했고 읽기 전용 모드라 저장할 수 없었습니다.                          이 채널은 다시 연결해야 할 수 있습니다",
+                    );
+                } else {
+                    self.seal(&refresh_account(account_id), new_refresh)?;
+                }
             }
         }
         self.cache_access_token(account_id, &tokens)?;
@@ -665,6 +742,79 @@ impl Youtube {
 
         self.db.set_youtube_status(broadcast_id, WAITING)?;
         Ok(())
+    }
+
+    /// Look at a broadcast on YouTube and write nothing anywhere. §3 of the
+    /// P0 follow-up: the diagnosis half, which has to be usable against a live
+    /// production database.
+    ///
+    /// Two `list` calls and no more. It does not touch `broadcasts`, does not
+    /// append an event, does not transition, and does not store a token — the
+    /// difference between this and [`Self::poll_status`], which does the first
+    /// three because it is the running server's own view.
+    ///
+    /// Never returns `Err`: a failure to ask is itself one of the things the
+    /// audit reports, so it comes back as a [`crate::audit::Seen`] with the
+    /// reach that failed. The caller gets a verdict either way, which is what
+    /// stops a broken question from reading as a healthy broadcast.
+    pub fn observe(&self, broadcast_id: &str) -> crate::audit::Seen {
+        use crate::audit::{Reach, Seen};
+
+        let Ok(b) = self.db.broadcast(broadcast_id) else {
+            return Seen {
+                reach: Reach::Unreachable,
+                error: Some("방송 행을 읽을 수 없습니다".into()),
+                ..Seen::default()
+            };
+        };
+        let (Some(account_id), Some(yt_id)) = (b.youtube.account_id.clone(), b.youtube.broadcast_id.clone())
+        else {
+            return Seen {
+                reach: Reach::Unreachable,
+                error: Some("YouTube 계정에 연결된 방송이 아닙니다".into()),
+                ..Seen::default()
+            };
+        };
+
+        let api = self.api();
+        let token = match self.access_token(&account_id) {
+            Ok(t) => t,
+            // A token that cannot be obtained is an auth problem by
+            // construction, whichever step of the dance refused.
+            Err(e) => return Seen { reach: Reach::Refused, error: Some(e.to_string()), ..Seen::default() },
+        };
+
+        let broadcast = match api.broadcast_by_id(&token, &yt_id) {
+            Ok(v) => v,
+            Err(e) => return Seen { error: Some(e.message.clone()), ..reach_of(&e) },
+        };
+
+        let mut seen = Seen {
+            reach: Reach::Answered,
+            life_cycle_status: broadcast.life_cycle_status.clone(),
+            bound_stream_id: broadcast.bound_stream_id.clone(),
+            enable_auto_start: broadcast.enable_auto_start,
+            enable_monitor_stream: broadcast.enable_monitor_stream,
+            ..Seen::default()
+        };
+
+        // The stream is a second question, and a broadcast with no stream to
+        // ask about is still worth a verdict — `classify` has one for it.
+        if let Some(stream_id) = b.youtube.stream_id.as_deref() {
+            match api.stream_by_id(&token, stream_id) {
+                Ok(stream) => {
+                    seen.stream_status = stream.stream_status.clone();
+                    seen.health_status = stream.health_status.clone();
+                    seen.configuration_issues = stream.configuration_issues.clone();
+                }
+                Err(e) => {
+                    // The broadcast answered and the stream did not. Say so
+                    // without throwing away the half that worked.
+                    seen.error = Some(format!("스트림 조회 실패: {}", e.message));
+                }
+            }
+        }
+        seen
     }
 
     /// Ask YouTube what it makes of the stream, once. §8: bounded, and called
@@ -899,5 +1049,25 @@ fn scheduled_start_for(b: &crate::models::Broadcast) -> String {
     match stored {
         Some(t) if t > soon => t.to_rfc3339(),
         _ => soon.to_rfc3339(),
+    }
+}
+
+/// Which kind of "could not ask" a core error is, for the audit.
+///
+/// The codes come from one `match` in the core
+/// (`crates/louver-core/src/youtube/api.rs`), so this is a translation rather
+/// than a second opinion: a refused credential is its own verdict, a 404 means
+/// the stored broadcast is not on the channel, and everything else — a 5xx, a
+/// timeout, an exhausted quota — is simply unanswered.
+fn reach_of(e: &louver_core::error::LouverError) -> crate::audit::Seen {
+    use crate::audit::{Reach, Seen};
+    use louver_core::error::ErrorCode as C;
+    match e.code {
+        C::YoutubeAuthExpired | C::YoutubeNotConnected | C::YoutubeAuthRefreshFailed => {
+            Seen { reach: Reach::Refused, ..Seen::default() }
+        }
+        // 404: the id 247streams holds is not a broadcast on this channel.
+        C::YoutubeNoActiveBroadcast => Seen { reach: Reach::Answered, not_found: true, ..Seen::default() },
+        _ => Seen { reach: Reach::Unreachable, ..Seen::default() },
     }
 }

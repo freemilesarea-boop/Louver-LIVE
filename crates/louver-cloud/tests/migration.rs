@@ -465,3 +465,89 @@ fn a_production_database_gains_prices_and_keeps_every_entitlement_it_had() {
     assert_eq!(still, sealed, "a migration must never touch an encrypted value");
     assert_eq!(db.items_owned("u-old", &broadcast_id).unwrap().len(), 1);
 }
+
+// --- a read that is actually a read -------------------------------------
+//
+// `CloudDb::open` runs `SCHEMA`, every `ensure_column`, and a `journal_mode`
+// pragma. That is right for a server taking ownership of its database and
+// wrong for looking at a live production one, which is what these cover.
+
+#[test]
+fn a_read_only_open_does_not_migrate_the_file_it_is_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.db");
+    yesterdays_database(&path);
+
+    let before = columns_of(&path, "broadcasts");
+    assert!(!before.contains(&"ffmpeg_pid".to_string()), "fixture is meant to be the old schema");
+
+    // Opening it read-only must leave the schema exactly as it found it. An
+    // `open` here would add every column added since the first release.
+    let _db = CloudDb::open_read_only(&path).unwrap();
+    assert_eq!(columns_of(&path, "broadcasts"), before, "a read changed the schema");
+}
+
+#[test]
+fn a_read_only_open_of_an_older_database_cannot_pretend_to_read_it() {
+    // The cost of not migrating, asserted rather than discovered in
+    // production: the row mapper selects columns this file has never had, so
+    // the read fails outright. That is the honest outcome — a diagnosis tool
+    // must say "this database predates me" rather than report a broadcast
+    // whose fields it had to invent.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.db");
+    yesterdays_database(&path);
+
+    let db = CloudDb::open_read_only(&path).unwrap();
+    let err = db.all_broadcasts().unwrap_err().to_string();
+    assert!(err.contains("privacy"), "expected a missing-column error, got: {err}");
+}
+
+#[test]
+fn a_read_only_open_reads_a_current_database_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.db");
+    let (broadcast_id, _) = yesterdays_database(&path);
+    // Migrated once by a server, as production has been.
+    drop(CloudDb::open(&path).unwrap());
+
+    let db = CloudDb::open_read_only(&path).unwrap();
+    let all = db.all_broadcasts().unwrap();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].id, broadcast_id);
+    assert_eq!(all[0].name, "COLORISTE 테스트");
+}
+
+#[test]
+fn a_read_only_open_refuses_to_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.db");
+    let (broadcast_id, _) = yesterdays_database(&path);
+    drop(CloudDb::open(&path).unwrap());
+
+    let db = CloudDb::open_read_only(&path).unwrap();
+    // Not a warning, not a silent no-op: SQLite refuses the statement, so a
+    // mistake in a diagnosis tool fails loudly instead of touching production.
+    let err = db.set_youtube_status(&broadcast_id, "live").unwrap_err();
+    let text = err.to_string().to_lowercase();
+    assert!(text.contains("readonly") || text.contains("read-only"), "got: {text}");
+}
+
+#[test]
+fn a_read_only_open_does_not_conjure_a_database_that_is_not_there() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nested").join("cloud.db");
+
+    assert!(CloudDb::open_read_only(&path).is_err(), "a missing file is an error, not a new one");
+    assert!(!path.exists(), "and nothing was created");
+    assert!(!path.parent().unwrap().exists(), "not even the directory");
+}
+
+/// The column names SQLite reports for a table, read through a connection of
+/// our own so the assertion does not depend on the code under test.
+fn columns_of(path: &std::path::Path, table: &str) -> Vec<String> {
+    let c = Connection::open(path).unwrap();
+    let mut q = c.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+    let rows = q.query_map([], |r| r.get::<_, String>(1)).unwrap();
+    rows.map(std::result::Result::unwrap).collect()
+}

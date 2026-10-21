@@ -819,9 +819,52 @@ async fn main() -> std::process::ExitCode {
         return audit_billing(&args);
     }
     // What is running, where it is sending, and what FFmpeg has said about it.
+    //
+    // Not safe against a live production database: `CloudDb::open` runs the
+    // schema and every `ensure_column`, so this *writes*. Use
+    // `--youtube-audit` there instead.
     if args.iter().any(|a| a == "--diagnose") {
         return louver_server::diagnose::run();
     }
+    // What YouTube says about each broadcast, read without writing anything.
+    // Safe to run while customers are broadcasting.
+    if args.iter().any(|a| a == "--youtube-audit") {
+        return louver_server::youtube_audit::run(&args);
+    }
+
+    // One writer per data directory, before anything is opened for writing.
+    //
+    // Taken here rather than inside `App::boot` because `App` is cloned into
+    // every request handler and a lease must not be: it is released when the
+    // last copy drops, and the point is that it is held for the life of the
+    // process. Held in `_lease` to the end of `main`.
+    //
+    // After the read-only subcommands above on purpose — a diagnosis has to be
+    // able to run while the server holds the lease, which is the whole reason
+    // it opens the database read-only.
+    let data = std::path::PathBuf::from(
+        std::env::var("LOUVER_DATA_DIR").unwrap_or_else(|_| "/var/lib/louver".into()),
+    );
+    let role = louver_cloud::runner::Role::from_env();
+    println!("[louver] 역할: {}", role.name());
+
+    // Whoever owns the workers owns the data directory. An API process takes
+    // no lease, so a rolling API deployment may overlap for a moment without
+    // either half refusing to start.
+    let _lease = if role.takes_the_lease() {
+        match louver_cloud::lease::Lease::acquire(&data) {
+            Ok(l) => {
+                println!("[louver] 데이터 디렉터리 점유: {}", l.path().display());
+                Some(l)
+            }
+            Err(e) => {
+                eprintln!("[louver] {e}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
 
     let app = match App::boot() {
         Ok(a) => a,
@@ -842,6 +885,46 @@ async fn main() -> std::process::ExitCode {
     // §8: the clock is watched by the server, not by a browser. It holds no
     // state, so it needs nothing from recovery.
     let _scheduler = app.mgr.spawn_scheduler();
+
+    // The runner serves commands instead of HTTP, and that is its whole job:
+    // it is the process that must outlive an API deployment, so it binds no
+    // port and nothing about it changes when the web side is replaced.
+    if !role.serves_http() {
+        #[cfg(unix)]
+        {
+            let server = match louver_cloud::runner::Server::bind(&data) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[louver] runner 소켓을 열 수 없습니다: {e}");
+                    std::process::exit(1);
+                }
+            };
+            println!("[louver] runner 대기 중: {}", server.socket().display());
+            // The signal handler runs on its own thread so a SIGTERM during a
+            // blocking `accept` still stops every broadcast properly.
+            let mgr = app.mgr.clone();
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().build();
+                if let Ok(rt) = rt {
+                    rt.block_on(wait_for_stop());
+                }
+                println!("[louver] 종료 신호를 받았습니다. 방송을 정리합니다");
+                mgr.shutdown();
+                std::process::exit(0);
+            });
+            let mgr = app.mgr.clone();
+            server.serve(|cmd| serve_runner_command(&mgr, cmd));
+            return std::process::ExitCode::SUCCESS;
+        }
+        // The socket the two halves speak over is a Unix socket, and the
+        // split only ever runs in the Linux container. Saying so is better
+        // than a Windows build that pretends to have a runner role.
+        #[cfg(not(unix))]
+        {
+            eprintln!("[louver] runner 역할은 Unix 에서만 동작합니다 (LOUVER_ROLE)");
+            std::process::exit(1);
+        }
+    }
 
     let addr = std::env::var("LOUVER_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -865,7 +948,7 @@ async fn main() -> std::process::ExitCode {
     let service =
         with_web_ui(router(app.clone())).into_make_service_with_connect_info::<std::net::SocketAddr>();
     let shutdown = async move {
-        let _ = tokio::signal::ctrl_c().await;
+        wait_for_stop().await;
         println!("[louver] 종료 신호를 받았습니다. 방송을 정리합니다");
     };
     if let Err(e) = axum::serve(listener, service).with_graceful_shutdown(shutdown).await {
@@ -876,4 +959,86 @@ async fn main() -> std::process::ExitCode {
     // brings these same broadcasts back.
     app.mgr.shutdown();
     std::process::ExitCode::SUCCESS
+}
+
+/// Wait for whichever signal means "stop", and return once one arrives.
+///
+/// `ctrl_c` on its own was a real gap rather than an omission of taste.
+/// `docker stop` sends SIGTERM, this process is PID 1 in its container (the
+/// image has a bare `CMD` and compose sets no init), and the kernel does not
+/// deliver a default-action signal to PID 1 at all. So SIGTERM was *ignored*:
+/// every `docker stop` waited out the full grace period and then SIGKILLed the
+/// container, which kills every FFmpeg mid-frame with no FLV trailer written
+/// and never runs `BroadcastManager::shutdown`.
+///
+/// With a handler installed the signal is delivered, the graceful path that
+/// was already here runs, and each FFmpeg gets its three seconds to close its
+/// stream properly.
+///
+/// SIGINT is kept for a terminal, and SIGQUIT is included because that is what
+/// some supervisors send when SIGTERM has not worked — which, before this, it
+/// never had.
+async fn wait_for_stop() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        // A failure to install a handler must not become a server that cannot
+        // be stopped, so each is optional and `ctrl_c` is always armed.
+        let mut term = signal(SignalKind::terminate()).ok();
+        let mut quit = signal(SignalKind::quit()).ok();
+        let term = async {
+            match term.as_mut() {
+                Some(s) => {
+                    s.recv().await;
+                }
+                // Nothing to wait for; never completes, so `select!` ignores it.
+                None => std::future::pending::<()>().await,
+            }
+        };
+        let quit = async {
+            match quit.as_mut() {
+                Some(s) => {
+                    s.recv().await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => println!("[louver] SIGINT"),
+            _ = term => println!("[louver] SIGTERM"),
+            _ = quit => println!("[louver] SIGQUIT"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// One command from an API process, carried out.
+///
+/// Deliberately thin: the policy — who may start what, which slot it takes,
+/// what YouTube has to be told — stays on the HTTP side where the user is
+/// waiting for an answer. What is here is the part that can only be done by
+/// the process that owns the FFmpeg children.
+#[cfg(unix)]
+fn serve_runner_command(
+    mgr: &louver_cloud::manager::BroadcastManager,
+    cmd: louver_cloud::runner::Command,
+) -> louver_cloud::runner::Reply {
+    use louver_cloud::runner::{Command, Reply};
+    match cmd {
+        Command::Ping => Reply::Ok,
+        Command::Running => Reply::Ids(mgr.running_ids()),
+        Command::Start(id) => match mgr.start_worker(&id) {
+            Ok(()) => Reply::Ok,
+            // The sentence travels back whole, so a refused start is still a
+            // refused start in front of the user rather than a generic error.
+            Err(e) => Reply::Err(e.to_string()),
+        },
+        Command::Halt(id) => {
+            mgr.stop_worker(&id);
+            Reply::Ok
+        }
+    }
 }
