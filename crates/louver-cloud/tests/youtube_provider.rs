@@ -330,6 +330,35 @@ impl Env {
         self.db.update_broadcast_owned(&self.user, id, &patch).unwrap();
     }
 
+    /// A schedule as the form stores one: two instants, and the stop is only
+    /// ever meaningful as the length between them.
+    fn set_schedule(&self, id: &str, start: &str, stop: Option<&str>, repeat_days: i64) {
+        let patch = louver_cloud::BroadcastPatch {
+            schedule: Some(louver_cloud::Schedule {
+                enabled: true,
+                start_at: Some(start.into()),
+                stop_at: stop.map(Into::into),
+                timezone: "Asia/Seoul".into(),
+                offset_minutes: 540,
+                repeat_days,
+                last_run_at: None,
+            }),
+            ..Default::default()
+        };
+        self.db.update_broadcast_owned(&self.user, id, &patch).unwrap();
+    }
+
+    /// The body of the most recent `liveBroadcasts` POST.
+    fn last_insert(&self) -> serde_json::Value {
+        self.api
+            .matching("/liveBroadcasts?")
+            .into_iter()
+            .rfind(|c| c.method == "POST")
+            .expect("no liveBroadcasts insert")
+            .body
+            .expect("insert had no body")
+    }
+
     /// Every line this broadcast has recorded, for the "no secret ever appears"
     /// assertions.
     fn log(&self, id: &str) -> String {
@@ -761,6 +790,117 @@ fn n2_a_pasted_key_broadcast_causes_no_api_call_at_all() {
 
     assert_eq!(e.api.calls().len(), calls_before, "manual RTMPS must not reach the YouTube API");
     let _ = account;
+}
+
+// --- V: the end time that goes with the start -----------------------------
+
+/// Minutes from now, as RFC 3339 — the form stores instants, not offsets.
+fn at(minutes: i64) -> String {
+    (chrono::Utc::now() + chrono::Duration::minutes(minutes)).to_rfc3339()
+}
+
+fn window_of(body: &serde_json::Value) -> chrono::Duration {
+    let p = |k: &str| {
+        chrono::DateTime::parse_from_rfc3339(
+            body["snippet"][k].as_str().unwrap_or_else(|| panic!("no {k} in the insert body: {body}")),
+        )
+        .unwrap()
+    };
+    p("scheduledEndTime") - p("scheduledStartTime")
+}
+
+#[test]
+fn v1_a_repeat_after_its_first_day_still_gets_an_end_after_its_start() {
+    // THE BUG. A daily schedule keeps the instant it was first saved at, so from
+    // the second occurrence the start is rolled forward to now and the stop was
+    // not: YouTube got an end a day or a month before the start and answered
+    // `400 invalidScheduledEndTime`. The broadcast then did not start at all —
+    // every day, on a service people run for months without touching.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    // Saved three days ago: 21:18 KST for three hours, every day.
+    let first_start = at(-3 * 24 * 60);
+    let first_stop = (chrono::DateTime::parse_from_rfc3339(&first_start).unwrap()
+        + chrono::Duration::hours(3))
+    .to_rfc3339();
+    e.set_schedule(&id, &first_start, Some(&first_stop), 0b111_1111);
+
+    e.yt.provision(&e.user, &id, &account).unwrap();
+
+    let body = e.last_insert();
+    let start = chrono::DateTime::parse_from_rfc3339(body["snippet"]["scheduledStartTime"].as_str().unwrap())
+        .unwrap();
+    let end =
+        chrono::DateTime::parse_from_rfc3339(body["snippet"]["scheduledEndTime"].as_str().unwrap()).unwrap();
+    assert!(end > start, "YouTube refuses this: start {start}, end {end}");
+    // And it is the window the customer asked for, not some invented length.
+    assert_eq!(window_of(&body), chrono::Duration::hours(3));
+}
+
+#[test]
+fn v2_the_first_occurrence_sends_exactly_what_it_sends_today() {
+    // The case that works now has to keep working byte for byte, because it is
+    // the one every broadcast goes through when it is created.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    let start = at(60);
+    let stop =
+        (chrono::DateTime::parse_from_rfc3339(&start).unwrap() + chrono::Duration::hours(2)).to_rfc3339();
+    e.set_schedule(&id, &start, Some(&stop), 0);
+
+    e.yt.provision(&e.user, &id, &account).unwrap();
+
+    let body = e.last_insert();
+    let sent_start = body["snippet"]["scheduledStartTime"].as_str().unwrap();
+    let sent_end = body["snippet"]["scheduledEndTime"].as_str().unwrap();
+    let same = |a: &str, b: &str| {
+        chrono::DateTime::parse_from_rfc3339(a).unwrap() == chrono::DateTime::parse_from_rfc3339(b).unwrap()
+    };
+    assert!(same(sent_start, &start), "the start moved: {sent_start} vs {start}");
+    assert!(same(sent_end, &stop), "the end moved: {sent_end} vs {stop}");
+}
+
+#[test]
+fn v3_a_broadcast_with_no_stop_time_is_never_given_one() {
+    // What most of this service's customers run: on, and left on. An end time
+    // invented here would be an end time YouTube shows to their viewers.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    e.set_schedule(&id, &at(-3 * 24 * 60), None, 0b111_1111);
+
+    e.yt.provision(&e.user, &id, &account).unwrap();
+
+    let body = e.last_insert();
+    assert!(
+        body["snippet"]["scheduledEndTime"].is_null(),
+        "an indefinite broadcast was given an end: {body}"
+    );
+}
+
+#[test]
+fn v4_renewing_a_repeat_carries_the_window_too() {
+    // `renew` is the path a daily schedule takes on its second day and every day
+    // after, which is where the 400 was actually being raised.
+    let e = env();
+    let account = e.connect();
+    let id = e.broadcast(&account, "밤의 플레이리스트");
+    let first_start = at(-24 * 60);
+    let first_stop = (chrono::DateTime::parse_from_rfc3339(&first_start).unwrap()
+        + chrono::Duration::hours(4))
+    .to_rfc3339();
+    e.set_schedule(&id, &first_start, Some(&first_stop), 0b111_1111);
+    e.yt.provision(&e.user, &id, &account).unwrap();
+
+    // Yesterday's broadcast is over, which is the ordinary state of a daily one.
+    *e.api.lifecycle.lock().unwrap() = "complete".into();
+    e.yt.before_start(&id).unwrap();
+
+    let body = e.last_insert();
+    assert_eq!(window_of(&body), chrono::Duration::hours(4));
+    assert!(window_of(&body) > chrono::Duration::zero());
 }
 
 // --- O: a broadcast YouTube has ended gets a new one ----------------------
