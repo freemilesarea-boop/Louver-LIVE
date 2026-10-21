@@ -73,20 +73,32 @@ Sources `scripts/fetch-ffmpeg.mjs` downloads:
 | Windows x64 | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) `release-essentials` | GPL v3 |
 | macOS Intel | [evermeet.cx](https://evermeet.cx/ffmpeg/) | GPL v3 |
 | macOS Apple Silicon | [osxexperts.net](https://www.osxexperts.net/) | GPL v3 |
-| Linux x64 / arm64 | [johnvansickle.com](https://johnvansickle.com/ffmpeg/) static | GPL v3 |
+| Linux x64 / arm64 | [jellyfin-ffmpeg](https://github.com/jellyfin/jellyfin-ffmpeg) `portable …-gpl`, pinned to a release tag | GPL v3 |
 
 Both macOS providers publish **one download per tool**, so `ffprobe` is fetched
-from its own archive there; gyan.dev and johnvansickle ship both in one. The
+from its own archive there; gyan.dev and jellyfin-ffmpeg ship both in one. The
 URLs a build actually used are written to `binaries/SOURCE-<triple>.txt` and
 `ffmpeg-manifest.mjs --check` refuses to release a binary whose source is not
 recorded.
 
+The Linux row used to be johnvansickle.com, which stopped answering in October
+2026 and published no versioned URL, so there was nothing of it left to pin.
+`scripts/sidecar-sources.mjs` records what the replacement was measured against
+and why the other reachable builds were rejected; **re-run those measurements
+before moving the version**, because one of the rejected candidates segfaults
+the camera pipeline and another stalls at a playlist loop boundary.
+
 **Obligations when shipping a GPL build:**
 
 1. Ship this notice with the application.
-2. Make the corresponding FFmpeg source available. These are unmodified
-   upstream releases, so linking to the matching release tag at
-   <https://git.ffmpeg.org/ffmpeg.git> satisfies it.
+2. Make the corresponding FFmpeg source available.
+   - Windows and macOS ship unmodified upstream releases, so linking to the
+     matching release tag at <https://git.ffmpeg.org/ffmpeg.git> satisfies it.
+   - **Linux does not.** jellyfin-ffmpeg carries its own patches, so the
+     corresponding source is that project's tree at the tag the binary was
+     built from — <https://github.com/jellyfin/jellyfin-ffmpeg> — and the exact
+     tag is the one in the URL recorded in `binaries/SOURCE-<triple>.txt`.
+     Linking upstream FFmpeg alone would not satisfy GPL §3 for this build.
 3. Do not remove FFmpeg's own copyright notices.
 4. Be aware that GPL v3 is widely read as incompatible with the Apple App
    Store's terms. Direct `.dmg` distribution is unaffected; App Store

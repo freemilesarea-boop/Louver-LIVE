@@ -94,7 +94,18 @@ function sleepSync(secs) {
  * and a line in the log.
  */
 function download(url, dest) {
-  const args = ['-sS', '-L', '-o', dest, '-w', '%{http_code}', '--fail', '--max-time', '300', url]
+  // `--speed-time`/`--speed-limit` is what tells a dead host from a slow one.
+  // johnvansickle.com went down answering nothing at all, and with --max-time
+  // alone each attempt sat out the full five minutes: every job spent twenty
+  // minutes reaching the conclusion it had after thirty seconds, four times a
+  // run, on every push. A transfer that is moving keeps the five minutes; one
+  // delivering under 1 kB/s for thirty seconds is given up on, which is the
+  // same verdict sooner.
+  const args = [
+    '-sS', '-L', '-o', dest, '-w', '%{http_code}', '--fail',
+    '--connect-timeout', '20', '--speed-time', '30', '--speed-limit', '1024', '--max-time', '300',
+    url,
+  ]
   try {
     execFileSync('curl', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
     return { ok: true }
