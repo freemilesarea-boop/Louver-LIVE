@@ -216,6 +216,17 @@ fn dir_bytes(dir: &Path) -> u64 {
 ///
 /// The key is the path relative to the root, which is exactly what the database
 /// stores, so the two can be compared as strings without guessing.
+/// A stored object's key, which is a `/`-separated name rather than a path.
+///
+/// `Path::to_string_lossy` answers `u1\a.mp4` on Windows, and the keys this is
+/// compared against come out of the database, where they are written with `/`.
+/// A mismatch there does not read as a mismatch: every object stops matching
+/// its `media` row, so every object is reported as an orphan — and an orphan is
+/// what the cleanup offers to delete.
+fn storage_key(rel: &Path) -> String {
+    rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
+}
+
 fn walk_objects(root: &Path) -> Vec<(String, PathBuf, u64)> {
     let mut out = Vec::new();
     fn go(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf, u64)>) {
@@ -232,7 +243,7 @@ fn walk_objects(root: &Path) -> Vec<(String, PathBuf, u64)> {
                 Ok(t) if t.is_file() => {
                     let key = path
                         .strip_prefix(root)
-                        .map(|p| p.to_string_lossy().into_owned())
+                        .map(storage_key)
                         .unwrap_or_else(|_| path.to_string_lossy().into_owned());
                     let bytes = e.metadata().map(|m| m.len()).unwrap_or(0);
                     out.push((key, path, bytes));
@@ -440,6 +451,21 @@ mod tests {
         let found = walk_objects(d.path());
         assert_eq!(found.len(), 1, "only the stored object is an object: {found:?}");
         assert_eq!(found[0].0, "u1/a.mp4");
+    }
+
+    #[test]
+    fn an_objects_key_is_slash_separated_whatever_the_platform() {
+        // The key is matched against `media.storage_path`, which is written
+        // with `/`. Building it from the path's own separator made every
+        // object on Windows unmatchable, and an unmatched object is an orphan.
+        // Only a Windows run can fail this one; it is here so that run says
+        // what it is failing about.
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("u1/prepared")).unwrap();
+        std::fs::write(d.path().join("u1/prepared/a.mp4"), b"x").unwrap();
+        let found = walk_objects(d.path());
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, "u1/prepared/a.mp4");
     }
 
     #[test]

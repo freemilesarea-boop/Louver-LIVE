@@ -315,6 +315,16 @@ fn d_a_reprepare_swaps_the_pointer_and_never_unlinks_the_old_file() {
 /// Test E — a file something is reading is never called safe to remove.
 #[test]
 fn e_a_file_that_is_open_or_in_a_manifest_is_not_cleanup_material() {
+    // The open-file set is read out of /proc, so it can only be had on Linux —
+    // which is where the server runs. Everywhere else the audit answers
+    // "unknown" on purpose and calls nothing safe, rather than returning an
+    // empty set that would read as "nothing is open". This test is about what
+    // the answer is when it can be had; that it is conservative when it cannot
+    // is asserted in test F, on every platform.
+    if !cfg!(target_os = "linux") {
+        eprintln!("SKIP: open files cannot be enumerated on this platform");
+        return;
+    }
     let Some(tools) = tools() else {
         eprintln!("SKIP: no FFmpeg sidecar");
         return;
@@ -383,7 +393,15 @@ fn f_an_unreferenced_file_is_reported_as_an_orphan() {
     assert_eq!(orphans.len(), 1, "{:?}", report.objects);
     assert!(orphans[0].key.ends_with("left-behind.mp4"));
     assert_eq!(orphans[0].bytes, 4096);
-    assert!(orphans[0].safe_to_delete);
+    // Nothing points at it and nothing holds it open, so it is a candidate —
+    // but only where the audit could actually read the open files. Where it
+    // could not it must refuse to call anything safe, and that is the direction
+    // worth pinning: the other way round offers a file a broadcast is still
+    // reading for deletion.
+    assert_eq!(
+        orphans[0].safe_to_delete, report.open_files_known,
+        "safe_to_delete must follow whether open files could be read"
+    );
     assert_eq!(report.totals.orphan_files, 1);
     assert_eq!(report.totals.orphan_bytes, 4096);
 }
