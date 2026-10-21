@@ -196,6 +196,42 @@ describe('a provider that is gone rather than busy', () => {
     expect(source).not.toContain('/gone.tar')
   })
 
+  it('takes ffprobe from the alternate too, not from the host it just gave up on', async () => {
+    // The bug this pins, found by running it: `main()` resolves `probeUrl`
+    // before the loop, and for a provider that ships both tools in one
+    // archive that resolved URL *is* the primary's. The first fall-through
+    // fetched ffmpeg from the new source and then went back to the dead host
+    // for ffprobe — the exact failure a second source exists to avoid.
+    const out = join(work, 'out-alt-probe')
+    mkdirSync(out, { recursive: true })
+    attempts.gone = 0
+    const alt = JSON.stringify([{ url: `${origin}/both.tar` }])
+    const r = await fetchInto(out, ['--url', `${origin}/gone.tar`], { LOUVER_FETCH_BACKOFF: '0,1' }, alt)
+    expect(r.stdout + r.stderr).toContain('done (downloaded)')
+    expect(r.status).toBe(0)
+    for (const tool of ['ffmpeg', 'ffprobe']) {
+      expect(existsSync(join(out, `${tool}-${TARGET}`)), tool).toBe(true)
+    }
+    // Once for ffmpeg, and never again: not a second time for ffprobe.
+    expect(attempts.gone).toBe(1)
+    const source = readFileSync(join(out, `SOURCE-${TARGET}.txt`), 'utf8')
+    expect(source).not.toContain('/gone.tar')
+    expect(source.split('\n').filter((l) => l.includes('both.tar'))).toHaveLength(1)
+  })
+
+  it('records the licence of the source that served, not the one listed first', async () => {
+    // A provenance file naming one provider's terms over another provider's
+    // binary is what `ffmpeg-manifest.mjs --check` would then report as what
+    // shipped. The first real fall-through wrote exactly that.
+    const out = join(work, 'out-alt-licence')
+    mkdirSync(out, { recursive: true })
+    const alt = JSON.stringify([{ url: `${origin}/both.tar`, license: 'GPL v3 (the alternate)' }])
+    const r = await fetchInto(out, ['--url', `${origin}/gone.tar`], { LOUVER_FETCH_BACKOFF: '0,1' }, alt)
+    expect(r.status).toBe(0)
+    const source = readFileSync(join(out, `SOURCE-${TARGET}.txt`), 'utf8')
+    expect(source).toContain('GPL v3 (the alternate)')
+  })
+
   it('still fails when every source is gone', async () => {
     const out = join(work, 'out-alt-none')
     mkdirSync(out, { recursive: true })

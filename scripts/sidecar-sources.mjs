@@ -22,10 +22,29 @@ const JELLYFIN = `https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/
 /** A pinned rehost of other people's builds, used only where it is a last resort. */
 const FFBINARIES = 'https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1'
 
+/** gyan.dev's own releases, which are the same builds its web server serves. */
+const GYAN_PINNED_VER = '7.1.1'
+const GYAN_PINNED = 'https://github.com/GyanD/codexffmpeg/releases/download/7.1.1'
+
 /** Tauri target triples, and where an official static build comes from. */
 export const SOURCES = {
+  // gyan.dev is the last provider here that is one person's web server rather
+  // than a pinned release asset, and it has already failed a release: it
+  // answered 503 for this exact URL during v1.0.4, ninety minutes after
+  // serving v1.0.3. So the same builder's own GitHub releases stand behind it,
+  // pinned — `essentials_build` is the same flavour this URL serves, at the
+  // version the other targets are on. Nothing has had to use it yet; it is
+  // here because the two providers that went down in October gave no warning
+  // either, and because this is the retry loop's only defence that does not
+  // depend on the same host coming back.
   'x86_64-pc-windows-msvc': {
     url: 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip',
+    alternates: [
+      {
+        url: `${GYAN_PINNED}/ffmpeg-${GYAN_PINNED_VER}-essentials_build.zip`,
+        license: `GPL v3 (gyan.dev essentials ${GYAN_PINNED_VER}, pinned mirror)`,
+      },
+    ],
     archive: 'zip',
     exe: '.exe',
     license: 'GPL v3 (gyan.dev release-essentials)',
@@ -38,26 +57,29 @@ export const SOURCES = {
   // the ffprobe URL beside it had always used — answers 410 as well. 410 is
   // permanent, so this job failed in about a second on every push.
   //
-  // So this target moves to osxexperts.net, which is the provider the Apple
-  // Silicon row below already uses and the same 7.1.1 build, with ffbinaries'
-  // pinned 6.1 behind it. Both are listed because neither can be checked from
-  // a Linux machine and the Intel runner builds no media in CI — the only
-  // thing that executes this binary before a release is
-  // `ffmpeg-manifest.mjs --check` on the Intel runner, which reads its
-  // version, licence, linkage and encoders out of the binary itself.
+  // So this target takes evermeet's build from the last place that still
+  // serves it: ffbinaries rehosts it as an asset of a pinned release, and the
+  // binary identifies itself as `6.1-tessus https://evermeet.cx/ffmpeg/` —
+  // the same builder, one version back from the one the dead API served.
+  // osxexperts.net was tried first, since the Apple Silicon row below uses it
+  // and it is still up, but it publishes no Intel build: `ffmpeg711intel.zip`
+  // is a 404. A primary that cannot ever answer is a wasted request on every
+  // build, so it is not kept here.
+  //
+  // What this is NOT known to be is a 6.x that works. The johnvansickle 6.0
+  // and 6.1 *Linux* statics segfault the camera pipeline, and whether
+  // evermeet's macOS 6.1 shares that is unmeasured: nothing executes this
+  // binary except `ffmpeg-manifest.mjs --check` on the Intel runner, which
+  // reads its version, licence, linkage and encoders but broadcasts nothing,
+  // and the `verify` job that does run the media tests on macOS runs on
+  // Apple Silicon. Worth measuring on an Intel Mac before trusting a camera
+  // broadcast there.
   'x86_64-apple-darwin': {
-    url: 'https://www.osxexperts.net/ffmpeg711intel.zip',
-    probeUrl: 'https://www.osxexperts.net/ffprobe711intel.zip',
-    alternates: [
-      {
-        url: `${FFBINARIES}/ffmpeg-6.1-macos-64.zip`,
-        probeUrl: `${FFBINARIES}/ffprobe-6.1-macos-64.zip`,
-        license: 'GPL v3 (ffbinaries pinned 6.1)',
-      },
-    ],
+    url: `${FFBINARIES}/ffmpeg-6.1-macos-64.zip`,
+    probeUrl: `${FFBINARIES}/ffprobe-6.1-macos-64.zip`,
     archive: 'zip',
     exe: '',
-    license: 'GPL v3 (osxexperts.net)',
+    license: 'GPL v3 (evermeet.cx build, ffbinaries pinned mirror)',
   },
   'aarch64-apple-darwin': {
     url: 'https://www.osxexperts.net/ffmpeg711arm.zip',

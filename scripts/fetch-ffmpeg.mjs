@@ -236,7 +236,18 @@ function install(from, target, name, out) {
  * three years. Two of the five providers then went down in the same week.
  */
 function candidates(spec) {
-  const alternates = (spec.alternates ?? []).map((alt) => ({ ...spec, ...alt }))
+  const alternates = (spec.alternates ?? []).map((alt) => ({
+    ...spec,
+    // Cleared before the alternate speaks, and this is the whole point of the
+    // field. `main()` has already resolved `probeUrl` to a concrete URL — for
+    // a provider that ships both tools in one archive, that URL *is* the
+    // primary's. Carrying it into an alternate fetched ffmpeg from the new
+    // source and then went back to the host we had just given up on for
+    // ffprobe, which is the exact failure a second source exists to avoid. An
+    // alternate that names no `probeUrl` holds both tools in its own download.
+    probeUrl: undefined,
+    ...alt,
+  }))
   return [spec, ...alternates]
 }
 
@@ -298,7 +309,14 @@ function main() {
       sleepSync(wait)
       const got = tryDownload(target, where, tmp, OUT)
       if (got.urls) {
-        writeFileSync(join(OUT, provenanceName(target)), `${got.urls.join('\n')}\n${base.license}\n`)
+        // `where.license`, not the table's first entry. A fall-through writes
+        // the URLs it actually used, and writing the primary's licence beside
+        // them produced a provenance file that named one provider's terms over
+        // another provider's binary — in the first run that used a second
+        // source, an Intel Mac build from ffbinaries recorded as osxexperts.
+        // This file is what `ffmpeg-manifest.mjs --check` reads to say what
+        // shipped, so every line of it has to be about the same download.
+        writeFileSync(join(OUT, provenanceName(target)), `${got.urls.join('\n')}\n${where.license}\n`)
         console.log('done (downloaded)')
         return
       }
