@@ -4,8 +4,7 @@
  *
  * Sections on one page rather than a wizard of steps, because every answer is
  * short and a first-time user is better served seeing the whole shape of a
- * broadcast than being walked through it blind. Only the sending settings are
- * folded away, since their default needs no decision.
+ * broadcast than being walked through it blind.
  */
 import { useEffect, useMemo, useState } from "react";
 import {
@@ -20,7 +19,6 @@ import {
 import { formatDurationKo } from "@/services/format";
 import { useTransport } from "../TransportContext";
 import {
-  AUTO_SETTINGS,
   DAY_NAMES,
   EVERY_DAY,
   PRIVACY_LABELS,
@@ -38,7 +36,6 @@ import type {
   Privacy,
   Schedule,
   StreamDestination,
-  StreamSettings,
   VideoSource,
   YoutubeAccount,
 } from "../cloud";
@@ -88,12 +85,17 @@ export function BroadcastForm({
   );
   const [cctvUrl, setCctvUrl] = useState(editing?.cctv_url ?? "");
   const [cctvCheck, setCctvCheck] = useState<CctvCheck | null>(null);
+  /**
+   * The URL the result in `cctvCheck` is about.
+   *
+   * Kept separately so that editing the address after a successful test
+   * invalidates the result. Without this, testing a working camera and then
+   * pasting a different address would save the second one on the first one's
+   * evidence.
+   */
+  const [cctvCheckedUrl, setCctvCheckedUrl] = useState<string | null>(null);
   const [cctvTesting, setCctvTesting] = useState(false);
   const [cctvError, setCctvError] = useState<string | null>(null);
-  const [settings, setSettings] = useState<StreamSettings>(
-    editing?.settings ?? AUTO_SETTINGS,
-  );
-  const [advanced, setAdvanced] = useState(false);
   const [schedule, setSchedule] = useState<Schedule>(
     editing?.schedule ?? emptySchedule(),
   );
@@ -174,11 +176,17 @@ export function BroadcastForm({
    * result with `ok: false`.
    */
   async function testCctv() {
+    const tried = cctvUrl.trim();
     setCctvTesting(true);
     setCctvError(null);
     setCctvCheck(null);
+    setCctvCheckedUrl(null);
     try {
-      setCctvCheck(await t.testCctv(cctvUrl.trim()));
+      const got = await t.testCctv(tried);
+      setCctvCheck(got);
+      // The address this verdict is about, not whatever is in the box by the
+      // time the answer arrives.
+      setCctvCheckedUrl(tried);
     } catch (e) {
       setCctvError(e instanceof Error ? e.message : "확인할 수 없습니다.");
     } finally {
@@ -188,6 +196,42 @@ export function BroadcastForm({
 
   /** An empty string clears a stored URL; `playlist` means there is none. */
   const cctvToSave = videoSource === "traffic_cctv" ? cctvUrl.trim() : "";
+
+  /**
+   * Has this exact address been opened by the server and found to carry video?
+   *
+   * The reason this gates saving: the address is only checked for shape and
+   * for where it points when it is stored. Whether anything readable is *at*
+   * it is a different question, and the only thing that can answer it is the
+   * probe. A broadcast saved with an unreadable address does not fail at save
+   * time — it fails when it starts, and then the supervisor retries it every
+   * sixty seconds for ever while the dashboard shows a broadcast that is
+   * trying. Far better to answer the question while the field is still on
+   * screen.
+   */
+  const cctvProven =
+    videoSource !== "traffic_cctv" ||
+    (cctvCheck?.ok === true && cctvCheckedUrl === cctvToSave);
+
+  /**
+   * Why saving is blocked, in the words the person needs.
+   *
+   * Ordered most specific first, because each of these is a different problem
+   * with a different next move.
+   */
+  const cctvBlocker = (): string | null => {
+    if (videoSource !== "traffic_cctv" || cctvProven) return null;
+    if (cctvToSave.length === 0) return "CCTV 주소를 입력해 주세요.";
+    // The request itself failed, or the server refused the address outright.
+    if (cctvError) return "연결 테스트가 실패했습니다. 주소를 확인해 주세요.";
+    // Opened, and there is nothing usable at it.
+    if (cctvCheck && cctvCheckedUrl === cctvToSave)
+      return "이 주소로는 송출할 수 없습니다. 위의 실패 이유를 확인해 주세요.";
+    // Tested, then edited: the evidence belongs to a different address.
+    if (cctvCheckedUrl !== null)
+      return "주소가 바뀌었습니다. 연결 테스트를 다시 실행해 주세요.";
+    return "저장하기 전에 연결 테스트를 실행해 주세요.";
+  };
 
   async function save() {
     setBusy(true);
@@ -211,7 +255,6 @@ export function BroadcastForm({
           // pointing it elsewhere would break the binding it already has.
           destination_id:
             provider === "manual_rtmps" ? destinationId : undefined,
-          settings,
           schedule,
           cctv_url: cctvToSave,
         });
@@ -231,7 +274,6 @@ export function BroadcastForm({
           tags,
           category,
           privacy,
-          settings,
           schedule,
           cctv_url: cctvToSave,
         });
@@ -261,7 +303,8 @@ export function BroadcastForm({
           <Button
             variant="primary"
             onClick={save}
-            disabled={busy || rows.length === 0 || !chosen}
+            disabled={busy || rows.length === 0 || !chosen || !cctvProven}
+            title={cctvBlocker() ?? undefined}
           >
             {busy ? "저장 중…" : editing ? "저장" : "방송 만들기"}
           </Button>
@@ -564,10 +607,31 @@ export function BroadcastForm({
               </div>
             )}
 
+            {/* Why the save button is off, where the field is. A `title` only
+                appears on hover, and the person who needs this sentence is
+                the one wondering why nothing happens when they click. */}
+            {cctvBlocker() && (
+              <p role="status" className="text-xs text-warn">
+                {cctvBlocker()}
+              </p>
+            )}
+
             <p className="text-xs text-ink-500">
               CCTV 원본 오디오는 송출하지 않습니다. 소리는 위 플레이리스트의
               음악만 나갑니다. 테스트 기능이므로 CCTV가 끊기면 이 방송만 재연결을
               시도합니다.
+            </p>
+            <p className="text-xs text-ink-500">
+              CCTV 방송은 화면과 소리를 실시간으로 합쳐야 해서 일반 방송보다 서버
+              자원을 훨씬 많이 씁니다. 그래서 서버가 동시에 처리할 수 있는 CCTV
+              방송 수에는 요금제와 별도인 한도가 있고, 한도에 도달하면 다른 CCTV
+              방송이 끝날 때까지 시작이 거절됩니다.
+            </p>
+            <p className="text-xs text-ink-500">
+              YouTube·Twitch·치지직 등의 <strong>시청 페이지 링크는 사용할 수
+              없습니다</strong>. 그 주소는 영상이 아니라 웹페이지라서 송출기가
+              영상을 찾지 못합니다. CCTV·카메라가 직접 제공하는 HLS(.m3u8) 주소가
+              필요합니다.
             </p>
             {rows.length === 0 && (
               <p className="text-xs text-warn">
@@ -666,89 +730,20 @@ export function BroadcastForm({
       </Card>
 
       {/* 4 — how it is sent */}
-      <Card
-        title="4. 송출 설정"
-        action={
-          <Button size="sm" onClick={() => setAdvanced(!advanced)}>
-            {advanced ? "간단히" : "고급 설정"}
-          </Button>
-        }
-      >
-        {!advanced ? (
-          <p className="text-sm text-ink-400">
-            자동 — 서버가 영상에 맞는 안정적인 설정으로 송출합니다.{" "}
-            <Badge tone="ok">권장</Badge>
-          </p>
-        ) : (
-          <>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <Field label="해상도">
-                <Select
-                  aria-label="해상도"
-                  value={settings.resolution}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      resolution: e.target
-                        .value as StreamSettings["resolution"],
-                    })
-                  }
-                >
-                  <option value="auto">자동</option>
-                  <option value="720p">720p</option>
-                  <option value="1080p">1080p</option>
-                </Select>
-              </Field>
-              <Field label="프레임레이트">
-                <Select
-                  aria-label="프레임레이트"
-                  value={settings.fps}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      fps: e.target.value as StreamSettings["fps"],
-                    })
-                  }
-                >
-                  <option value="auto">자동</option>
-                  <option value="30">30</option>
-                  <option value="60">60</option>
-                </Select>
-              </Field>
-              <Field label="영상 비트레이트 (kbps)" hint="0은 자동">
-                <Input
-                  type="number"
-                  aria-label="영상 비트레이트"
-                  value={settings.video_bitrate_kbps}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      video_bitrate_kbps: Number(e.target.value) || 0,
-                    })
-                  }
-                />
-              </Field>
-              <Field label="음성 비트레이트 (kbps)" hint="0은 자동">
-                <Input
-                  type="number"
-                  aria-label="음성 비트레이트"
-                  value={settings.audio_bitrate_kbps}
-                  onChange={(e) =>
-                    setSettings({
-                      ...settings,
-                      audio_bitrate_kbps: Number(e.target.value) || 0,
-                    })
-                  }
-                />
-              </Field>
-            </div>
-            <p className="mt-2 text-xs text-warn">
-              현재 송출은 업로드할 때 준비된 1080p30 파일을 그대로
-              보냅니다(스트림 복사). 자동이 아닌 값은 저장되며, 재인코딩 송출이
-              추가되면 적용됩니다.
-            </p>
-          </>
-        )}
+      <Card title="4. 송출 설정">
+        <p className="text-sm text-ink-400">
+          서버가 정합니다. 고를 것은 없습니다. <Badge tone="ok">자동</Badge>
+        </p>
+        <ul className="mt-2 space-y-1 text-xs text-ink-500">
+          <li>
+            플레이리스트 방송은 올릴 때 준비된 파일을 다시 인코딩하지 않고 그대로
+            보냅니다. 화질은 준비된 파일 그대로입니다.
+          </li>
+          <li>
+            영상 소스를 쓰는 방송은 실시간으로 인코딩합니다. 화면이 1080p 보다
+            크면 1080p 로 줄여 보내고, 더 작은 화면은 늘리지 않습니다.
+          </li>
+        </ul>
       </Card>
 
       {/* 5 — when */}
@@ -858,11 +853,11 @@ export function BroadcastForm({
             }
           />
           <Row
-            label="송출 설정"
+            label="송출 방식"
             value={
-              settings.resolution === "auto"
-                ? "자동"
-                : `${settings.resolution} ${settings.fps}fps`
+              videoSource === "traffic_cctv"
+                ? "영상 소스 실시간 인코딩 · 최대 1080p"
+                : "준비된 파일 그대로 복사"
             }
           />
         </dl>

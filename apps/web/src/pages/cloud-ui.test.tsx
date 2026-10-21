@@ -19,7 +19,7 @@ import { Pricing } from "./Pricing";
 import { BillingComplete, BillingPanel, isBillingComplete } from "./Billing";
 import { LegalPage, legalPageFor } from "./Legal";
 import { MediaLibrary } from "./MediaLibrary";
-import { AUTO_SETTINGS, emptySchedule } from "../cloud";
+import { emptySchedule } from "../cloud";
 import type {
   Broadcast,
   BroadcastDetail,
@@ -48,7 +48,6 @@ function broadcast(over: Partial<Broadcast> = {}): Broadcast {
     tags: "",
     category: "",
     privacy: "private",
-    settings: AUTO_SETTINGS,
     schedule: emptySchedule(),
     item_count: 1,
     play_count: 1,
@@ -757,9 +756,24 @@ describe("making a broadcast", () => {
     expect(screen.queryByLabelText("CCTV 주소")).not.toBeInTheDocument();
   });
 
+  /** A probe result for a camera that works. */
+  const WORKING_CAM = {
+    ok: true,
+    message: "연결됨 · h264 · 1280×720",
+    video_codec: "h264",
+    width: 1280,
+    height: 720,
+    fps: "30",
+    stream_type: "hls",
+    has_audio: false,
+  };
+
   it("sends the CCTV address with the broadcast, and the playlist with it", async () => {
     const created = vi.fn().mockResolvedValue({});
-    const t = withVideos({ createBroadcast: created });
+    const t = withVideos({
+      createBroadcast: created,
+      testCctv: vi.fn().mockResolvedValue(WORKING_CAM),
+    });
     show(
       <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
       t,
@@ -775,12 +789,128 @@ describe("making a broadcast", () => {
       screen.getByLabelText("CCTV 주소"),
       "https://cam.example/live/a.m3u8",
     );
+    // The address has to be opened by the server before it can be saved; an
+    // unreadable one does not fail at save time, it fails on air.
+    await userEvent.click(screen.getByRole("button", { name: "연결 테스트" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^방송 만들기$/ })).toBeEnabled(),
+    );
     await userEvent.click(screen.getByRole("button", { name: /^방송 만들기$/ }));
 
     await waitFor(() => expect(created).toHaveBeenCalled());
     const sent = created.mock.calls[0]?.[0];
     expect(sent.cctv_url).toBe("https://cam.example/live/a.m3u8");
     expect(sent.items.map((i: { media_id: string }) => i.media_id)).toEqual(["m1"]);
+  });
+
+  it("will not save a CCTV address the server has not opened", async () => {
+    // The gap this closes: an unreadable address used to save cleanly, and the
+    // broadcast then failed every sixty seconds for ever.
+    const created = vi.fn().mockResolvedValue({});
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos({ createBroadcast: created }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
+    await userEvent.selectOptions(
+      screen.getByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+    await userEvent.type(
+      screen.getByLabelText("CCTV 주소"),
+      "https://www.youtube.com/watch?v=x",
+    );
+
+    const save = screen.getByRole("button", { name: /^방송 만들기$/ });
+    expect(save).toBeDisabled();
+    expect(
+      screen.getByText("저장하기 전에 연결 테스트를 실행해 주세요."),
+    ).toBeInTheDocument();
+    await userEvent.click(save);
+    expect(created).not.toHaveBeenCalled();
+  });
+
+  it("will not save on a failed test either", async () => {
+    const created = vi.fn().mockResolvedValue({});
+    const testCctv = vi.fn().mockResolvedValue({
+      ok: false,
+      reason: "unsupported",
+      message: "읽을 수 있는 스트림 형식이 아닙니다.",
+      has_audio: false,
+    });
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos({ createBroadcast: created, testCctv }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
+    await userEvent.selectOptions(screen.getByLabelText("영상 소스"), "traffic_cctv");
+    await userEvent.type(screen.getByLabelText("CCTV 주소"), "https://cam.example/x");
+    await userEvent.click(screen.getByRole("button", { name: "연결 테스트" }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByText("이 주소로는 송출할 수 없습니다. 위의 실패 이유를 확인해 주세요."),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.getByRole("button", { name: /^방송 만들기$/ })).toBeDisabled();
+    expect(created).not.toHaveBeenCalled();
+  });
+
+  it("stops trusting a successful test once the address is edited", async () => {
+    // Otherwise a working camera's result would be the evidence for whatever
+    // address was pasted over it.
+    const created = vi.fn().mockResolvedValue({});
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos({
+        createBroadcast: created,
+        testCctv: vi.fn().mockResolvedValue(WORKING_CAM),
+      }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
+    await userEvent.selectOptions(screen.getByLabelText("영상 소스"), "traffic_cctv");
+    const field = screen.getByLabelText("CCTV 주소");
+    await userEvent.type(field, "https://cam.example/good.m3u8");
+    await userEvent.click(screen.getByRole("button", { name: "연결 테스트" }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /^방송 만들기$/ })).toBeEnabled(),
+    );
+
+    // One more character, and the result no longer describes this address.
+    await userEvent.type(field, "x");
+    expect(screen.getByRole("button", { name: /^방송 만들기$/ })).toBeDisabled();
+    expect(
+      screen.getByText("주소가 바뀌었습니다. 연결 테스트를 다시 실행해 주세요."),
+    ).toBeInTheDocument();
+  });
+
+  it("says plainly that a watch-page link is not a stream", async () => {
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos(),
+    );
+    await userEvent.selectOptions(
+      await screen.findByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+    // The field already explains what an acceptable address looks like; what
+    // was missing is that a watch-page link is not one of them.
+    expect(screen.getByText(/시청 페이지 링크는 사용할 수/)).toBeInTheDocument();
+    expect(screen.getByText(/YouTube·Twitch·치지직/)).toBeInTheDocument();
+  });
+
+  it("asks nothing of a playlist broadcast", async () => {
+    // The gate is for the CCTV source only; an ordinary broadcast must not
+    // suddenly need a connection test.
+    const created = vi.fn().mockResolvedValue({});
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos({ createBroadcast: created }),
+    );
+    await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
+    await userEvent.click(screen.getByRole("button", { name: /^방송 만들기$/ }));
+    await waitFor(() => expect(created).toHaveBeenCalled());
+    expect(created.mock.calls[0]?.[0].cctv_url).toBe("");
   });
 
   it("shows what the server found, and leaves the judging to it", async () => {
@@ -894,7 +1024,7 @@ describe("making a broadcast", () => {
     ).toBeInTheDocument();
   });
 
-  it("hides the sending settings until asked, and defaults to auto", async () => {
+  it("offers no sending settings, because nothing reads one", async () => {
     const created = vi.fn().mockResolvedValue({});
     const t = withVideos({ createBroadcast: created });
     show(
@@ -902,25 +1032,36 @@ describe("making a broadcast", () => {
       t,
     );
 
+    // The card says what the sender actually does, which is the whole of what
+    // there is to say about it.
+    expect(await screen.findByText(/서버가 정합니다/)).toBeInTheDocument();
     expect(
-      await screen.findByText(/자동 — 서버가 영상에 맞는/),
+      screen.getByText(/다시 인코딩하지 않고 그대로/),
     ).toBeInTheDocument();
-    expect(screen.queryByLabelText("해상도")).not.toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "고급 설정" }));
-    expect(screen.getByLabelText("해상도")).toHaveValue("auto");
+    // These four were stored and validated and never read by anything, and a
+    // form that collects them is a promise the encoder does not keep. There is
+    // no "고급 설정" to open any more, and nothing behind it.
+    expect(
+      screen.queryByRole("button", { name: "고급 설정" }),
+    ).not.toBeInTheDocument();
+    for (const label of [
+      "해상도",
+      "프레임레이트",
+      "영상 비트레이트",
+      "음성 비트레이트",
+    ]) {
+      expect(screen.queryByLabelText(label)).not.toBeInTheDocument();
+    }
 
     await userEvent.click(screen.getByRole("button", { name: "+ one.mp4" }));
     await userEvent.click(
       screen.getByRole("button", { name: /^방송 만들기$/ }),
     );
     await waitFor(() => expect(created).toHaveBeenCalled());
-    expect(created.mock.calls[0]?.[0].settings).toEqual({
-      resolution: "auto",
-      fps: "auto",
-      video_bitrate_kbps: 0,
-      audio_bitrate_kbps: 0,
-    });
+    // Not "settings: auto" — no such field. An API that still accepted one
+    // would be a place for it to come back.
+    expect(created.mock.calls[0]?.[0]).not.toHaveProperty("settings");
   });
 
   it("schedules in the reader own clock and sends UTC", async () => {

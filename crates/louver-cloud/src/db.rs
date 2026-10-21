@@ -534,11 +534,30 @@ impl CloudDb {
             ("tags", "TEXT NOT NULL DEFAULT ''"),
             ("category", "TEXT NOT NULL DEFAULT ''"),
             ("privacy", "TEXT NOT NULL DEFAULT 'private'"),
-            // §6 settings
+            // §6 settings. Nothing reads or writes these four any more: the
+            // sender has no per-broadcast resolution, frame rate or bitrate,
+            // and the form that collected them was removed rather than left
+            // promising something the encoder never did. They are still
+            // created, because `ensure_column` is what makes an older
+            // database open at all and dropping a column on a live service
+            // rewrites the table — which is not worth doing for four values
+            // nobody reads. A broadcast row from before this change keeps
+            // whatever it had.
             ("resolution", "TEXT NOT NULL DEFAULT 'auto'"),
             ("fps", "TEXT NOT NULL DEFAULT 'auto'"),
             ("video_bitrate_kbps", "INTEGER NOT NULL DEFAULT 0"),
             ("audio_bitrate_kbps", "INTEGER NOT NULL DEFAULT 0"),
+            // Set when recovery refused to put the box over its encoder budget,
+            // and cleared the moment the broadcast actually claims a slot.
+            //
+            // A column rather than a shape inferred from the other two, because
+            // the obvious inference — `desired_state='running'` with
+            // `runtime_state='STOPPED'` — is also what a restart looks like
+            // between its stop and its start (`stop_with` keeps the intent and
+            // the worker thread writes `Stopped` on its way out). Treating that
+            // as held back would let somebody else's start take the slot a
+            // restart is in the middle of reusing.
+            ("held_back_at", "TEXT"),
             // §8 schedule
             ("sched_enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("sched_start_at", "TEXT"),
@@ -2586,10 +2605,9 @@ impl CloudDb {
 
     /// Change what a broadcast is, without touching what it is doing.
     ///
-    /// Only the fields present are written. A playlist, a destination or a
-    /// settings change takes effect at the next start — the running FFmpeg is
-    /// deliberately not interrupted, because an edit is not a reason to drop a
-    /// live stream.
+    /// Only the fields present are written. A playlist or destination change
+    /// takes effect at the next start — the running FFmpeg is deliberately not
+    /// interrupted, because an edit is not a reason to drop a live stream.
     pub fn update_broadcast_owned(
         &self,
         user_id: &str,
@@ -2597,9 +2615,6 @@ impl CloudDb {
         patch: &BroadcastPatch,
     ) -> Result<Broadcast> {
         self.broadcast_owned(user_id, id)?;
-        if let Some(s) = &patch.settings {
-            s.validate()?;
-        }
         if let Some(sc) = &patch.schedule {
             crate::schedule::validate(sc)?;
         }
@@ -2647,12 +2662,6 @@ impl CloudDb {
         }
         if let Some(v) = &patch.destination_id {
             set("destination_id = ?2", v)?;
-        }
-        if let Some(v) = &patch.settings {
-            set("resolution = ?2", &v.resolution)?;
-            set("fps = ?2", &v.fps)?;
-            set("video_bitrate_kbps = ?2", &v.video_bitrate_kbps)?;
-            set("audio_bitrate_kbps = ?2", &v.audio_bitrate_kbps)?;
         }
         if let Some(v) = &patch.cctv_url {
             // Stored as NULL rather than '' when cleared, so "no live source"
@@ -2792,6 +2801,29 @@ impl CloudDb {
             params![id, state.id(), restart_count, uptime_secs, bytes_sent, ffmpeg_pid],
         )?;
         Ok(())
+    }
+
+    /// Mark a broadcast as one recovery had no room for.
+    ///
+    /// The intent (`desired_state`) is deliberately untouched: it is still
+    /// meant to run, and this is the record of why it is not.
+    pub fn hold_back(&self, id: &str) -> Result<()> {
+        self.raw()
+            .lock()
+            .unwrap()
+            .execute("UPDATE broadcasts SET held_back_at=datetime('now') WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    /// Which broadcasts are waiting for room. Oldest first, so the one that has
+    /// been waiting longest gets the slot.
+    pub fn held_back_ids(&self) -> Result<Vec<String>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard
+            .prepare("SELECT id FROM broadcasts WHERE held_back_at IS NOT NULL ORDER BY held_back_at, id")?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn record_runtime_only(&self, id: &str, state: RuntimeState) -> Result<()> {
@@ -3096,12 +3128,6 @@ fn row_to_broadcast(r: &rusqlite::Row<'_>) -> rusqlite::Result<Broadcast> {
         tags: r.get("tags")?,
         category: r.get("category")?,
         privacy: Privacy::from_id(&privacy).unwrap_or(Privacy::Private),
-        settings: StreamSettings {
-            resolution: r.get("resolution")?,
-            fps: r.get("fps")?,
-            video_bitrate_kbps: r.get("video_bitrate_kbps")?,
-            audio_bitrate_kbps: r.get("audio_bitrate_kbps")?,
-        },
         schedule: Schedule {
             enabled: r.get::<_, i64>("sched_enabled")? != 0,
             start_at: r.get("sched_start_at")?,

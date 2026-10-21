@@ -131,9 +131,23 @@ fn yesterdays_database_opens_and_nothing_is_lost() {
 
     // The new columns read as their defaults rather than as an error.
     assert_eq!(b.privacy, Privacy::Private);
-    assert_eq!(b.settings, louver_cloud::StreamSettings::default());
     assert!(!b.schedule.enabled);
     assert_eq!(b.ffmpeg_pid, None);
+
+    // The four §6 settings columns are still added, with their defaults, even
+    // though nothing reads them any more. That is the claim `db.rs` makes when
+    // it keeps them: `ensure_column` is what lets an older file open at all,
+    // and dropping a column on a live service rewrites the table.
+    let c = Connection::open(&path).unwrap();
+    let stored: (String, String, i64, i64) = c
+        .query_row(
+            "SELECT resolution, fps, video_bitrate_kbps, audio_bitrate_kbps
+             FROM broadcasts WHERE id = ?1",
+            [&broadcast_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, ("auto".to_string(), "auto".to_string(), 0, 0));
 
     // The single video became a one-item playlist, so the editor has something
     // to show — and the old column still points at it.
@@ -550,4 +564,52 @@ fn columns_of(path: &std::path::Path, table: &str) -> Vec<String> {
     let mut q = c.prepare(&format!("PRAGMA table_info({table})")).unwrap();
     let rows = q.query_map([], |r| r.get::<_, String>(1)).unwrap();
     rows.map(std::result::Result::unwrap).collect()
+}
+
+/// A broadcast that was saved with explicit sending settings keeps them.
+///
+/// Nobody reads `resolution`, `fps` or either bitrate any more, and the form
+/// that collected them is gone. "Not read" has to mean exactly that, though:
+/// an edit must not quietly rewrite the four values to a default, because the
+/// row is a paying customer's and the columns are the only record that they
+/// once asked for something.
+#[test]
+fn an_edit_does_not_overwrite_the_sending_settings_nobody_reads_any_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cloud.db");
+    let (broadcast_id, _) = yesterdays_database(&path);
+    let db = CloudDb::open(&path).unwrap();
+
+    // What the previous release would have written when somebody opened
+    // "고급 설정" and chose 720p.
+    {
+        let c = Connection::open(&path).unwrap();
+        c.execute(
+            "UPDATE broadcasts SET resolution='720p', fps='30',
+                                   video_bitrate_kbps=4000, audio_bitrate_kbps=128
+             WHERE id = ?1",
+            [&broadcast_id],
+        )
+        .unwrap();
+    }
+
+    let patch =
+        louver_cloud::BroadcastPatch { name: Some("이름만 바꿉니다".into()), ..Default::default() };
+    let after = db.update_broadcast_owned("u-old", &broadcast_id, &patch).unwrap();
+    assert_eq!(after.name, "이름만 바꿉니다");
+
+    let c = Connection::open(&path).unwrap();
+    let stored: (String, String, i64, i64) = c
+        .query_row(
+            "SELECT resolution, fps, video_bitrate_kbps, audio_bitrate_kbps
+             FROM broadcasts WHERE id = ?1",
+            [&broadcast_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        stored,
+        ("720p".to_string(), "30".to_string(), 4000, 128),
+        "the edit left the unread columns exactly as they were"
+    );
 }

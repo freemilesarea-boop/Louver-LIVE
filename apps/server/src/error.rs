@@ -41,6 +41,10 @@ impl IntoResponse for ApiError {
             // server has no room. 507 rather than 500 so it is distinguishable
             // in a log without reading the message.
             CloudError::OutOfSpace => (StatusCode::INSUFFICIENT_STORAGE, self.0.to_string()),
+            // 503 and not 507: the encoder being full is temporary and clears
+            // when a broadcast stops, so "try again shortly" is the truth. Not
+            // 402 either — paying more does not add cores to this box.
+            CloudError::EncoderBusy { .. } => (StatusCode::SERVICE_UNAVAILABLE, self.0.to_string()),
             // Anything internal keeps its detail in the log, not in the body.
             CloudError::Db(_) | CloudError::Io(_) | CloudError::Crypto => {
                 eprintln!("[louver] internal: {}", self.0);
