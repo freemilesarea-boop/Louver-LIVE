@@ -40,8 +40,11 @@ function archiveWith(names) {
  * and a synchronous child blocks the event loop that would answer the request
  * — the script waits for a download that cannot arrive until it exits.
  */
-function fetchInto(out, extra = [], env = {}) {
-  const args = ['scripts/fetch-ffmpeg.mjs', '--require-download', '--force', '--target', TARGET, '--out', out]
+function fetchInto(out, extra = [], env = {}, alternates = '') {
+  const args = [
+    'scripts/fetch-ffmpeg.mjs', '--require-download', '--force',
+    '--target', TARGET, '--alternates', alternates, '--out', out,
+  ]
   return new Promise((done, fail) => {
     const child = spawn(process.execPath, [...args, ...extra], {
       encoding: 'utf8',
@@ -152,6 +155,88 @@ describe('placing the sidecars from a real download', () => {
     const out = join(work, 'out-404')
     mkdirSync(out, { recursive: true })
     const r = await fetchInto(out, ['--url', `${origin}/nothing-here.tar`])
+    expect(r.status).toBe(1)
+    expect(r.stderr).toContain('--require-download')
+    expect(existsSync(join(out, `ffmpeg-${TARGET}`))).toBe(false)
+  })
+})
+
+/**
+ * A second source for one target, which is the thing a dead provider needs.
+ *
+ * evermeet.cx answered `HTTP 410 Gone` and there was no way to name a
+ * replacement: the field the retry loop read carried a URL on its own, no
+ * source had ever set it, and ffprobe's own archive would have gone on being
+ * read from the dead provider. A source is listed whole now, so a fall-through
+ * takes both of its URLs.
+ */
+describe('a provider that is gone rather than busy', () => {
+  it('moves to the next source on a 404 and records the one that served', async () => {
+    const out = join(work, 'out-alt')
+    mkdirSync(out, { recursive: true })
+    attempts.gone = 0
+    const alt = JSON.stringify([{ url: `${origin}/both.tar`, probeUrl: `${origin}/both.tar` }])
+    const r = await fetchInto(
+      out,
+      ['--url', `${origin}/gone.tar`, '--probe-url', `${origin}/gone.tar`],
+      { LOUVER_FETCH_BACKOFF: '0,1' },
+      alt,
+    )
+    expect(r.stdout + r.stderr).toContain('done (downloaded)')
+    expect(r.status).toBe(0)
+    expect(r.stdout).toContain('trying the next source')
+    // A 404 is not waited on, so the dead source is asked exactly once.
+    expect(attempts.gone).toBe(1)
+    for (const tool of ['ffmpeg', 'ffprobe']) {
+      expect(existsSync(join(out, `${tool}-${TARGET}`)), tool).toBe(true)
+    }
+    // The provenance names what actually served, not what was tried first.
+    const source = readFileSync(join(out, `SOURCE-${TARGET}.txt`), 'utf8')
+    expect(source).toContain('/both.tar')
+    expect(source).not.toContain('/gone.tar')
+  })
+
+  it('takes ffprobe from the alternate too, not from the host it just gave up on', async () => {
+    // The bug this pins, found by running it: `main()` resolves `probeUrl`
+    // before the loop, and for a provider that ships both tools in one
+    // archive that resolved URL *is* the primary's. The first fall-through
+    // fetched ffmpeg from the new source and then went back to the dead host
+    // for ffprobe — the exact failure a second source exists to avoid.
+    const out = join(work, 'out-alt-probe')
+    mkdirSync(out, { recursive: true })
+    attempts.gone = 0
+    const alt = JSON.stringify([{ url: `${origin}/both.tar` }])
+    const r = await fetchInto(out, ['--url', `${origin}/gone.tar`], { LOUVER_FETCH_BACKOFF: '0,1' }, alt)
+    expect(r.stdout + r.stderr).toContain('done (downloaded)')
+    expect(r.status).toBe(0)
+    for (const tool of ['ffmpeg', 'ffprobe']) {
+      expect(existsSync(join(out, `${tool}-${TARGET}`)), tool).toBe(true)
+    }
+    // Once for ffmpeg, and never again: not a second time for ffprobe.
+    expect(attempts.gone).toBe(1)
+    const source = readFileSync(join(out, `SOURCE-${TARGET}.txt`), 'utf8')
+    expect(source).not.toContain('/gone.tar')
+    expect(source.split('\n').filter((l) => l.includes('both.tar'))).toHaveLength(1)
+  })
+
+  it('records the licence of the source that served, not the one listed first', async () => {
+    // A provenance file naming one provider's terms over another provider's
+    // binary is what `ffmpeg-manifest.mjs --check` would then report as what
+    // shipped. The first real fall-through wrote exactly that.
+    const out = join(work, 'out-alt-licence')
+    mkdirSync(out, { recursive: true })
+    const alt = JSON.stringify([{ url: `${origin}/both.tar`, license: 'GPL v3 (the alternate)' }])
+    const r = await fetchInto(out, ['--url', `${origin}/gone.tar`], { LOUVER_FETCH_BACKOFF: '0,1' }, alt)
+    expect(r.status).toBe(0)
+    const source = readFileSync(join(out, `SOURCE-${TARGET}.txt`), 'utf8')
+    expect(source).toContain('GPL v3 (the alternate)')
+  })
+
+  it('still fails when every source is gone', async () => {
+    const out = join(work, 'out-alt-none')
+    mkdirSync(out, { recursive: true })
+    const alt = JSON.stringify([{ url: `${origin}/also-nothing.tar` }])
+    const r = await fetchInto(out, ['--url', `${origin}/gone.tar`], { LOUVER_FETCH_BACKOFF: '0,1' }, alt)
     expect(r.status).toBe(1)
     expect(r.stderr).toContain('--require-download')
     expect(existsSync(join(out, `ffmpeg-${TARGET}`))).toBe(false)

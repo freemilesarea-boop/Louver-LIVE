@@ -522,7 +522,7 @@ impl Youtube {
 
         let meta = metadata_of(&b);
         let start = scheduled_start_for(&b);
-        let end = b.schedule.stop_at.clone().filter(|_| b.schedule.enabled);
+        let end = scheduled_end_for(&b, &start);
 
         let broadcast =
             self.call_api(broadcast_id, account_id, ApiMethod::LiveBroadcastsInsert, |api, token| {
@@ -576,7 +576,7 @@ impl Youtube {
     fn renew(&self, b: &crate::models::Broadcast, account_id: &str) -> Result<()> {
         let meta = metadata_of(b);
         let start = scheduled_start_for(b);
-        let end = b.schedule.stop_at.clone().filter(|_| b.schedule.enabled);
+        let end = scheduled_end_for(b, &start);
         let fresh = self.call_api(&b.id, account_id, ApiMethod::LiveBroadcastsInsert, |api, token| {
             api.create_broadcast(token, &meta, &start, end.as_deref(), true)
         })?;
@@ -605,7 +605,7 @@ impl Youtube {
         };
         let meta = metadata_of(&b);
         let start = scheduled_start_for(&b);
-        let end = b.schedule.stop_at.clone().filter(|_| b.schedule.enabled);
+        let end = scheduled_end_for(&b, &start);
         self.call_api(broadcast_id, &account_id, ApiMethod::LiveBroadcastsUpdate, |api, token| {
             api.update_broadcast(token, &yt_id, &meta, Some(&start), end.as_deref())
         })
@@ -847,6 +847,38 @@ fn metadata_of(b: &crate::models::Broadcast) -> BroadcastMetadata {
             crate::models::Privacy::Private => YtPrivacy::Private,
         },
     }
+}
+
+/// The `scheduledEndTime` that belongs with the start we are actually sending.
+///
+/// A schedule stores two instants, and the stop is only ever meaningful as a
+/// *length*: "every day at 21:18, for three hours". `schedule::decide` has
+/// always read it that way — it stops a broadcast at
+/// `occurrence + (stop_at - start_at)` — but what went to YouTube was the
+/// stored `stop_at` itself, unrolled, while the start beside it was rolled
+/// forward by [`scheduled_start_for`].
+///
+/// That asymmetry is the bug this function exists to remove. From the second
+/// occurrence onwards the start was today and the end was the day the schedule
+/// was first saved, so `liveBroadcasts.insert` answered
+/// `400 invalidScheduledEndTime` and the broadcast did not start — for ever,
+/// once a day, on a service whose customers run broadcasts for months.
+///
+/// `None` stays `None`: a schedule with no stop is an indefinite broadcast and
+/// must not acquire an end here.
+fn scheduled_end_for(b: &crate::models::Broadcast, start: &str) -> Option<String> {
+    if !b.schedule.enabled {
+        return None;
+    }
+    let parse = |s: &str| chrono::DateTime::parse_from_rfc3339(s).ok().map(|t| t.with_timezone(&chrono::Utc));
+    let window = parse(b.schedule.stop_at.as_deref()?)? - parse(b.schedule.start_at.as_deref()?)?;
+    // `schedule::validate` refuses a stop that is not after the start, so this
+    // is a belt rather than a case: a zero or negative window would be the same
+    // 400 by another route, and an end YouTube rejects is worse than no end.
+    if window <= chrono::Duration::zero() {
+        return None;
+    }
+    Some((parse(start)? + window).to_rfc3339())
 }
 
 /// A `scheduledStartTime` YouTube will accept. §5: required even for "start now".
