@@ -19,6 +19,9 @@
 const JELLYFIN_VER = '7.1.1-7'
 const JELLYFIN = `https://github.com/jellyfin/jellyfin-ffmpeg/releases/download/v${JELLYFIN_VER}`
 
+/** A pinned rehost of other people's builds, used only where it is a last resort. */
+const FFBINARIES = 'https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1'
+
 /** Tauri target triples, and where an official static build comes from. */
 export const SOURCES = {
   'x86_64-pc-windows-msvc': {
@@ -30,17 +33,31 @@ export const SOURCES = {
   // evermeet.cx and osxexperts.net publish one download per tool. The archive
   // named "ffmpeg" holds ffmpeg and nothing else, so ffprobe needs its own URL.
   //
-  // `getrelease/zip` — the form with no tool in it — started answering
-  // `HTTP 410 Gone`, and this job failed in under a second on every push from
-  // 2026-10-18. 410 is permanent, so no retry reached it. The tool is named
-  // explicitly now, which is the form the ffprobe URL beside it has always
-  // used and the one that kept working.
+  // evermeet.cx is gone, not moved. `getrelease/zip` answered `HTTP 410 Gone`
+  // from 2026-10-18, and naming the tool — `getrelease/ffmpeg/zip`, the form
+  // the ffprobe URL beside it had always used — answers 410 as well. 410 is
+  // permanent, so this job failed in about a second on every push.
+  //
+  // So this target moves to osxexperts.net, which is the provider the Apple
+  // Silicon row below already uses and the same 7.1.1 build, with ffbinaries'
+  // pinned 6.1 behind it. Both are listed because neither can be checked from
+  // a Linux machine and the Intel runner builds no media in CI — the only
+  // thing that executes this binary before a release is
+  // `ffmpeg-manifest.mjs --check` on the Intel runner, which reads its
+  // version, licence, linkage and encoders out of the binary itself.
   'x86_64-apple-darwin': {
-    url: 'https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip',
-    probeUrl: 'https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip',
+    url: 'https://www.osxexperts.net/ffmpeg711intel.zip',
+    probeUrl: 'https://www.osxexperts.net/ffprobe711intel.zip',
+    alternates: [
+      {
+        url: `${FFBINARIES}/ffmpeg-6.1-macos-64.zip`,
+        probeUrl: `${FFBINARIES}/ffprobe-6.1-macos-64.zip`,
+        license: 'GPL v3 (ffbinaries pinned 6.1)',
+      },
+    ],
     archive: 'zip',
     exe: '',
-    license: 'GPL v3 (evermeet.cx)',
+    license: 'GPL v3 (osxexperts.net)',
   },
   'aarch64-apple-darwin': {
     url: 'https://www.osxexperts.net/ffmpeg711arm.zip',
@@ -98,7 +115,7 @@ export const TOOLS = ['ffmpeg', 'ffprobe']
 /**
  * Which archive each tool must be downloaded from, keyed by tool.
  *
- * `spec.url` may be overridden — `main()` retries with `fallbackUrl` — but the
+ * `spec.url` may be overridden — `main()` works through `alternates` — but the
  * ffprobe archive is a property of the source, so it is read from the table.
  */
 export function urlsFor(target, url) {
