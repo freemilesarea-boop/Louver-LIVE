@@ -1180,15 +1180,64 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// Forty lines rather than a dependency: what this needs is a `Content-Length`
 /// and a status line, and the point of the test is that the error text survives
 /// a real HTTP round trip.
+/// Read one HTTP request to its end: headers, then `Content-Length` bytes.
+///
+/// Bounded twice over — a cap on the bytes and a read timeout — because this
+/// runs on a test thread and a client that stops mid-request must not hang the
+/// suite. Falling out early is safe: the worst case is the abortive close this
+/// exists to avoid, which is where it started.
+fn drain_request(sock: &mut std::net::TcpStream) {
+    use std::io::Read;
+    let _ = sock.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    let mut req: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 1024];
+    loop {
+        match sock.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => req.extend_from_slice(&buf[..n]),
+        }
+        if req.len() > 64 * 1024 {
+            return;
+        }
+        let Some(head) = req.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+        let body_at = head + 4;
+        let want = std::str::from_utf8(&req[..head])
+            .ok()
+            .and_then(|h| {
+                h.lines()
+                    .find_map(|l| l.split_once(':').filter(|(k, _)| k.eq_ignore_ascii_case("content-length")))
+                    .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+            })
+            .unwrap_or(0);
+        if req.len() >= body_at + want {
+            return;
+        }
+    }
+}
+
 fn refusing_token_endpoint(status_line: &str, body: &'static str) -> (String, std::thread::JoinHandle<()>) {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}/token", listener.local_addr().unwrap());
     let status_line = status_line.to_string();
     let handle = std::thread::spawn(move || {
         if let Ok((mut sock, _)) = listener.accept() {
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf); // the form body; nothing here asserts on it
+            // The whole request is read before anything is written back, and
+            // that is the point rather than tidiness.
+            //
+            // One `read` was enough on Linux and macOS and not on Windows. A
+            // POST arrives in more than one segment, so the first read can
+            // return only the headers — and closing a socket that still holds
+            // unread bytes is an abortive close there: the client is sent RST
+            // and loses the response it was in the middle of reading. The
+            // failure was `os error 10053 … connection was aborted by the
+            // software in your host machine`, with the 400 this test is about
+            // nowhere in it, on a commit whose other CI event passed.
+            //
+            // Nothing asserts on the form, and nothing may: `post_token` keeps
+            // the client secret out of the detail and a test that read it back
+            // would be a place for one to leak into an assertion message.
+            drain_request(&mut sock);
             let _ = sock.write_all(
                 format!(
                     "{status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
