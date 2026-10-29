@@ -5,7 +5,7 @@
  * without a server, and the same components would render against the desktop's
  * backend, because neither of them knows the difference.
  */
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { ReactElement } from "react";
@@ -26,6 +26,7 @@ import type {
   CloudMedia,
   Dashboard,
   StreamDestination,
+  Subscription,
 } from "../cloud";
 import type { Transport } from "../transport";
 
@@ -110,6 +111,7 @@ const PLANS = [
     label: "Business",
     limits: {
       max_concurrent_streams: 3,
+      cctv_enabled: 1,
       max_storage_bytes: 60 * 1024 ** 3,
       max_upload_bytes: 20 * 1024 ** 3,
     },
@@ -192,7 +194,18 @@ function fake(over: Partial<Transport> = {}): Transport {
     login: vi.fn(),
     logout: vi.fn(),
     me: vi.fn(),
-    subscription: vi.fn(),
+    // Resolves, like the real one: the broadcast form reads it to decide
+    // whether to offer the CCTV source, and a bare `vi.fn()` hands it
+    // `undefined` where a promise belongs.
+    subscription: vi.fn().mockResolvedValue({
+      user_id: "u-1",
+      plan_id: "pro",
+      plan_label: "Pro",
+      status: "active",
+      limits: {},
+      active: true,
+      cctv_enabled: false,
+    } satisfies Subscription),
     listMedia: vi.fn().mockResolvedValue([READY_MEDIA]),
     uploadMedia: vi.fn(),
     deleteMedia: vi.fn().mockResolvedValue(undefined),
@@ -714,6 +727,28 @@ describe("making a broadcast", () => {
     return fake({ listMedia: vi.fn().mockResolvedValue(VIDEOS), ...over });
   }
 
+  /**
+   * The same, on Business.
+   *
+   * The CCTV source is sold with that plan, so a test about the field has to
+   * say which plan it is on — the default account in `fake` is not on it, and
+   * that is the point of the test below this block.
+   */
+  function withCamera(over: Partial<Transport> = {}) {
+    return withVideos({
+      subscription: vi.fn().mockResolvedValue({
+        user_id: "u-1",
+        plan_id: "business",
+        plan_label: "Business",
+        status: "active",
+        limits: {},
+        active: true,
+        cctv_enabled: true,
+      } satisfies Subscription),
+      ...over,
+    });
+  }
+
   it("builds a playlist of several videos and sends it in order", async () => {
     const created = vi.fn().mockResolvedValue({});
     const t = withVideos({ createBroadcast: created });
@@ -768,9 +803,39 @@ describe("making a broadcast", () => {
     has_audio: false,
   };
 
+  it("does not offer the CCTV source to an account whose plan lacks it", async () => {
+    // `withVideos` leaves the account on the default fake subscription, which
+    // is Pro. The server would answer 402; the form does not get that far.
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withVideos(),
+    );
+
+    const source = await screen.findByLabelText("영상 소스");
+    const cctv = within(source).getByRole("option", { name: /CCTV/ });
+    expect(cctv).toBeDisabled();
+    expect(cctv).toHaveTextContent("Business 요금제 전용");
+    expect(screen.getByTestId("cctv-upsell")).toHaveTextContent(
+      "무료 체험으로 받은 권한에는 포함되지 않습니다",
+    );
+  });
+
+  it("offers it once the account is on the plan that carries it", async () => {
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      withCamera(),
+    );
+
+    const source = await screen.findByLabelText("영상 소스");
+    await waitFor(() =>
+      expect(within(source).getByRole("option", { name: /CCTV/ })).toBeEnabled(),
+    );
+    expect(screen.queryByTestId("cctv-upsell")).not.toBeInTheDocument();
+  });
+
   it("sends the CCTV address with the broadcast, and the playlist with it", async () => {
     const created = vi.fn().mockResolvedValue({});
-    const t = withVideos({
+    const t = withCamera({
       createBroadcast: created,
       testCctv: vi.fn().mockResolvedValue(WORKING_CAM),
     });
@@ -809,7 +874,7 @@ describe("making a broadcast", () => {
     const created = vi.fn().mockResolvedValue({});
     show(
       <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
-      withVideos({ createBroadcast: created }),
+      withCamera({ createBroadcast: created }),
     );
     await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
     await userEvent.selectOptions(
@@ -840,7 +905,7 @@ describe("making a broadcast", () => {
     });
     show(
       <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
-      withVideos({ createBroadcast: created, testCctv }),
+      withCamera({ createBroadcast: created, testCctv }),
     );
     await userEvent.click(await screen.findByRole("button", { name: "+ one.mp4" }));
     await userEvent.selectOptions(screen.getByLabelText("영상 소스"), "traffic_cctv");
@@ -862,7 +927,7 @@ describe("making a broadcast", () => {
     const created = vi.fn().mockResolvedValue({});
     show(
       <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
-      withVideos({
+      withCamera({
         createBroadcast: created,
         testCctv: vi.fn().mockResolvedValue(WORKING_CAM),
       }),
@@ -887,7 +952,7 @@ describe("making a broadcast", () => {
   it("says plainly that a watch-page link is not a stream", async () => {
     show(
       <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
-      withVideos(),
+      withCamera(),
     );
     await userEvent.selectOptions(
       await screen.findByLabelText("영상 소스"),
@@ -926,7 +991,7 @@ describe("making a broadcast", () => {
     });
     show(
       <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
-      withVideos({ testCctv }),
+      withCamera({ testCctv }),
     );
     await userEvent.selectOptions(
       await screen.findByLabelText("영상 소스"),
@@ -949,7 +1014,7 @@ describe("making a broadcast", () => {
       .mockRejectedValue(new Error("127.0.0.1 는 루프백 주소로 연결됩니다."));
     show(
       <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
-      withVideos({ testCctv }),
+      withCamera({ testCctv }),
     );
     await userEvent.selectOptions(
       await screen.findByLabelText("영상 소스"),
@@ -1836,6 +1901,19 @@ describe("the price list", () => {
     expect(
       await screen.findByText("저장공간 12.5GB · 파일당 최대 7GB"),
     ).toBeInTheDocument();
+  });
+
+  it("names the CCTV source on the plan that carries it, and only there", async () => {
+    show(<Pricing />, fake());
+
+    const lines = await screen.findAllByTestId("cctv");
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toHaveTextContent("CCTV 트래픽 이용 가능");
+    // On the Business card, because that is the plan whose payload carries it.
+    expect(lines[0].closest("[data-testid='plan-card']")).toHaveAttribute(
+      "data-plan",
+      "business",
+    );
   });
 
   it("renders a price the server changed, without this file knowing the number", async () => {

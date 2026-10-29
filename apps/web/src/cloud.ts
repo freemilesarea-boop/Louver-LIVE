@@ -77,6 +77,15 @@ export interface Subscription {
   /** `null` when there is no subscription — which is how "no plan" is told from
    * "Basic" without comparing plan ids here. */
   plan?: Plan | null;
+  /**
+   * May this account point a broadcast at a CCTV address?
+   *
+   * From the plan that is **paid for**, not from `plan` above: a free trial is
+   * handed out as a grant, a grant raises quotas on purpose, and this is the
+   * one thing it must not open. Absent means an older server, and the form
+   * treats that as "no" rather than offering a field the save would refuse.
+   */
+  cctv_enabled?: boolean;
 }
 
 /** Limit keys, matching `louver_cloud::entitlement`. */
@@ -99,6 +108,22 @@ export function storageLimit(plan: Plan): number {
 /** The largest single file this plan accepts. */
 export function uploadLimit(plan: Plan): number {
   return plan.limits[MAX_UPLOAD_BYTES] ?? 0;
+}
+
+/** Live video from a CCTV address instead of the playlist's own picture. */
+export const CCTV_ENABLED = "cctv_enabled";
+
+/**
+ * May this plan point a broadcast at a CCTV address?
+ *
+ * Read from the plan payload, like every other entitlement on this page, so
+ * what the pricing page claims is what the server enforces. The server reads
+ * the *paid* plan for this one — a free trial is handed out as a grant and a
+ * grant does not open it — which is why a card that says this is a statement
+ * about the plan rather than about any one account.
+ */
+export function cctvEnabled(plan: Plan): boolean {
+  return (plan.limits[CCTV_ENABLED] ?? 0) > 0;
 }
 
 /**

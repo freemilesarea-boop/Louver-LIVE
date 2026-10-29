@@ -25,6 +25,13 @@ pub const MAX_BROADCASTS: &str = "max_broadcasts";
 pub const MAX_STORAGE_BYTES: &str = "max_storage_bytes";
 pub const MAX_UPLOAD_BYTES: &str = "max_upload_bytes";
 pub const SCHEDULING_ENABLED: &str = "scheduling_enabled";
+/// Live video from a CCTV address, rather than from the playlist's own video.
+///
+/// Sold with Business and read from the **paid** plan — see
+/// [`CloudDb::paid_flag`]. Every other limit is read through `effective_plan`,
+/// which a grant may raise; this one is not, because a free trial is a trial of
+/// the service and not of a feature a plan is sold for.
+pub const CCTV_ENABLED: &str = "cctv_enabled";
 
 /// Overrides how many broadcasts this machine will encode at once.
 pub const ENCODING_BUDGET_ENV: &str = "LOUVER_MAX_ENCODING_STREAMS";
@@ -115,6 +122,22 @@ impl CloudDb {
 
     pub fn flag(&self, user_id: &str, key: &str) -> Result<bool> {
         Ok(self.limit(user_id, key)? != 0)
+    }
+
+    /// One limit for one user, from the plan they **pay for** only.
+    ///
+    /// [`Self::limit`] reads `effective_plan`, which an operator's grant may
+    /// raise — that is what a free trial is. For a feature sold with a plan
+    /// that is the wrong answer: a trial of the service must not also be a
+    /// trial of everything in it. So this reads `users.plan_id` and nothing
+    /// else, and a limit absent from that plan is zero, exactly as above.
+    pub fn paid_limit(&self, user_id: &str, key: &str) -> Result<i64> {
+        Ok(self.paid_plan(user_id)?.limits.get(key).copied().unwrap_or(0))
+    }
+
+    /// [`Self::paid_limit`] as a yes or no.
+    pub fn paid_flag(&self, user_id: &str, key: &str) -> Result<bool> {
+        Ok(self.paid_limit(user_id, key)? != 0)
     }
 
     /// How many of this user's broadcasts are holding a slot right now.

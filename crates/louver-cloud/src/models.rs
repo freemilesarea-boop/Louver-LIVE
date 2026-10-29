@@ -235,6 +235,14 @@ pub struct Subscription {
     /// The plan being paid for. `None` when there is no subscription, which is
     /// what lets a client tell "no plan" from "Basic".
     pub plan: Option<Plan>,
+    /// May this account point a broadcast at a CCTV address?
+    ///
+    /// Read from the plan the account **pays for**, and deliberately not from
+    /// `plan` above, which a grant may have replaced. A free trial is a grant
+    /// and raises quotas on purpose; it does not hand out a feature a plan is
+    /// sold for. Sent so the form asks the same question the save path does,
+    /// instead of offering a field the server would then refuse.
+    pub cctv_enabled: bool,
 }
 
 /// Where a paid subscription has got to with the payment provider.

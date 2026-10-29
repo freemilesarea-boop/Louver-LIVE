@@ -111,6 +111,14 @@ export function BroadcastForm({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState<number | null>(null);
+  /**
+   * Whether this account's **paid** plan carries the CCTV source.
+   *
+   * Starts false so the option is never offered before the answer is known —
+   * the save path refuses it anyway, and a field that appears and then is
+   * rejected is worse than one that appears a moment later.
+   */
+  const [cctvAllowed, setCctvAllowed] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -118,9 +126,13 @@ export function BroadcastForm({
       t.listMedia(),
       t.listDestinations(),
       t.listYoutubeAccounts().catch(() => []),
+      // An older server does not send `cctv_enabled`; a failure here must not
+      // stop the rest of the form loading, so it answers "not allowed".
+      t.subscription().catch(() => null),
     ])
-      .then(([m, d, a]) => {
+      .then(([m, d, a, sub]) => {
         if (!live) return;
+        setCctvAllowed(sub?.cctv_enabled === true);
         setMedia(m);
         setDestinations(d.filter((x) => x.kind !== "youtube_account"));
         setDestinationId(
@@ -220,7 +232,15 @@ export function BroadcastForm({
    * with a different next move.
    */
   const cctvBlocker = (): string | null => {
-    if (videoSource !== "traffic_cctv" || cctvProven) return null;
+    if (videoSource !== "traffic_cctv") return null;
+    // Asked before the connection test, for the same reason the server asks the
+    // plan before the address: somebody without the feature must not be sent
+    // off to test a URL that was never the problem. A disabled option cannot
+    // normally be chosen, so this is for the broadcast that already had a
+    // camera when the plan changed under it.
+    if (!cctvAllowed)
+      return "CCTV 영상 송출은 Business 요금제에서만 사용할 수 있습니다.";
+    if (cctvProven) return null;
     if (cctvToSave.length === 0) return "CCTV 주소를 입력해 주세요.";
     // The request itself failed, or the server refused the address outright.
     if (cctvError) return "연결 테스트가 실패했습니다. 주소를 확인해 주세요.";
@@ -550,9 +570,22 @@ export function BroadcastForm({
             }}
           >
             <option value="playlist">플레이리스트 영상 (기본)</option>
-            <option value="traffic_cctv">Traffic CCTV (Test)</option>
+            {/* Disabled rather than hidden: somebody editing a broadcast that
+                already has a camera must still see which source it is on, and
+                somebody who does not have the feature should be able to see
+                that it exists. */}
+            <option value="traffic_cctv" disabled={!cctvAllowed}>
+              CCTV 영상{cctvAllowed ? "" : " (Business 요금제 전용)"}
+            </option>
           </Select>
         </Field>
+
+        {!cctvAllowed && (
+          <p className="mt-2 text-xs text-ink-500" data-testid="cctv-upsell">
+            CCTV 영상 송출은 Business 요금제에서 사용할 수 있습니다. 무료 체험으로
+            받은 권한에는 포함되지 않습니다.
+          </p>
+        )}
 
         {videoSource === "traffic_cctv" && (
           <div className="mt-3 space-y-3 rounded-md border border-ink-700 bg-ink-900 p-3">

@@ -17,6 +17,7 @@ import {
   PLAN_FEATURES,
   RECOMMENDED_PLAN,
   billingIsLive,
+  cctvEnabled,
   concurrentStreams,
   formatPlanGb,
   formatWon,
@@ -133,6 +134,7 @@ function PlanCard({ plan, onChoose }: { plan: Plan; onChoose: () => void }) {
   const streams = concurrentStreams(plan);
   const storage = storageLimit(plan);
   const perFile = uploadLimit(plan);
+  const cctv = cctvEnabled(plan);
 
   return (
     <div
@@ -176,6 +178,14 @@ function PlanCard({ plan, onChoose }: { plan: Plan; onChoose: () => void }) {
       {storage > 0 && perFile > 0 && (
         <p className="mt-2 text-xs text-ink-400" data-testid="storage">
           저장공간 {formatPlanGb(storage)} · 파일당 최대 {formatPlanGb(perFile)}
+        </p>
+      )}
+
+      {/* Only on the plans that carry it, so this reads as what sets them
+          apart rather than as a line every card repeats. */}
+      {cctv && (
+        <p className="mt-2 text-xs text-ok" data-testid="cctv">
+          CCTV 트래픽 이용 가능
         </p>
       )}
 

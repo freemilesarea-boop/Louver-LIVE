@@ -325,6 +325,17 @@ impl CloudDb {
         }
     }
 
+    /// The plan this account pays for, with no grant considered.
+    ///
+    /// The other half of [`Self::effective_plan`], and the reason both exist:
+    /// a grant is how a free trial is given, so it raises quotas on purpose.
+    /// A feature that a plan is sold for is the one thing it must not open,
+    /// or the trial becomes the product. `CloudDb::paid_flag` is what reads
+    /// this; everything about quotas still goes through `effective_plan`.
+    pub fn paid_plan(&self, user_id: &str) -> Result<Plan> {
+        self.plan(&self.user(user_id)?.plan_id)
+    }
+
     /// Every grant this account has ever had, newest first.
     pub fn grants_for(&self, user_id: &str) -> Result<Vec<Grant>> {
         self.grant_rows("WHERE g.user_id = ?1", &[&user_id], MAX_GRANT_PAGE, 0)

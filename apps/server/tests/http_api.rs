@@ -1925,6 +1925,46 @@ async fn a_live_video_source_is_stored_on_the_broadcast_and_can_be_cleared() {
     assert!(s.app.db.broadcast(&id).unwrap().cctv_url.is_none());
 }
 
+/// The feature is sold with Business, and the answer a browser gets says so.
+///
+/// 402 and not 403: the caller has asked for something their plan does not
+/// cover, and paying is what changes the answer — the same code every other
+/// plan limit uses (`apps/server/src/error.rs`).
+#[tokio::test]
+async fn a_cctv_url_needs_the_business_plan() {
+    let s = server();
+    let token = account(&s, "cctv-plan@example.com").await;
+    let uid = get(&s, "/api/me", &token).await.id();
+    // `ready_broadcast` puts every test account on Business; this one is not.
+    let (id, _media) = ready_broadcast(&s, &token, &uid, "cctv-plan").await;
+    s.app.db.activate_subscription(&uid, "pro").unwrap();
+
+    let r = send(
+        &s,
+        Method::PATCH,
+        &format!("/api/broadcasts/{id}"),
+        Some(&token),
+        Some(serde_json::json!({ "cctv_url": "https://93.184.216.34/live/cam1.m3u8" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PAYMENT_REQUIRED, "{}", r.body);
+    assert!(r.body.contains("Business"), "the message must name the plan that has it: {}", r.body);
+    assert!(s.app.db.broadcast(&id).unwrap().cctv_url.is_none(), "nothing may be stored");
+
+    // Back on Business, the same request is accepted — so what was refused was
+    // the plan and not the address.
+    s.app.db.activate_subscription(&uid, "business").unwrap();
+    let r = send(
+        &s,
+        Method::PATCH,
+        &format!("/api/broadcasts/{id}"),
+        Some(&token),
+        Some(serde_json::json!({ "cctv_url": "https://93.184.216.34/live/cam1.m3u8" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+}
+
 /// Saving is the same chokepoint as testing: a URL the server would refuse to
 /// open cannot be parked on a broadcast and started later.
 #[tokio::test]

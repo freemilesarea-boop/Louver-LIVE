@@ -294,6 +294,7 @@ const SEED_PLANS: &[SeedPlan] = &[
             // is the thing being sold.
             ("scheduling_enabled", 1),
             ("priority_recovery", 0),
+            ("cctv_enabled", 0),
         ],
     },
     SeedPlan {
@@ -310,6 +311,7 @@ const SEED_PLANS: &[SeedPlan] = &[
             ("max_upload_bytes", 15 * 1024 * 1024 * 1024),
             ("scheduling_enabled", 1),
             ("priority_recovery", 0),
+            ("cctv_enabled", 0),
         ],
     },
     SeedPlan {
@@ -326,6 +328,9 @@ const SEED_PLANS: &[SeedPlan] = &[
             ("max_upload_bytes", 20 * 1024 * 1024 * 1024),
             ("scheduling_enabled", 1),
             ("priority_recovery", 1),
+            // Live video from a CCTV address. Business only, and only when it
+            // is paid for — `CloudDb::paid_flag` is what reads this.
+            ("cctv_enabled", 1),
         ],
     },
     SeedPlan {
@@ -346,6 +351,7 @@ const SEED_PLANS: &[SeedPlan] = &[
             ("max_upload_bytes", 0),
             ("scheduling_enabled", 0),
             ("priority_recovery", 0),
+            ("cctv_enabled", 0),
         ],
     },
 ];
@@ -364,7 +370,13 @@ impl std::fmt::Debug for CloudDb {
 /// The 2026-09 upload relief: Basic 15/10GB, Pro 30/15GB, Business 60/20GB.
 const UPLOAD_RELIEF_2026_09: &str = "plan_storage_upload_relief_2026_09";
 
-/// Bring every seeded plan's storage keys **up** to `SEED_PLANS`, once.
+/// CCTV video, opened for Business.
+///
+/// A separate marker from the one above because it is a separate decision, and
+/// because a database that has already run that one must still run this.
+const CCTV_BUSINESS_2026_10: &str = "plan_cctv_business_2026_10";
+
+/// Bring the named keys of every seeded plan **up** to `SEED_PLANS`, once.
 ///
 /// `seed_plans` leaves `limits` alone on conflict, so without this a raised
 /// ceiling in code would reach nobody who already has a plan row — which is
@@ -372,12 +384,14 @@ const UPLOAD_RELIEF_2026_09: &str = "plan_storage_upload_relief_2026_09";
 /// broadcast depends on a ceiling being low, so no operator has to look first
 /// the way `--audit-storage` exists for lowering one.
 ///
-/// - Only `max_storage_bytes` and `max_upload_bytes`, and only upwards. A row an
-///   operator already set higher keeps its figure.
+/// - Only the keys in `keys`, and only upwards. A row an operator already set
+///   higher keeps its figure, and a key whose seeded value is `0` — a feature
+///   a plan does not include — is therefore never written, so this can open a
+///   feature for one plan without closing it for anyone.
 /// - No price, subscription, billing or user row is in any statement here.
 /// - Once, recorded under `marker`: a ceiling an operator lowers afterwards is
 ///   not raised back at the next restart.
-fn raise_storage_limits_once(conn: &Connection, marker: &str) -> Result<()> {
+fn raise_limits_once(conn: &Connection, marker: &str, keys: &[&str]) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS cloud_migrations (
              id         TEXT PRIMARY KEY,
@@ -403,7 +417,7 @@ fn raise_storage_limits_once(conn: &Connection, marker: &str) -> Result<()> {
             continue;
         };
         let mut moved = false;
-        for key in [crate::entitlement::MAX_STORAGE_BYTES, crate::entitlement::MAX_UPLOAD_BYTES] {
+        for key in keys.iter().copied() {
             let want = target.get(key).copied().unwrap_or(0);
             if limits.get(key).copied().unwrap_or(0) < want {
                 limits.insert(key.to_string(), want);
@@ -881,7 +895,12 @@ impl CloudDb {
                 ],
             )?;
         }
-        raise_storage_limits_once(&c, UPLOAD_RELIEF_2026_09)?;
+        raise_limits_once(
+            &c,
+            UPLOAD_RELIEF_2026_09,
+            &[crate::entitlement::MAX_STORAGE_BYTES, crate::entitlement::MAX_UPLOAD_BYTES],
+        )?;
+        raise_limits_once(&c, CCTV_BUSINESS_2026_10, &[crate::entitlement::CCTV_ENABLED])?;
         Ok(())
     }
 
@@ -1158,6 +1177,11 @@ impl CloudDb {
             .unwrap_or_else(|| SUBSCRIPTION_ACTIVE.into());
 
         let paid_active = status == SUBSCRIPTION_ACTIVE && paid.can_broadcast();
+        // Taken here, while `paid` is still the plan that was paid for: the
+        // match below may replace it with a granted one, and this must not
+        // follow it there. Same answer as `paid_flag`, which is what the save
+        // path asks.
+        let cctv_enabled = paid.limits.get(crate::entitlement::CCTV_ENABLED).copied().unwrap_or(0) != 0;
 
         // A grant an operator handed out is a second, independent source of
         // entitlement. It can only raise what the account already has: it takes
@@ -1189,6 +1213,7 @@ impl CloudDb {
             // `None` is what lets a client tell "no plan" from "Basic" without
             // comparing against a plan id it would have to hard-code.
             plan: active.then_some(plan),
+            cctv_enabled,
         })
     }
 
@@ -2619,11 +2644,29 @@ impl CloudDb {
             crate::schedule::validate(sc)?;
         }
         // The one place a CCTV URL can enter the database, so the one place the
-        // check has to be. An empty string clears it; anything else must pass
-        // the protocol and address rules in `cctv`. Done before the connection
-        // is locked, because it resolves a host name.
+        // checks have to be. An empty string clears it — and clearing is always
+        // allowed, so an account that drops off Business can still take the URL
+        // back out of a broadcast it can no longer run.
+        //
+        // The plan is asked first and the address second: telling someone their
+        // address is malformed when the feature is not theirs to use would send
+        // them to fix the wrong thing.
+        //
+        // `paid_flag` and not `flag`: a grant is how a free trial is given and
+        // it raises quotas on purpose, but a feature sold with a plan is not
+        // part of the trial. See `CloudDb::paid_plan`.
         if let Some(u) = &patch.cctv_url {
             if !u.trim().is_empty() {
+                if !self.paid_flag(user_id, crate::entitlement::CCTV_ENABLED)? {
+                    return Err(CloudError::LimitReached {
+                        limit: crate::entitlement::CCTV_ENABLED,
+                        plan_label: self.plan_label_of(user_id)?,
+                        used: 1,
+                        allowed: 0,
+                    });
+                }
+                // Resolves a host name, so it is done before the connection is
+                // locked.
                 crate::cctv::validate(u)?;
             }
         }

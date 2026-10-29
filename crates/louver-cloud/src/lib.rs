@@ -60,6 +60,14 @@ fn limit_message(limit: &str, plan_label: &str, used: i64, allowed: i64) -> Stri
         entitlement::MAX_BROADCASTS => {
             format!("이 요금제에서는 방송을 {allowed}개까지 만들 수 있습니다.")
         }
+        // Not a ceiling anyone can be under, so the numbers are left out: it is
+        // on or it is off. The plan the account is actually on is named, because
+        // "upgrade" is unhelpful to someone who believes they already did — a
+        // free trial is a grant, and a grant does not open this.
+        entitlement::CCTV_ENABLED => format!(
+            "CCTV 영상 송출은 Business 요금제에서만 사용할 수 있습니다. \
+             현재 요금제는 {plan_label}입니다. 무료 체험으로 받은 권한으로는 사용할 수 없습니다."
+        ),
         other => format!("{other} 한도를 초과했습니다 ({used}/{allowed})"),
     }
 }

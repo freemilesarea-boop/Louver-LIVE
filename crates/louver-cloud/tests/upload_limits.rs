@@ -228,14 +228,19 @@ fn an_existing_database_is_raised_once_and_only_upwards() {
 fn a_fresh_database_needs_no_raise_and_records_it_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cloud.db");
-    drop(CloudDb::open(&path).unwrap());
+
+    let migrations = |db: &CloudDb| -> i64 {
+        db.raw().lock().unwrap().query_row("SELECT COUNT(*) FROM cloud_migrations", [], |r| r.get(0)).unwrap()
+    };
+
     let db = CloudDb::open(&path).unwrap();
-    let n: i64 = db
-        .raw()
-        .lock()
-        .unwrap()
-        .query_row("SELECT COUNT(*) FROM cloud_migrations", [], |r| r.get(0))
-        .unwrap();
-    assert_eq!(n, 1);
+    let first = migrations(&db);
+    assert!(first >= 1, "a fresh database records the migrations it has run");
+    drop(db);
+
+    // The property, rather than a count that every later migration would have
+    // to come back and edit: opening again runs nothing a second time.
+    let db = CloudDb::open(&path).unwrap();
+    assert_eq!(migrations(&db), first, "a restart must not record a migration twice");
     assert_eq!(storage_of(&db, "basic"), (15 * GB, 10 * GB));
 }
