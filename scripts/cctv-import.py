@@ -203,6 +203,20 @@ def main():
     )
     ap.add_argument("--out-dir", default="/root/cctv-import")
     ap.add_argument("--dry-run", action="store_true", help="만들어질 행만 보여주고 전송하지 않는다")
+    ap.add_argument(
+        "--exclude-name",
+        action="append",
+        default=[],
+        metavar="낱말",
+        help="이름에 이 낱말이 들어간 카메라를 버린다. 여러 번 쓸 수 있다 (예: --exclude-name 터널)",
+    )
+    ap.add_argument(
+        "--include-name",
+        action="append",
+        default=[],
+        metavar="낱말",
+        help="이름에 이 낱말 중 하나라도 들어간 카메라만 남긴다. 여러 번 쓸 수 있다",
+    )
     ap.add_argument("--cookie-file", default=DEFAULT_COOKIE_FILE, help="관리자 세션 쿠키가 담긴 파일")
     ap.add_argument(
         "--provider",
@@ -223,8 +237,19 @@ def main():
     # Deduplicated here as well as in the server, because a feed that lists one
     # camera twice would otherwise spend two requests on it and report it twice.
     seen, rows = set(), []
+    dropped = 0
     for name, url in spec["extract"](doc):
         if url in seen:
+            continue
+        # Name filters. A tunnel's inside wall is a working camera and a
+        # useless backdrop, and a catalogue of eleven thousand of them cannot
+        # be re-checked inside the lifetime of its own URLs — so which ones are
+        # worth offering is a decision made here, with the numbers in hand.
+        if any(w in name for w in args.exclude_name):
+            dropped += 1
+            continue
+        if args.include_name and not any(w in name for w in args.include_name):
+            dropped += 1
             continue
         seen.add(url)
         rows.append(
@@ -242,7 +267,8 @@ def main():
             "       피드 구조가 바뀐 것일 수 있습니다. 응답 앞부분을 확인해 주세요."
         )
 
-    print(f"[cctv] {spec['provider']} — 사용 가능 {len(rows)}대")
+    print(f"[cctv] {spec['provider']} — 사용 가능 {len(rows)}대", end="")
+    print(f"  (이름 조건으로 제외 {dropped}대)" if dropped else "")
     for r in rows[:5]:
         print(f"         {r['name']}\n           {r['url']}")
     if len(rows) > 5:

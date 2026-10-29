@@ -165,6 +165,20 @@ def main():
     ap.add_argument("--provider", help="이 제공처만 확인한다 (예: 'VDOT (Virginia)')")
     ap.add_argument("--region", help="이 지역 코드만 확인한다 (예: US)")
     ap.add_argument("--sleep", type=float, default=2.0, help="카메라 사이 간격(초)")
+    ap.add_argument(
+        "--exclude-name",
+        action="append",
+        default=[],
+        metavar="낱말",
+        help="이름에 이 낱말이 들어간 카메라는 건너뛴다 (예: --exclude-name 터널)",
+    )
+    ap.add_argument(
+        "--include-name",
+        action="append",
+        default=[],
+        metavar="낱말",
+        help="이름에 이 낱말 중 하나라도 들어간 카메라만 확인한다",
+    )
     ap.add_argument("--limit", type=int, help="이번 실행에서 확인할 최대 대수")
     ap.add_argument(
         "--logout",
@@ -189,6 +203,13 @@ def main():
         rows = [r for r in rows if r.get("provider") == args.provider]
     if args.region:
         rows = [r for r in rows if r.get("region") == args.region.upper()]
+    # Applied to the catalogue rather than the import, so a list already in the
+    # database can be narrowed without deleting anything: what is not checked
+    # is not offered, so the rest simply stays hidden.
+    if args.exclude_name:
+        rows = [r for r in rows if not any(w in r.get("name", "") for w in args.exclude_name)]
+    if args.include_name:
+        rows = [r for r in rows if any(w in r.get("name", "") for w in args.include_name)]
 
     if args.recheck_failed:
         todo = [r for r in rows if r.get("checked_at") and not r.get("checked_ok")]
