@@ -43,6 +43,18 @@ pub const MAX_URL_CHARS: usize = 2048;
 /// How long `Test Connection` may take before the child is killed.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(12);
 
+/// How wide a catalogue thumbnail is, in pixels. Height follows the source.
+///
+/// Wide enough to tell a tunnel wall from a river at a glance in a grid, small
+/// enough that a few thousand of them are megabytes rather than gigabytes.
+pub const THUMB_WIDTH: i64 = 640;
+
+/// How long a frame grab may take.
+///
+/// More than the probe, because this one has to decode: an HLS source hands
+/// over a playlist, then a segment, and only then a keyframe.
+pub const THUMB_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// The protocols FFmpeg may use for this input, and nothing else.
 ///
 /// `crypto` is there because an AES-128 HLS playlist needs it; `file` is
@@ -393,6 +405,90 @@ pub fn test_connection(tools: &FfmpegTools, raw: &str) -> Result<CctvCheck> {
         Err(e) => return Ok(CctvCheck::failed("unreadable", format!("스트림 정보를 읽을 수 없습니다: {e}"))),
     };
     Ok(summarise(&parsed))
+}
+
+/// ffmpeg's argv for one frame out of a live source, written to `dest`.
+///
+/// `-frames:v 1` and nothing else: no audio, no second output, no re-connect.
+/// The scale filter keeps the aspect ratio — `-2` rounds the height to an even
+/// number, which JPEG does not care about but every encoder after it does.
+pub fn thumb_args(url: &str, dest: &std::path::Path, timeout: Duration) -> Vec<String> {
+    vec![
+        "-hide_banner".into(),
+        "-loglevel".into(),
+        "error".into(),
+        "-rw_timeout".into(),
+        (timeout.as_micros() as u64).to_string(),
+        "-protocol_whitelist".into(),
+        PROTOCOL_WHITELIST.into(),
+        "-i".into(),
+        url.to_string(),
+        "-frames:v".into(),
+        "1".into(),
+        "-vf".into(),
+        format!("scale={THUMB_WIDTH}:-2"),
+        // 2 is visually lossless and 31 is mush; 6 is a thumbnail.
+        "-q:v".into(),
+        "6".into(),
+        "-f".into(),
+        "image2".into(),
+        "-y".into(),
+        dest.to_string_lossy().to_string(),
+    ]
+}
+
+/// Grab one frame and leave it at `dest`.
+///
+/// Validated first, so this cannot reach an address [`validate`] refuses — the
+/// same rule the probe follows, for the same reason.
+///
+/// Written to a sibling and renamed, because the file this produces is served
+/// to customers: a half-written JPEG under the real name would be served as a
+/// broken image, and a rename is the only way to publish bytes all at once.
+///
+/// A failure here is not a failure of the camera. The caller has usually just
+/// established that the stream opens, and a picture that could not be decoded
+/// — a source that only hands over audio, a codec ffmpeg declines — is a
+/// missing thumbnail, not a missing camera. So this reports the error and
+/// lets the caller carry on.
+pub fn capture_thumb(tools: &FfmpegTools, raw: &str, dest: &std::path::Path) -> Result<()> {
+    let url = validate(raw)?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // The pid keeps two captures of the same camera from writing one temp file.
+    let staging = dest.with_extension(format!("part{}", std::process::id()));
+    let mut cmd = Command::new(&tools.ffmpeg);
+    cmd.args(thumb_args(url.as_str(), &staging, THUMB_TIMEOUT));
+    let run = match run_with_timeout(cmd, THUMB_TIMEOUT) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(CloudError::Invalid(format!("ffmpeg를 실행할 수 없습니다: {e}")));
+        }
+    };
+    if run.timed_out || !run.ok {
+        let _ = std::fs::remove_file(&staging);
+        let why = if run.timed_out {
+            format!("{}초 안에 한 장면도 받지 못했습니다.", THUMB_TIMEOUT.as_secs())
+        } else {
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            classify(&stderr).1
+        };
+        return Err(CloudError::Invalid(format!("미리보기를 만들지 못했습니다: {why}")));
+    }
+    // ffmpeg can exit 0 having written nothing when the stream ends before a
+    // frame arrives. An empty file published under the real name is a broken
+    // image on every card in the grid.
+    match std::fs::metadata(&staging) {
+        Ok(m) if m.len() > 0 => {}
+        _ => {
+            let _ = std::fs::remove_file(&staging);
+            return Err(CloudError::Invalid("미리보기가 비어 있습니다.".into()));
+        }
+    }
+    std::fs::rename(&staging, dest)?;
+    Ok(())
 }
 
 /// Turn ffprobe's JSON into the answer the UI shows.
@@ -989,6 +1085,44 @@ mod tests {
         // Reported, so the user can see it is being dropped on purpose.
         assert!(c.has_audio);
         assert!(c.message.contains("원본 오디오"), "{}", c.message);
+    }
+
+    #[test]
+    fn a_thumbnail_asks_for_one_frame_and_nothing_else() {
+        let args = thumb_args(
+            "https://cam.example/live/a.m3u8",
+            std::path::Path::new("/tmp/x.jpg"),
+            Duration::from_secs(20),
+        );
+        let joined = args.join(" ");
+        // One frame. Without this ffmpeg would sit on a live source forever.
+        assert!(joined.contains("-frames:v 1"), "{joined}");
+        // The same whitelist as the probe: a thumbnail must not be a way to
+        // reach a protocol the probe refuses.
+        let w = args.iter().position(|a| a == "-protocol_whitelist").expect("whitelist");
+        assert_eq!(args[w + 1], PROTOCOL_WHITELIST);
+        assert!(!args[w + 1].contains("file"), "file:// must stay out");
+        // Input options before -i, or ffmpeg applies them to the output.
+        let i = args.iter().position(|a| a == "-i").expect("-i");
+        assert!(w < i, "whitelist must precede -i");
+        assert!(joined.contains(&format!("scale={THUMB_WIDTH}:-2")), "{joined}");
+        assert_eq!(args.last().map(String::as_str), Some("/tmp/x.jpg"));
+    }
+
+    #[test]
+    fn a_thumbnail_is_never_written_for_an_address_the_probe_would_refuse() {
+        let tools = FfmpegTools { ffmpeg: "ffmpeg".into(), ffprobe: "ffprobe".into() };
+        let dir = std::env::temp_dir().join(format!("louver-thumb-{}", std::process::id()));
+        let dest = dir.join("x.jpg");
+        for bad in [
+            "http://127.0.0.1/a.m3u8",
+            "https://www.youtube.com/watch?v=abc",
+            "file:///etc/passwd",
+        ] {
+            assert!(capture_thumb(&tools, bad, &dest).is_err(), "{bad}");
+            assert!(!dest.exists(), "{bad} left a file behind");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

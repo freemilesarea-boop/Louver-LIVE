@@ -20,6 +20,7 @@ import { formatDurationKo } from "@/services/format";
 import { useTransport } from "../TransportContext";
 import {
   DAY_NAMES,
+  cctvThumbUrl,
   regionName,
   EVERY_DAY,
   PRIVACY_LABELS,
@@ -58,11 +59,22 @@ const CAMERA_LIST_CAP = 300;
 
 export function BroadcastForm({
   editing,
+  initialCctvUrl,
   onDone,
   onCancel,
 }: {
   /** The broadcast being changed, or nothing for a new one. */
   editing?: BroadcastDetail;
+  /**
+   * A camera chosen in the gallery, for a new broadcast.
+   *
+   * Only an opening value — the form owns the field from then on, so somebody
+   * who changes their mind in the picker is not overruled by where they came
+   * from. It still goes through the connection test like any other address:
+   * the gallery's picture was taken when the camera was last checked, which is
+   * not a statement about now.
+   */
+  initialCctvUrl?: string;
   onDone: () => void;
   onCancel: () => void;
 }) {
@@ -94,9 +106,9 @@ export function BroadcastForm({
   // Where the picture comes from. `playlist` is every broadcast that existed
   // before the traffic-CCTV test, and the one the form opens on.
   const [videoSource, setVideoSource] = useState<VideoSource>(
-    editing?.cctv_url ? "traffic_cctv" : "playlist",
+    editing?.cctv_url || initialCctvUrl ? "traffic_cctv" : "playlist",
   );
-  const [cctvUrl, setCctvUrl] = useState(editing?.cctv_url ?? "");
+  const [cctvUrl, setCctvUrl] = useState(editing?.cctv_url ?? initialCctvUrl ?? "");
   const [cctvCheck, setCctvCheck] = useState<CctvCheck | null>(null);
   /**
    * The URL the result in `cctvCheck` is about.
@@ -146,6 +158,8 @@ export function BroadcastForm({
    */
   const [cctvProvider, setCctvProvider] = useState("");
   const [cameraQuery, setCameraQuery] = useState("");
+  /** Set when the chosen camera has no frame on the server to show. */
+  const [thumbBroken, setThumbBroken] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -224,6 +238,12 @@ export function BroadcastForm({
     );
   }, [providers]);
 
+  /** The catalogue row this address belongs to, when it came from the list. */
+  const chosenCamera = useMemo(
+    () => cameras.find((c) => c.url === cctvUrl),
+    [cameras, cctvUrl],
+  );
+
   /** What region, provider and the search box leave — the honest count. */
   const hits = useMemo(() => {
     const q = cameraQuery.trim().toLowerCase();
@@ -248,11 +268,10 @@ export function BroadcastForm({
    */
   const options = useMemo(() => {
     const head = hits.slice(0, CAMERA_LIST_CAP);
-    const chosen = cameras.find((c) => c.url === cctvUrl);
-    return chosen && !head.some((c) => c.id === chosen.id)
-      ? [chosen, ...head]
+    return chosenCamera && !head.some((c) => c.id === chosenCamera.id)
+      ? [chosenCamera, ...head]
       : head;
-  }, [hits, cameras, cctvUrl]);
+  }, [hits, chosenCamera]);
 
   const ready = media.filter((m) => m.state === "ready");
   const unused = ready.filter((m) => !rows.some((r) => r.media_id === m.id));
@@ -760,6 +779,7 @@ export function BroadcastForm({
                       setCctvCheck(null);
                       setCctvError(null);
                       setCctvCheckedUrl(null);
+                      setThumbBroken(false);
                     }}
                   >
                     <option value="">직접 입력</option>
@@ -785,6 +805,26 @@ export function BroadcastForm({
               <p className="text-xs text-ink-500" data-testid="cctv-no-catalogue">
                 등록된 카메라 목록이 없습니다. 아래에 주소를 직접 입력해 주세요.
               </p>
+            )}
+            {/* The same frame the gallery shows, for the camera now chosen.
+                Here because the picker's option text is a road name, and a
+                road name does not say whether the camera points at a river or
+                at the inside of a tunnel. Hidden when the address was typed
+                rather than picked: there is no frame for an address this
+                server has never opened. */}
+            {chosenCamera && !thumbBroken && (
+              <div>
+                <img
+                  src={cctvThumbUrl(chosenCamera.id)}
+                  alt={chosenCamera.name}
+                  className="aspect-video w-full max-w-sm rounded-md border border-ink-700 bg-ink-800 object-cover"
+                  onError={() => setThumbBroken(true)}
+                  data-testid="cctv-thumb"
+                />
+                <p className="mt-1 text-xs text-ink-500">
+                  마지막 확인 때의 화면입니다. 실시간 영상이 아닙니다.
+                </p>
+              </div>
             )}
             <Field
               label="CCTV 주소"

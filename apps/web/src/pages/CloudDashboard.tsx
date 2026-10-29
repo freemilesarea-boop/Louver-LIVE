@@ -72,10 +72,21 @@ function youtubeTone(b: Broadcast): "default" | "ok" | "warn" | "live" {
 export function CloudDashboard({
   onChanged,
   onSeePricing,
+  startWithCctv,
+  onStartConsumed,
 }: {
   onChanged?: () => void;
   /** Take the user to the price list. Absent in tests that do not need it. */
   onSeePricing?: () => void;
+  /**
+   * A camera chosen in the gallery: open a new broadcast on it.
+   *
+   * Handed down rather than read from a route because the form is a tab. The
+   * dashboard reports back through `onStartConsumed` as soon as it has acted,
+   * so closing the form does not re-open it on the same camera.
+   */
+  startWithCctv?: string;
+  onStartConsumed?: () => void;
 }) {
   const t = useTransport();
   const [dash, setDash] = useState<Dashboard | null>(null);
@@ -84,6 +95,15 @@ export function CloudDashboard({
   const [busy, setBusy] = useState<string | null>(null);
   /** `null` — the list. `'new'` — the create form. Otherwise the one being edited. */
   const [editing, setEditing] = useState<"new" | BroadcastDetail | null>(null);
+
+  // A camera arriving from the gallery opens the form once. Reported back
+  // immediately, so the parent clears it: otherwise cancelling the form would
+  // land back here and open it again on the same camera, with no way out.
+  useEffect(() => {
+    if (!startWithCctv) return;
+    setEditing((current) => current ?? "new");
+    onStartConsumed?.();
+  }, [startWithCctv, onStartConsumed]);
 
   async function refresh() {
     try {
@@ -134,6 +154,9 @@ export function CloudDashboard({
     return (
       <BroadcastForm
         {...(editing === "new" ? {} : { editing })}
+        {...(editing === "new" && startWithCctv
+          ? { initialCctvUrl: startWithCctv }
+          : {})}
         onDone={() => {
           setEditing(null);
           refresh();

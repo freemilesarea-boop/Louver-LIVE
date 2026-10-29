@@ -16,6 +16,7 @@ import { DeploymentBanner, ServerStatus } from "./ServerStatus";
 import { Destinations } from "./Destinations";
 import { SignIn } from "./SignIn";
 import { Pricing } from "./Pricing";
+import { CameraGallery } from "./CameraGallery";
 import { BillingComplete, BillingPanel, isBillingComplete } from "./Billing";
 import { LegalPage, legalPageFor } from "./Legal";
 import { MediaLibrary } from "./MediaLibrary";
@@ -2628,5 +2629,147 @@ describe("the subscription panel", () => {
     expect(await screen.findByText("결제 실패")).toBeInTheDocument();
     expect(screen.getByText(/기존 이용은 계속 유지됩니다/)).toBeInTheDocument();
     expect(screen.getByText("Pro")).toBeInTheDocument();
+  });
+});
+
+describe("browsing the cameras", () => {
+  const CAMS = [
+    {
+      id: "c-de",
+      region: "US",
+      provider: "DelDOT (Delaware)",
+      name: "I-95 at Christiana",
+      url: "https://93.184.216.34/de/1.m3u8",
+      active: true,
+      checked_ok: true,
+    },
+    {
+      id: "c-de2",
+      region: "US",
+      provider: "DelDOT (Delaware)",
+      name: "SR-1 at Dover",
+      url: "https://93.184.216.34/de/2.m3u8",
+      active: true,
+      checked_ok: true,
+    },
+    {
+      id: "c-va",
+      region: "US",
+      provider: "VDOT (Virginia)",
+      name: "I-64 AT PARHAM",
+      url: "https://93.184.216.34/va/1.m3u8",
+      active: true,
+      checked_ok: true,
+    },
+  ];
+
+  function onBusiness(over: Partial<Transport> = {}) {
+    return fake({
+      subscription: vi.fn().mockResolvedValue({
+        user_id: "u-1",
+        plan_id: "business",
+        plan_label: "Business",
+        status: "active",
+        limits: {},
+        active: true,
+        cctv_enabled: true,
+      } satisfies Subscription),
+      listCctvSources: vi.fn().mockResolvedValue(CAMS),
+      ...over,
+    });
+  }
+
+  it("does not fetch the catalogue for an account without the plan", async () => {
+    const list = vi.fn().mockResolvedValue(CAMS);
+    const t = fake({ listCctvSources: list });
+    show(<CameraGallery />, t);
+
+    expect(await screen.findByTestId("gallery-upsell")).toHaveTextContent(
+      "Business 요금제",
+    );
+    // The point of asking the plan first: a list that would answer 402 is not
+    // requested, so the page says which plan carries this rather than showing
+    // an error about payment.
+    expect(list).not.toHaveBeenCalled();
+  });
+
+  it("shows a frame per camera and hands the chosen one over", async () => {
+    const used = vi.fn();
+    show(<CameraGallery onUse={used} />, onBusiness());
+
+    // Two of the three: the provider select opens on the first authority in
+    // sorted order, so Virginia's camera is one filter away rather than mixed
+    // into the same grid.
+    const cards = await screen.findAllByTestId("camera-card");
+    expect(cards).toHaveLength(2);
+    expect(screen.queryByText("I-64 AT PARHAM")).not.toBeInTheDocument();
+
+    // Found by what it says rather than by position, so the assertion is
+    // about the Delaware camera and not about whatever sorted first.
+    const card = cards.find((c) => c.textContent?.includes("I-95 at Christiana"));
+    if (!card) throw new Error("Delaware 카드가 없습니다");
+    // The picture is the server's last captured frame, fetched by the tag
+    // itself — the session is a cookie, so nothing here carries a token.
+    const img = within(card).getByRole("img");
+    expect(img).toHaveAttribute("src", "/api/cctv/sources/c-de/thumb");
+    expect(img).toHaveAttribute("loading", "lazy");
+
+    await userEvent.click(within(card).getByTestId("use-camera"));
+    expect(used).toHaveBeenCalledWith("https://93.184.216.34/de/1.m3u8");
+  });
+
+  it("narrows by authority and by name", async () => {
+    show(<CameraGallery />, onBusiness());
+    await screen.findAllByTestId("camera-card");
+
+    await userEvent.selectOptions(
+      screen.getByLabelText("제공처"),
+      "VDOT (Virginia)",
+    );
+    expect(await screen.findByText("I-64 AT PARHAM")).toBeInTheDocument();
+    expect(screen.queryByText("I-95 at Christiana")).not.toBeInTheDocument();
+    expect(screen.getByTestId("gallery-count")).toHaveTextContent("1대 중 1대");
+
+    await userEvent.type(screen.getByLabelText("카메라 찾기"), "없는도로");
+    expect(screen.getByTestId("gallery-count")).toHaveTextContent(
+      "검색어에 맞는 카메라가 없습니다.",
+    );
+  });
+
+  it("says so rather than showing a broken image when there is no frame", async () => {
+    show(<CameraGallery />, onBusiness());
+    const cards = await screen.findAllByTestId("camera-card");
+    const card = cards.find((c) => c.textContent?.includes("I-95 at Christiana"));
+    if (!card) throw new Error("Delaware 카드가 없습니다");
+    // jsdom does not load images, so the failure is fired the way a 404 would.
+    within(card).getByRole("img").dispatchEvent(new Event("error"));
+    expect(await screen.findByText("미리보기 없음")).toBeInTheDocument();
+  });
+
+  it("opens the form on a camera handed to it, and shows that camera's frame", async () => {
+    const t = onBusiness({ listMedia: vi.fn().mockResolvedValue([]) });
+    show(
+      <BroadcastForm
+        initialCctvUrl="https://93.184.216.34/va/1.m3u8"
+        onDone={() => undefined}
+        onCancel={() => undefined}
+      />,
+      t,
+    );
+
+    // Opened on the CCTV source, with the address already in the field.
+    expect(await screen.findByLabelText("영상 소스")).toHaveValue("traffic_cctv");
+    expect(screen.getByLabelText("CCTV 주소")).toHaveValue(
+      "https://93.184.216.34/va/1.m3u8",
+    );
+    expect(await screen.findByTestId("cctv-thumb")).toHaveAttribute(
+      "src",
+      "/api/cctv/sources/c-va/thumb",
+    );
+    // Picking is still not proving: the frame is from the last check, so the
+    // connection test is what lets it save.
+    expect(
+      screen.getByText("저장하기 전에 연결 테스트를 실행해 주세요."),
+    ).toBeInTheDocument();
   });
 });

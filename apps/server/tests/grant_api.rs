@@ -76,6 +76,8 @@ fn server() -> Server {
     let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools.clone(), "libx264".into());
     let upload_tmp = dir.path().join("uploads");
     std::fs::create_dir_all(&upload_tmp).unwrap();
+    let cctv_thumbs = dir.path().join("cctv-thumbs");
+    std::fs::create_dir_all(&cctv_thumbs).unwrap();
     Server {
         _dir: dir,
         app: App {
@@ -85,6 +87,7 @@ fn server() -> Server {
             storage,
             keys,
             upload_tmp,
+            cctv_thumbs,
             tools,
             youtube: None,
             payapp: None,

@@ -96,6 +96,7 @@ pub fn router(app: App) -> Router {
         // The catalogue a Business account picks from, so choosing a picture is
         // choosing from a list rather than hunting for a stream URL.
         .route("/api/cctv/sources", get(api::list_cctv_sources))
+        .route("/api/cctv/sources/{id}/thumb", get(api::cctv_thumb))
         // §2. `oauth/callback` is the one authenticated-by-state route: see the
         // module for why a session cookie cannot reach it.
         .route("/api/youtube", get(youtube::availability))

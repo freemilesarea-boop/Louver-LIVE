@@ -122,6 +122,16 @@ export const REGION_NAMES: Record<string, string> = {
   NL: "네덜란드",
 };
 
+/**
+ * Where one camera's last captured frame is served from.
+ *
+ * A path and not a fetch, because the browser loads this with an `<img>`: the
+ * session is a cookie, so the tag carries it without anything here doing so.
+ */
+export function cctvThumbUrl(id: string): string {
+  return `/api/cctv/sources/${encodeURIComponent(id)}/thumb`;
+}
+
 export function regionName(code: string): string {
   return REGION_NAMES[code] ?? code;
 }

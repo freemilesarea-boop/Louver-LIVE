@@ -29,6 +29,13 @@ pub struct App {
     /// again a supported deployment: everything but paying works, and the
     /// checkout route is the only thing that has to say so.
     pub payapp: Option<louver_cloud::billing::Payapp>,
+    /// Where catalogue thumbnails live.
+    ///
+    /// Beside the media rather than inside it: these are not a customer's
+    /// files, so they do not belong under a user's key and must not count
+    /// against anybody's storage. One picture per camera, overwritten by the
+    /// next check.
+    pub cctv_thumbs: PathBuf,
     /// CPU and memory, sampled on demand for the admin console.
     ///
     /// One long-lived sampler rather than a fresh one per request: `sysinfo`
@@ -79,6 +86,8 @@ impl App {
         let storage: Arc<dyn Storage> = Arc::new(LocalStorage::new(data.join("media")));
         let upload_tmp = data.join("uploads");
         std::fs::create_dir_all(&upload_tmp)?;
+        let cctv_thumbs = data.join("cctv-thumbs");
+        std::fs::create_dir_all(&cctv_thumbs)?;
         sweep_abandoned_uploads(&upload_tmp);
 
         let tools =
@@ -138,6 +147,7 @@ impl App {
             storage,
             keys,
             upload_tmp,
+            cctv_thumbs,
             tools,
             youtube,
             payapp,

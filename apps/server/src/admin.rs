@@ -277,6 +277,19 @@ pub async fn check_cctv_source(
         let source = app.db.cctv_source(&id)?;
         let check = louver_cloud::cctv::test_connection(&app.tools, &source.url)?;
         app.db.record_cctv_check(&id, &check)?;
+        // The picture rides along with the check, because this is the one
+        // moment the stream is known to be open — asking for a frame later
+        // means opening every camera a second time, and for a feed whose URLs
+        // expire in a day there may not be a later.
+        //
+        // A thumbnail that cannot be grabbed does not fail the check. The
+        // camera works; the grid will just show a placeholder for it.
+        if check.ok {
+            let dest = app.cctv_thumbs.join(format!("{id}.jpg"));
+            if let Err(e) = louver_cloud::cctv::capture_thumb(&app.tools, &source.url, &dest) {
+                eprintln!("[louver] 미리보기 실패 {id}: {e}");
+            }
+        }
         Ok(check)
     })
     .await?;

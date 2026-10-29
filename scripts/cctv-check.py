@@ -190,6 +190,13 @@ def main():
         action="store_true",
         help="확인은 됐지만 실패한 카메라를 다시 열어본다 (소스 쪽 복구 후)",
     )
+    ap.add_argument(
+        "--recheck-all",
+        action="store_true",
+        help="이미 확인된 것까지 전부 다시 열어본다. 미리보기 사진을 처음 만들 때 쓴다 "
+        "— 사진은 확인하는 순간에만 찍히므로, 그 기능이 생기기 전에 확인된 "
+        "카메라에는 사진이 없다",
+    )
     args = ap.parse_args()
 
     cookie = read_cookie(args.cookie_file)
@@ -211,7 +218,10 @@ def main():
     if args.include_name:
         rows = [r for r in rows if any(w in r.get("name", "") for w in args.include_name)]
 
-    if args.recheck_failed:
+    if args.recheck_all:
+        todo = list(rows)
+        what = "전부 다시"
+    elif args.recheck_failed:
         todo = [r for r in rows if r.get("checked_at") and not r.get("checked_ok")]
         what = "실패했던"
     else:

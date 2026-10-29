@@ -706,6 +706,47 @@ pub async fn list_cctv_sources(
     ))
 }
 
+/// One camera's picture, as the last check left it.
+///
+/// Business only, gated exactly like the list above: a thumbnail is part of
+/// what the plan sells, and a grid of them would otherwise be the whole
+/// catalogue for free.
+///
+/// 404 when there is no file. That happens for a camera that has not been
+/// checked yet and for one whose frame could not be decoded, and the grid
+/// shows the same placeholder either way — the distinction matters to the
+/// operator, who has `check_note`, not to the person choosing a camera.
+pub async fn cctv_thumb(
+    State(app): State<App>,
+    Caller(uid): Caller,
+    Path(id): Path<String>,
+) -> std::result::Result<axum::response::Response, ApiError> {
+    let bytes = crate::blocking(move || {
+        if !app.db.paid_flag(&uid, louver_cloud::entitlement::CCTV_ENABLED)? {
+            return Err(CloudError::LimitReached {
+                limit: louver_cloud::entitlement::CCTV_ENABLED,
+                plan_label: app.db.plan_label_of(&uid)?,
+                used: 1,
+                allowed: 0,
+            });
+        }
+        // Through the database rather than straight to the filesystem: the id
+        // arrives from the URL, and `cctv_source` is what establishes that it
+        // names a row rather than a path.
+        let source = app.db.cctv_source(&id)?;
+        std::fs::read(app.cctv_thumbs.join(format!("{}.jpg", source.id)))
+            .map_err(|_| CloudError::NotFound("cctv thumbnail"))
+    })
+    .await?;
+    Ok(axum::response::Response::builder()
+        .header(axum::http::header::CONTENT_TYPE, "image/jpeg")
+        // Long enough that scrolling a grid does not re-fetch, short enough
+        // that a camera re-checked this morning looks like this morning.
+        .header(axum::http::header::CACHE_CONTROL, "private, max-age=900")
+        .body(axum::body::Body::from(bytes))
+        .expect("static header values"))
+}
+
 pub async fn test_cctv(
     State(app): State<App>,
     Caller(_uid): Caller,

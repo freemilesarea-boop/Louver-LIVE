@@ -10,6 +10,7 @@ import { CloudDashboard } from "./pages/CloudDashboard";
 import { Destinations } from "./pages/Destinations";
 import { MediaLibrary } from "./pages/MediaLibrary";
 import { Pricing } from "./pages/Pricing";
+import { CameraGallery } from "./pages/CameraGallery";
 import {
   BillingComplete,
   BillingPanel,
@@ -33,11 +34,21 @@ import type { Me } from "./cloud";
 import { Wordmark } from "./brand";
 export { Wordmark };
 
-type Tab = "broadcasts" | "media" | "destinations" | "pricing" | "status";
+type Tab =
+  | "broadcasts"
+  | "media"
+  | "cameras"
+  | "destinations"
+  | "pricing"
+  | "status";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "broadcasts", label: "방송" },
   { id: "media", label: "영상" },
+  // Shown to everyone, like the disabled CCTV option in the form: an account
+  // without the feature should be able to see that it exists, and the page
+  // itself says which plan carries it.
+  { id: "cameras", label: "CCTV" },
   { id: "destinations", label: "송출 대상" },
   { id: "pricing", label: "요금제" },
   { id: "status", label: "서버 상태" },
@@ -119,6 +130,8 @@ export function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [checked, setChecked] = useState(false);
   const [consent] = useState(consentOutcome);
+  /** A camera picked in the gallery, waiting for the form to open on it. */
+  const [pendingCamera, setPendingCamera] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>(
     consent ? "destinations" : landedOnPricing ? "pricing" : "broadcasts",
   );
@@ -315,9 +328,24 @@ export function App() {
           </div>
         )}
         {tab === "broadcasts" && (
-          <CloudDashboard onSeePricing={() => setTab("pricing")} />
+          <CloudDashboard
+            onSeePricing={() => setTab("pricing")}
+            {...(pendingCamera ? { startWithCctv: pendingCamera } : {})}
+            onStartConsumed={() => setPendingCamera(null)}
+          />
         )}
         {tab === "media" && <MediaLibrary />}
+        {tab === "cameras" && (
+          <CameraGallery
+            onUse={(url) => {
+              // Carried in state rather than in the URL: the form is a tab,
+              // not a route, and a camera chosen here is a draft nobody has
+              // saved yet.
+              setPendingCamera(url);
+              setTab("broadcasts");
+            }}
+          />
+        )}
         {tab === "destinations" && <Destinations />}
         {tab === "pricing" && (
           <div className="space-y-6">

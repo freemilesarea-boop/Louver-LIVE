@@ -85,6 +85,8 @@ fn server() -> Server {
     let ingest = Ingest::new(db.clone(), Arc::clone(&storage), tools.clone(), "libx264".into());
     let upload_tmp = dir.path().join("uploads");
     std::fs::create_dir_all(&upload_tmp).unwrap();
+    let cctv_thumbs = dir.path().join("cctv-thumbs");
+    std::fs::create_dir_all(&cctv_thumbs).unwrap();
     Server {
         _dir: dir,
         app: App {
@@ -94,6 +96,7 @@ fn server() -> Server {
             storage,
             keys,
             upload_tmp,
+            cctv_thumbs,
             tools,
             youtube: None,
             payapp: None,
@@ -1963,6 +1966,49 @@ async fn a_cctv_url_needs_the_business_plan() {
     )
     .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+}
+
+/// The thumbnail is part of what Business buys, so it is gated like the list.
+///
+/// Otherwise a grid of pictures would be the catalogue, available to anyone
+/// with an account and a camera id.
+#[tokio::test]
+async fn a_camera_thumbnail_needs_the_business_plan() {
+    let s = server();
+    let token = account(&s, "cctv-thumb@example.com").await;
+    let uid = get(&s, "/api/me", &token).await.id();
+    let out = s
+        .app
+        .db
+        .import_cctv_sources(&[louver_cloud::cctv::NewCctvSource {
+            region: "US".into(),
+            provider: "DelDOT (Delaware)".into(),
+            name: "I-95 at Christiana".into(),
+            url: "https://93.184.216.34/de/1.m3u8".into(),
+        }])
+        .unwrap();
+    let cam = out[0].id.clone().expect("imported");
+
+    s.app.db.activate_subscription(&uid, "pro").unwrap();
+    let r = send(&s, Method::GET, &format!("/api/cctv/sources/{cam}/thumb"), Some(&token), None).await;
+    assert_eq!(r.status, StatusCode::PAYMENT_REQUIRED, "{}", r.body);
+    assert!(r.body.contains("Business"), "the message must name the plan: {}", r.body);
+
+    // On Business the gate opens, and what is left is simply that no picture
+    // has been taken yet — a different answer, and the grid shows a
+    // placeholder for it rather than an upsell.
+    s.app.db.activate_subscription(&uid, "business").unwrap();
+    let r = send(&s, Method::GET, &format!("/api/cctv/sources/{cam}/thumb"), Some(&token), None).await;
+    assert_eq!(r.status, StatusCode::NOT_FOUND, "{}", r.body);
+
+    // A real file is served as an image, not as JSON.
+    std::fs::write(s.app.cctv_thumbs.join(format!("{cam}.jpg")), b"\xff\xd8\xff-not-really").unwrap();
+    let r = send(&s, Method::GET, &format!("/api/cctv/sources/{cam}/thumb"), Some(&token), None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    // An id that is not a row cannot become a path.
+    let r = send(&s, Method::GET, "/api/cctv/sources/..%2F..%2Fcloud.db/thumb", Some(&token), None).await;
+    assert_ne!(r.status, StatusCode::OK, "{}", r.body);
 }
 
 /// Saving is the same chokepoint as testing: a URL the server would refuse to
