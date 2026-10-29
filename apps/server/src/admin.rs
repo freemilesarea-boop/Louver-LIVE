@@ -229,6 +229,119 @@ pub struct DisableRequest {
     pub note: Option<String>,
 }
 
+/* ------------------------------------------------- the camera catalogue */
+
+/// Every camera, including the ones that failed their check.
+///
+/// The operator's view, and the only one that shows a failure: a customer is
+/// shown what works, an operator is shown what does not and why.
+pub async fn cctv_sources(State(app): State<App>, _who: Admin) -> Out<Vec<louver_cloud::CctvSource>> {
+    Ok(Json(crate::blocking(move || app.db.cctv_sources_all()).await?))
+}
+
+/// Add cameras from a published list.
+///
+/// A list and not a file format: whatever a traffic authority publishes, the
+/// operator transforms it into these four fields once. Each row is reported
+/// separately, because a list of three hundred with four bad addresses in it
+/// should import two hundred and ninety six.
+///
+/// Nothing here is offered to a customer yet — `check` is what does that.
+pub async fn import_cctv_sources(
+    State(app): State<App>,
+    who: Admin,
+    Json(rows): Json<Vec<louver_cloud::cctv::NewCctvSource>>,
+) -> Out<Vec<louver_cloud::cctv::ImportOutcome>> {
+    let count = rows.len();
+    let log = app.clone();
+    let out = crate::blocking(move || app.db.import_cctv_sources(&rows)).await?;
+    let accepted = out.iter().filter(|o| o.ok).count();
+    audit_cctv(&log, &who, "cctv.import", "", Some(format!("{accepted}/{count} accepted")));
+    Ok(Json(out))
+}
+
+/// Open a camera's address with FFmpeg and record what was there.
+///
+/// The one thing that puts a camera in front of a customer. Deliberately an
+/// operator action rather than something that happens on a timer: a probe is a
+/// connection to somebody else's server, and a few hundred of them starting by
+/// themselves is a thing to decide on purpose.
+pub async fn check_cctv_source(
+    State(app): State<App>,
+    who: Admin,
+    Path(id): Path<String>,
+) -> Out<louver_cloud::cctv::CctvCheck> {
+    let log = app.clone();
+    let target = id.clone();
+    let check = crate::blocking(move || {
+        let source = app.db.cctv_source(&id)?;
+        let check = louver_cloud::cctv::test_connection(&app.tools, &source.url)?;
+        app.db.record_cctv_check(&id, &check)?;
+        Ok(check)
+    })
+    .await?;
+    audit_cctv(&log, &who, "cctv.check", &target, Some(format!("ok={}", check.ok)));
+    Ok(Json(check))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActiveRequest {
+    pub active: bool,
+}
+
+/// Retire a camera, or bring it back. The row stays either way, so the reason
+/// a broadcast stopped working is still readable afterwards.
+pub async fn set_cctv_source_active(
+    State(app): State<App>,
+    who: Admin,
+    Path(id): Path<String>,
+    Json(body): Json<ActiveRequest>,
+) -> Out<louver_cloud::CctvSource> {
+    let log = app.clone();
+    let row = crate::blocking(move || {
+        app.db.set_cctv_source_active(&id, body.active)?;
+        app.db.cctv_source(&id)
+    })
+    .await?;
+    audit_cctv(&log, &who, "cctv.active", &row.id, Some(format!("active={}", row.active)));
+    Ok(Json(row))
+}
+
+/// Remove a camera from the catalogue.
+///
+/// Broadcasts are untouched: a broadcast stores the address, not a reference to
+/// this row, so one that is on air stays on air. What changes is that nobody
+/// can pick it again.
+pub async fn delete_cctv_source(
+    State(app): State<App>,
+    who: Admin,
+    Path(id): Path<String>,
+) -> Out<crate::api::Gone> {
+    let log = app.clone();
+    let gone = id.clone();
+    crate::blocking(move || app.db.delete_cctv_source(&id)).await?;
+    audit_cctv(&log, &who, "cctv.delete", &gone, None);
+    Ok(Json(crate::api::Gone { deleted: true }))
+}
+
+/// One audit line for a catalogue change.
+///
+/// Best effort on purpose: the action is already done by the time this is
+/// called, and reporting it as failed because the log of it could not be
+/// written would be a lie in the other direction.
+fn audit_cctv(app: &App, who: &Admin, action: &str, target_id: &str, after: Option<String>) {
+    let _ = app.db.record_admin_action(&AuditEntry {
+        admin_id: &who.0.id,
+        admin_email: &who.0.email,
+        action,
+        target_type: "cctv_source",
+        target_id,
+        before: None,
+        after,
+        note: None,
+    });
+}
+
 /// Switch an account off, or back on. Never deletes anything.
 pub async fn set_disabled(
     State(app): State<App>,

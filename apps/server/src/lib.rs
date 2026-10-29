@@ -93,6 +93,9 @@ pub fn router(app: App) -> Router {
         // The traffic-CCTV test: check a live video URL before a broadcast is
         // pointed at it. Signed in only, like every route above.
         .route("/api/cctv/test", post(api::test_cctv))
+        // The catalogue a Business account picks from, so choosing a picture is
+        // choosing from a list rather than hunting for a stream URL.
+        .route("/api/cctv/sources", get(api::list_cctv_sources))
         // §2. `oauth/callback` is the one authenticated-by-state route: see the
         // module for why a session cookie cannot reach it.
         .route("/api/youtube", get(youtube::availability))
@@ -117,6 +120,12 @@ pub fn router(app: App) -> Router {
         .route("/api/admin/audit", get(admin::audit))
         // Entitlement an operator hands out. Separate from everything billing:
         // these routes never write a payment, a subscription or a plan.
+        // The catalogue, from the other side: what is in it, what opened, and
+        // what an operator has retired.
+        .route("/api/admin/cctv/sources", get(admin::cctv_sources).post(admin::import_cctv_sources))
+        .route("/api/admin/cctv/sources/{id}", delete(admin::delete_cctv_source))
+        .route("/api/admin/cctv/sources/{id}/check", post(admin::check_cctv_source))
+        .route("/api/admin/cctv/sources/{id}/active", post(admin::set_cctv_source_active))
         .route("/api/admin/grants", get(admin::grants).post(admin::create_grants))
         .route("/api/admin/grants/{id}/extend", post(admin::extend_grant))
         .route("/api/admin/grants/{id}/plan", post(admin::change_grant_plan))

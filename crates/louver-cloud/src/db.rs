@@ -784,6 +784,28 @@ impl CloudDb {
              );",
         )?;
 
+        // The camera catalogue. Rows arrive from an operator import rather than
+        // from this file, because the lists they come from are other people's
+        // and change without telling anyone — a URL compiled in here would be
+        // a promise this build cannot keep. `url` is unique so importing the
+        // same list twice updates rather than duplicates.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS cctv_sources (
+                 id         TEXT PRIMARY KEY,
+                 region     TEXT NOT NULL,
+                 provider   TEXT NOT NULL,
+                 name       TEXT NOT NULL,
+                 url        TEXT NOT NULL UNIQUE,
+                 active     INTEGER NOT NULL DEFAULT 1,
+                 checked_at TEXT,
+                 checked_ok INTEGER NOT NULL DEFAULT 0,
+                 check_note TEXT,
+                 added_at   TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE INDEX IF NOT EXISTS idx_cctv_pickable
+                 ON cctv_sources(active, checked_ok, region, name);",
+        )?;
+
         // §5: which kind of destination this is. Every existing row is a stream
         // key someone pasted, which is exactly what the default says.
         ensure_column(&conn, "stream_destinations", "kind", "TEXT NOT NULL DEFAULT 'manual_rtmps'")?;

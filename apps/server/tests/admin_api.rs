@@ -747,3 +747,142 @@ async fn the_system_page_reuses_the_healthcheck_and_bounds_what_it_returns() {
     assert!(j["problems"].as_array().unwrap().len() <= 50);
     assert_eq!(j["disk_floor_bytes"], louver_cloud::ingest::DISK_FLOOR_BYTES);
 }
+
+// --- the camera catalogue --------------------------------------------------
+//
+// Two gates, and they are different gates: an operator fills the catalogue, a
+// Business customer reads it. Neither can do the other's half.
+
+#[tokio::test]
+async fn an_ordinary_user_cannot_fill_the_catalogue() {
+    let s = server();
+    account(&s, "not-an-operator@example.com").await;
+    let token = token_for(&s, "not-an-operator@example.com").await;
+    let r = post(
+        &s,
+        "/api/admin/cctv/sources",
+        &token,
+        serde_json::json!([{
+            "region": "KR", "provider": "한국도로공사",
+            "name": "경부선", "url": "https://93.184.216.34/live/a.m3u8"
+        }]),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "{}", r.body);
+    assert!(s.app.db.cctv_sources_all().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_import_reports_every_row_and_offers_none_of_them_yet() {
+    let s = server();
+    let token = admin(&s, "operator@example.com").await;
+    let r = post(
+        &s,
+        "/api/admin/cctv/sources",
+        &token,
+        serde_json::json!([
+            { "region": "KR", "provider": "한국도로공사", "name": "경부선 서울",
+              "url": "https://93.184.216.34/live/a.m3u8" },
+            { "region": "GB", "provider": "TfL", "name": "A40",
+              "url": "https://93.184.216.34/live/b.m3u8" },
+            // The list is not a way around the address rules.
+            { "region": "KR", "provider": "x", "name": "유튜브",
+              "url": "https://www.youtube.com/watch?v=abc" }
+        ]),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    let out: Vec<serde_json::Value> = serde_json::from_str(&r.body).unwrap();
+    assert_eq!(out.len(), 3, "every row is answered for");
+    assert_eq!(out.iter().filter(|o| o["ok"] == true).count(), 2);
+    assert!(out[2]["message"].as_str().unwrap().contains("YouTube"));
+
+    // Two rows are in the table and none of them is on offer: nothing has been
+    // opened yet.
+    assert_eq!(s.app.db.cctv_sources_all().unwrap().len(), 2);
+    assert!(s.app.db.cctv_sources_for_pick().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn the_catalogue_is_read_by_business_and_refused_to_everyone_else() {
+    let s = server();
+    let op = admin(&s, "operator2@example.com").await;
+    post(
+        &s,
+        "/api/admin/cctv/sources",
+        &op,
+        serde_json::json!([{
+            "region": "KR", "provider": "한국도로공사", "name": "경부선 서울",
+            "url": "https://93.184.216.34/live/a.m3u8"
+        }]),
+    )
+    .await;
+    // Stand in for the probe: what matters here is who may read the result.
+    let id = s.app.db.cctv_sources_all().unwrap()[0].id.clone();
+    s.app
+        .db
+        .record_cctv_check(
+            &id,
+            &louver_cloud::cctv::CctvCheck {
+                ok: true,
+                message: "h264 1280x720".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let uid = account(&s, "customer@example.com").await;
+    let customer = token_for(&s, "customer@example.com").await;
+
+    s.app.db.activate_subscription(&uid, "pro").unwrap();
+    let r = get(&s, "/api/cctv/sources", &customer).await;
+    assert_eq!(r.status, StatusCode::PAYMENT_REQUIRED, "{}", r.body);
+    assert!(r.body.contains("Business"), "{}", r.body);
+
+    s.app.db.activate_subscription(&uid, "business").unwrap();
+    let r = get(&s, "/api/cctv/sources", &customer).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(r.body.contains("경부선 서울"), "{}", r.body);
+    // The operator's note is not a customer's business, but it is in the row
+    // the operator reads.
+    let r = get(&s, "/api/admin/cctv/sources", &op).await;
+    assert!(r.body.contains("h264 1280x720"), "{}", r.body);
+}
+
+#[tokio::test]
+async fn retiring_a_camera_takes_it_off_the_list_without_deleting_it() {
+    let s = server();
+    let op = admin(&s, "operator3@example.com").await;
+    post(
+        &s,
+        "/api/admin/cctv/sources",
+        &op,
+        serde_json::json!([{
+            "region": "GB", "provider": "TfL", "name": "A40",
+            "url": "https://93.184.216.34/live/b.m3u8"
+        }]),
+    )
+    .await;
+    let id = s.app.db.cctv_sources_all().unwrap()[0].id.clone();
+    s.app
+        .db
+        .record_cctv_check(&id, &louver_cloud::cctv::CctvCheck { ok: true, ..Default::default() })
+        .unwrap();
+    assert_eq!(s.app.db.cctv_sources_for_pick().unwrap().len(), 1);
+
+    let r = post(
+        &s,
+        &format!("/api/admin/cctv/sources/{id}/active"),
+        &op,
+        serde_json::json!({ "active": false }),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    assert!(s.app.db.cctv_sources_for_pick().unwrap().is_empty());
+    assert_eq!(s.app.db.cctv_sources_all().unwrap().len(), 1, "the row stays");
+
+    // And the operator's actions are in the audit log, like every other one.
+    let log = get(&s, "/api/admin/audit", &op).await;
+    assert!(log.body.contains("cctv.import"), "{}", log.body);
+    assert!(log.body.contains("cctv.active"), "{}", log.body);
+}

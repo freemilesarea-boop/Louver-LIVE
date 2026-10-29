@@ -29,6 +29,7 @@
 
 use crate::{CloudError, Result};
 use louver_core::streaming::ffmpeg::FfmpegTools;
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::io::Read;
 use std::net::{IpAddr, ToSocketAddrs};
@@ -551,6 +552,232 @@ fn run_with_timeout(mut cmd: Command, limit: Duration) -> std::io::Result<Finish
         stdout: out_t.join().unwrap_or_default(),
         stderr: err_t.join().unwrap_or_default(),
     })
+}
+
+/* --------------------------------------------------------- the catalogue */
+
+/// How many rows one import may carry.
+///
+/// A published camera list is hundreds of rows and an operator pastes the whole
+/// thing, so this is generous. It exists so that a mistake — a whole different
+/// file, a runaway export — is refused rather than written.
+pub const MAX_IMPORT_ROWS: usize = 2000;
+
+/// A camera an operator is adding, before it is a row.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct NewCctvSource {
+    pub region: String,
+    pub provider: String,
+    pub name: String,
+    pub url: String,
+}
+
+/// What became of one row of an import.
+///
+/// Per row and not per file: a list of three hundred cameras with four bad
+/// addresses in it should import two hundred and ninety six, and say which
+/// four it did not and why.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImportOutcome {
+    pub url: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub message: String,
+}
+
+/// `kr` → `KR`. A two-letter ISO code and nothing else, so the UI can group on
+/// it without matching prose.
+fn region_code(raw: &str) -> Result<String> {
+    let c = raw.trim().to_ascii_uppercase();
+    if c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()) {
+        return Ok(c);
+    }
+    Err(CloudError::Invalid(format!("지역 코드는 두 글자 국가 코드여야 합니다 (KR, US, JP, GB 등): {raw}")))
+}
+
+fn one_line(raw: &str, what: &str, max: usize) -> Result<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err(CloudError::Invalid(format!("{what}을(를) 입력해 주세요.")));
+    }
+    if t.chars().count() > max {
+        return Err(CloudError::Invalid(format!("{what}이(가) 너무 깁니다 ({max}자 이내).")));
+    }
+    if t.chars().any(char::is_control) {
+        return Err(CloudError::Invalid(format!("{what}에 제어문자가 들어 있습니다.")));
+    }
+    Ok(t.to_string())
+}
+
+fn row_to_source(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::CctvSource> {
+    Ok(crate::models::CctvSource {
+        id: r.get("id")?,
+        region: r.get("region")?,
+        provider: r.get("provider")?,
+        name: r.get("name")?,
+        url: r.get("url")?,
+        active: r.get::<_, i64>("active")? != 0,
+        checked_at: r.get("checked_at")?,
+        checked_ok: r.get::<_, i64>("checked_ok")? != 0,
+        check_note: r.get("check_note")?,
+    })
+}
+
+const SOURCE_COLUMNS: &str = "SELECT id, region, provider, name, url, active, checked_at, \
+                              checked_ok, check_note FROM cctv_sources";
+
+impl crate::CloudDb {
+    /// The cameras a customer may choose from.
+    ///
+    /// Active **and** opened by this server. An imported row is somebody else's
+    /// claim about a URL; until `record_cctv_check` has seen FFmpeg open it,
+    /// it is not offered. That is what keeps four bad rows in a list of three
+    /// hundred from becoming four broken broadcasts.
+    pub fn cctv_sources_for_pick(&self) -> Result<Vec<crate::models::CctvSource>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare(&format!(
+            "{SOURCE_COLUMNS} WHERE active = 1 AND checked_ok = 1 ORDER BY region, provider, name"
+        ))?;
+        let rows = st.query_map([], row_to_source)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Every camera, including the ones that failed and the retired ones. For
+    /// the operator console, which is the only place the failures are useful.
+    pub fn cctv_sources_all(&self) -> Result<Vec<crate::models::CctvSource>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare(&format!("{SOURCE_COLUMNS} ORDER BY region, provider, name"))?;
+        let rows = st.query_map([], row_to_source)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn cctv_source(&self, id: &str) -> Result<crate::models::CctvSource> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        guard
+            .query_row(&format!("{SOURCE_COLUMNS} WHERE id = ?1"), rusqlite::params![id], row_to_source)
+            .optional()?
+            .ok_or(CloudError::NotFound("cctv_source"))
+    }
+
+    /// Add or update cameras from an operator's list.
+    ///
+    /// The address goes through the same `validate` a customer's typed URL
+    /// does, so an import cannot put an address into the database that the
+    /// form would have refused — a list is not a way around the address rules.
+    ///
+    /// Importing the same list again updates the rows rather than duplicating
+    /// them, and **resets the check**: a row whose name or address moved has
+    /// not been opened in its new form, whatever the old row said.
+    pub fn import_cctv_sources(&self, rows: &[NewCctvSource]) -> Result<Vec<ImportOutcome>> {
+        if rows.len() > MAX_IMPORT_ROWS {
+            return Err(CloudError::Invalid(format!(
+                "한 번에 {MAX_IMPORT_ROWS}개까지 등록할 수 있습니다 ({}개를 받았습니다).",
+                rows.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            match self.import_one(r) {
+                Ok(id) => out.push(ImportOutcome {
+                    url: r.url.trim().to_string(),
+                    ok: true,
+                    id: Some(id),
+                    message: "등록했습니다. 연결 확인을 거쳐야 사용자에게 보입니다.".into(),
+                }),
+                Err(e) => out.push(ImportOutcome {
+                    url: r.url.trim().to_string(),
+                    ok: false,
+                    id: None,
+                    message: e.to_string(),
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    fn import_one(&self, r: &NewCctvSource) -> Result<String> {
+        let region = region_code(&r.region)?;
+        let provider = one_line(&r.provider, "제공처", 120)?;
+        let name = one_line(&r.name, "카메라 이름", 200)?;
+        // Resolves a host, so it is done before the connection is locked.
+        let url = validate(&r.url)?.as_str().to_string();
+
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let existing: Option<String> = guard
+            .query_row("SELECT id FROM cctv_sources WHERE url = ?1", rusqlite::params![&url], |x| x.get(0))
+            .optional()?;
+        match existing {
+            Some(id) => {
+                guard.execute(
+                    "UPDATE cctv_sources
+                        SET region = ?2, provider = ?3, name = ?4, active = 1,
+                            checked_at = NULL, checked_ok = 0, check_note = NULL
+                      WHERE id = ?1",
+                    rusqlite::params![&id, &region, &provider, &name],
+                )?;
+                Ok(id)
+            }
+            None => {
+                let id = crate::new_id();
+                guard.execute(
+                    "INSERT INTO cctv_sources (id, region, provider, name, url) VALUES (?1,?2,?3,?4,?5)",
+                    rusqlite::params![&id, &region, &provider, &name, &url],
+                )?;
+                Ok(id)
+            }
+        }
+    }
+
+    /// Record what FFmpeg found at a camera's address.
+    ///
+    /// The only thing that makes a row visible to a customer. The note is the
+    /// operator's: it carries the probe's own message, including the failure
+    /// reason, and is never shown in the form.
+    pub fn record_cctv_check(&self, id: &str, check: &CctvCheck) -> Result<()> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let n = guard.execute(
+            "UPDATE cctv_sources
+                SET checked_at = datetime('now'), checked_ok = ?2, check_note = ?3
+              WHERE id = ?1",
+            rusqlite::params![id, check.ok as i64, &check.message],
+        )?;
+        if n == 0 {
+            return Err(CloudError::NotFound("cctv_source"));
+        }
+        Ok(())
+    }
+
+    /// Retire a camera, or bring it back. Retiring leaves the row, so a
+    /// broadcast that stopped working still has something to point at when
+    /// somebody asks why.
+    pub fn set_cctv_source_active(&self, id: &str, active: bool) -> Result<()> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let n = guard.execute(
+            "UPDATE cctv_sources SET active = ?2 WHERE id = ?1",
+            rusqlite::params![id, active as i64],
+        )?;
+        if n == 0 {
+            return Err(CloudError::NotFound("cctv_source"));
+        }
+        Ok(())
+    }
+
+    pub fn delete_cctv_source(&self, id: &str) -> Result<()> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let n = guard.execute("DELETE FROM cctv_sources WHERE id = ?1", rusqlite::params![id])?;
+        if n == 0 {
+            return Err(CloudError::NotFound("cctv_source"));
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

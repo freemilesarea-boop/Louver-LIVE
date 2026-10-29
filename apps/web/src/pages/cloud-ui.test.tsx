@@ -214,6 +214,7 @@ function fake(over: Partial<Transport> = {}): Transport {
     deleteDestination: vi.fn().mockResolvedValue(undefined),
     plans: vi.fn().mockResolvedValue(PLANS),
     testCctv: vi.fn(),
+    listCctvSources: vi.fn().mockResolvedValue([]),
     billingStatus: vi.fn().mockResolvedValue(NO_BILLING),
     startCheckout: vi.fn(),
     cancelBilling: vi.fn(),
@@ -831,6 +832,86 @@ describe("making a broadcast", () => {
       expect(within(source).getByRole("option", { name: /CCTV/ })).toBeEnabled(),
     );
     expect(screen.queryByTestId("cctv-upsell")).not.toBeInTheDocument();
+  });
+
+  it("fills the address from the catalogue instead of making anyone find a link", async () => {
+    const CAMERAS = [
+      {
+        id: "c1",
+        region: "KR",
+        provider: "한국도로공사",
+        name: "경부선 서울요금소",
+        url: "https://93.184.216.34/kr/a.m3u8",
+        active: true,
+        checked_ok: true,
+      },
+      {
+        id: "c2",
+        region: "GB",
+        provider: "TfL",
+        name: "A40 Westway",
+        url: "https://93.184.216.34/gb/b.m3u8",
+        active: true,
+        checked_ok: true,
+      },
+    ];
+    const t = withCamera({
+      listCctvSources: vi.fn().mockResolvedValue(CAMERAS),
+    });
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      t,
+    );
+
+    await userEvent.selectOptions(
+      await screen.findByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+
+    // The catalogue is only asked for once the panel is open.
+    const cameras = await screen.findByLabelText("CCTV 카메라");
+    expect(t.listCctvSources).toHaveBeenCalled();
+
+    // Grouped by region, and the first region is chosen for the reader.
+    expect(screen.getByLabelText("CCTV 지역")).toHaveValue("GB");
+    expect(within(cameras).getByRole("option", { name: /A40 Westway/ })).toBeInTheDocument();
+    expect(within(cameras).queryByRole("option", { name: /경부선/ })).not.toBeInTheDocument();
+
+    await userEvent.selectOptions(screen.getByLabelText("CCTV 지역"), "KR");
+    await userEvent.selectOptions(
+      screen.getByLabelText("CCTV 카메라"),
+      "https://93.184.216.34/kr/a.m3u8",
+    );
+    expect(screen.getByLabelText("CCTV 주소")).toHaveValue(
+      "https://93.184.216.34/kr/a.m3u8",
+    );
+
+    // Picking is not proving: a catalogue row was opened by the server once,
+    // which is not the same as it being open now. The connection test is still
+    // what lets it save.
+    const save = screen.getByRole("button", { name: /^방송 만들기$/ });
+    expect(save).toBeDisabled();
+    expect(
+      screen.getByText("저장하기 전에 연결 테스트를 실행해 주세요."),
+    ).toBeInTheDocument();
+    await userEvent.click(save);
+    expect(t.createBroadcast).not.toHaveBeenCalled();
+  });
+
+  it("says so when there is no catalogue to pick from", async () => {
+    const t = withCamera({ listCctvSources: vi.fn().mockResolvedValue([]) });
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      t,
+    );
+    await userEvent.selectOptions(
+      await screen.findByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+    expect(
+      await screen.findByTestId("cctv-no-catalogue"),
+    ).toHaveTextContent("주소를 직접 입력");
+    expect(screen.queryByLabelText("CCTV 카메라")).not.toBeInTheDocument();
   });
 
   it("sends the CCTV address with the broadcast, and the playlist with it", async () => {
@@ -1908,9 +1989,10 @@ describe("the price list", () => {
 
     const lines = await screen.findAllByTestId("cctv");
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toHaveTextContent("CCTV 트래픽 이용 가능");
+    const line = lines[0]!;
+    expect(line).toHaveTextContent("CCTV 트래픽 이용 가능");
     // On the Business card, because that is the plan whose payload carries it.
-    expect(lines[0].closest("[data-testid='plan-card']")).toHaveAttribute(
+    expect(line.closest("[data-testid='plan-card']")).toHaveAttribute(
       "data-plan",
       "business",
     );

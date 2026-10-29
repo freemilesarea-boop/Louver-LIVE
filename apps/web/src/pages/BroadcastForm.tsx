@@ -20,6 +20,7 @@ import { formatDurationKo } from "@/services/format";
 import { useTransport } from "../TransportContext";
 import {
   DAY_NAMES,
+  regionName,
   EVERY_DAY,
   PRIVACY_LABELS,
   WEEKDAYS,
@@ -30,6 +31,7 @@ import {
 import type {
   BroadcastDetail,
   CctvCheck,
+  CctvSource,
   CloudMedia,
   DestinationKind,
   NewItem,
@@ -119,6 +121,10 @@ export function BroadcastForm({
    * rejected is worse than one that appears a moment later.
    */
   const [cctvAllowed, setCctvAllowed] = useState(false);
+  /** The catalogue, loaded only when the CCTV source is actually chosen. */
+  const [cameras, setCameras] = useState<CctvSource[]>([]);
+  const [camerasLoaded, setCamerasLoaded] = useState(false);
+  const [region, setRegion] = useState("");
 
   useEffect(() => {
     let live = true;
@@ -147,6 +153,44 @@ export function BroadcastForm({
       live = false;
     };
   }, [t]);
+
+  // Loaded when the source is chosen rather than with the rest of the form:
+  // most broadcasts never open this panel, and the list is a request.
+  useEffect(() => {
+    if (!cctvAllowed || videoSource !== "traffic_cctv" || camerasLoaded) return;
+    let live = true;
+    t.listCctvSources()
+      .then((list) => {
+        if (!live) return;
+        setCameras(list);
+        setCamerasLoaded(true);
+        // The first region in the same order the select shows them, so the
+        // default does not depend on how the server happened to order the
+        // payload.
+        setRegion(
+          (current) =>
+            current || [...new Set(list.map((c) => c.region))].sort()[0] || "",
+        );
+      })
+      // An empty catalogue and an unreachable one look the same here on
+      // purpose: either way the operator has not given this account a list to
+      // pick from, and typing an address still works.
+      .catch(() => {
+        if (live) setCamerasLoaded(true);
+      });
+    return () => {
+      live = false;
+    };
+  }, [t, cctvAllowed, videoSource, camerasLoaded]);
+
+  const regions = useMemo(
+    () => [...new Set(cameras.map((c) => c.region))].sort(),
+    [cameras],
+  );
+  const inRegion = useMemo(
+    () => cameras.filter((c) => c.region === region),
+    [cameras, region],
+  );
 
   const ready = media.filter((m) => m.state === "ready");
   const unused = ready.filter((m) => !rows.some((r) => r.media_id === m.id));
@@ -589,6 +633,53 @@ export function BroadcastForm({
 
         {videoSource === "traffic_cctv" && (
           <div className="mt-3 space-y-3 rounded-md border border-ink-700 bg-ink-900 p-3">
+            {cameras.length > 0 && (
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Field label="지역">
+                  <Select
+                    aria-label="CCTV 지역"
+                    value={region}
+                    onChange={(e) => setRegion(e.target.value)}
+                  >
+                    {regions.map((r) => (
+                      <option key={r} value={r}>
+                        {regionName(r)}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+                <Field
+                  label="카메라"
+                  hint="고르면 주소가 채워집니다. 저장하려면 연결 테스트를 한 번 더 거칩니다."
+                >
+                  <Select
+                    aria-label="CCTV 카메라"
+                    value={
+                      inRegion.some((c) => c.url === cctvUrl) ? cctvUrl : ""
+                    }
+                    onChange={(e) => {
+                      setCctvUrl(e.target.value);
+                      // The verdict in hand belongs to the previous address.
+                      setCctvCheck(null);
+                      setCctvError(null);
+                      setCctvCheckedUrl(null);
+                    }}
+                  >
+                    <option value="">직접 입력</option>
+                    {inRegion.map((c) => (
+                      <option key={c.id} value={c.url}>
+                        {c.provider} · {c.name}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              </div>
+            )}
+            {camerasLoaded && cameras.length === 0 && (
+              <p className="text-xs text-ink-500" data-testid="cctv-no-catalogue">
+                등록된 카메라 목록이 없습니다. 아래에 주소를 직접 입력해 주세요.
+              </p>
+            )}
             <Field
               label="CCTV 주소"
               hint="HLS(.m3u8) 또는 FFmpeg가 바로 읽을 수 있는 http / https 라이브 주소. 내부망·localhost 주소는 서버가 거부합니다."

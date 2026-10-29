@@ -13,6 +13,7 @@ import type {
   BroadcastItem,
   BroadcastPatch,
   CctvCheck,
+  CctvSource,
   CloudMedia,
   Dashboard,
   Health,
@@ -90,6 +91,14 @@ export interface Transport {
    * than throwing — that is a fact about the stream, not a failed request.
    */
   testCctv(url: string): Promise<CctvCheck>;
+
+  /**
+   * The cameras this account may choose from.
+   *
+   * Business only — the server answers 402 otherwise, which is a different
+   * thing from an empty catalogue and the form says so differently.
+   */
+  listCctvSources(): Promise<CctvSource[]>;
 
   /** Live dashboard updates. Returns an unsubscribe function. */
   watchDashboard(onSnapshot: (d: Dashboard) => void): () => void;
@@ -368,6 +377,10 @@ export class WebTransport implements Transport {
       `/api/broadcasts/${encodeURIComponent(id)}/stop`,
       { method: "POST" },
     );
+  }
+
+  listCctvSources() {
+    return this.json<CctvSource[]>("/api/cctv/sources");
   }
 
   testCctv(url: string) {

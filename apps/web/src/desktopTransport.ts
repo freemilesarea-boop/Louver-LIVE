@@ -186,6 +186,12 @@ export class DesktopTransport implements Transport {
     return toBroadcast(Number(id), status.playlist_name ?? "", status);
   }
 
+  async listCctvSources(): Promise<never> {
+    // Same reason as `testCctv`: there is no server here to have opened any of
+    // them, so an empty list would be a claim rather than an answer.
+    throw new Error("CCTV 목록은 웹(클라우드)에서만 사용할 수 있습니다.");
+  }
+
   async testCctv(): Promise<never> {
     // The desktop app broadcasts from this computer and has no server to open
     // the address with. Saying so is better than a fetch to nothing.

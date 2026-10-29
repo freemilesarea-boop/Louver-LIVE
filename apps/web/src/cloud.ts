@@ -88,6 +88,44 @@ export interface Subscription {
   cctv_enabled?: boolean;
 }
 
+/**
+ * One camera in the catalogue, as `GET /api/cctv/sources` serves it.
+ *
+ * Only cameras this server has opened are served there, so a row arriving here
+ * is one the server saw video at — not merely one somebody listed.
+ */
+export interface CctvSource {
+  id: string;
+  /** An ISO 3166-1 alpha-2 code: `KR`, `US`, `JP`, `GB`. */
+  region: string;
+  provider: string;
+  name: string;
+  url: string;
+  active: boolean;
+  checked_at?: string | null;
+  checked_ok: boolean;
+  check_note?: string | null;
+}
+
+/** `KR` → `한국`. Falls back to the code, so a new country still reads. */
+export const REGION_NAMES: Record<string, string> = {
+  KR: "한국",
+  US: "미국",
+  JP: "일본",
+  GB: "영국",
+  TW: "대만",
+  SG: "싱가포르",
+  AU: "호주",
+  CA: "캐나다",
+  DE: "독일",
+  FR: "프랑스",
+  NL: "네덜란드",
+};
+
+export function regionName(code: string): string {
+  return REGION_NAMES[code] ?? code;
+}
+
 /** Limit keys, matching `louver_cloud::entitlement`. */
 export const MAX_CONCURRENT_STREAMS = "max_concurrent_streams";
 

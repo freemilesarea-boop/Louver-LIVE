@@ -679,6 +679,33 @@ pub struct CctvTest {
 /// A URL that cannot be used answers 400 with the reason; a URL that can be
 /// reached but holds no video answers 200 with `ok: false`, because that is a
 /// fact about the stream rather than a bad request.
+/// The cameras this account may choose from.
+///
+/// Business only, asked the same way the save path asks it — from the plan the
+/// account pays for — so the picker cannot offer a list whose every choice the
+/// save would then refuse. An account without the feature gets 402 rather than
+/// an empty list, because "none for you" and "none at all" are different
+/// answers and the form says different things about them.
+pub async fn list_cctv_sources(
+    State(app): State<App>,
+    Caller(uid): Caller,
+) -> Out<Vec<louver_cloud::CctvSource>> {
+    Ok(Json(
+        crate::blocking(move || {
+            if !app.db.paid_flag(&uid, louver_cloud::entitlement::CCTV_ENABLED)? {
+                return Err(CloudError::LimitReached {
+                    limit: louver_cloud::entitlement::CCTV_ENABLED,
+                    plan_label: app.db.plan_label_of(&uid)?,
+                    used: 1,
+                    allowed: 0,
+                });
+            }
+            app.db.cctv_sources_for_pick()
+        })
+        .await?,
+    ))
+}
+
 pub async fn test_cctv(
     State(app): State<App>,
     Caller(_uid): Caller,

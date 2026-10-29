@@ -213,6 +213,40 @@ impl Plan {
     }
 }
 
+/// One camera in the catalogue a Business account picks from.
+///
+/// The catalogue exists so that choosing a live picture is choosing from a
+/// list rather than hunting for a stream URL and pasting it. What is stored is
+/// an address that has already passed `cctv::validate`; what is *offered* is
+/// narrower still — see `checked_ok`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CctvSource {
+    pub id: String,
+    /// An ISO 3166-1 alpha-2 country code, upper case: `KR`, `US`, `JP`, `GB`.
+    /// A code and not a display name, so the UI can group and translate without
+    /// matching on prose.
+    pub region: String,
+    /// Who publishes the camera, for attribution. Open traffic data is nearly
+    /// always published under terms that require it.
+    pub provider: String,
+    pub name: String,
+    pub url: String,
+    /// An operator may retire a camera without deleting the row, so the reason
+    /// a broadcast stopped working stays readable.
+    pub active: bool,
+    /// When this server last opened the address with FFmpeg, and what happened.
+    ///
+    /// A camera is offered to a customer only once this says yes. An imported
+    /// list is somebody else's claim about a URL; this is this server having
+    /// opened it. The difference is what keeps a bad row in a list of hundreds
+    /// from reaching a paying account.
+    pub checked_at: Option<String>,
+    pub checked_ok: bool,
+    /// What FFmpeg found, or why it could not look. Shown to the operator, not
+    /// to the customer.
+    pub check_note: Option<String>,
+}
+
 /// What a user is entitled to, and why.
 ///
 /// `status` and `plan` are reported separately because they fail separately: a
