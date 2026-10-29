@@ -74,9 +74,21 @@ Georgia 511 과 NYSDOT 은 **개발자 키가 필요**하다.
 
 ### 인증
 
-관리자 세션 쿠키를 `LOUVER_COOKIE` 로 넘긴다. **브라우저에서 가져온다** — 개발자도구,
-Application, Cookies, `louver_session` 값. 비밀번호를 명령줄에 쓰지 않는 이유는 그것이
-셸 히스토리와 화면에 남기 때문이다.
+관리자 세션 쿠키를 **파일로** 넘긴다. 기본 경로는 `/root/.louver-cookie`.
+
+```bash
+cat > /root/.louver-cookie     # 브라우저의 louver_session 값을 붙여넣고 Enter, Ctrl-D
+chmod 600 /root/.louver-cookie
+```
+
+값은 브라우저에서 가져온다 — 개발자도구, Application, Cookies, `louver_session`.
+파일에는 값만 있어도 되고 `louver_session=값` 전체여도 된다.
+
+**환경변수로 넘기지 않는 이유는 실패해 봤기 때문이다.**
+`export LOUVER_COOKIE="louver_session=$C"` 를 쓰면 붙여넣기가 이름 쪽에 떨어질 수
+있고, 그러면 서버는 401 밖에 답할 수 없다. 그리고 그 과정에서 살아 있는 세션 토큰이
+명령줄에 올라가 셸 히스토리에 남는다. `cat > 파일` 은 토큰을 표준입력으로 받으므로
+히스토리에 남지 않는다. 비밀번호를 명령줄에 쓰지 않는 것과 같은 이유다.
 
 ### 0) 먼저 응답을 본다
 
@@ -96,8 +108,8 @@ head -c 1800 /root/va-cams.json
 # 무엇이 만들어지는지 먼저 본다. 전송하지 않는다.
 python3 scripts/cctv-import.py --source vdot --input /root/va-cams.json --dry-run
 
-LOUVER_COOKIE='louver_session=...' \
-  python3 scripts/cctv-import.py --source vdot --input /root/va-cams.json
+# 같은 명령에서 --dry-run 만 뺀다.
+python3 scripts/cctv-import.py --source vdot --input /root/va-cams.json
 ```
 
 소스 함수는 발행 기관이 스스로 고장났다고 표시한 카메라(`active=false`,
@@ -107,10 +119,10 @@ LOUVER_COOKIE='louver_session=...' \
 ### 2) 열어보고, 통과한 것만 공개
 
 ```bash
-LOUVER_COOKIE='louver_session=...' \
-  nohup python3 scripts/cctv-check.py --provider 'VDOT (Virginia)' \
-  > /root/va-check.log 2>&1 &
+# 먼저 20대만. 세 시간을 걸기 전에 패턴이 맞는지 본다.
+python3 scripts/cctv-check.py --provider 'VDOT (Virginia)' --limit 20
 
+nohup python3 scripts/cctv-check.py --provider 'VDOT (Virginia)' > /root/va-check.log 2>&1 &
 tail -f /root/va-check.log
 ```
 
