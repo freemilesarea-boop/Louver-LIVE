@@ -45,6 +45,17 @@ import type {
 /** A playlist row being edited: a video plus how it should play. */
 type Row = NewItem & { filename: string; duration_secs: number };
 
+/**
+ * How many cameras the select renders at once.
+ *
+ * One region is a country, so every US feed shares `US`: Delaware and Virginia
+ * together are already past two thousand. A select that long is slow to render
+ * and useless to scroll, so the list is capped and the search box is how to
+ * reach what the cap leaves out. The hint under the select says how many are
+ * hidden, because a silently truncated list would look like missing cameras.
+ */
+const CAMERA_LIST_CAP = 300;
+
 export function BroadcastForm({
   editing,
   onDone,
@@ -125,6 +136,16 @@ export function BroadcastForm({
   const [cameras, setCameras] = useState<CctvSource[]>([]);
   const [camerasLoaded, setCamerasLoaded] = useState(false);
   const [region, setRegion] = useState("");
+  /**
+   * Which authority's cameras, and a name filter.
+   *
+   * `region` is a country code, not a state: every US feed lands under `US`,
+   * so one region now holds two thousand cameras and a single select of them
+   * is not a thing anybody can choose from. The provider is what separates
+   * Delaware from Virginia, and the search is what finds a road inside one.
+   */
+  const [cctvProvider, setCctvProvider] = useState("");
+  const [cameraQuery, setCameraQuery] = useState("");
 
   useEffect(() => {
     let live = true;
@@ -187,10 +208,51 @@ export function BroadcastForm({
     () => [...new Set(cameras.map((c) => c.region))].sort(),
     [cameras],
   );
-  const inRegion = useMemo(
-    () => cameras.filter((c) => c.region === region),
+  const providers = useMemo(
+    () =>
+      [
+        ...new Set(cameras.filter((c) => c.region === region).map((c) => c.provider)),
+      ].sort(),
     [cameras, region],
   );
+  // A provider belongs to a region, so changing the region leaves the old one
+  // selecting nothing. Corrected here rather than in the region's onChange,
+  // because the list also arrives after the first render.
+  useEffect(() => {
+    setCctvProvider((current) =>
+      providers.includes(current) ? current : (providers[0] ?? ""),
+    );
+  }, [providers]);
+
+  /** What region, provider and the search box leave — the honest count. */
+  const hits = useMemo(() => {
+    const q = cameraQuery.trim().toLowerCase();
+    const pool = cameras.filter(
+      (c) => c.region === region && c.provider === cctvProvider,
+    );
+    return q ? pool.filter((c) => c.name.toLowerCase().includes(q)) : pool;
+  }, [cameras, region, cctvProvider, cameraQuery]);
+
+  /**
+   * The options the select renders.
+   *
+   * Capped, because two thousand `<option>` elements are slow to render and
+   * nobody scrolls that far — the search is how to reach the rest, and the
+   * hint under the select says how many are hidden.
+   *
+   * The camera already chosen is kept in the list even when the filter would
+   * drop it, so a narrowed search cannot make a made choice look lost: the
+   * select would otherwise fall back to "직접 입력" over a perfectly good
+   * address. It is prepended rather than counted, so it never inflates the
+   * number the hint reports.
+   */
+  const options = useMemo(() => {
+    const head = hits.slice(0, CAMERA_LIST_CAP);
+    const chosen = cameras.find((c) => c.url === cctvUrl);
+    return chosen && !head.some((c) => c.id === chosen.id)
+      ? [chosen, ...head]
+      : head;
+  }, [hits, cameras, cctvUrl]);
 
   const ready = media.filter((m) => m.state === "ready");
   const unused = ready.filter((m) => !rows.some((r) => r.media_id === m.id));
@@ -634,19 +696,56 @@ export function BroadcastForm({
         {videoSource === "traffic_cctv" && (
           <div className="mt-3 space-y-3 rounded-md border border-ink-700 bg-ink-900 p-3">
             {cameras.length > 0 && (
-              <div className="grid gap-3 sm:grid-cols-2">
-                <Field label="지역">
-                  <Select
-                    aria-label="CCTV 지역"
-                    value={region}
-                    onChange={(e) => setRegion(e.target.value)}
-                  >
-                    {regions.map((r) => (
-                      <option key={r} value={r}>
-                        {regionName(r)}
-                      </option>
-                    ))}
-                  </Select>
+              <>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <Field label="지역">
+                    <Select
+                      aria-label="CCTV 지역"
+                      value={region}
+                      onChange={(e) => {
+                        setRegion(e.target.value);
+                        // The old search was about the old region's roads.
+                        setCameraQuery("");
+                      }}
+                    >
+                      {regions.map((r) => (
+                        <option key={r} value={r}>
+                          {regionName(r)}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                  {/* Only when there is a choice to make. One authority in a
+                      region does not need a select saying so. */}
+                  {providers.length > 1 && (
+                    <Field label="제공처">
+                      <Select
+                        aria-label="CCTV 제공처"
+                        value={cctvProvider}
+                        onChange={(e) => {
+                          setCctvProvider(e.target.value);
+                          setCameraQuery("");
+                        }}
+                      >
+                        {providers.map((p) => (
+                          <option key={p} value={p}>
+                            {p}
+                          </option>
+                        ))}
+                      </Select>
+                    </Field>
+                  )}
+                </div>
+                <Field
+                  label="카메라 찾기"
+                  hint="도로 이름이나 지역 일부를 입력하면 아래 목록이 좁혀집니다."
+                >
+                  <Input
+                    value={cameraQuery}
+                    aria-label="CCTV 카메라 검색"
+                    onChange={(e) => setCameraQuery(e.target.value)}
+                    placeholder="예: I-64, Arlington, Dock St"
+                  />
                 </Field>
                 <Field
                   label="카메라"
@@ -654,9 +753,7 @@ export function BroadcastForm({
                 >
                   <Select
                     aria-label="CCTV 카메라"
-                    value={
-                      inRegion.some((c) => c.url === cctvUrl) ? cctvUrl : ""
-                    }
+                    value={options.some((c) => c.url === cctvUrl) ? cctvUrl : ""}
                     onChange={(e) => {
                       setCctvUrl(e.target.value);
                       // The verdict in hand belongs to the previous address.
@@ -666,14 +763,23 @@ export function BroadcastForm({
                     }}
                   >
                     <option value="">직접 입력</option>
-                    {inRegion.map((c) => (
+                    {options.map((c) => (
                       <option key={c.id} value={c.url}>
-                        {c.provider} · {c.name}
+                        {c.name}
                       </option>
                     ))}
                   </Select>
                 </Field>
-              </div>
+                {/* What the list is not showing, said plainly. A capped list
+                    with no note looks like cameras that were never imported. */}
+                <p className="text-xs text-ink-500" data-testid="cctv-count">
+                  {hits.length === 0
+                    ? "검색어에 맞는 카메라가 없습니다."
+                    : hits.length > CAMERA_LIST_CAP
+                      ? `${hits.length}대 중 ${CAMERA_LIST_CAP}대 표시 — 검색으로 좁혀 주세요.`
+                      : `${hits.length}대`}
+                </p>
+              </>
             )}
             {camerasLoaded && cameras.length === 0 && (
               <p className="text-xs text-ink-500" data-testid="cctv-no-catalogue">

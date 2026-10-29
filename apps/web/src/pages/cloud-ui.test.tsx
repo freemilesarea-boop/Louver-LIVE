@@ -898,6 +898,128 @@ describe("making a broadcast", () => {
     expect(t.createBroadcast).not.toHaveBeenCalled();
   });
 
+  // Two thousand cameras under one region is not a hypothetical: `region` is a
+  // country code, so every US feed shares `US`. These two cover the only ways
+  // out of a list that long — narrow by authority, or search by road.
+  const US_CAMERAS = [
+    {
+      id: "d1",
+      region: "US",
+      provider: "DelDOT (Delaware)",
+      name: "I-95 at Christiana",
+      url: "https://93.184.216.34/de/1.m3u8",
+      active: true,
+      checked_ok: true,
+    },
+    {
+      id: "v1",
+      region: "US",
+      provider: "VDOT (Virginia)",
+      name: "I-64 AT PARHAM (Henrico County)",
+      url: "https://93.184.216.34/va/1.m3u8",
+      active: true,
+      checked_ok: true,
+    },
+    {
+      id: "v2",
+      region: "US",
+      provider: "VDOT (Virginia)",
+      name: "RT 50 AT PATRICK HENRY DR. (Arlington County)",
+      url: "https://93.184.216.34/va/2.m3u8",
+      active: true,
+      checked_ok: true,
+    },
+  ];
+
+  it("separates two states that share one region code, by authority", async () => {
+    const t = withCamera({
+      listCctvSources: vi.fn().mockResolvedValue(US_CAMERAS),
+    });
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      t,
+    );
+    await userEvent.selectOptions(
+      await screen.findByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+
+    // One region, two authorities, so the authority gets a select of its own.
+    const providers = await screen.findByLabelText("CCTV 제공처");
+    expect(screen.getByLabelText("CCTV 지역")).toHaveValue("US");
+    expect(providers).toHaveValue("DelDOT (Delaware)");
+
+    const cameras = screen.getByLabelText("CCTV 카메라");
+    expect(within(cameras).getByRole("option", { name: /Christiana/ })).toBeInTheDocument();
+    expect(within(cameras).queryByRole("option", { name: /PARHAM/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId("cctv-count")).toHaveTextContent("1대");
+
+    await userEvent.selectOptions(providers, "VDOT (Virginia)");
+    expect(within(cameras).getByRole("option", { name: /PARHAM/ })).toBeInTheDocument();
+    expect(within(cameras).queryByRole("option", { name: /Christiana/ })).not.toBeInTheDocument();
+    expect(screen.getByTestId("cctv-count")).toHaveTextContent("2대");
+  });
+
+  it("keeps the chosen camera in the list when the search would hide it", async () => {
+    const t = withCamera({
+      listCctvSources: vi.fn().mockResolvedValue(US_CAMERAS),
+    });
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      t,
+    );
+    await userEvent.selectOptions(
+      await screen.findByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+    await userEvent.selectOptions(
+      await screen.findByLabelText("CCTV 제공처"),
+      "VDOT (Virginia)",
+    );
+
+    const search = screen.getByLabelText("CCTV 카메라 검색");
+    await userEvent.type(search, "parham");
+    const cameras = screen.getByLabelText("CCTV 카메라");
+    // Case does not matter: nobody types a road name in the data's own case.
+    expect(within(cameras).getByRole("option", { name: /PARHAM/ })).toBeInTheDocument();
+    expect(within(cameras).queryByRole("option", { name: /PATRICK HENRY/ })).not.toBeInTheDocument();
+
+    await userEvent.selectOptions(cameras, "https://93.184.216.34/va/1.m3u8");
+    expect(screen.getByLabelText("CCTV 주소")).toHaveValue(
+      "https://93.184.216.34/va/1.m3u8",
+    );
+
+    // A search that matches nothing must not silently drop the choice that is
+    // already made — the address field would still hold it while the select
+    // claimed "직접 입력".
+    await userEvent.clear(search);
+    await userEvent.type(search, "zzzz");
+    expect(screen.getByTestId("cctv-count")).toHaveTextContent(
+      "검색어에 맞는 카메라가 없습니다.",
+    );
+    expect(screen.getByLabelText("CCTV 카메라")).toHaveValue(
+      "https://93.184.216.34/va/1.m3u8",
+    );
+  });
+
+  it("does not ask which authority when a region has only one", async () => {
+    const t = withCamera({
+      listCctvSources: vi
+        .fn()
+        .mockResolvedValue(US_CAMERAS.filter((c) => c.id === "d1")),
+    });
+    show(
+      <BroadcastForm onDone={() => undefined} onCancel={() => undefined} />,
+      t,
+    );
+    await userEvent.selectOptions(
+      await screen.findByLabelText("영상 소스"),
+      "traffic_cctv",
+    );
+    await screen.findByLabelText("CCTV 카메라");
+    expect(screen.queryByLabelText("CCTV 제공처")).not.toBeInTheDocument();
+  });
+
   it("says so when there is no catalogue to pick from", async () => {
     const t = withCamera({ listCctvSources: vi.fn().mockResolvedValue([]) });
     show(
