@@ -22,6 +22,7 @@ session will not stay open that long.
 
 import argparse
 import json
+import os
 import sys
 import time
 import urllib.error
@@ -118,6 +119,37 @@ def check_one(base, cookie, source_id):
         return False, f"응답을 읽을 수 없습니다: {e}"
 
 
+def logout(base, cookie, path):
+    """Invalidate the session this file holds, then delete the file.
+
+    Here because a token that has been seen — pasted into a terminal, read off
+    a screen — is spent, and the way to spend it is to end the session rather
+    than wait out the thirty days it is otherwise good for. The server deletes
+    the row for the token it is shown, so this ends exactly this session and
+    nobody else's.
+
+    The token never reaches a command line: it is read from the file, which is
+    the whole reason the file exists.
+    """
+    req = urllib.request.Request(
+        f"{base}/api/auth/logout", data=b"", headers={"cookie": cookie}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            print(f"[cctv] 로그아웃 HTTP {r.status} — 이 세션은 서버에서 지워졌습니다.")
+    except urllib.error.HTTPError as e:
+        # A session the server does not recognise is a session nobody can use,
+        # which is the outcome asked for. Say so rather than fail.
+        print(f"[cctv] 로그아웃 HTTP {e.code} — 서버가 이 세션을 모릅니다(이미 무효).")
+    except urllib.error.URLError as e:
+        raise SystemExit(f"[cctv] 서버에 연결할 수 없습니다: {e.reason}. 쿠키 파일은 그대로 둡니다.")
+    try:
+        os.remove(path)
+        print(f"[cctv] {path} 삭제했습니다.")
+    except OSError as e:
+        print(f"[cctv] {path} 을 지우지 못했습니다: {e}")
+
+
 def summarise(done, ok, reasons, started):
     print(f"[cctv] 확인 {done}  성공 {ok}  실패 {done - ok}  경과 {int(time.time() - started)}s")
     if reasons:
@@ -135,6 +167,11 @@ def main():
     ap.add_argument("--sleep", type=float, default=2.0, help="카메라 사이 간격(초)")
     ap.add_argument("--limit", type=int, help="이번 실행에서 확인할 최대 대수")
     ap.add_argument(
+        "--logout",
+        action="store_true",
+        help="쿠키 파일의 세션을 서버에서 무효화하고 파일을 지운다. 확인이 끝난 뒤에 쓴다",
+    )
+    ap.add_argument(
         "--recheck-failed",
         action="store_true",
         help="확인은 됐지만 실패한 카메라를 다시 열어본다 (소스 쪽 복구 후)",
@@ -142,6 +179,10 @@ def main():
     args = ap.parse_args()
 
     cookie = read_cookie(args.cookie_file)
+
+    if args.logout:
+        logout(args.base, cookie, args.cookie_file)
+        return
 
     rows = get(args.base, cookie, "/api/admin/cctv/sources")
     if args.provider:
