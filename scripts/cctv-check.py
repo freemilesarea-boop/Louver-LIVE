@@ -14,8 +14,7 @@ Resumable: it asks the server which rows have no check yet, so a run that is
 interrupted — a dropped ssh session, a Ctrl-C — is continued by running it
 again. Nothing is lost and nothing is checked twice.
 
-    LOUVER_COOKIE='louver_session=...' \\
-      nohup python3 cctv-check.py --provider 'VDOT (Virginia)' > /root/va-check.log 2>&1 &
+    nohup python3 cctv-check.py --provider 'VDOT (Virginia)' > /root/va-check.log 2>&1 &
 
 `nohup` matters for a large list: 1,700 cameras take hours, and a laptop's ssh
 session will not stay open that long.
@@ -23,11 +22,48 @@ session will not stay open that long.
 
 import argparse
 import json
-import os
 import sys
 import time
 import urllib.error
 import urllib.request
+
+
+# --- the cookie ------------------------------------------------------------
+
+DEFAULT_COOKIE_FILE = "/root/.louver-cookie"
+
+
+def read_cookie(path):
+    """The admin session cookie, from a file.
+
+    A file and not a shell variable. The variable form was tried and it failed
+    in the way that matters: pasting a token into
+    `export LOUVER_COOKIE="louver_session=$C"` let the paste land on the
+    *name*, which produced a header the server could only answer with 401 —
+    and put a live session token on a command line, where the shell keeps it.
+
+    A file takes the token on stdin (`cat > file`), so nothing is in the
+    history. The content may be the bare value or the whole `name=value`;
+    both work, because whoever is pasting this should not have to know which.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except OSError as e:
+        raise SystemExit(
+            f"[cctv] 쿠키 파일을 읽을 수 없습니다 ({path}): {e}\n"
+            f"       브라우저에서 louver_session 값을 복사한 뒤:\n"
+            f"         cat > {path}\n"
+            f"         <값 붙여넣기, Enter, Ctrl-D>\n"
+            f"         chmod 600 {path}"
+        )
+    if not raw:
+        raise SystemExit(f"[cctv] {path} 이(가) 비어 있습니다.")
+    if any(c.isspace() for c in raw):
+        raise SystemExit(
+            f"[cctv] {path} 에 공백이나 줄바꿈이 섞여 있습니다. 값만 들어 있어야 합니다."
+        )
+    return raw if "=" in raw else f"louver_session={raw}"
 
 
 def get(base, cookie, path):
@@ -48,8 +84,8 @@ def get(base, cookie, path):
     except urllib.error.HTTPError as e:
         if e.code == 401:
             raise SystemExit(
-                "[cctv] HTTP 401 — 세션 쿠키가 만료됐습니다.\n"
-                "       브라우저에서 louver_session 값을 다시 복사해 주세요."
+                "[cctv] HTTP 401 — 서버가 세션을 인정하지 않았습니다.\n"
+                "       만료됐거나, 값이 잘못 들어갔거나, 관리자 계정이 아닙니다."
             )
         if e.code == 403:
             raise SystemExit("[cctv] HTTP 403 — 이 계정은 관리자가 아닙니다.")
@@ -93,6 +129,7 @@ def summarise(done, ok, reasons, started):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="https://247streams.kr")
+    ap.add_argument("--cookie-file", default=DEFAULT_COOKIE_FILE, help="관리자 세션 쿠키가 담긴 파일")
     ap.add_argument("--provider", help="이 제공처만 확인한다 (예: 'VDOT (Virginia)')")
     ap.add_argument("--region", help="이 지역 코드만 확인한다 (예: US)")
     ap.add_argument("--sleep", type=float, default=2.0, help="카메라 사이 간격(초)")
@@ -104,9 +141,7 @@ def main():
     )
     args = ap.parse_args()
 
-    cookie = os.environ.get("LOUVER_COOKIE", "").strip()
-    if not cookie:
-        raise SystemExit("[cctv] LOUVER_COOKIE 가 비어 있습니다 (louver_session=... 형태).")
+    cookie = read_cookie(args.cookie_file)
 
     rows = get(args.base, cookie, "/api/admin/cctv/sources")
     if args.provider:

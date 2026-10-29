@@ -10,11 +10,13 @@ nothing like an error if you only read it with `grep`.
 
 Standard library only, so it runs on the server with nothing installed.
 
-    LOUVER_COOKIE='louver_session=...' \\
-      python3 cctv-import.py --source vdot --input /root/va-cams.json
+    cat > /root/.louver-cookie     # paste the browser's louver_session value
+    chmod 600 /root/.louver-cookie
+    python3 cctv-import.py --source vdot --input /root/va-cams.json
 
 The cookie comes from the browser (DevTools, Application, Cookies), not from a
-password on a command line.
+password on a command line, and it arrives on stdin rather than in a variable
+assignment — see `read_cookie`.
 
 Adding a source means adding one function to SOURCES below. Each one is written
 against a response that was actually fetched and read — never against a field
@@ -81,6 +83,44 @@ SOURCES = {
 }
 
 
+# --- the cookie ------------------------------------------------------------
+
+DEFAULT_COOKIE_FILE = "/root/.louver-cookie"
+
+
+def read_cookie(path):
+    """The admin session cookie, from a file.
+
+    A file and not a shell variable. The variable form was tried and it failed
+    in the way that matters: pasting a token into
+    `export LOUVER_COOKIE="louver_session=$C"` let the paste land on the
+    *name*, which produced a header the server could only answer with 401 —
+    and put a live session token on a command line, where the shell keeps it.
+
+    A file takes the token on stdin (`cat > file`), so nothing is in the
+    history. The content may be the bare value or the whole `name=value`;
+    both work, because whoever is pasting this should not have to know which.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read().strip()
+    except OSError as e:
+        raise SystemExit(
+            f"[cctv] 쿠키 파일을 읽을 수 없습니다 ({path}): {e}\n"
+            f"       브라우저에서 louver_session 값을 복사한 뒤:\n"
+            f"         cat > {path}\n"
+            f"         <값 붙여넣기, Enter, Ctrl-D>\n"
+            f"         chmod 600 {path}"
+        )
+    if not raw:
+        raise SystemExit(f"[cctv] {path} 이(가) 비어 있습니다.")
+    if any(c.isspace() for c in raw):
+        raise SystemExit(
+            f"[cctv] {path} 에 공백이나 줄바꿈이 섞여 있습니다. 값만 들어 있어야 합니다."
+        )
+    return raw if "=" in raw else f"louver_session={raw}"
+
+
 # --- posting ---------------------------------------------------------------
 
 
@@ -101,7 +141,8 @@ def post(base, cookie, rows):
         body = e.read().decode(errors="replace")[:400]
         if e.code == 401:
             raise SystemExit(
-                "[cctv] HTTP 401 — 세션 쿠키가 만료됐거나 관리자 계정이 아닙니다.\n"
+                "[cctv] HTTP 401 — 서버가 세션을 인정하지 않았습니다. 셋 중 하나입니다:\n"
+                "       쿠키가 만료됐거나, 값이 잘못 들어갔거나, 관리자 계정이 아닙니다.\n"
                 "       브라우저에서 louver_session 값을 다시 복사해 주세요."
             )
         if e.code == 403:
@@ -125,6 +166,7 @@ def main():
     )
     ap.add_argument("--out-dir", default="/root/cctv-import")
     ap.add_argument("--dry-run", action="store_true", help="만들어질 행만 보여주고 전송하지 않는다")
+    ap.add_argument("--cookie-file", default=DEFAULT_COOKIE_FILE, help="관리자 세션 쿠키가 담긴 파일")
     args = ap.parse_args()
 
     spec = SOURCES[args.source]
@@ -174,9 +216,7 @@ def main():
         print("[cctv] --dry-run 이므로 전송하지 않았습니다.")
         return
 
-    cookie = os.environ.get("LOUVER_COOKIE", "").strip()
-    if not cookie:
-        raise SystemExit("[cctv] LOUVER_COOKIE 가 비어 있습니다 (louver_session=... 형태).")
+    cookie = read_cookie(args.cookie_file)
 
     ok = bad = 0
     reasons = {}
