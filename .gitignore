@@ -35,3 +35,8 @@ tests/fixtures/rc/
 # The SEO prerender bundle: a build artefact, rebuilt by `npm run build:cloud`.
 apps/web/.seo-ssr/
 apps/web/.seo-shell.html
+
+# Python bytecode. The CCTV catalogue tools are scripts, not a package, but
+# importing one from a test leaves this behind.
+__pycache__/
+*.pyc
