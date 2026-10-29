@@ -74,11 +74,48 @@ def vdot(doc):
         yield name, url
 
 
+def its(doc):
+    """Korea's 국가교통정보센터, from the ITS open API.
+
+    Verified against the live response on 2026-10-29: `response.data` is the
+    array, and each row carries `cctvname` (a readable name, already prefixed
+    with the road), `cctvurl`, `cctvtype` and `cctvformat`.
+
+    `cctvtype` is the whole filter. 1 and 4 are live HLS (4 over HTTPS); 2 and
+    5 are mp4 files and 3 is a still image, and none of those three can carry a
+    broadcast that runs for days — FFmpeg reaches the end of a file and stops.
+
+    Two things to know about these addresses. They are tokenised, so the URL is
+    the grant rather than a location, and the token expires in about a day:
+    this import has to be repeated, and a row whose URL moved has its check
+    reset so it cannot be offered on the strength of yesterday's. And the list
+    API refuses connections from outside Korea, so this import runs from a
+    machine there, while the server that opens the streams does not have to be
+    — `cctvsec.ktict.co.kr` answers from abroad.
+    """
+    data = (doc.get("response") or {}).get("data") or []
+    for r in data:
+        if str(r.get("cctvtype")) not in ("1", "4"):
+            continue
+        url = (r.get("cctvurl") or "").strip()
+        name = (r.get("cctvname") or "").strip()
+        if not url or not name:
+            continue
+        yield name, url
+
+
 SOURCES = {
     "vdot": {
         "region": "US",
         "provider": "VDOT (Virginia)",
         "extract": vdot,
+    },
+    "its": {
+        "region": "KR",
+        # Overridden with --provider when the highways and the national roads
+        # are imported separately, which is how the picker tells them apart.
+        "provider": "국가교통정보센터",
+        "extract": its,
     },
 }
 
@@ -167,9 +204,16 @@ def main():
     ap.add_argument("--out-dir", default="/root/cctv-import")
     ap.add_argument("--dry-run", action="store_true", help="만들어질 행만 보여주고 전송하지 않는다")
     ap.add_argument("--cookie-file", default=DEFAULT_COOKIE_FILE, help="관리자 세션 쿠키가 담긴 파일")
+    ap.add_argument(
+        "--provider",
+        help="제공처 이름을 바꾼다. 같은 API를 쪼개 받을 때 쓴다 "
+        "(예: '국가교통정보센터 (고속도로)'). 선택 화면에서 이것으로 구분된다",
+    )
     args = ap.parse_args()
 
-    spec = SOURCES[args.source]
+    spec = dict(SOURCES[args.source])
+    if args.provider:
+        spec["provider"] = args.provider
     try:
         with open(args.input, encoding="utf-8") as fh:
             doc = json.load(fh)

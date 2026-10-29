@@ -142,6 +142,29 @@ python3 scripts/cctv-check.py --logout
 서버에서 그 세션 행을 지우고 쿠키 파일을 삭제한다. 보여준 토큰에 해당하는 세션만
 지우므로 다른 사람의 로그인에는 영향이 없다.
 
+### 한국 — 목록은 한국에서, 영상은 서버에서
+
+측정 결과(2026-10-29): `openapi.its.go.kr` 은 **해외 IP 에서 연결이 거부된다**(독일
+서버에서 80·9443 모두 타임아웃, 한국에서 HTTP 200). 반면 영상 호스트
+`cctvsec.ktict.co.kr` 은 독일 서버에서 응답한다. 그래서 역할을 나눈다.
+
+| 단계 | 어디서 |
+|---|---|
+| 목록 받기 (`curl`) | 한국에 있는 기계 |
+| 등록 (`cctv-import.py`) | 같은 기계 — 247streams 는 어디서든 된다 |
+| 열어보기 (`cctv-check.py`), 실제 송출 | 운영 서버 |
+
+```bash
+# 한국에 있는 기계에서. 고속도로와 국도를 따로 받아 제공처로 구분한다.
+curl -sS -m 30 -o /tmp/kr-ex.json \
+  "https://openapi.its.go.kr:9443/cctvInfo?apiKey=$(cat /tmp/its-key)&type=ex&cctvType=4&getType=json&minX=124&maxX=132&minY=33&maxY=39"
+
+python3 scripts/cctv-import.py --source its --input /tmp/kr-ex.json \
+  --provider '국가교통정보센터 (고속도로)' --cookie-file /tmp/louver-cookie
+```
+
+`type=its` 로 한 번 더 받아 `--provider '국가교통정보센터 (국도)'` 로 넣는다.
+
 ### 3) 다시 수집 (한국은 필수)
 
 주소가 만료되는 피드는 0~2번을 주기적으로 반복한다. 같은 URL 은 중복되지 않고 갱신되며,
