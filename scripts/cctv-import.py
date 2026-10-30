@@ -33,9 +33,18 @@ import urllib.request
 
 # --- sources ---------------------------------------------------------------
 #
-# A source yields (name, url) pairs. It filters; it does not validate. The
-# server validates — these addresses go through the same rules as one typed
+# A source yields (name, url, key) triples. It filters; it does not validate.
+# The server validates — these addresses go through the same rules as one typed
 # into the form, and a list is not a way around them.
+#
+# `key` is the publisher's own id for the camera, and it is only used when two
+# cameras in one feed carry the same name. That happens: VDOT has two cameras
+# described identically, Korea's ITS has twenty-three. Since a camera is
+# identified by its name, the second one would overwrite the first and
+# disappear — quietly, which is the worst way for a camera to go missing. The
+# key must come from the feed rather than from the row's position, because the
+# feed's order is not promised and a name that changes between imports is a new
+# camera as far as the catalogue is concerned.
 
 
 def vdot(doc):
@@ -71,7 +80,7 @@ def vdot(doc):
             name = where or area or str(p.get("id") or "").strip()
         if not name:
             continue
-        yield name, url
+        yield name, url, str(p.get("id") or "").strip()
 
 
 def its(doc):
@@ -101,7 +110,12 @@ def its(doc):
         name = (r.get("cctvname") or "").strip()
         if not url or not name:
             continue
-        yield name, url
+        # The first path segment of the address is the camera's number at the
+        # publisher — `.../4003/<token>`. It is the only stable id the response
+        # carries: `cctvurl` rotates daily but that segment does not.
+        parts = url.split("/")
+        key = parts[3] if len(parts) > 3 else ""
+        yield name, url, key
 
 
 SOURCES = {
@@ -236,9 +250,20 @@ def main():
 
     # Deduplicated here as well as in the server, because a feed that lists one
     # camera twice would otherwise spend two requests on it and report it twice.
+    # Read the feed once to find which names are not unique, before deciding
+    # what anything is called. Suffixing only the second camera to arrive would
+    # make the names depend on the feed's order, which nobody promises: a
+    # reordered feed would hand the bare name to the other camera and the two
+    # would swap rows. Every member of a colliding group gets the suffix, so
+    # the name a camera gets depends only on the camera.
+    from collections import Counter
+
+    extracted = [t for t in spec["extract"](doc)]
+    repeated = {n for n, c in Counter(n for n, _, _ in extracted).items() if c > 1}
+
     seen, rows = set(), []
-    dropped = 0
-    for name, url in spec["extract"](doc):
+    dropped = collided = 0
+    for name, url, key in extracted:
         if url in seen:
             continue
         # Name filters. A tunnel's inside wall is a working camera and a
@@ -252,11 +277,17 @@ def main():
             dropped += 1
             continue
         seen.add(url)
+        # Two cameras, one name. The publisher's id separates them, and it is
+        # the same id tomorrow, so the row each one updates stays the same row.
+        if name in repeated and key:
+            name = f"{name} #{key}"
+            collided += 1
+        name = name[:200]
         rows.append(
             {
                 "region": spec["region"],
                 "provider": spec["provider"],
-                "name": name[:200],
+                "name": name,
                 "url": url,
             }
         )
@@ -268,7 +299,8 @@ def main():
         )
 
     print(f"[cctv] {spec['provider']} — 사용 가능 {len(rows)}대", end="")
-    print(f"  (이름 조건으로 제외 {dropped}대)" if dropped else "")
+    print(f"  (이름 조건으로 제외 {dropped}대)" if dropped else "", end="")
+    print(f"  (이름이 겹쳐 번호를 붙인 카메라 {collided}대)" if collided else "")
     for r in rows[:5]:
         print(f"         {r['name']}\n           {r['url']}")
     if len(rows) > 5:
