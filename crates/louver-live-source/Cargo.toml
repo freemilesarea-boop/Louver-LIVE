@@ -1,0 +1,24 @@
+[package]
+name = "louver-live-source"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Isolated worker that sends a YouTube Live picture with the playlist's sound (Beta). Separate process, separate state, no production database."
+
+[dependencies]
+# Reused verbatim, not reimplemented: the FFmpeg composition that already
+# sends a live picture with the playlist's sound.
+louver-core = { path = "../louver-core" }
+# Reused for URL validation only (SSRF, private ranges, credentials, ports).
+louver-cloud = { path = "../louver-cloud" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[[bin]]
+name = "live-source-worker"
+path = "src/bin/live-source-worker.rs"

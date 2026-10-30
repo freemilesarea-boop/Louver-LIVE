@@ -2350,6 +2350,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "louver-live-source"
+version = "1.0.8"
+dependencies = [
+ "chrono",
+ "louver-cloud",
+ "louver-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "louver-server"
 version = "1.0.8"
 dependencies = [
