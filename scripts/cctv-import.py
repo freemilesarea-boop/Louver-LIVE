@@ -118,11 +118,63 @@ def its(doc):
         yield name, url, key
 
 
+# Korea's national parks: eighteen cameras at scenic points, written out.
+#
+# A table and not a parser, which is the opposite of every other source here,
+# and the reason is the page. `www.knps.or.kr` renders the camera list with
+# JavaScript: the card markup carries `data-url` but its `stream-title` is
+# empty in the HTML, and the only Korean names in the document are the labels
+# on a map, in document order and with no link to the cards. Pairing them means
+# counting positions, which breaks the first time the park service reorders the
+# map — silently, by hanging the wrong name on a camera, which is worse than
+# failing.
+#
+# So the pairing was made once, by hand, against that order and confirmed by
+# romanisation: `sapesan` is 사패산, `gaksan` is 각산, `zchunje` is 천제단,
+# `hakampo` is 학암포 — fourteen of the eighteen match their own name, and the
+# rest are consistent with where the camera is.
+#
+# This is cheap to keep: the addresses carry no token and do not rotate, so
+# unlike Korea's traffic feed there is nothing to re-import daily. When the
+# park service adds a camera it appears on that page and this table is edited.
+KNPS = [
+    ("gangbuk", "북한산국립공원 (백운대)"),
+    ("sobak", "소백산국립공원 (연화봉)"),
+    ("zsulchun", "덕유산국립공원 (설천봉)"),
+    ("hakampo", "태안해안국립공원 (학암포)"),
+    ("jukmak", "변산반도국립공원 (죽막탐방로)"),
+    ("zjangteo", "지리산국립공원 (장터목)"),
+    ("jirisan", "지리산국립공원 (천왕봉)"),
+    ("zjungchung", "설악산국립공원 (대청봉)"),
+    ("zduro", "오대산국립공원 (두로령)"),
+    ("zchunje", "태백산국립공원 (천제단)"),
+    ("zjulje", "주왕산국립공원 (기암)"),
+    ("gaksan", "한려해상국립공원 (각산)"),
+    ("jodo", "다도해해상국립공원 (지리청송해변)"),
+    ("sapesan", "북한산국립공원 (사패산)"),
+    ("jangbuljai", "무등산국립공원 (장불재)"),
+    ("sinsungbong", "계룡산국립공원 (천황봉)"),
+    ("sangwonsa", "치악산국립공원 (상원사)"),
+    ("naejang-1", "내장산국립공원 (108 단풍길)"),
+]
+
+
+def knps(_doc):
+    """The table above. Takes no input file; `--input` is ignored."""
+    for slug, name in KNPS:
+        yield name, f"https://live.knps.or.kr/cctv/hls/{slug}.m3u8", slug
+
+
 SOURCES = {
     "vdot": {
         "region": "US",
         "provider": "VDOT (Virginia)",
         "extract": vdot,
+    },
+    "knps": {
+        "region": "KR",
+        "provider": "국립공원공단",
+        "extract": knps,
     },
     "its": {
         "region": "KR",
@@ -206,7 +258,10 @@ def post(base, cookie, rows):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True, choices=sorted(SOURCES))
-    ap.add_argument("--input", required=True, help="피드를 받아 저장한 JSON 파일")
+    ap.add_argument(
+        "--input",
+        help="피드를 받아 저장한 JSON 파일. 주소를 표로 들고 있는 소스(knps)는 필요 없다",
+    )
     ap.add_argument("--base", default="https://247streams.kr")
     ap.add_argument(
         "--chunk",
@@ -242,11 +297,20 @@ def main():
     spec = dict(SOURCES[args.source])
     if args.provider:
         spec["provider"] = args.provider
-    try:
-        with open(args.input, encoding="utf-8") as fh:
-            doc = json.load(fh)
-    except (OSError, ValueError) as e:
-        raise SystemExit(f"[cctv] {args.input} 을 읽을 수 없습니다: {e}")
+
+    # A source that carries its own addresses reads no file.
+    if spec.get("extract") is knps:
+        doc = None
+    elif not args.input:
+        raise SystemExit(f"[cctv] --source {args.source} 에는 --input 이 필요합니다.")
+    else:
+        doc = None  # replaced below
+    if args.input:
+        try:
+            with open(args.input, encoding="utf-8") as fh:
+                doc = json.load(fh)
+        except (OSError, ValueError) as e:
+            raise SystemExit(f"[cctv] {args.input} 을 읽을 수 없습니다: {e}")
 
     # Deduplicated here as well as in the server, because a feed that lists one
     # camera twice would otherwise spend two requests on it and report it twice.
@@ -294,7 +358,7 @@ def main():
 
     if not rows:
         raise SystemExit(
-            f"[cctv] {args.input} 에서 쓸 수 있는 카메라를 찾지 못했습니다.\n"
+            f"[cctv] {args.input or args.source} 에서 쓸 수 있는 카메라를 찾지 못했습니다.\n"
             "       피드 구조가 바뀐 것일 수 있습니다. 응답 앞부분을 확인해 주세요."
         )
 
