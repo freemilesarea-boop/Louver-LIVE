@@ -804,17 +804,39 @@ impl crate::CloudDb {
 
         let conn = self.raw();
         let guard = conn.lock().unwrap();
+        // Two ways to recognise a camera that is already here, and the order
+        // matters.
+        //
+        // The address first, because for a feed whose URLs are stable that is
+        // exactly the camera.
+        //
+        // Then the name, because for a feed whose URLs are not stable the
+        // address is not an identity at all. Korea's ITS hands out a tokenised
+        // URL that expires in about a day, so every re-import brought a
+        // *different* address for the same camera and inserted a second row —
+        // the catalogue grew by eleven thousand rows a day and customers saw
+        //every camera twice. What a camera is, is a name published by an
+        // authority; where it is, is today's URL.
         let existing: Option<String> = guard
             .query_row("SELECT id FROM cctv_sources WHERE url = ?1", rusqlite::params![&url], |x| x.get(0))
-            .optional()?;
+            .optional()?
+            .or(guard
+                .query_row(
+                    "SELECT id FROM cctv_sources
+                      WHERE region = ?1 AND provider = ?2 AND name = ?3
+                      ORDER BY added_at DESC, rowid DESC LIMIT 1",
+                    rusqlite::params![&region, &provider, &name],
+                    |x| x.get(0),
+                )
+                .optional()?);
         match existing {
             Some(id) => {
                 guard.execute(
                     "UPDATE cctv_sources
-                        SET region = ?2, provider = ?3, name = ?4, active = 1,
+                        SET region = ?2, provider = ?3, name = ?4, url = ?5, active = 1,
                             checked_at = NULL, checked_ok = 0, check_note = NULL
                       WHERE id = ?1",
-                    rusqlite::params![&id, &region, &provider, &name],
+                    rusqlite::params![&id, &region, &provider, &name, &url],
                 )?;
                 Ok(id)
             }
@@ -863,6 +885,42 @@ impl crate::CloudDb {
             return Err(CloudError::NotFound("cctv_source"));
         }
         Ok(())
+    }
+
+    /// Remove the older copies of any camera that is in here more than once.
+    ///
+    /// Needed because identity used to be the URL. A feed that hands out a new
+    /// tokenised address every day therefore produced a second row per camera
+    /// per import, and the rows are already there — `import_one` matching on
+    /// the name stops it happening again but cannot undo it.
+    ///
+    /// Keeps the newest of each `(region, provider, name)` and deletes the
+    /// rest, because the newest is the one holding today's address. Idempotent:
+    /// running it on a clean catalogue removes nothing.
+    pub fn dedupe_cctv_sources(&self) -> Result<usize> {
+        let conn = self.raw();
+        let mut guard = conn.lock().unwrap();
+        let tx = guard.transaction()?;
+        // One statement, so there is no window in which a reader sees neither
+        // copy. `rowid` breaks the tie when two rows were added in the same
+        // second, which a bulk import does constantly.
+        let n = tx.execute(
+            "DELETE FROM cctv_sources
+              WHERE rowid NOT IN (
+                SELECT rowid FROM cctv_sources AS keep
+                 WHERE keep.rowid = (
+                   SELECT inner.rowid FROM cctv_sources AS inner
+                    WHERE inner.region = keep.region
+                      AND inner.provider = keep.provider
+                      AND inner.name = keep.name
+                    ORDER BY inner.added_at DESC, inner.rowid DESC
+                    LIMIT 1
+                 )
+              )",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(n)
     }
 
     pub fn delete_cctv_source(&self, id: &str) -> Result<()> {

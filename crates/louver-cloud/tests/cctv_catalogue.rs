@@ -145,3 +145,77 @@ fn checking_or_retiring_a_camera_that_is_not_there_says_so() {
     assert!(matches!(db.set_cctv_source_active("nope", false), Err(CloudError::NotFound(_))));
     assert!(matches!(db.delete_cctv_source("nope"), Err(CloudError::NotFound(_))));
 }
+
+/// A camera is its name, not its address.
+///
+/// Korea's ITS hands out a tokenised URL that expires in about a day, so the
+/// same camera arrives with a different address on every import. Matching on
+/// the address made each of those a new row: the catalogue grew by thousands
+/// of rows a day and the picker offered every camera twice.
+#[test]
+fn the_same_camera_at_a_new_address_updates_the_row_it_already_has() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let first = only(&db.import_cctv_sources(&[row("KR", "한강대교", CAM_A)]).unwrap())
+        .id
+        .clone()
+        .expect("imported");
+    db.record_cctv_check(&first, &ok_check()).unwrap();
+    assert_eq!(db.cctv_sources_for_pick().unwrap().len(), 1);
+
+    // Tomorrow's token for the same camera.
+    let again = only(&db.import_cctv_sources(&[row("KR", "한강대교", CAM_B)]).unwrap())
+        .id
+        .clone()
+        .expect("imported");
+    assert_eq!(again, first, "the same camera must keep its row");
+
+    let all = db.cctv_sources_all().unwrap();
+    assert_eq!(all.len(), 1, "one camera, one row: {all:?}");
+    assert_eq!(all[0].url, CAM_B, "the row must now hold today's address");
+    // And the move resets the check, so yesterday's success cannot offer an
+    // address this server has not opened.
+    assert!(db.cctv_sources_for_pick().unwrap().is_empty());
+}
+
+/// A different camera with a different name is still a different camera.
+#[test]
+fn two_cameras_under_one_provider_do_not_collapse_into_one() {
+    let db = CloudDb::open_in_memory().unwrap();
+    db.import_cctv_sources(&[row("KR", "한강대교", CAM_A), row("KR", "성남요금소", CAM_B)])
+        .unwrap();
+    assert_eq!(db.cctv_sources_all().unwrap().len(), 2);
+}
+
+/// Cleaning up the rows the old rule already created.
+#[test]
+fn deduping_keeps_the_newest_copy_of_each_camera() {
+    let db = CloudDb::open_in_memory().unwrap();
+    // Built by hand, because `import_cctv_sources` can no longer produce the
+    // mess this exists to clear: two rows, one camera, two addresses.
+    let keep = {
+        let conn = db.raw();
+        let guard = conn.lock().unwrap();
+        for (id, url, added) in [
+            ("old", CAM_A, "2026-10-29 00:00:00"),
+            ("new", CAM_B, "2026-10-30 00:00:00"),
+        ] {
+            guard
+                .execute(
+                    "INSERT INTO cctv_sources (id, region, provider, name, url, added_at)
+                     VALUES (?1, 'KR', '한국도로공사', '한강대교', ?2, ?3)",
+                    rusqlite::params![id, url, added],
+                )
+                .unwrap();
+        }
+        "new"
+    };
+    assert_eq!(db.cctv_sources_all().unwrap().len(), 2);
+
+    assert_eq!(db.dedupe_cctv_sources().unwrap(), 1, "one copy removed");
+    let left = db.cctv_sources_all().unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].id, keep, "the newest copy is the one holding today's URL");
+
+    // Idempotent: nothing left to remove.
+    assert_eq!(db.dedupe_cctv_sources().unwrap(), 0);
+}

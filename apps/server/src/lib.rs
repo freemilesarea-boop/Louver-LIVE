@@ -125,6 +125,7 @@ pub fn router(app: App) -> Router {
         // what an operator has retired.
         .route("/api/admin/cctv/sources", get(admin::cctv_sources).post(admin::import_cctv_sources))
         .route("/api/admin/cctv/sources/{id}", delete(admin::delete_cctv_source))
+        .route("/api/admin/cctv/dedupe", post(admin::dedupe_cctv_sources))
         .route("/api/admin/cctv/sources/{id}/check", post(admin::check_cctv_source))
         .route("/api/admin/cctv/sources/{id}/active", post(admin::set_cctv_source_active))
         .route("/api/admin/grants", get(admin::grants).post(admin::create_grants))

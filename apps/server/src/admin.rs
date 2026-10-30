@@ -260,6 +260,19 @@ pub async fn import_cctv_sources(
     Ok(Json(out))
 }
 
+/// Clear the duplicate rows a URL-based identity left behind.
+///
+/// One call, because the rows it removes were created by a rule that no longer
+/// applies: a camera used to be recognised by its address, and a feed whose
+/// addresses rotate daily therefore produced a new row per camera per import.
+/// Imports no longer do that; this clears what they already did.
+pub async fn dedupe_cctv_sources(State(app): State<App>, who: Admin) -> Out<serde_json::Value> {
+    let log = app.clone();
+    let removed = crate::blocking(move || app.db.dedupe_cctv_sources()).await?;
+    audit_cctv(&log, &who, "cctv.dedupe", "", Some(format!("{removed} removed")));
+    Ok(Json(serde_json::json!({ "removed": removed })))
+}
+
 /// Open a camera's address with FFmpeg and record what was there.
 ///
 /// The one thing that puts a camera in front of a customer. Deliberately an
