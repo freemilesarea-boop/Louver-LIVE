@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Runs scripts/cctv-daily-kr.sh once a day on a Mac that sits in Korea.
+
+  Install:
+    cp scripts/launchd/kr.247streams.cctv-daily.plist ~/Library/LaunchAgents/
+    # edit the two paths below to match where the repo actually is
+    launchctl unload ~/Library/LaunchAgents/kr.247streams.cctv-daily.plist 2>/dev/null
+    launchctl load  ~/Library/LaunchAgents/kr.247streams.cctv-daily.plist
+    launchctl start kr.247streams.cctv-daily     # one run now, to prove it works
+
+  05:12, not 05:00: the whole world's cron jobs fire on the hour, and this one
+  waits on a government API that is slowest exactly then.
+
+  If the Mac is asleep at 05:12 the job does not vanish — launchd runs it at
+  the next wake. A day that is missed entirely is a day of dead addresses, so
+  the honest upgrade is a small Korean VPS that is never asleep.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>kr.247streams.cctv-daily</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <!-- Through a login shell on purpose: launchd starts jobs with almost no
+         PATH, and this needs python3, curl and ssh. -->
+    <string>exec "$HOME/Louver-LIVE/scripts/cctv-daily-kr.sh"</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>5</integer>
+    <key>Minute</key><integer>12</integer>
+  </dict>
+
+  <!-- Both streams in one file, appended, so a failed day can be read after
+       the fact. The script timestamps every line it prints. -->
+  <key>StandardOutPath</key>
+  <string>/tmp/cctv-daily-kr.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/cctv-daily-kr.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>
