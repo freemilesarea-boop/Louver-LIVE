@@ -1,0 +1,45 @@
+# Re-collects Korea's camera list once a day. Installed by cctv-vps-setup.sh.
+#
+# Not root: this job needs a Korean IP, python3 and two files. Nothing else.
+# A box whose only job is to hold a credential should hold as little else as
+# possible.
+[Unit]
+Description=한국 CCTV 재수집 (ITS 주소 갱신 + 확인)
+Documentation=https://github.com/freemilesarea-boop/Louver-LIVE/blob/main/docs/cctv-sources.md
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=louver
+Group=louver
+WorkingDirectory=/opt/louver
+ExecStart=/opt/louver/cctv-daily-kr.sh
+
+# Three hours is the normal run; six is the point at which something is wrong
+# and tomorrow's run should get its turn instead.
+TimeoutStartSec=6h
+
+# The whole filesystem is read-only to this unit except the two places it
+# needs: its own state directory and /tmp. If this box is ever taken, the
+# credential is the loss — not a foothold.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/louver
+PrivateTmp=true
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# MemoryDenyWriteExecute is deliberately absent. It is good hardening and it
+# has broken Python builds that allocate libffi closures; the gain over the
+# restrictions above is small, and a mysterious failure at 05:12 on a box
+# nobody is watching costs more than it saves.
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

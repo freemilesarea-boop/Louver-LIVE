@@ -10,26 +10,35 @@
 # on Monday. Customers are then offered cameras that cannot be opened. This is
 # the job that stops that happening.
 #
-# WHY THIS RUNS IN KOREA AND NOT ON THE SERVER
+# WHY THIS RUNS IN KOREA
 #
 # `openapi.its.go.kr` refuses connections from outside Korea — measured, not
 # assumed: the production server in Germany times out on ports 80 and 9443
-# while the same request from Seoul answers 200. The *video* host
-# (`cctvsec.ktict.co.kr`) has no such block, so the split is:
+# while the same request from Seoul answers 200. So the machine that fetches
+# the list has to be in Korea. Nothing else does.
 #
-#   here (Korea)    fetch the list, import it
-#   the server      open each camera and take its picture
+# In particular the check does not: `cctv-check.py` only calls
+# `POST /api/admin/cctv/sources/{id}/check` over HTTPS, and the server is what
+# runs FFmpeg against the camera. So this one script does the whole cycle from
+# wherever it is, and needs no ssh into production — no key on this box, no way
+# from here into the machine that carries the live broadcasts. The only secret
+# that leaves is an admin session cookie, over TLS, to the public API.
 #
-# The second half is started over ssh and left running; it takes hours and
-# there is no reason to hold this script open for it.
+# It takes about three hours, nearly all of it waiting on the server to open
+# cameras one at a time. The check is resumable, so a run that is killed
+# half-way is continued by the next one rather than restarted.
 #
 # WHAT IT NEEDS
 #
 #   --key-file      the ITS API key            (default ~/.its-key)
-#   --cookie-file   an admin session cookie    (default ~/.louver-cookie)
-#   --ssh           where the server is        (default root@2.28.225.85)
+#   --login-file    an admin e-mail and password, one per line, to mint a
+#                   session for this run and revoke it at the end
+#                   (default ~/.louver-login, used only if it exists)
+#   --cookie-file   a session cookie, if no login file (default ~/.louver-cookie)
+#   --base          the API                    (default https://247streams.kr)
 #   --import        cctv-import.py             (default beside this script)
-#   --remote-check  cctv-check.py, on the server (default /root/cctv-check.py)
+#   --check         cctv-check.py              (default beside this script)
+#   --no-check      import only, check nothing
 #
 # Both secrets are files, never arguments: an argument is in the process list
 # and in the shell's history, and this runs unattended where nobody would see
@@ -37,10 +46,14 @@
 set -euo pipefail
 
 KEY_FILE="${HOME}/.its-key"
+LOGIN_FILE="${HOME}/.louver-login"
 COOKIE_FILE="${HOME}/.louver-cookie"
-SSH_TARGET="root@2.28.225.85"
-IMPORT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cctv-import.py"
-REMOTE_CHECK="/root/cctv-check.py"
+MINTED=0
+BASE="https://247streams.kr"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMPORT="$HERE/cctv-import.py"
+CHECK="$HERE/cctv-check.py"
+NO_CHECK=0
 WORK="${TMPDIR:-/tmp}/cctv-daily-kr"
 DRY=0
 
@@ -48,12 +61,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --key-file) KEY_FILE="${2:?--key-file needs a path}"; shift 2 ;;
     --cookie-file) COOKIE_FILE="${2:?--cookie-file needs a path}"; shift 2 ;;
-    --ssh) SSH_TARGET="${2:?--ssh needs a target}"; shift 2 ;;
+    --login-file) LOGIN_FILE="${2:?--login-file needs a path}"; shift 2 ;;
+    --base) BASE="${2:?--base needs a URL}"; shift 2 ;;
     --import) IMPORT="${2:?--import needs a path}"; shift 2 ;;
-    --remote-check) REMOTE_CHECK="${2:?--remote-check needs a path}"; shift 2 ;;
+    --check) CHECK="${2:?--check needs a path}"; shift 2 ;;
+    --no-check) NO_CHECK=1; shift ;;
     --work) WORK="${2:?--work needs a directory}"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n '2,36p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,44p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "모르는 옵션: $1" >&2; exit 2 ;;
   esac
 done
@@ -88,15 +103,73 @@ mkdir -p "$WORK"
 if ! mkdir "$LOCK" 2>/dev/null; then
   die "이미 실행 중입니다 ($LOCK). 아니라면 그 디렉터리를 지우고 다시 실행하세요."
 fi
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT
+cleanup() {
+  # A session minted for this run is revoked even when the run dies half-way.
+  # The alternative is a live admin token sitting on an unattended box until it
+  # ages out thirty days later.
+  if [ "$MINTED" = 1 ] && [ -r "$WORK/cookie" ]; then
+    python3 "$CHECK" --base "$BASE" --cookie-file "$WORK/cookie" --logout \
+      >/dev/null 2>&1 || true
+  fi
+  rm -f "$WORK/cookie" "$WORK/login.json" "$WORK/login.head"
+  rmdir "$LOCK" 2>/dev/null || true
+}
+trap cleanup EXIT
 
 [ -r "$KEY_FILE" ] || die "ITS 인증키 파일을 읽을 수 없습니다: $KEY_FILE"
-[ -r "$COOKIE_FILE" ] || die "세션 쿠키 파일을 읽을 수 없습니다: $COOKIE_FILE"
 [ -r "$IMPORT" ] || die "적재 스크립트를 찾을 수 없습니다: $IMPORT"
+[ "$NO_CHECK" = 1 ] || [ -r "$CHECK" ] || die "확인 스크립트를 찾을 수 없습니다: $CHECK"
 command -v python3 >/dev/null || die "python3 가 없습니다."
 
 KEY="$(tr -d '[:space:]' < "$KEY_FILE")"
 [ -n "$KEY" ] || die "$KEY_FILE 이 비어 있습니다."
+
+# --- 0. the session ---------------------------------------------------------
+#
+# Two ways in, and the first is better on a machine nobody watches.
+#
+#   a login file   e-mail and password; a session is minted for this run and
+#                  revoked when it ends. Nothing long-lived is left behind, and
+#                  the job does not die once a month when a cookie ages out.
+#   a cookie file  a session copied from a browser. Valid for thirty days, then
+#                  the job stops — loudly, but it stops.
+#
+# Neither is a scoped credential, because the server has none to give: both are
+# full admin access. The password's exposure is that it cannot be revoked
+# without changing it; the cookie's is that it must be replaced by hand every
+# month. On an unattended box the shorter-lived secret wins.
+if [ -r "$LOGIN_FILE" ]; then
+  [ -r "$CHECK" ] || die "로그인 방식은 세션을 되돌리기 위해 $CHECK 가 필요합니다."
+
+  # The body is built by python from the file, so the password is never an
+  # argument and never reaches the process list or the shell's history.
+  ( umask 077
+    python3 -c '
+import json, sys
+lines = [l.strip() for l in open(sys.argv[1], encoding="utf-8").read().splitlines() if l.strip()]
+if len(lines) < 2:
+    sys.exit("두 줄(메일, 비밀번호)이 필요합니다")
+json.dump({"email": lines[0], "password": lines[1]}, open(sys.argv[2], "w"))
+' "$LOGIN_FILE" "$WORK/login.json" ) || die "$LOGIN_FILE 을 읽을 수 없습니다. 첫 줄 메일, 둘째 줄 비밀번호."
+
+  code="$(curl -sS -m 60 -o /dev/null -D "$WORK/login.head" -w '%{http_code}' \
+    -H 'content-type: application/json' --data-binary "@$WORK/login.json" \
+    "$BASE/api/auth/login" || true)"
+  rm -f "$WORK/login.json"
+  [ "$code" = "200" ] || die "로그인이 HTTP ${code} 입니다. 401 이면 메일·비밀번호가 틀렸고, 429 면 잠시 뒤 다시 하세요."
+
+  ( umask 077
+    sed -n 's/.*[Ll]ouver_session=\([^;]*\).*/louver_session=\1/p' "$WORK/login.head" \
+      | head -1 > "$WORK/cookie" )
+  rm -f "$WORK/login.head"
+  [ -s "$WORK/cookie" ] || die "로그인은 됐지만 응답에서 세션 쿠키를 찾지 못했습니다."
+  COOKIE_FILE="$WORK/cookie"
+  MINTED=1
+  say "이번 실행용 세션을 받았습니다. 끝나면 되돌립니다."
+else
+  [ -r "$COOKIE_FILE" ] || die "로그인 파일($LOGIN_FILE)도, 쿠키 파일($COOKIE_FILE)도 없습니다."
+  say "쿠키 파일을 씁니다. 30일마다 손으로 갱신해야 합니다 — $LOGIN_FILE 을 쓰면 그 일이 없어집니다."
+fi
 
 # --- 1. fetch ---------------------------------------------------------------
 #
@@ -138,7 +211,7 @@ import_one() { # import_one <input> <provider>
   local extra=()
   [ "$DRY" = 1 ] && extra+=(--dry-run)
   python3 "$IMPORT" --source its \
-    --input "$1" --provider "$2" \
+    --input "$1" --provider "$2" --base "$BASE" \
     --out-dir "$WORK/out" \
     --cookie-file "$COOKIE_FILE" \
     "${FILTER[@]}" "${extra[@]}" \
@@ -153,36 +226,23 @@ if [ "$DRY" = 1 ]; then
   exit 0
 fi
 
-# --- 3. check, on the server ------------------------------------------------
+# --- 3. check ---------------------------------------------------------------
 #
-# Detached on purpose: this is hours of work and the laptop that started it may
-# close. Refused if one is already running, because two checkers racing over
-# the same rows would each record a verdict the other has already replaced.
-say "서버에서 확인을 시작합니다 ($SSH_TARGET)"
-
-# The script's path is substituted into the text piped over ssh, not into any
-# command line. That matters for the `pgrep` below: a path mentioned in an
-# argument would appear in this very shell's own argv and the guard would match
-# itself, so it would always report "already running" and never start anything.
-# This exact mistake has been made in this project before.
-ssh "$SSH_TARGET" bash -s <<REMOTE || die "서버에서 확인을 시작하지 못했습니다."
-set -eu
-if [ ! -r "$REMOTE_CHECK" ]; then
-  echo "서버에 확인 스크립트가 없습니다: $REMOTE_CHECK" >&2
-  exit 1
-fi
-if pgrep -f cctv-check >/dev/null 2>&1; then
-  echo "이미 확인이 돌고 있습니다. 새로 시작하지 않습니다."
+# In the foreground, so this script's exit code is the whole cycle's verdict
+# and the scheduler's log says what happened. Three hours of it is the server
+# opening cameras; the lock above is what keeps tomorrow's run from starting on
+# top of today's.
+if [ "$NO_CHECK" = 1 ]; then
+  say "--no-check 이므로 확인은 건너뜁니다. 갱신된 카메라는 아직 고객에게 안 보입니다."
   exit 0
 fi
-nohup python3 "$REMOTE_CHECK" --region KR --sleep 3 \
-  --exclude-name 터널 \
-  --include-name 대교 --include-name 해안 --include-name 강 \
-  --include-name 휴게소 --include-name 고개 \
-  > /root/kr-check.log 2>&1 &
-sleep 5
-head -2 /root/kr-check.log
-REMOTE
 
-say "끝. 확인 진행은 다음으로 봅니다:"
-say "  ssh $SSH_TARGET 'tail -3 /root/kr-check.log; python3 /root/cctv-report.py'"
+say "확인을 시작합니다. 약 세 시간 걸립니다."
+python3 "$CHECK" --base "$BASE" --cookie-file "$COOKIE_FILE" \
+  --region KR --sleep 3 \
+  "${FILTER[@]}" \
+  || die "확인이 끝까지 가지 못했습니다. 이어서 하려면 다시 실행하면 됩니다 — 확인은 안 된 것만 골라서 합니다."
+
+say "끝. 현황:"
+python3 "$HERE/cctv-report.py" --base "$BASE" --cookie-file "$COOKIE_FILE" 2>/dev/null \
+  || say "  (현황 집계는 건너뜀 — cctv-report.py 를 찾지 못했습니다)"

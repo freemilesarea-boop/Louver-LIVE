@@ -13,9 +13,14 @@
   05:12, not 05:00: the whole world's cron jobs fire on the hour, and this one
   waits on a government API that is slowest exactly then.
 
-  If the Mac is asleep at 05:12 the job does not vanish — launchd runs it at
-  the next wake. A day that is missed entirely is a day of dead addresses, so
-  the honest upgrade is a small Korean VPS that is never asleep.
+  The run takes about three hours, nearly all of it waiting on the server to
+  open cameras one at a time. The check is resumable, so a run cut short by a
+  closing lid is continued by the next day's rather than restarted.
+
+  If the Mac is asleep at 05:12 launchd runs the job at the next wake. A day
+  missed entirely is a day of dead addresses in the catalogue, which is why
+  scripts/cctv-vps-setup.sh exists: a Korean box that never sleeps, with
+  systemd's Persistent=true to catch what it missed.
 -->
 <plist version="1.0">
 <dict>

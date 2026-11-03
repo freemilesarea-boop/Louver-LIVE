@@ -1,0 +1,22 @@
+# 05:12 Korean time, every day.
+#
+# 05:12 and not 05:00 because every scheduled job in the world fires on the
+# hour and this one waits on a government API that is slowest exactly then.
+[Unit]
+Description=한국 CCTV 재수집을 매일 05:12 에
+
+[Timer]
+OnCalendar=*-*-* 05:12:00
+
+# The reason this box exists. A laptop that was asleep at 05:12 simply misses
+# the day, and a missed day is a day of dead addresses in the catalogue.
+# Persistent=true runs the job as soon as the machine is back, having noticed
+# that the last run never happened.
+Persistent=true
+
+# Spread the start over five minutes. One box does not need this; it costs
+# nothing and means a second one added later does not hit the API in lockstep.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
