@@ -220,11 +220,29 @@ whatever `--plan` says.
 | `POST …/start`, `…/restart` | `BroadcastManager::start`, then `claim_stream_slot` |
 | the scheduler | `run_schedules` → `start` (same gate), logged as its own case |
 | recovery after a restart | `recover_all`, per broadcast, before any worker is spawned |
+| **while it is already running** | `expire_lapsed`, every scheduler tick |
 
 Recovery is the one that would be missed, because nobody is watching a boot: it
 spawns workers directly rather than through `start`, so the gate is repeated
 there. It leaves `desired_state` alone — subscribing again is meant to bring the
 broadcast back, and rewriting it to stopped would silently discard that.
+
+The last row is the one that was missing, and it cost money. Every other gate
+fires on an **event**: a request, a boot, a cancellation callback. A month
+running out is not an event — `expires_at` passes and nothing is called. FFmpeg
+does not read the database, and the scheduler only looked at schedules, so a
+broadcast that was perfectly legitimate when it started kept sending for as long
+as the process lived. On a service sold by the month whose product is 24/7
+streaming, that is one paid month in exchange for unlimited broadcasting.
+
+`expire_lapsed` asks `require_active_subscription` — the same function START
+asks, so "entitled" has exactly one definition and cannot drift. It only acts on
+`NoSubscription` and `Disabled`; any other error leaves the broadcast alone,
+because a failed query is not evidence that somebody stopped paying and taking a
+paying customer off air on that basis would be the worse failure. It runs in the
+process that owns the workers, which is the same early return `spawn_scheduler`
+already makes. Covered by `tests/subscription_expiry.rs`, including the
+assertion that expiry alone changes nothing until the tick notices.
 
 The concurrency refusal is its own error, `ConcurrencyReached`, so the sentence
 names the user's plan and their number instead of a database key.

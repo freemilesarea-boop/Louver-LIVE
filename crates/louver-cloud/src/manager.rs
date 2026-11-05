@@ -707,6 +707,81 @@ impl BroadcastManager {
     /// asks [`crate::schedule::decide`] what to do. That is what makes a restart
     /// recover schedules without recovery code — and what makes the behaviour
     /// testable without a thread at all.
+    /// Take off air every broadcast whose account is no longer entitled to it.
+    ///
+    /// # Why this has to exist
+    ///
+    /// The subscription gate is asked at the three moments something *starts*:
+    /// CREATE, START, and boot recovery. All three are events, and all three
+    /// were covered. What nobody was watching is the case where no event
+    /// happens at all: a broadcast that is already running when the
+    /// subscription behind it runs out. `expires_at` passes, no code is called,
+    /// and FFmpeg keeps sending — for weeks, on a 24/7 service, until somebody
+    /// notices by hand or the server happens to restart.
+    ///
+    /// Cancellation was covered because the provider calls back
+    /// ([`crate::billing`]) and an operator switching an account off is a
+    /// request. Expiry is covered by nothing, because time passing is not a
+    /// request. This is the clock, so this is where it belongs.
+    ///
+    /// # What it does not do
+    ///
+    /// It does not read billing, dates or grants itself. It asks
+    /// [`CloudDb::require_active_subscription`] — the same gate START asks — so
+    /// there is exactly one definition of "entitled" in the product and this
+    /// cannot drift away from it. A manual grant still in force keeps a
+    /// broadcast on air precisely because that one function says it should.
+    ///
+    /// Returns how many broadcasts were stopped, for the tests and the log.
+    pub fn expire_lapsed(&self) -> usize {
+        // Only the process that owns the workers. An API process asking the
+        // runner to stop things would be the second opinion this split exists
+        // to prevent — and `spawn_scheduler` already returns early for it, so
+        // this is belt as well as braces.
+        if self.remote.is_some() {
+            return 0;
+        }
+        let Ok(wanted) = self.db.broadcasts_wanting_to_run() else { return 0 };
+
+        // Per account, not per broadcast. Four broadcasts on one lapsed
+        // account is one subscription lookup and one stop, and `stop_all_for`
+        // is already written to take all of them down together.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut stopped = 0usize;
+        for b in &wanted {
+            if !seen.insert(b.user_id.as_str()) {
+                continue;
+            }
+            // Entitled, or unreadable. A database error is not evidence that
+            // somebody stopped paying, and taking a paying customer off air on
+            // the strength of one failed query would be a worse failure than
+            // the one this function exists to fix. Only `NoSubscription` and a
+            // disabled account — the two answers that mean *not entitled* —
+            // stop anything.
+            match self.db.require_active_subscription(&b.user_id) {
+                Ok(_) => continue,
+                Err(CloudError::NoSubscription) | Err(CloudError::Disabled) => {}
+                Err(e) => {
+                    say(&b.id, "warn", &format!("구독 상태를 확인할 수 없어 그대로 둡니다: {e}"));
+                    continue;
+                }
+            }
+            let ids = self.stop_all_for(&b.user_id, StopReason::SubscriptionCancelled);
+            if !ids.is_empty() {
+                // Named in the log because this is money: an operator reading
+                // back through a day needs to see which account went off air
+                // and why, without inferring it from a stop with no cause.
+                say(
+                    &b.id,
+                    "info",
+                    &format!("요금제가 끝나 방송 {}개를 종료했습니다 (user {})", ids.len(), &b.user_id),
+                );
+                stopped += ids.len();
+            }
+        }
+        stopped
+    }
+
     pub fn spawn_scheduler(&self) -> std::thread::JoinHandle<()> {
         let mgr = self.clone();
         std::thread::spawn(move || {
@@ -727,6 +802,13 @@ impl BroadcastManager {
                 // that does; a broadcast held back at boot is otherwise waiting
                 // for a human on a service that is meant not to need one.
                 mgr.resume_held_back();
+                // A subscription does not end with an event. It ends because a
+                // date passes, and a date passing calls nothing — so this tick
+                // is what notices. Without it, an entitlement checked only at
+                // START means one paid month buys unlimited broadcasting: the
+                // stream simply stays up, and on a service that is sold by the
+                // month that is the whole product given away.
+                mgr.expire_lapsed();
                 std::thread::sleep(SCHEDULE_TICK);
             }
         })
