@@ -99,7 +99,7 @@ fn an_unsubscribed_account_with_a_grant_gets_the_granted_plan() {
     assert!(sub.active, "a live grant must let an account broadcast");
     assert_eq!(sub.plan_id, "business");
     assert_eq!(db.limit(&u, MAX_CONCURRENT_STREAMS).unwrap(), 3);
-    assert_eq!(db.limit(&u, MAX_STORAGE_BYTES).unwrap(), 60 * GB);
+    assert_eq!(db.limit(&u, MAX_STORAGE_BYTES).unwrap(), 30 * GB);
     assert_eq!(db.limit(&u, MAX_UPLOAD_BYTES).unwrap(), 20 * GB);
     db.require_active_subscription(&u).expect("the one gate every START goes through");
 }
@@ -155,7 +155,7 @@ fn a_weaker_grant_cannot_lower_a_paid_plan() {
     let sub = db.subscription(&u).unwrap();
     assert_eq!(sub.plan_id, "business", "a Basic grant pulled a Business customer down");
     assert_eq!(db.limit(&u, MAX_CONCURRENT_STREAMS).unwrap(), 3);
-    assert_eq!(db.limit(&u, MAX_STORAGE_BYTES).unwrap(), 60 * GB);
+    assert_eq!(db.limit(&u, MAX_STORAGE_BYTES).unwrap(), 30 * GB);
 }
 
 /// Case 15 — a grant that has not started yet grants nothing either.
@@ -612,7 +612,7 @@ fn changing_the_plan_keeps_the_term() {
 fn accounts_without_a_grant_are_untouched() {
     let (_d, db) = db();
     for (plan, streams, storage, upload) in
-        [("basic", 1, 15 * GB, 10 * GB), ("pro", 2, 30 * GB, 15 * GB), ("business", 3, 60 * GB, 20 * GB)]
+        [("basic", 1, 10 * GB, 10 * GB), ("pro", 2, 20 * GB, 15 * GB), ("business", 3, 30 * GB, 20 * GB)]
     {
         let u = user(&db, &format!("{plan}@x.com"), plan);
         assert_eq!(db.limit(&u, MAX_CONCURRENT_STREAMS).unwrap(), streams, "{plan} concurrency");
@@ -631,7 +631,7 @@ fn accounts_without_a_grant_are_untouched() {
     let lapsed = user(&db, "lapsed@x.com", "basic");
     lapse(&db, &lapsed);
     assert!(matches!(db.require_active_subscription(&lapsed), Err(CloudError::NoSubscription)));
-    assert_eq!(db.limit(&lapsed, MAX_STORAGE_BYTES).unwrap(), 15 * GB);
+    assert_eq!(db.limit(&lapsed, MAX_STORAGE_BYTES).unwrap(), 10 * GB);
 }
 
 /// A lapsed subscription with a live grant still works until the grant ends.

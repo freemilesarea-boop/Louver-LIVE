@@ -273,9 +273,30 @@ struct SeedPlan {
 }
 
 /// Storage figures are per **account** and in GiB (`1024³`), which is what the
-/// rest of the product calls "GB". Every Basic account gets its own 15GB; the
+/// rest of the product calls "GB". Every Basic account gets its own 10GB; the
 /// plans do not share a pool. What protects the one physical disk is
 /// `ingest::DISK_FLOOR_BYTES`, checked on every upload whatever the plan says.
+///
+/// # These numbers are a promise the disk has to be able to keep
+///
+/// They were 15/30/60GB. Three Business accounts was then 180GB of promises on
+/// a disk that did not have it, and the first customer to find that out met
+/// "서버 저장공간이 부족" — a refusal caused by other people's quotas, with
+/// nothing they could do about it and nothing in their own account to explain
+/// it. A ceiling that cannot be honoured is worse than a lower one: the lower
+/// one is a number a customer can plan around.
+///
+/// So the sum of what is sold has to fit the disk, with
+/// `ingest::DISK_FLOOR_BYTES` left standing underneath and room for the
+/// database, the CCTV thumbnails and the container's logs. `size_bytes` counts
+/// the source *and* the prepared copy, so a quota is the true cost on disk and
+/// this arithmetic needs no multiplier.
+///
+/// Lowering one of these does not reach an existing database by itself:
+/// `seed_plans` leaves `limits` alone on conflict. `louver-server
+/// --audit-storage` shows what would move and who would be over it, and
+/// `--apply --yes` writes it — deliberately a human's decision, because
+/// lowering a ceiling can put a paying account over it.
 const SEED_PLANS: &[SeedPlan] = &[
     SeedPlan {
         id: "basic",
@@ -287,7 +308,7 @@ const SEED_PLANS: &[SeedPlan] = &[
         limits: &[
             ("max_concurrent_streams", 1),
             ("max_broadcasts", 3),
-            ("max_storage_bytes", 15 * 1024 * 1024 * 1024),
+            ("max_storage_bytes", 10 * 1024 * 1024 * 1024),
             ("max_upload_bytes", 10 * 1024 * 1024 * 1024),
             // Scheduling is a common feature of every paid plan now: a
             // broadcaster who cannot schedule cannot run 24/7 unattended, which
@@ -307,7 +328,7 @@ const SEED_PLANS: &[SeedPlan] = &[
         limits: &[
             ("max_concurrent_streams", 2),
             ("max_broadcasts", 10),
-            ("max_storage_bytes", 30 * 1024 * 1024 * 1024),
+            ("max_storage_bytes", 20 * 1024 * 1024 * 1024),
             ("max_upload_bytes", 15 * 1024 * 1024 * 1024),
             ("scheduling_enabled", 1),
             ("priority_recovery", 0),
@@ -324,7 +345,7 @@ const SEED_PLANS: &[SeedPlan] = &[
         limits: &[
             ("max_concurrent_streams", 3),
             ("max_broadcasts", 30),
-            ("max_storage_bytes", 60 * 1024 * 1024 * 1024),
+            ("max_storage_bytes", 30 * 1024 * 1024 * 1024),
             ("max_upload_bytes", 20 * 1024 * 1024 * 1024),
             ("scheduling_enabled", 1),
             ("priority_recovery", 1),
@@ -367,7 +388,14 @@ impl std::fmt::Debug for CloudDb {
     }
 }
 
-/// The 2026-09 upload relief: Basic 15/10GB, Pro 30/15GB, Business 60/20GB.
+/// The 2026-09 upload relief, which **raised** the ceilings of the day to
+/// Basic 15/10GB, Pro 30/15GB, Business 60/20GB.
+///
+/// Historical, and deliberately left as it was: a marker records that a
+/// migration ran, so its figures are the ones it ran with and not today's.
+/// Storage was lowered to 10/20/30GB afterwards — see `SEED_PLANS` — through
+/// `--audit-storage`, because `raise_limits_once` only ever moves a ceiling up
+/// and lowering one is not a thing to do to a paying account unattended.
 const UPLOAD_RELIEF_2026_09: &str = "plan_storage_upload_relief_2026_09";
 
 /// CCTV video, opened for Business.

@@ -554,6 +554,25 @@ fn a_revoked_account_can_be_put_back_on_a_plan() {
 
 const GB: i64 = 1024 * 1024 * 1024;
 
+/// The disk the production server runs on.
+const DISK: i64 = 80 * GB;
+
+/// What the disk owes to things that are not a customer's video: the SQLite
+/// database and its WAL, the container's capped logs (3 × 50MB for the app plus
+/// Caddy's), the CCTV thumbnails, the work directories, and the headroom a
+/// preparation needs while it writes its output next to its source.
+///
+/// Deliberately generous. Being wrong in this direction means selling less than
+/// the disk could hold; being wrong in the other direction means a customer
+/// meeting "서버 저장공간이 부족" because of somebody else's quota, which is a
+/// refusal they can do nothing about and cannot see the cause of.
+const SYSTEM_RESERVE: i64 = 10 * GB;
+
+/// What may be promised to customers in total.
+fn sellable() -> i64 {
+    DISK - louver_cloud::ingest::DISK_FLOOR_BYTES as i64 - SYSTEM_RESERVE
+}
+
 #[test]
 fn the_storage_ceilings_fit_the_server_they_run_on() {
     // One 80 GB disk holds the database, the container's logs, the working
@@ -562,9 +581,9 @@ fn the_storage_ceilings_fit_the_server_they_run_on() {
     // concurrency that actually distinguish the plans must not have moved.
     let db = CloudDb::open_in_memory().unwrap();
     for (id, storage, upload, price, streams) in [
-        ("basic", 15 * GB, 10 * GB, 19_900, 1),
-        ("pro", 30 * GB, 15 * GB, 39_900, 2),
-        ("business", 60 * GB, 20 * GB, 59_900, 3),
+        ("basic", 10 * GB, 10 * GB, 19_900, 1),
+        ("pro", 20 * GB, 15 * GB, 39_900, 2),
+        ("business", 30 * GB, 20 * GB, 59_900, 3),
     ] {
         let p = db.plan(id).unwrap();
         assert_eq!(p.limits.get(MAX_STORAGE_BYTES).copied(), Some(storage), "{id} 저장 한도");
@@ -575,14 +594,51 @@ fn the_storage_ceilings_fit_the_server_they_run_on() {
         // limit that can never be the one that fires.
         assert!(upload <= storage, "{id}: 한 파일 한도가 전체 한도보다 큽니다");
     }
-    // These are per-account ceilings, not a share of the disk: the plans
-    // together may promise more than one server holds, and what stops the disk
-    // filling is the free-space floor every upload is checked against. Even so,
-    // one account alone must never be promised more than the server has.
-    let disk = 80 * GB - louver_cloud::ingest::DISK_FLOOR_BYTES as i64;
+}
+
+/// The arithmetic that decides whether a ceiling is honest.
+///
+/// These are per-account ceilings, and nothing in the code stops the operator
+/// selling more of them than the disk can back: `size_bytes` is summed per
+/// account, never across accounts. What refuses the upload when the disk does
+/// run out is `ingest::DISK_FLOOR_BYTES`, and that refusal lands on **whoever
+/// uploads next** — not on whoever filled it. That is how an account using 6GB
+/// of an allowed 60GB came to be told the server was full, with nothing in its
+/// own usage to explain it.
+///
+/// So the ceilings have to be small enough that a realistic roster fits, and
+/// this test is where that is written down rather than assumed.
+#[test]
+fn a_realistic_roster_fits_the_disk() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let ceiling = |id: &str| db.plan(id).unwrap().limits.get(MAX_STORAGE_BYTES).copied().unwrap_or(0);
+
+    // One of each plan — the smallest mix worth having — with room to spare.
+    let one_of_each = ceiling("basic") + ceiling("pro") + ceiling("business");
+    assert!(
+        one_of_each <= sellable(),
+        "요금제 하나씩만 팔아도 디스크를 넘습니다: {}GB 약속 / {}GB 가능",
+        one_of_each / GB,
+        sellable() / GB,
+    );
+
+    // How many Business accounts the disk can actually back, if they were the
+    // only customers. Pinned, not merely asserted positive: the number is what
+    // the operator may sell, and a change to the ceiling that moves it should
+    // make somebody look at this line.
+    //
+    // At 60GB — what Business was — this was 1. One customer filling their
+    // allowance left nothing for anyone else, and the ceiling was a promise
+    // the disk could not keep twice.
+    assert_eq!(sellable() / ceiling("business"), 2, "Business 계정을 몇 개까지 받을 수 있는지");
+
+    // One account must never be promised more than the whole disk could give.
     for id in ["basic", "pro", "business"] {
-        let one = db.plan(id).unwrap().limits.get(MAX_STORAGE_BYTES).copied().unwrap_or(0);
-        assert!(one <= disk, "{id} 한 계정이 서버 전체보다 큰 {}GB를 약속합니다", one / GB);
+        assert!(
+            ceiling(id) <= sellable(),
+            "{id} 한 계정이 팔 수 있는 전체보다 큰 {}GB를 약속합니다",
+            ceiling(id) / GB,
+        );
     }
 }
 
@@ -619,7 +675,7 @@ fn a_production_row_keeps_its_old_limits_until_an_operator_applies_the_new_ones(
     let audit = db.storage_audit().unwrap();
     let business = audit.iter().find(|a| a.plan_id == "business").unwrap();
     assert_eq!(business.storage_now, 400 * GB);
-    assert_eq!(business.storage_target, 60 * GB);
+    assert_eq!(business.storage_target, 30 * GB);
     assert_eq!(business.monthly_price_krw, 59_900);
     assert_eq!(business.concurrent_streams, 3);
     assert_eq!(db.plan("business").unwrap().limits.get(MAX_STORAGE_BYTES).copied(), Some(400 * GB));
@@ -628,7 +684,7 @@ fn a_production_row_keeps_its_old_limits_until_an_operator_applies_the_new_ones(
     let changed = db.apply_seed_storage_limits().unwrap();
     assert!(changed.contains(&"business".to_string()), "{changed:?}");
     let after = db.plan("business").unwrap();
-    assert_eq!(after.limits.get(MAX_STORAGE_BYTES).copied(), Some(60 * GB));
+    assert_eq!(after.limits.get(MAX_STORAGE_BYTES).copied(), Some(30 * GB));
     assert_eq!(after.limits.get(MAX_UPLOAD_BYTES).copied(), Some(20 * GB));
     assert_eq!(after.monthly_price_krw, 59_900, "가격이 바뀌었습니다");
     assert_eq!(after.max_concurrent_streams(), 3, "동시 송출이 바뀌었습니다");
@@ -649,10 +705,12 @@ fn an_account_over_the_new_ceiling_keeps_everything_and_can_still_broadcast() {
     // only thing it does is refuse the next upload.
     let db = CloudDb::open_in_memory().unwrap();
     let (uid, b) = user_with_broadcasts(&db, "full@x.com", "basic", 1);
-    // More stored than the plan's 15 GB, as a lowered ceiling would leave it.
-    let m = db.create_media(&uid, "big.mp4", 16 * GB, "key/big.mp4").unwrap();
-    db.record_media_prepared(&m.id, "key/big-prepared.mp4", 3600.0, 0, 16 * GB).unwrap();
-    assert!(db.storage_used(&uid).unwrap() > 15 * GB);
+    // More stored than the plan's 10 GB, which is exactly what lowering the
+    // ceiling from 15GB leaves behind: a real account, over the line, through
+    // no fault of its own.
+    let m = db.create_media(&uid, "big.mp4", 12 * GB, "key/big.mp4").unwrap();
+    db.record_media_prepared(&m.id, "key/big-prepared.mp4", 3600.0, 0, 12 * GB).unwrap();
+    assert!(db.storage_used(&uid).unwrap() > 10 * GB);
 
     // The next upload is refused, in words that say what to do.
     match db.check_upload_allowed(&uid, 1024) {
@@ -661,11 +719,11 @@ fn an_account_over_the_new_ceiling_keeps_everything_and_can_still_broadcast() {
             let said = CloudError::LimitReached {
                 limit,
                 plan_label: "Basic".into(),
-                used: 16 * GB,
-                allowed: 15 * GB,
+                used: 12 * GB,
+                allowed: 10 * GB,
             }
             .to_string();
-            assert!(said.contains("Basic 플랜 저장공간 15GB를 초과합니다"), "{said}");
+            assert!(said.contains("Basic 플랜 저장공간 10GB를 초과합니다"), "{said}");
             assert!(said.contains("삭제"), "{said}");
             assert!(!said.contains("max_storage_bytes"), "데이터베이스 키가 사용자에게 보입니다: {said}");
         }

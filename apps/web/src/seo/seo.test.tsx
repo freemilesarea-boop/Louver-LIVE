@@ -267,13 +267,26 @@ describe("a rendered public page", () => {
     }
   });
 
-  it("shows the plan numbers the plan table holds", () => {
+  it("shows the plan numbers the plan table holds, each against its own label", () => {
     render(<PlanCards />);
+    // Read each figure from the row it belongs to rather than from the card as
+    // a whole. Two rows can legitimately carry the same number — Basic's
+    // account ceiling and its per-file ceiling are both 10GB — and a bare text
+    // query then either throws on the duplicate or, worse, passes while the two
+    // values are the wrong way round.
+    const figure = (card: HTMLElement, label: string) => {
+      const dt = within(card).getByText(label);
+      const dd = dt.parentElement?.querySelector("dd");
+      if (!dd) throw new Error(`"${label}" 행에 값이 없습니다`);
+      return dd.textContent;
+    };
     for (const plan of PUBLIC_PLANS) {
       const card = screen.getByRole("heading", { name: plan.label }).closest("section")!;
       expect(within(card).getByText(`₩${plan.monthlyKrw.toLocaleString("en-US")}`)).toBeInTheDocument();
-      expect(within(card).getByText(`${plan.storageGb}GB`)).toBeInTheDocument();
-      expect(within(card).getByText(`${plan.uploadGb}GB`)).toBeInTheDocument();
+      expect(figure(card, "저장 용량")).toBe(`${plan.storageGb}GB`);
+      expect(figure(card, "파일 하나 최대")).toBe(`${plan.uploadGb}GB`);
+      expect(figure(card, "동시 송출")).toBe(`${plan.concurrent}개`);
+      expect(figure(card, "저장 방송 수")).toBe(`${plan.broadcasts}개`);
     }
   });
 

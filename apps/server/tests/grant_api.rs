@@ -633,7 +633,7 @@ async fn the_user_list_shows_the_source_of_the_entitlement() {
     assert_eq!(g["grant_plan_id"], "business");
     assert!(g["grant_days_left"].as_i64().unwrap() >= 19);
     // The ceiling shown is the one in force.
-    assert_eq!(g["storage_limit_bytes"].as_i64(), Some(60 * 1024 * 1024 * 1024));
+    assert_eq!(g["storage_limit_bytes"].as_i64(), Some(30 * 1024 * 1024 * 1024));
 
     let p = of("paid@x.com");
     assert_eq!(p["plan_id"], "basic", "a grant rewrote the paid plan");
