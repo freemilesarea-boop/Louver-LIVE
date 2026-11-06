@@ -38,7 +38,26 @@ services:
       LOUVER_ENCODER: ${LOUVER_ENCODER:-libx264}
     volumes:
       # The database, the originals and the prepared copies.
-      - louver-data:/var/lib/louver
+      #
+      # A named volume by default, which Docker keeps under /var/lib/docker on
+      # the **root** filesystem. That is the right default for one machine and
+      # the wrong place as soon as the videos outgrow it: an attached data
+      # volume is a separate device, and nothing here would ever write to it.
+      #
+      # So the source is configurable. Set LOUVER_DATA_PATH in .env to an
+      # absolute path and Compose binds that directory instead — an attached
+      # volume's mount point, for example:
+      #
+      #   LOUVER_DATA_PATH=/mnt/HC_Volume_107274382/louver
+      #
+      # Compose decides by the first character: a value starting with `/` is a
+      # bind mount, anything else is a named volume. Leave it unset and this is
+      # exactly what it has always been.
+      #
+      # Moving an existing install is not just this line — the data has to be
+      # copied first, with the container stopped so SQLite's WAL is settled.
+      # See docs/OPERATIONS.md.
+      - ${LOUVER_DATA_PATH:-louver-data}:/var/lib/louver
     # No CPU or memory ceiling by default. Docker refuses a `cpus` limit larger
     # than the host has, so a default of 4 made every 2-vCPU server fail to
     # start — and the server is one process whose work is FFmpeg, which there is

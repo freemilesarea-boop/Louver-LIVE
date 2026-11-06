@@ -91,7 +91,57 @@ ssh <서버> 'cd louver-live && docker compose exec -T louver tar -cf - -C /var/
 
 ## 3. 디스크가 차기 시작할 때
 
-80GB 짜리 서버입니다. 다음 순서로 봅니다.
+### 먼저: 데이터가 어느 디스크에 있는지
+
+`docker-compose.yml` 의 `louver-data` 는 **네임드 볼륨**이고, 도커는 그걸 항상
+`/var/lib/docker/volumes/` 아래, 즉 **루트 디스크**에 만듭니다. 따로 사서 붙인
+데이터 볼륨(Hetzner Volume 등)은 별개의 블록 장치이고 보통 `/mnt/HC_Volume_…`
+에 마운트되는데, **compose 는 그 경로를 전혀 모릅니다.**
+
+그래서 500GB 를 추가로 사서 붙여 놓고도 업로드가 "서버 저장공간 부족"으로
+거부되는 일이 실제로 있었습니다. 디스크를 사는 것과 앱이 그 디스크를 쓰는 것은
+별개입니다. 먼저 확인합니다.
+
+```bash
+lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT          # 어떤 장치가 어디에 붙었나
+df -hT -x tmpfs -x overlay                    # 각 파일시스템의 여유
+docker volume inspect louver-live_louver-data -f '{{.Mountpoint}}'
+df -hT "$(docker volume inspect louver-live_louver-data -f '{{.Mountpoint}}')"
+```
+
+마지막 줄이 가리키는 파일시스템이 **앱이 실제로 쓰는 디스크**입니다. 그게 루트
+(`/dev/sda1`)이고 500GB 쪽이 거의 비어 있다면, 산 용량은 쓰이지 않고 있습니다.
+
+### 데이터를 붙인 볼륨으로 옮기기
+
+`LOUVER_DATA_PATH` 를 `.env` 에 넣으면 compose 가 네임드 볼륨 대신 그 경로를
+바인드 마운트합니다(값이 `/` 로 시작하면 바인드, 아니면 네임드 볼륨).
+
+```bash
+LOUVER_DATA_PATH=/mnt/HC_Volume_107274382/louver
+```
+
+**경로만 바꾸면 안 됩니다.** 데이터를 먼저 복사해야 하고, 복사는 **컨테이너를
+멈춘 상태에서** 해야 합니다 — SQLite 의 WAL 때문입니다. 쓰는 중에 복사하면 DB 와
+WAL 의 시점이 어긋난 사본이 생기고, 그건 열리긴 하면서 내용이 틀린 쪽이라 더
+나쁩니다.
+
+순서:
+
+1. 목적지에 이미 무엇이 있는지 **본다**. 모르는 것을 덮어쓰지 않습니다.
+2. `docker compose stop` — 여기서 송출이 끊깁니다.
+3. `rsync -aH <볼륨경로>/ <목적지>/` (원본은 지우지 않습니다)
+4. 파일 수와 용량, `cloud.db` 존재를 확인한다.
+5. `.env` 에 `LOUVER_DATA_PATH` 를 넣고 `docker compose up -d`.
+6. `docker compose exec louver df -h /var/lib/louver` 로 새 디스크가 보이는지 확인.
+
+**옛 데이터는 바로 지우지 않습니다.** 며칠 돌려보고 멀쩡한 뒤에
+`docker volume rm louver-live_louver-data` 로 되찾습니다. 되돌리려면 `.env` 의
+`LOUVER_DATA_PATH` 줄을 지우고 다시 올리면 옛 볼륨으로 돌아갑니다.
+
+### 그 다음: 무엇이 차 있는지
+
+다음 순서로 봅니다.
 
 ```bash
 df -h /                                    # 전체
@@ -104,7 +154,7 @@ docker compose exec louver louver-server --diagnose | head -8   # 여유 공간 
 | --- | --- |
 | 빌드 캐시·옛 이미지 | `docker system prune -af` (실행 중 컨테이너는 남습니다) |
 | 컨테이너 로그 | `max-size: 50m`, `max-file: 3` 으로 제한되어 있습니다. 더 줄이려면 `docker-compose.yml` 의 `logging` 을 수정 |
-| `media/` | 수강생에게 쓰지 않는 영상 삭제를 요청, 또는 요금제의 `max_storage_bytes` 를 낮춤 |
+| `media/` | 먼저 위의 "어느 디스크에 있는지"를 확인. 붙인 볼륨이 비어 있으면 그쪽으로 옮기는 것이 답이고, 영상을 지우는 것은 그 다음입니다. 그래도 모자라면 쓰지 않는 영상 삭제를 요청하거나 `--audit-storage` 로 요금제 한도를 낮춤 |
 | `work/` | 방송별 작업 디렉터리. 삭제된 방송의 것은 자동으로 지워집니다 |
 | `uploads/` | 중단된 업로드 조각. 서버가 뜰 때 자동으로 정리됩니다 |
 
