@@ -1,11 +1,13 @@
 //! Per-account storage and per-file ceilings.
 //!
-//! Basic 10GB / 10GB, Pro 20GB / 15GB, Business 30GB / 20GB, in the GiB the
-//! rest of the product calls "GB". Storage was 15/30/60 and was lowered,
-//! because the sum of what was sold did not fit the disk: the account that hit
-//! it was refused for other people's quotas, with nothing in its own usage to
-//! explain why. No fixture here is tens of gigabytes: usage
-//! is a `size_bytes` row and an upload is a byte count, which is all the
+//! Basic 15GB / 10GB, Pro 30GB / 15GB, Business 60GB / 20GB, in the GiB the
+//! rest of the product calls "GB" — storage first, then the per-file ceiling.
+//!
+//! Storage was briefly 10/20/30 on 2026-11-06, when the sum of what was sold
+//! did not fit the 75GB disk the app was writing to. It fits the 492GB volume
+//! the data now lives on, so these are the sold figures again; see
+//! `SEED_PLANS` in `db.rs`. No fixture here is tens of gigabytes: usage is a
+//! `size_bytes` row and an upload is a byte count, which is all the
 //! entitlement check ever looks at.
 
 use louver_cloud::entitlement::*;
@@ -34,7 +36,7 @@ fn refused_for(r: louver_cloud::Result<()>) -> Option<&'static str> {
 fn the_seeded_plans_carry_the_new_ceilings() {
     let db = CloudDb::open_in_memory().unwrap();
     for (id, storage, upload) in
-        [("basic", 10 * GB, 10 * GB), ("pro", 20 * GB, 15 * GB), ("business", 30 * GB, 20 * GB)]
+        [("basic", 15 * GB, 10 * GB), ("pro", 30 * GB, 15 * GB), ("business", 60 * GB, 20 * GB)]
     {
         let p = db.plan(id).unwrap();
         assert_eq!(p.limits.get(MAX_STORAGE_BYTES).copied(), Some(storage), "{id} 저장 한도");
@@ -58,29 +60,31 @@ fn basic_boundaries() {
         "10GB + 1 byte"
     );
 
-    // 4GB used + 6GB = 10GB of 10GB.
+    // 5GB used + 10GB = 15GB of 15GB.
     let a = user_on(&db, "basic-a@x.com", "basic");
-    stored(&db, &a, 4 * GB);
-    assert_eq!(refused_for(db.check_upload_allowed(&a, 6 * GB)), None, "4 + 6 = 10GB");
+    stored(&db, &a, 5 * GB);
+    assert_eq!(refused_for(db.check_upload_allowed(&a, 10 * GB)), None, "5 + 10 = 15GB");
 
-    // 6GB used + 5GB = 11GB of 10GB.
+    // 10GB used + 10GB = 20GB of 15GB. The upload is within the per-file
+    // ceiling, so the limit that fires has to be the account one.
     let b = user_on(&db, "basic-b@x.com", "basic");
-    stored(&db, &b, 6 * GB);
-    assert_eq!(refused_for(db.check_upload_allowed(&b, 5 * GB)), Some(MAX_STORAGE_BYTES), "6 + 5 = 11GB");
+    stored(&db, &b, 10 * GB);
+    assert_eq!(refused_for(db.check_upload_allowed(&b, 10 * GB)), Some(MAX_STORAGE_BYTES), "10 + 10 = 20GB");
 
     // Filling the account exactly is allowed; one byte past is not.
     let c = user_on(&db, "basic-c@x.com", "basic");
-    stored(&db, &c, 10 * GB);
-    assert_eq!(refused_for(db.check_upload_allowed(&c, 1)), Some(MAX_STORAGE_BYTES), "10GB + 1 byte");
+    stored(&db, &c, 15 * GB);
+    assert_eq!(refused_for(db.check_upload_allowed(&c, 1)), Some(MAX_STORAGE_BYTES), "15GB + 1 byte");
 
-    // The per-file ceiling equals the account ceiling on this plan, so one
-    // file at the maximum fills it. Allowed, and worth pinning: the refusal a
-    // Basic customer meets next must be the storage one, naming the account,
-    // not the per-file one naming the file they just chose.
+    // A file at the per-file maximum does not fill the account on this plan:
+    // 10GB of 15GB. Worth pinning, because when it was 10GB of 10GB one file
+    // filled the account, and the refusal a customer met next changed with it.
     let d = user_on(&db, "basic-d@x.com", "basic");
-    assert_eq!(refused_for(db.check_upload_allowed(&d, 10 * GB)), None, "one file fills Basic exactly");
+    assert_eq!(refused_for(db.check_upload_allowed(&d, 10 * GB)), None, "one file at the per-file max");
     stored(&db, &d, 10 * GB);
-    assert_eq!(refused_for(db.check_upload_allowed(&d, 1 * GB)), Some(MAX_STORAGE_BYTES), "then full");
+    assert_eq!(refused_for(db.check_upload_allowed(&d, 5 * GB)), None, "10 + 5 = 15GB exactly");
+    stored(&db, &d, 5 * GB);
+    assert_eq!(refused_for(db.check_upload_allowed(&d, 1)), Some(MAX_STORAGE_BYTES), "then full");
 }
 
 #[test]
@@ -91,14 +95,15 @@ fn pro_boundaries() {
     assert_eq!(refused_for(db.check_upload_allowed(&u, 15 * GB + 1)), Some(MAX_UPLOAD_BYTES));
 
     stored(&db, &u, 5 * GB);
-    assert_eq!(refused_for(db.check_upload_allowed(&u, 15 * GB)), None, "5 + 15 = 20GB exactly");
+    assert_eq!(refused_for(db.check_upload_allowed(&u, 15 * GB)), None, "5 + 15 = 20GB");
     assert_eq!(refused_for(db.check_upload_allowed(&u, 15 * GB + 1)), Some(MAX_UPLOAD_BYTES));
     stored(&db, &u, 10 * GB);
-    assert_eq!(refused_for(db.check_upload_allowed(&u, 5 * GB)), None, "15 + 5 = 20GB exactly");
+    assert_eq!(refused_for(db.check_upload_allowed(&u, 15 * GB)), None, "15 + 15 = 30GB exactly");
+    stored(&db, &u, 15 * GB);
     assert_eq!(
-        refused_for(db.check_upload_allowed(&u, 5 * GB + 1)),
+        refused_for(db.check_upload_allowed(&u, 1)),
         Some(MAX_STORAGE_BYTES),
-        "20GB + 1 byte"
+        "30GB + 1 byte"
     );
 }
 
@@ -109,10 +114,10 @@ fn business_boundaries() {
     assert_eq!(refused_for(db.check_upload_allowed(&u, 20 * GB)), None, "20GB exactly");
     assert_eq!(refused_for(db.check_upload_allowed(&u, 20 * GB + 1)), Some(MAX_UPLOAD_BYTES));
 
-    stored(&db, &u, 10 * GB);
-    assert_eq!(refused_for(db.check_upload_allowed(&u, 20 * GB)), None, "10 + 20 = 30GB exactly");
+    stored(&db, &u, 40 * GB);
+    assert_eq!(refused_for(db.check_upload_allowed(&u, 20 * GB)), None, "40 + 20 = 60GB exactly");
     stored(&db, &u, 1);
-    assert_eq!(refused_for(db.check_upload_allowed(&u, 20 * GB)), Some(MAX_STORAGE_BYTES), "30GB + 1 byte");
+    assert_eq!(refused_for(db.check_upload_allowed(&u, 20 * GB)), Some(MAX_STORAGE_BYTES), "60GB + 1 byte");
 }
 
 #[test]
@@ -122,9 +127,9 @@ fn the_quota_is_per_account_not_per_plan() {
     let db = CloudDb::open_in_memory().unwrap();
     let a = user_on(&db, "one@x.com", "basic");
     let b = user_on(&db, "two@x.com", "basic");
-    stored(&db, &a, 9 * GB);
-    stored(&db, &b, 9 * GB);
-    assert_eq!(db.storage_used(&a).unwrap(), 9 * GB, "b's files are not a's");
+    stored(&db, &a, 14 * GB);
+    stored(&db, &b, 14 * GB);
+    assert_eq!(db.storage_used(&a).unwrap(), 14 * GB, "b's files are not a's");
     assert_eq!(refused_for(db.check_upload_allowed(&a, GB)), None);
     assert_eq!(refused_for(db.check_upload_allowed(&b, GB)), None);
     // And one account filling up refuses only that account.
@@ -141,9 +146,9 @@ fn the_three_refusals_read_differently() {
     let too_big = db.check_upload_allowed(&u, 11 * GB).unwrap_err().to_string();
     assert!(too_big.contains("파일 크기가 Basic 플랜의 파일당 최대 용량 10GB를 초과했습니다"), "{too_big}");
 
-    stored(&db, &u, 6 * GB);
+    stored(&db, &u, 11 * GB);
     let full = db.check_upload_allowed(&u, 10 * GB).unwrap_err().to_string();
-    assert!(full.contains("Basic 플랜 저장공간 10GB를 초과합니다"), "{full}");
+    assert!(full.contains("Basic 플랜 저장공간 15GB를 초과합니다"), "{full}");
     assert!(!full.contains("파일당"), "{full}");
 
     let disk = CloudError::OutOfSpace.to_string();
@@ -207,12 +212,12 @@ fn an_existing_database_is_raised_once_and_only_upwards() {
     // Raised to what this build seeds — today's figures, not the ones the
     // marker was named after. The migration's job is "bring an old row up to
     // current", and the marker only stops it running twice.
-    assert_eq!(storage_of(&db, "basic"), (10 * GB, 10 * GB));
-    assert_eq!(storage_of(&db, "pro"), (20 * GB, 99 * GB), "a higher figure an operator set is kept");
-    assert_eq!(storage_of(&db, "business"), (30 * GB, 20 * GB));
+    assert_eq!(storage_of(&db, "basic"), (15 * GB, 10 * GB));
+    assert_eq!(storage_of(&db, "pro"), (30 * GB, 99 * GB), "a higher figure an operator set is kept");
+    assert_eq!(storage_of(&db, "business"), (60 * GB, 20 * GB));
     // The existing customer gets it with no change to their own rows.
     assert_eq!(db.limit(&uid, MAX_UPLOAD_BYTES).unwrap(), 10 * GB);
-    assert_eq!(db.limit(&uid, MAX_STORAGE_BYTES).unwrap(), 10 * GB);
+    assert_eq!(db.limit(&uid, MAX_STORAGE_BYTES).unwrap(), 15 * GB);
     let s = db.subscription(&uid).unwrap();
     assert_eq!((s.plan_id, s.status, s.active), sub_before, "구독이 바뀌었습니다");
     let billing: i64 = db
@@ -255,5 +260,5 @@ fn a_fresh_database_needs_no_raise_and_records_it_once() {
     // to come back and edit: opening again runs nothing a second time.
     let db = CloudDb::open(&path).unwrap();
     assert_eq!(migrations(&db), first, "a restart must not record a migration twice");
-    assert_eq!(storage_of(&db, "basic"), (10 * GB, 10 * GB));
+    assert_eq!(storage_of(&db, "basic"), (15 * GB, 10 * GB));
 }

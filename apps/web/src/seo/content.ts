@@ -93,7 +93,7 @@ export const PUBLIC_PLANS: PublicPlan[] = [
     label: "Basic",
     monthlyKrw: 19_900,
     concurrent: 1,
-    storageGb: 10,
+    storageGb: 15,
     uploadGb: 10,
     broadcasts: 3,
     who: "채널 하나를 24시간 돌리는 경우",
@@ -103,7 +103,7 @@ export const PUBLIC_PLANS: PublicPlan[] = [
     label: "Pro",
     monthlyKrw: 39_900,
     concurrent: 2,
-    storageGb: 20,
+    storageGb: 30,
     uploadGb: 15,
     broadcasts: 10,
     who: "두 개 채널을 동시에 운영하는 경우",
@@ -113,7 +113,7 @@ export const PUBLIC_PLANS: PublicPlan[] = [
     label: "Business",
     monthlyKrw: 59_900,
     concurrent: 3,
-    storageGb: 30,
+    storageGb: 60,
     uploadGb: 20,
     broadcasts: 30,
     who: "세 개 채널과 여러 플레이리스트를 함께 운영하는 경우",
@@ -287,7 +287,7 @@ const PLAYLIST: PublicPage = {
     {
       heading: "저장 용량 계산",
       body: [
-        "같은 파일을 여러 방송에서 함께 쓸 수 있습니다. 저장 용량은 업로드한 파일을 기준으로 계산하며, 요금제에 따라 총 10GB에서 30GB입니다.",
+        "같은 파일을 여러 방송에서 함께 쓸 수 있습니다. 저장 용량은 업로드한 파일을 기준으로 계산하며, 요금제에 따라 총 15GB에서 60GB입니다.",
       ],
     },
   ],
@@ -388,7 +388,7 @@ const PRICING: PublicPage = {
   faq: [
     {
       q: "요금제별로 무엇이 다른가요?",
-      a: "동시에 송출할 수 있는 방송 수(1~3개), 총 저장 용량(10~30GB), 파일 하나의 최대 크기(10~20GB), 저장할 수 있는 방송 수(3~30개)가 다릅니다.",
+      a: "동시에 송출할 수 있는 방송 수(1~3개), 총 저장 용량(15~60GB), 파일 하나의 최대 크기(10~20GB), 저장할 수 있는 방송 수(3~30개)가 다릅니다.",
     },
     {
       q: "결제 수단은 무엇인가요?",

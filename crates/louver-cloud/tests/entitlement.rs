@@ -550,12 +550,20 @@ fn a_revoked_account_can_be_put_back_on_a_plan() {
     assert_eq!(db.limit("u-legacy", MAX_CONCURRENT_STREAMS).unwrap(), 1);
 }
 
-// --- storage ceilings for one 80 GB server --------------------------------
+// --- storage ceilings for the disk the server actually runs on ------------
 
 const GB: i64 = 1024 * 1024 * 1024;
 
-/// The disk the production server runs on.
-const DISK: i64 = 80 * GB;
+/// The disk the production server runs on: the 500GB volume bought for it,
+/// 492GB after the filesystem, mounted at the app's data directory.
+///
+/// It was 80GB here until 2026-11-06, and that number was the reason the
+/// ceilings were cut to 10/20/30GB. The 80GB was the *boot* disk: a named
+/// Docker volume always lands under `/var/lib/docker/volumes`, so the app was
+/// writing there while the volume bought for it sat empty. Moving the data
+/// (`LOUVER_DATA_PATH`) is what made this number true, and what let the sold
+/// 15/30/60 figures come back. See `SEED_PLANS` in `db.rs`.
+const DISK: i64 = 492 * GB;
 
 /// What the disk owes to things that are not a customer's video: the SQLite
 /// database and its WAL, the container's capped logs (3 × 50MB for the app plus
@@ -575,15 +583,15 @@ fn sellable() -> i64 {
 
 #[test]
 fn the_storage_ceilings_fit_the_server_they_run_on() {
-    // One 80 GB disk holds the database, the container's logs, the working
+    // One disk holds the database, the container's logs, the working
     // directories and every account's originals *and* prepared copies. The
     // ceilings have to be numbers that fit that, and the prices and the
     // concurrency that actually distinguish the plans must not have moved.
     let db = CloudDb::open_in_memory().unwrap();
     for (id, storage, upload, price, streams) in [
-        ("basic", 10 * GB, 10 * GB, 19_900, 1),
-        ("pro", 20 * GB, 15 * GB, 39_900, 2),
-        ("business", 30 * GB, 20 * GB, 59_900, 3),
+        ("basic", 15 * GB, 10 * GB, 19_900, 1),
+        ("pro", 30 * GB, 15 * GB, 39_900, 2),
+        ("business", 60 * GB, 20 * GB, 59_900, 3),
     ] {
         let p = db.plan(id).unwrap();
         assert_eq!(p.limits.get(MAX_STORAGE_BYTES).copied(), Some(storage), "{id} 저장 한도");
@@ -627,10 +635,10 @@ fn a_realistic_roster_fits_the_disk() {
     // the operator may sell, and a change to the ceiling that moves it should
     // make somebody look at this line.
     //
-    // At 60GB — what Business was — this was 1. One customer filling their
-    // allowance left nothing for anyone else, and the ceiling was a promise
-    // the disk could not keep twice.
-    assert_eq!(sellable() / ceiling("business"), 2, "Business 계정을 몇 개까지 받을 수 있는지");
+    // On the 80GB boot disk this was 1 at 60GB, which is why the ceiling was
+    // cut. On the volume the data now lives on it is 7, so the sold figure is
+    // one the disk can keep seven times over.
+    assert_eq!(sellable() / ceiling("business"), 7, "Business 계정을 몇 개까지 받을 수 있는지");
 
     // One account must never be promised more than the whole disk could give.
     for id in ["basic", "pro", "business"] {
@@ -675,7 +683,7 @@ fn a_production_row_keeps_its_old_limits_until_an_operator_applies_the_new_ones(
     let audit = db.storage_audit().unwrap();
     let business = audit.iter().find(|a| a.plan_id == "business").unwrap();
     assert_eq!(business.storage_now, 400 * GB);
-    assert_eq!(business.storage_target, 30 * GB);
+    assert_eq!(business.storage_target, 60 * GB);
     assert_eq!(business.monthly_price_krw, 59_900);
     assert_eq!(business.concurrent_streams, 3);
     assert_eq!(db.plan("business").unwrap().limits.get(MAX_STORAGE_BYTES).copied(), Some(400 * GB));
@@ -684,7 +692,7 @@ fn a_production_row_keeps_its_old_limits_until_an_operator_applies_the_new_ones(
     let changed = db.apply_seed_storage_limits().unwrap();
     assert!(changed.contains(&"business".to_string()), "{changed:?}");
     let after = db.plan("business").unwrap();
-    assert_eq!(after.limits.get(MAX_STORAGE_BYTES).copied(), Some(30 * GB));
+    assert_eq!(after.limits.get(MAX_STORAGE_BYTES).copied(), Some(60 * GB));
     assert_eq!(after.limits.get(MAX_UPLOAD_BYTES).copied(), Some(20 * GB));
     assert_eq!(after.monthly_price_krw, 59_900, "가격이 바뀌었습니다");
     assert_eq!(after.max_concurrent_streams(), 3, "동시 송출이 바뀌었습니다");
@@ -705,12 +713,13 @@ fn an_account_over_the_new_ceiling_keeps_everything_and_can_still_broadcast() {
     // only thing it does is refuse the next upload.
     let db = CloudDb::open_in_memory().unwrap();
     let (uid, b) = user_with_broadcasts(&db, "full@x.com", "basic", 1);
-    // More stored than the plan's 10 GB, which is exactly what lowering the
-    // ceiling from 15GB leaves behind: a real account, over the line, through
-    // no fault of its own.
-    let m = db.create_media(&uid, "big.mp4", 12 * GB, "key/big.mp4").unwrap();
-    db.record_media_prepared(&m.id, "key/big-prepared.mp4", 3600.0, 0, 12 * GB).unwrap();
-    assert!(db.storage_used(&uid).unwrap() > 10 * GB);
+    // More stored than the plan's 15 GB, which is what lowering a ceiling
+    // leaves behind: a real account, over the line, through no fault of its
+    // own. Nothing is deleted and nothing goes off air; only the next upload
+    // is refused.
+    let m = db.create_media(&uid, "big.mp4", 16 * GB, "key/big.mp4").unwrap();
+    db.record_media_prepared(&m.id, "key/big-prepared.mp4", 3600.0, 0, 16 * GB).unwrap();
+    assert!(db.storage_used(&uid).unwrap() > 15 * GB);
 
     // The next upload is refused, in words that say what to do.
     match db.check_upload_allowed(&uid, 1024) {
@@ -719,11 +728,11 @@ fn an_account_over_the_new_ceiling_keeps_everything_and_can_still_broadcast() {
             let said = CloudError::LimitReached {
                 limit,
                 plan_label: "Basic".into(),
-                used: 12 * GB,
-                allowed: 10 * GB,
+                used: 16 * GB,
+                allowed: 15 * GB,
             }
             .to_string();
-            assert!(said.contains("Basic 플랜 저장공간 10GB를 초과합니다"), "{said}");
+            assert!(said.contains("Basic 플랜 저장공간 15GB를 초과합니다"), "{said}");
             assert!(said.contains("삭제"), "{said}");
             assert!(!said.contains("max_storage_bytes"), "데이터베이스 키가 사용자에게 보입니다: {said}");
         }
