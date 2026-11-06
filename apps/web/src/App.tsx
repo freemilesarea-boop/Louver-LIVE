@@ -131,7 +131,10 @@ export function App() {
   const [checked, setChecked] = useState(false);
   const [consent] = useState(consentOutcome);
   /** A camera picked in the gallery, waiting for the form to open on it. */
-  const [pendingCamera, setPendingCamera] = useState<string | null>(null);
+  const [pendingCamera, setPendingCamera] = useState<{
+    url: string;
+    sourceId: string;
+  } | null>(null);
   const [tab, setTab] = useState<Tab>(
     consent ? "destinations" : landedOnPricing ? "pricing" : "broadcasts",
   );
@@ -337,11 +340,11 @@ export function App() {
         {tab === "media" && <MediaLibrary />}
         {tab === "cameras" && (
           <CameraGallery
-            onUse={(url) => {
+            onUse={(camera) => {
               // Carried in state rather than in the URL: the form is a tab,
               // not a route, and a camera chosen here is a draft nobody has
               // saved yet.
-              setPendingCamera(url);
+              setPendingCamera(camera);
               setTab("broadcasts");
             }}
           />

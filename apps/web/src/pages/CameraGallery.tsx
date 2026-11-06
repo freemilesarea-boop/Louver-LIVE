@@ -28,7 +28,14 @@ import type { CctvSource } from "../cloud";
  */
 const PAGE = 48;
 
-export function CameraGallery({ onUse }: { onUse?: (url: string) => void }) {
+export function CameraGallery({
+  onUse,
+}: {
+  /** Hands over the address **and** the row it came from. The id is what lets
+   * the server keep the broadcast on a working address after this camera's own
+   * one expires, so dropping it here would quietly cost that. */
+  onUse?: (camera: { url: string; sourceId: string }) => void;
+}) {
   const t = useTransport();
   const [allowed, setAllowed] = useState<boolean | null>(null);
   const [cameras, setCameras] = useState<CctvSource[]>([]);
@@ -228,7 +235,10 @@ export function CameraGallery({ onUse }: { onUse?: (url: string) => void }) {
                 <p className="text-sm text-ink-100">{c.name}</p>
                 <p className="text-xs text-ink-500">{c.provider}</p>
                 {onUse && (
-                  <Button onClick={() => onUse(c.url)} data-testid="use-camera">
+                  <Button
+                    onClick={() => onUse({ url: c.url, sourceId: c.id })}
+                    data-testid="use-camera"
+                  >
                     이 카메라로 방송 만들기
                   </Button>
                 )}

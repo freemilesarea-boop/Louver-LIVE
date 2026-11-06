@@ -642,6 +642,16 @@ pub struct Broadcast {
     /// playlist above.
     pub cctv_url: Option<String>,
 
+    /// Which catalogue camera [`Self::cctv_url`] came from, if it came from the
+    /// catalogue rather than being typed in.
+    ///
+    /// `cctv_url` is a snapshot of an address that the Korean feeds expire after
+    /// about a day. This is the link back to the row that gets a fresh one, so
+    /// the broadcast can be pointed at the new address instead of reconnecting
+    /// onto the dead one for ever. `None` means a hand-typed URL: nobody else
+    /// refreshes it, and nobody else may change it.
+    pub cctv_source_id: Option<String>,
+
     /// Where this broadcast's YouTube resources are, when an account is
     /// connected. Every field is `None` for a pasted stream key, which is how
     /// the two providers coexist without a branch in the sending path. §7.
@@ -693,6 +703,9 @@ pub struct BroadcastPatch {
     /// Set a live video source, or clear it with an empty string. Absent leaves
     /// whatever is stored alone, like every other field here.
     pub cctv_url: Option<String>,
+    /// Which catalogue camera the URL above was picked from. Empty string
+    /// clears it, which is what a hand-typed URL wants.
+    pub cctv_source_id: Option<String>,
 }
 
 /// Where the playlist has got to, as the worker sees it.

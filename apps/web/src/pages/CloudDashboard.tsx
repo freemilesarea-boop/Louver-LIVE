@@ -85,7 +85,7 @@ export function CloudDashboard({
    * dashboard reports back through `onStartConsumed` as soon as it has acted,
    * so closing the form does not re-open it on the same camera.
    */
-  startWithCctv?: string;
+  startWithCctv?: { url: string; sourceId: string };
   onStartConsumed?: () => void;
 }) {
   const t = useTransport();
@@ -155,7 +155,10 @@ export function CloudDashboard({
       <BroadcastForm
         {...(editing === "new" ? {} : { editing })}
         {...(editing === "new" && startWithCctv
-          ? { initialCctvUrl: startWithCctv }
+          ? {
+              initialCctvUrl: startWithCctv.url,
+              initialCctvSourceId: startWithCctv.sourceId,
+            }
           : {})}
         onDone={() => {
           setEditing(null);

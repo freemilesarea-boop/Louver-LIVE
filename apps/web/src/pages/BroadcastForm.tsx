@@ -60,6 +60,7 @@ const CAMERA_LIST_CAP = 300;
 export function BroadcastForm({
   editing,
   initialCctvUrl,
+  initialCctvSourceId,
   onDone,
   onCancel,
 }: {
@@ -75,6 +76,8 @@ export function BroadcastForm({
    * not a statement about now.
    */
   initialCctvUrl?: string;
+  /** The catalogue id of `initialCctvUrl`, when it came from the gallery. */
+  initialCctvSourceId?: string;
   onDone: () => void;
   onCancel: () => void;
 }) {
@@ -109,6 +112,21 @@ export function BroadcastForm({
     editing?.cctv_url || initialCctvUrl ? "traffic_cctv" : "playlist",
   );
   const [cctvUrl, setCctvUrl] = useState(editing?.cctv_url ?? initialCctvUrl ?? "");
+  /**
+   * Which catalogue camera `cctvUrl` came from, or `""` for a typed address.
+   *
+   * This is what lets the server move the broadcast onto a fresh address when
+   * the camera's own one expires — a Korean address lasts about a day, and
+   * without the link the broadcast reconnects onto the dead one for ever.
+   *
+   * Cleared the moment the address field is edited by hand. Keeping it would
+   * be worse than not having it: the server resolves the catalogue row in
+   * preference to the stored address, so a stale id would quietly throw away
+   * the address the customer actually typed.
+   */
+  const [cctvSourceId, setCctvSourceId] = useState(
+    editing?.cctv_source_id ?? initialCctvSourceId ?? "",
+  );
   const [cctvCheck, setCctvCheck] = useState<CctvCheck | null>(null);
   /**
    * The URL the result in `cctvCheck` is about.
@@ -333,6 +351,16 @@ export function BroadcastForm({
 
   /** An empty string clears a stored URL; `playlist` means there is none. */
   const cctvToSave = videoSource === "traffic_cctv" ? cctvUrl.trim() : "";
+  /**
+   * The catalogue link to store, cleared whenever there is no URL to link.
+   *
+   * The field handlers clear the id on every hand edit, so this only has to
+   * cover the case where there is no address at all — but it covers it here
+   * too, because sending a link with no URL beside it would hand the server
+   * two different answers.
+   */
+  const cctvSourceIdToSave =
+    cctvToSave === "" ? "" : cctvSourceId;
 
   /**
    * Has this exact address been opened by the server and found to carry video?
@@ -402,6 +430,7 @@ export function BroadcastForm({
             provider === "manual_rtmps" ? destinationId : undefined,
           schedule,
           cctv_url: cctvToSave,
+          cctv_source_id: cctvSourceIdToSave,
         });
         await t.replaceItems(editing.id, items);
       } else {
@@ -421,6 +450,7 @@ export function BroadcastForm({
           privacy,
           schedule,
           cctv_url: cctvToSave,
+          cctv_source_id: cctvSourceIdToSave,
         });
       }
       onDone();
@@ -774,7 +804,15 @@ export function BroadcastForm({
                     aria-label="CCTV 카메라"
                     value={options.some((c) => c.url === cctvUrl) ? cctvUrl : ""}
                     onChange={(e) => {
-                      setCctvUrl(e.target.value);
+                      const url = e.target.value;
+                      setCctvUrl(url);
+                      // Which row this address came from, so the server can
+                      // follow the camera when the address expires. `직접 입력`
+                      // sends an empty value and so clears it, which is right:
+                      // an address nobody picked is nobody's to refresh.
+                      setCctvSourceId(
+                        options.find((c) => c.url === url)?.id ?? "",
+                      );
                       // The verdict in hand belongs to the previous address.
                       setCctvCheck(null);
                       setCctvError(null);
@@ -835,6 +873,11 @@ export function BroadcastForm({
                 aria-label="CCTV 주소"
                 onChange={(e) => {
                   setCctvUrl(e.target.value);
+                  // Typed by hand, so it is no longer the camera that was
+                  // picked. Left set, the server would resolve the catalogue
+                  // row in preference to this field and silently send the
+                  // broadcast somewhere the customer did not choose.
+                  setCctvSourceId("");
                   setCctvCheck(null);
                   setCctvError(null);
                 }}

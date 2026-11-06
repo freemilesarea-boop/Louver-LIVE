@@ -36,6 +36,9 @@ CCTV (HLS/HTTP)  ──► VIDEO ─┐
 | `crates/louver-core/src/streaming/ffmpeg.rs` | `build_live_video_stream_args` **추가**. 기존 `build_stream_args` 는 손대지 않음 |
 | `crates/louver-core/src/runtime.rs` | `set_live_video_source()` 추가. 설정되면 위 builder를 쓰고, `None` 이면 기존 경로 그대로 |
 | `crates/louver-cloud/src/db.rs` | `broadcasts.cctv_url` 컬럼 1개 추가(nullable), 저장·검증 |
+| `crates/louver-cloud/src/db.rs` | `broadcasts.cctv_source_id` 컬럼 1개 추가(nullable) — 어느 카탈로그 카메라에서 고른 것인지. 주소가 만료되면 이 링크로 새 주소를 찾는다 |
+| `crates/louver-cloud/src/cctv.rs` | `resolve_cctv_url` / `cctv_urls_needing_refresh` / `adopt_cctv_url`, 그리고 한국 카메라 신선도 창 |
+| `crates/louver-cloud/src/manager.rs` | START 시 주소를 카탈로그에서 다시 읽고, `refresh_cctv_urls` 틱이 주소가 바뀐 방송만 다시 시작 |
 | `crates/louver-cloud/src/models.rs` | `Broadcast.cctv_url`, `BroadcastPatch.cctv_url` |
 | `crates/louver-cloud/src/manager.rs` | worker 시작 시 URL 재검증 후 runtime에 전달 |
 | `apps/server/src/api.rs`, `lib.rs` | `POST /api/cctv/test`, 생성 시 `cctv_url` 수용 |

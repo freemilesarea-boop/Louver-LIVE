@@ -782,6 +782,73 @@ impl BroadcastManager {
         stopped
     }
 
+    /// Move running broadcasts onto the fresh address their camera was given.
+    ///
+    /// The Korean feeds hand out addresses that stop working after about a day.
+    /// Re-import writes the new one onto the `cctv_sources` row, but a running
+    /// worker holds the old string inside an FFmpeg argv that is never rebuilt:
+    /// `spawn_now` relaunches `last_args`, so the reconnect backoff walks 2, 5,
+    /// 10, 20, 60 seconds onto the same dead address and then stays there. The
+    /// broadcast reads as 재접속 중 for ever and the channel is dark.
+    ///
+    /// Nothing calls this on its own, because nothing happens when an address
+    /// expires — there is no event, only an address that stops answering. So it
+    /// rides the scheduler tick, exactly as `expire_lapsed` does.
+    ///
+    /// A restart is a visible interruption, so it happens only when the address
+    /// has actually changed. A camera that keeps its address is left alone, and
+    /// a broadcast already restarted for this change is not restarted again:
+    /// `start_worker` writes the new snapshot, which is what the next pass
+    /// compares against.
+    pub fn refresh_cctv_urls(&self) -> usize {
+        // The process with the workers is the only one that may restart one.
+        if self.remote.is_some() {
+            return 0;
+        }
+        let Ok(changed) = self.db.cctv_urls_needing_refresh() else { return 0 };
+        let live = self.running_ids();
+        let mut moved = 0usize;
+        for (id, fresh) in changed {
+            // A broadcast that is meant to run but has no worker is the
+            // hold-back path's business, and it will resolve the address for
+            // itself when it starts. Restarting what is not running would be a
+            // start this budget never approved.
+            if !live.contains(&id) {
+                continue;
+            }
+            // Refuse a replacement that could not be used anyway, rather than
+            // taking a working broadcast down for it. The old address is dead,
+            // but a dead address that FFmpeg is still retrying is a broadcast
+            // that recovers the moment a good one arrives; one restarted onto a
+            // rejected address is a broadcast that stops.
+            if let Err(e) = crate::cctv::validate(&fresh) {
+                say(&id, "warn", &format!("카메라의 새 주소를 쓸 수 없어 그대로 둡니다: {e}"));
+                continue;
+            }
+            let Ok(b) = self.db.broadcast(&id) else { continue };
+            // Written before the restart, not after: if the process dies
+            // between the two, the broadcast is left pointing at the address it
+            // is about to be started with rather than the one that is dead.
+            if let Err(e) = self.db.adopt_cctv_url(&id, &fresh) {
+                say(&id, "warn", &format!("카메라의 새 주소를 저장할 수 없습니다: {e}"));
+                continue;
+            }
+            let _ = self.db.append_event(
+                &id,
+                EventLevel::Info,
+                "카메라 주소가 갱신되어 방송을 새 주소로 다시 연결합니다",
+            );
+            match self.restart(&b.user_id, &id) {
+                Ok(()) => {
+                    say(&id, "info", "카메라 주소 갱신으로 다시 시작했습니다");
+                    moved += 1;
+                }
+                Err(e) => say(&id, "warn", &format!("새 주소로 다시 시작하지 못했습니다: {e}")),
+            }
+        }
+        moved
+    }
+
     pub fn spawn_scheduler(&self) -> std::thread::JoinHandle<()> {
         let mgr = self.clone();
         std::thread::spawn(move || {
@@ -809,6 +876,11 @@ impl BroadcastManager {
                 // stream simply stays up, and on a service that is sold by the
                 // month that is the whole product given away.
                 mgr.expire_lapsed();
+                // A CCTV address expiring calls nothing either. Without this
+                // tick a Korean camera broadcast is dark within a day and stays
+                // dark, because the reconnect that is meant to save it relaunches
+                // the same dead address every sixty seconds for ever.
+                mgr.refresh_cctv_urls();
                 std::thread::sleep(SCHEDULE_TICK);
             }
         })
@@ -1081,7 +1153,14 @@ impl BroadcastManager {
         // where it was saved: this is the last point before a URL is handed to
         // FFmpeg, and a row could have been written by an older build or by
         // hand. A bad one fails this one start and nothing else.
-        if let Some(url) = b.cctv_url.as_deref().map(str::trim).filter(|u| !u.is_empty()) {
+        //
+        // Resolved and not read straight off the row: `cctv_url` is a snapshot
+        // of an address the Korean feeds expire after about a day, and the
+        // catalogue row is where re-import puts the fresh one. A broadcast
+        // recovered at boot, or restarted an hour later, must leave with
+        // today's address rather than the one it was created with.
+        if let Some(url) = self.db.resolve_cctv_url(&b) {
+            let url = url.as_str();
             let checked = crate::cctv::validate(url).map_err(|e| {
                 let _ = self.db.append_event(
                     broadcast_id,
@@ -1095,6 +1174,13 @@ impl BroadcastManager {
                 EventLevel::Info,
                 "CCTV 영상 + 플레이리스트 음악으로 송출합니다 (CCTV 원본 오디오는 사용하지 않습니다)",
             );
+            // The snapshot is the record of what this worker was launched with,
+            // and `cctv_urls_needing_refresh` compares against it. Left stale,
+            // every pass would see a difference and restart the worker on every
+            // tick.
+            if b.cctv_url.as_deref().map(str::trim) != Some(url) {
+                let _ = self.db.adopt_cctv_url(broadcast_id, url);
+            }
             rt.set_live_video_source(Some(checked.into_string()));
         }
 

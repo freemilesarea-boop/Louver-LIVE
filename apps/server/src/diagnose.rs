@@ -53,6 +53,7 @@ pub fn run() -> std::process::ExitCode {
         "디스크   : 여유 {free}MB (업로드 차단 기준 {floor}MB){}",
         if free != 0 && free < floor { "  ← 업로드가 거부됩니다" } else { "" }
     );
+    cameras(&db);
     youtube_configuration();
     accounts(&db, keys.as_ref());
     println!();
@@ -169,6 +170,34 @@ pub fn run() -> std::process::ExitCode {
 /// Presence only. §15: the client secret is never printed, and the line says so
 /// explicitly rather than leaving a reader to wonder whether it was omitted or
 /// simply missing.
+/// The camera catalogue, and how much of it has gone stale.
+///
+/// Worth a line of its own because the failure is silent. A Korean address
+/// stops working after about a day, `checked_ok` never expires on its own, and
+/// the daily re-import is the only thing that refreshes either — so a re-import
+/// that stopped running looks, from the outside, exactly like a working one.
+/// The number that gives it away is how many cameras are being withheld, and
+/// there is nowhere else to read it.
+fn cameras(db: &CloudDb) {
+    let Ok(all) = db.cctv_sources_all() else {
+        println!("카메라   : 목록을 읽을 수 없습니다");
+        return;
+    };
+    if all.is_empty() {
+        return;
+    }
+    let offered = db.cctv_sources_for_pick().map(|v| v.len()).unwrap_or(0);
+    let stale = db.cctv_stale_counts().unwrap_or_default();
+    let hidden: i64 = stale.iter().map(|(_, n)| n).sum();
+    print!("카메라   : {}대 중 {offered}대 제공", all.len());
+    if hidden > 0 {
+        let by_region =
+            stale.iter().map(|(r, n)| format!("{r} {n}대")).collect::<Vec<_>>().join(", ");
+        print!("  ← 확인이 오래돼 숨긴 카메라 {by_region} (매일 재수집이 돌고 있는지 확인하세요)");
+    }
+    println!();
+}
+
 fn youtube_configuration() {
     let id = std::env::var("YOUTUBE_CLIENT_ID").unwrap_or_default();
     let secret = std::env::var("YOUTUBE_CLIENT_SECRET").unwrap_or_default();

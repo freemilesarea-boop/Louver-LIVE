@@ -399,6 +399,16 @@ export interface Broadcast {
    */
   cctv_url?: string | null;
 
+  /**
+   * Which catalogue camera `cctv_url` was picked from, if it was picked.
+   *
+   * `cctv_url` is a snapshot, and the Korean feeds expire the address in it
+   * after about a day. This is the link back to the row that gets a fresh one,
+   * so the server can move the broadcast onto it. `null` means the URL was
+   * typed by hand and nobody refreshes it.
+   */
+  cctv_source_id?: string | null;
+
   /** Where this broadcast's YouTube resources are, when an account is
    * connected. Every field is null for a pasted stream key. §7. */
   youtube: YoutubeLink;
@@ -422,6 +432,9 @@ export interface BroadcastPatch {
   schedule?: Schedule;
   /** Set a live video source, or clear it with an empty string. */
   cctv_url?: string;
+  /** Which catalogue camera the URL above came from. Empty string clears it,
+   * which is what a hand-typed URL wants. */
+  cctv_source_id?: string;
 }
 
 export interface NewBroadcast {
@@ -440,6 +453,10 @@ export interface NewBroadcast {
   schedule?: Schedule;
   /** A live video source. Absent is an ordinary broadcast. */
   cctv_url?: string;
+  /** Which catalogue camera the URL above came from, when it was picked rather
+   * than typed. Sending it is what lets the server keep this broadcast on a
+   * working address after the camera's own one expires. */
+  cctv_source_id?: string;
 }
 
 export interface Dashboard {

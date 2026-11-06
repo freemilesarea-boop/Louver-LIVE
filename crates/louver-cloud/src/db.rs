@@ -663,6 +663,20 @@ impl CloudDb {
             // identically. One nullable column rather than a table: there is
             // one URL per broadcast and nothing else to store about it.
             ("cctv_url", "TEXT"),
+            // Which catalogue camera `cctv_url` was taken from, when it came
+            // from the catalogue at all.
+            //
+            // The Korean feeds hand out URLs that stop working after about a
+            // day, so `cctv_url` is a snapshot of something perishable. Re-import
+            // replaces the address on the `cctv_sources` row, but a broadcast
+            // holding only a copy of the old string never learns — it reconnects
+            // onto the dead address every sixty seconds, for ever. This column is
+            // the link back, so the address can be resolved again at START and
+            // whenever it changes underneath a running broadcast.
+            //
+            // NULL means the URL was typed by hand and is nobody else's to
+            // change, which is how every row from the previous release reads.
+            ("cctv_source_id", "TEXT"),
         ] {
             ensure_column(&conn, "broadcasts", column, decl)?;
         }
@@ -2737,6 +2751,15 @@ impl CloudDb {
                 crate::cctv::validate(u)?;
             }
         }
+        // A catalogue id that names no row would be a broadcast that looks
+        // refreshable and is not: resolution would fall back to the stored
+        // snapshot for ever and the failure would be invisible. Checked here,
+        // where it can still be refused.
+        if let Some(sid) = &patch.cctv_source_id {
+            if !sid.trim().is_empty() {
+                self.cctv_source(sid.trim())?;
+            }
+        }
         if let Some(d) = &patch.destination_id {
             // Moving a broadcast to a destination that is not yours would be a
             // way to send your video to someone else's channel.
@@ -2778,6 +2801,13 @@ impl CloudDb {
             // is one value in the column and not two.
             let trimmed = v.trim();
             set("cctv_url = ?2", &(if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }))?;
+        }
+        if let Some(v) = &patch.cctv_source_id {
+            let trimmed = v.trim();
+            set(
+                "cctv_source_id = ?2",
+                &(if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }),
+            )?;
         }
         if let Some(v) = &patch.schedule {
             set("sched_enabled = ?2", &(v.enabled as i64))?;
@@ -3256,6 +3286,7 @@ fn row_to_broadcast(r: &rusqlite::Row<'_>) -> rusqlite::Result<Broadcast> {
         current_duration_secs: r.get("current_duration_secs")?,
         cycle_duration_secs: r.get("cycle_duration_secs")?,
         cctv_url: r.get("cctv_url")?,
+        cctv_source_id: r.get("cctv_source_id")?,
         youtube: crate::youtube::YoutubeLink {
             account_id: r.get("youtube_account_id")?,
             broadcast_id: r.get("youtube_broadcast_id")?,

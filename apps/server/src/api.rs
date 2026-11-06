@@ -255,6 +255,12 @@ pub struct NewBroadcast {
     /// ordinary broadcast, which is every broadcast that existed before it.
     #[serde(default)]
     pub cctv_url: Option<String>,
+    /// Which catalogue camera the URL above was picked from, when it was picked
+    /// rather than typed. Sending it is what lets the server move this
+    /// broadcast onto a fresh address when the camera gets one; without it the
+    /// URL is a snapshot nobody refreshes.
+    #[serde(default)]
+    pub cctv_source_id: Option<String>,
 }
 
 impl NewBroadcast {
@@ -340,6 +346,7 @@ pub async fn create_broadcast(
             privacy: b.privacy,
             schedule: b.schedule.clone(),
             cctv_url: b.cctv_url.clone(),
+            cctv_source_id: b.cctv_source_id.clone(),
             ..Default::default()
         };
         let broadcast = app.db.update_broadcast_owned(&uid, &made.id, &patch)?;

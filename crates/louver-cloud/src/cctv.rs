@@ -723,6 +723,26 @@ fn row_to_source(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::models::CctvS
 const SOURCE_COLUMNS: &str = "SELECT id, region, provider, name, url, active, checked_at, \
                               checked_ok, check_note FROM cctv_sources";
 
+/// Regions whose feeds hand out an address that stops working.
+///
+/// Korea's ITS API is the one measured: the address carries a token and a
+/// personal project's notes put its life at about a day. The American feeds are
+/// public HLS playlists with no token, so a check that passed stays true until
+/// the camera itself is taken down — and the American catalogue is re-checked by
+/// hand, so a window applied to it would quietly empty the list instead of
+/// keeping it honest.
+///
+/// A region in here is a region where `checked_ok` alone is not evidence.
+const PERISHABLE_REGIONS: &[&str] = &["KR"];
+
+/// How old a passing check may be, in a perishable region, and still count.
+///
+/// Longer than one daily re-import plus the three hours it takes to walk the
+/// cameras, so an ordinary day never blinks the catalogue out; shorter than two
+/// days, so a re-import that stopped running shows up as cameras disappearing
+/// rather than as customers building broadcasts on dead addresses.
+const PERISHABLE_CHECK_MAX_HOURS: i64 = 36;
+
 impl crate::CloudDb {
     /// The cameras a customer may choose from.
     ///
@@ -730,13 +750,56 @@ impl crate::CloudDb {
     /// claim about a URL; until `record_cctv_check` has seen FFmpeg open it,
     /// it is not offered. That is what keeps four bad rows in a list of three
     /// hundred from becoming four broken broadcasts.
+    ///
+    /// And, in a [perishable region](PERISHABLE_REGIONS), opened **recently**.
+    /// A Korean address expires in about a day while `checked_ok` stays 1 for
+    /// ever, so without the window a camera that passed last week is offered
+    /// today as a verified one. Nothing resets it either: re-import only clears
+    /// the check when the address string changes, so a re-import that is not
+    /// running clears nothing at all. The window is the one part of this that
+    /// does not depend on the re-import working.
     pub fn cctv_sources_for_pick(&self) -> Result<Vec<crate::models::CctvSource>> {
         let conn = self.raw();
         let guard = conn.lock().unwrap();
+        let perishable = PERISHABLE_REGIONS
+            .iter()
+            .map(|r| format!("'{r}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut st = guard.prepare(&format!(
-            "{SOURCE_COLUMNS} WHERE active = 1 AND checked_ok = 1 ORDER BY region, provider, name"
+            "{SOURCE_COLUMNS} WHERE active = 1 AND checked_ok = 1
+               AND (region NOT IN ({perishable})
+                    OR (checked_at IS NOT NULL
+                        AND checked_at >= datetime('now', '-{PERISHABLE_CHECK_MAX_HOURS} hours')))
+             ORDER BY region, provider, name"
         ))?;
         let rows = st.query_map([], row_to_source)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// How many cameras the window above is currently hiding, per region.
+    ///
+    /// For the operator console and `--diagnose`. A catalogue that has quietly
+    /// emptied out is the symptom of a re-import that stopped running, and that
+    /// is worth being able to see without opening the database.
+    pub fn cctv_stale_counts(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let perishable = PERISHABLE_REGIONS
+            .iter()
+            .map(|r| format!("'{r}'"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut st = guard.prepare(&format!(
+            "SELECT region, COUNT(*)
+               FROM cctv_sources
+              WHERE active = 1 AND checked_ok = 1
+                AND region IN ({perishable})
+                AND (checked_at IS NULL
+                     OR checked_at < datetime('now', '-{PERISHABLE_CHECK_MAX_HOURS} hours'))
+              GROUP BY region ORDER BY region"
+        ))?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
@@ -868,6 +931,67 @@ impl crate::CloudDb {
         if n == 0 {
             return Err(CloudError::NotFound("cctv_source"));
         }
+        Ok(())
+    }
+
+    /// The address a broadcast should be sending **now**.
+    ///
+    /// `broadcasts.cctv_url` is a snapshot, and the Korean feeds expire the
+    /// address in it after about a day. Where the broadcast remembers which
+    /// catalogue row it picked, the row is the truth and the snapshot is
+    /// history: re-import writes a fresh address there, and this is what reads
+    /// it back.
+    ///
+    /// Falls back to the snapshot in all three cases where the row cannot
+    /// answer — no id (typed by hand), the row is gone, or it has been retired.
+    /// Falling back is deliberate: a camera withdrawn from the catalogue is not
+    /// a reason to take a paying customer's broadcast off the air, and the
+    /// snapshot is the last address known to have worked.
+    pub fn resolve_cctv_url(&self, b: &crate::models::Broadcast) -> Option<String> {
+        let snapshot = b.cctv_url.as_deref().map(str::trim).filter(|u| !u.is_empty());
+        let id = b.cctv_source_id.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let Some(id) = id else { return snapshot.map(str::to_owned) };
+        match self.cctv_source(id) {
+            Ok(src) if src.active && !src.url.trim().is_empty() => Some(src.url.trim().to_owned()),
+            _ => snapshot.map(str::to_owned),
+        }
+    }
+
+    /// Every running broadcast whose camera has been given a new address.
+    ///
+    /// Returns `(broadcast_id, fresh_url)`. The comparison is against
+    /// `broadcasts.cctv_url`, which is the address the worker was last started
+    /// with, so a row appears here exactly once per change — the caller writes
+    /// the fresh address back as it restarts, and the next pass sees nothing.
+    pub fn cctv_urls_needing_refresh(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare(
+            "SELECT b.id, s.url
+               FROM broadcasts b
+               JOIN cctv_sources s ON s.id = b.cctv_source_id
+              WHERE b.desired_state = 'running'
+                AND s.active = 1
+                AND TRIM(COALESCE(s.url, '')) <> ''
+                AND TRIM(COALESCE(s.url, '')) <> TRIM(COALESCE(b.cctv_url, ''))
+              ORDER BY b.id",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Point a broadcast at the address its camera now has.
+    ///
+    /// Only the snapshot moves; the id stays. Written before the worker is
+    /// restarted, so a crash between the two leaves the broadcast with the
+    /// address it will be started with rather than the one that is dead.
+    pub fn adopt_cctv_url(&self, broadcast_id: &str, url: &str) -> Result<()> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        guard.execute(
+            "UPDATE broadcasts SET cctv_url = ?2 WHERE id = ?1",
+            rusqlite::params![broadcast_id, url.trim()],
+        )?;
         Ok(())
     }
 

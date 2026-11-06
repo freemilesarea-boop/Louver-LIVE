@@ -2715,7 +2715,15 @@ describe("browsing the cameras", () => {
     expect(img).toHaveAttribute("loading", "lazy");
 
     await userEvent.click(within(card).getByTestId("use-camera"));
-    expect(used).toHaveBeenCalledWith("https://93.184.216.34/de/1.m3u8");
+    // The id travels with the address, and that is not a detail. A Korean
+    // address stops working after about a day; the id is what lets the server
+    // move the broadcast onto the camera's new one instead of reconnecting
+    // onto the dead address for ever. Dropped here, the whole mechanism is
+    // inert and nothing else fails.
+    expect(used).toHaveBeenCalledWith({
+      url: "https://93.184.216.34/de/1.m3u8",
+      sourceId: "c-de",
+    });
   });
 
   it("narrows by authority and by name", async () => {
