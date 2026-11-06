@@ -2295,7 +2295,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "louver-cloud"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2314,7 +2314,7 @@ dependencies = [
 
 [[package]]
 name = "louver-core"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2333,7 +2333,7 @@ dependencies = [
 
 [[package]]
 name = "louver-desktop"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "chrono",
  "keyring",
@@ -2351,7 +2351,7 @@ dependencies = [
 
 [[package]]
 name = "louver-server"
-version = "1.0.8"
+version = "1.0.9"
 dependencies = [
  "axum",
  "chrono",
