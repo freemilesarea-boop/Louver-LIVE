@@ -57,6 +57,14 @@ for f in docker-compose.yml Dockerfile crates/louver-cloud/src/db.rs apps/server
   [ -r "$NEW/$f" ] || die "번들에 $f 가 없습니다. 잘못된 파일입니다."
 done
 printf '  파일 %s개\n' "$(find "$NEW" -type f | wc -l | tr -d ' ')"
+BUNDLE_VER="$(sed -n 's/^version = "\(.*\)"/\1/p' "$NEW/Cargo.toml" | head -1)"
+printf '  번들 버전: %s\n' "${BUNDLE_VER:-알 수 없음}"
+# The old upload formula demanded three times the file size in free space. A
+# bundle still carrying it would deploy the very bug this is meant to remove.
+if grep -q 'saturating_mul(3)' "$NEW/crates/louver-cloud/src/ingest.rs" 2>/dev/null; then
+  die "이 번들에는 옛 디스크 공식(× 3)이 들어 있습니다. 잘못된 번들입니다."
+fi
+echo "  디스크 공식: 새 것 (여유 5GB 만 확인)"
 
 say "2/6  .env 가져오기"
 # Never in the bundle: it holds LOUVER_MASTER_KEY, and that key is what decrypts
@@ -90,10 +98,12 @@ docker exec "$C" sqlite3 /var/lib/louver/cloud.db \
 say "6/6  확인할 것"
 cat <<'NEXT'
   요금제 한도는 아직 바뀌지 않았습니다. 코드의 한도는 기존 DB 행을 건드리지
-  않기 때문입니다. 먼저 읽고, 그 다음에 적용합니다:
+  않기 때문입니다. 아래를 서버에서 그대로 붙여넣으세요 (컨테이너 이름을
+  직접 넣을 필요 없습니다):
 
-    docker exec <컨테이너> louver-server --audit-storage
-    docker exec <컨테이너> louver-server --audit-storage --apply --yes
+    C=$(docker ps --format '{{.Names}}' | grep -i louver | head -1)
+    docker exec "$C" louver-server --audit-storage                # 먼저 읽기
+    docker exec "$C" louver-server --audit-storage --apply --yes   # 그 다음 적용
 
   되돌리려면:
     rm -rf /root/louver-live && mv <위에 남겨둔 old 경로> /root/louver-live
