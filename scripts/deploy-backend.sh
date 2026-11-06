@@ -26,6 +26,21 @@
 # **new, empty** volume and the service comes up as a blank install with the
 # real data orphaned beside it. So the directory name is restored before
 # anything is built, and the volume is checked by name before and after.
+#
+# THE SECOND THING THAT MUST NOT GO WRONG
+#
+# Caddy sits behind `profiles: ['https']`, and the app publishes on loopback
+# only. A bare `docker compose up -d` leaves a profiled service alone, so a
+# compose command written without the profile can take the site off the
+# internet while leaving the app "healthy" and every broadcast on air — the
+# failure is invisible from the server's own process list. On 2026-11-06 that
+# is exactly what happened: a `stop` during the volume migration took Caddy
+# down and three bare `up -d` calls could not bring it back. So the profile
+# this install actually uses is read off the running containers at the start
+# and passed to every compose call here, and Caddy is checked at the end.
+#
+# A sibling trap: `restart: unless-stopped` does NOT revive a container a
+# person stopped, so nothing recovers this by itself.
 set -euo pipefail
 
 BUNDLE="${1:?사용법: deploy-backend.sh <번들.tar.gz>}"
@@ -48,6 +63,29 @@ BEFORE="$(docker volume inspect "$VOLUME" -f '{{.Mountpoint}}')"
 docker ps --filter "name=$PROJECT" --format '  {{.Names}}  {{.Status}}'
 echo "  송출 중인 FFmpeg: $(pgrep -c ffmpeg || true)"
 
+# Which profiles does this install actually run? Asking the containers beats
+# guessing: an IP-only server has no Caddy and must not be given the profile,
+# and a server behind a domain must never lose it.
+PROFILE_ARGS=()
+if docker ps -a --filter "name=${PROJECT}-caddy" --format '{{.Names}}' | grep -q .; then
+  PROFILE_ARGS=(--profile https)
+  echo "  caddy 있음 → compose 에 --profile https 를 붙입니다"
+else
+  echo "  caddy 없음 (IP 전용 배포) → 프로필 없이 진행합니다"
+fi
+
+# Free space, before the build and not after it. A build pulls images and
+# writes layers; on 2026-11-06 one run pushed the root filesystem under the
+# app's own 5GB floor and the service came up "degraded" with uploads refused.
+FREE_MB="$(df -Pm /var/lib/docker | awk 'NR==2 {print $4}')"
+printf '  /var/lib/docker 여유: %s MB\n' "$FREE_MB"
+if [ "${FREE_MB:-0}" -lt 8000 ]; then
+  die "빌드에 쓸 여유가 ${FREE_MB}MB 뿐입니다 (8GB 이상 필요). 먼저 공간을 비우세요:
+    docker builder prune -af      # 빌드 캐시
+    docker image prune -af        # 안 쓰는 이미지
+    rm -rf /root/louver-live-old.*  # 옛 소스 트리"
+fi
+
 say "1/6  풀어보기 (아직 아무것도 바꾸지 않습니다)"
 NEW="/root/louver-live-new.$$"
 mkdir -p "$NEW"
@@ -65,6 +103,19 @@ if grep -q 'saturating_mul(3)' "$NEW/crates/louver-cloud/src/ingest.rs" 2>/dev/n
   die "이 번들에는 옛 디스크 공식(× 3)이 들어 있습니다. 잘못된 번들입니다."
 fi
 echo "  디스크 공식: 새 것 (여유 5GB 만 확인)"
+# If this install keeps its data somewhere other than the default volume, the
+# bundle's compose file has to honour that variable. One that does not would
+# move every customer's video back onto the boot disk, quietly, and the only
+# symptom would be uploads failing again once it filled. 2026-11-06: a bundle
+# predating the compose fix did precisely this.
+if grep -q '^LOUVER_DATA_PATH=' "$LIVE/.env" 2>/dev/null; then
+  DATA_PATH="$(sed -n 's/^LOUVER_DATA_PATH=//p' "$LIVE/.env" | head -1)"
+  grep -q 'LOUVER_DATA_PATH' "$NEW/docker-compose.yml" \
+    || die "이 서버는 데이터를 $DATA_PATH 에 두고 있는데, 번들의 docker-compose.yml 은
+그 설정을 읽지 않습니다. 이걸 배포하면 영상과 DB 가 조용히 부팅 디스크로
+돌아갑니다. 더 새 번들을 쓰세요."
+  printf '  데이터 경로: %s (번들이 이 설정을 읽습니다)\n' "$DATA_PATH"
+fi
 
 say "2/6  .env 가져오기"
 # Never in the bundle: it holds LOUVER_MASTER_KEY, and that key is what decrypts
@@ -83,7 +134,7 @@ printf '  이전 트리는 %s 에 남겨 뒀습니다 (되돌릴 때 씁니다)\
 
 say "4/6  빌드와 교체 — 여기서 약 1분 끊깁니다"
 cd "$LIVE"
-docker compose -p "$PROJECT" up -d --build
+docker compose -p "$PROJECT" ${PROFILE_ARGS[@]+"${PROFILE_ARGS[@]}"} up -d --build
 
 say "5/6  데이터가 그대로인지"
 AFTER="$(docker volume inspect "$VOLUME" -f '{{.Mountpoint}}')"
@@ -94,6 +145,15 @@ C="$(docker ps --format '{{.Names}}' | grep -i louver | head -1)"
 docker exec "$C" sqlite3 /var/lib/louver/cloud.db \
   'SELECT "회원 " || COUNT(*) FROM users;' 2>/dev/null \
   || echo "  (sqlite3 없음 — 관리자 화면에서 회원 수를 확인하세요)"
+# The app can be healthy while the site is unreachable, so say it out loud.
+if [ "${#PROFILE_ARGS[@]}" -gt 0 ]; then
+  if docker ps --filter "name=${PROJECT}-caddy" --format '{{.Names}}' | grep -q .; then
+    echo "  caddy 도 올라왔습니다 (사이트 접속 가능)"
+  else
+    die "앱은 올라왔지만 caddy 가 없습니다. 사이트는 밖에서 안 열립니다:
+    cd $LIVE && docker compose -p $PROJECT --profile https up -d"
+  fi
+fi
 
 say "6/6  확인할 것"
 cat <<'NEXT'
@@ -107,7 +167,8 @@ cat <<'NEXT'
 
   되돌리려면:
     rm -rf /root/louver-live && mv <위에 남겨둔 old 경로> /root/louver-live
-    cd /root/louver-live && docker compose -p louver-live up -d --build
+    cd /root/louver-live && docker compose -p louver-live --profile https up -d --build
+                                  # ↑ caddy 가 있는 배포라면 이 프로필이 필요합니다
 NEXT
 NEXT_HINT="docker logs $C --since 5m 2>&1 | tail -20"
 echo

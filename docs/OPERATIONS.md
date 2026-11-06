@@ -27,6 +27,35 @@ YouTube 는 [YOUTUBE_OAUTH.md](YOUTUBE_OAUTH.md), 매출·회원·방송을 화�
 | 매출·회원·방송을 화면으로 | `https://247streams.kr/admin` ([ADMIN.md](ADMIN.md)) |
 | 관리자 계정 목록 | `docker compose exec louver louver-server --list-admins` |
 
+> ### ⚠️ `stop` 과 `up` 에는 `--profile https` 가 필요합니다
+>
+> `docker-compose.yml` 에서 Caddy 는 `profiles: ['https']` 안에 있고, 앱은
+> 루프백(`127.0.0.1:8080`)에만 포트를 엽니다. 프로필 없는
+> `docker compose up -d` 는 **프로필에 든 서비스를 건드리지 않습니다.**
+>
+> 그래서 프로필 없이 `stop` → `up -d` 를 하면:
+> 앱은 `healthy`, 송출은 전부 YouTube 로 그대로 나가는데, **사이트만 밖에서
+> 안 열립니다.** 서버 안에서는 아무 이상이 보이지 않습니다. `restart:
+> unless-stopped` 도 사람이 멈춘 컨테이너는 되살리지 않으니 저절로 돌아오지도
+> 않습니다. 2026-11-06 에 이걸로 3시간을 날렸습니다.
+>
+> ```bash
+> docker compose -p louver-live --profile https up -d     # 올릴 때
+> docker compose -p louver-live --profile https stop      # 멈출 때
+> docker compose -p louver-live --profile https ps        # 볼 때
+> ```
+>
+> 매번 쓰기 싫으면 `.env` 에 한 줄 넣으면 그 디렉터리의 모든 compose 명령이
+> 프로필을 갖습니다 (`COMPOSE_FILE` 과 같은 방식이고, `.env` 는 배포 tar 에서
+> 제외되므로 재배포를 견딥니다):
+>
+> ```bash
+> COMPOSE_PROFILES=https
+> ```
+>
+> 사이트가 열리는지는 서버 안이 아니라 **밖에서** 확인하세요:
+> `curl -sS https://247streams.kr/api/health`
+
 `/health` 의 `checks` 는 전부 `true` 여야 합니다. 하나라도 `false` 면 HTTP 503 이
 나오고, `status` 는 `degraded` 입니다.
 
@@ -74,7 +103,7 @@ ssh <서버> 'cd louver-live && docker compose exec -T louver tar -cf - -C /var/
 
 > 이미지에 `sqlite3` 가 없으면 위 첫 줄이 실패하고 `cp` 로 넘어갑니다. WAL 이
 > 켜진 DB 를 그냥 복사하면 마지막 몇 초의 쓰기가 빠질 수 있습니다. 계정과 결제
-> 기록에 대해서는 허용되는 수준이고, 확실히 하려면 **2번 전에 `docker compose stop
+> 기록에 대해서는 허용되는 수준이고, 확실히 하려면 **2번 전에 `docker compose --profile https stop
 > louver` 로 멈추세요** — 그 동안 방송은 끊깁니다.
 
 **하루 한 번 자동으로:**
@@ -121,19 +150,48 @@ df -hT "$(docker volume inspect louver-live_louver-data -f '{{.Mountpoint}}')"
 LOUVER_DATA_PATH=/mnt/HC_Volume_107274382/louver
 ```
 
-**경로만 바꾸면 안 됩니다.** 데이터를 먼저 복사해야 하고, 복사는 **컨테이너를
-멈춘 상태에서** 해야 합니다 — SQLite 의 WAL 때문입니다. 쓰는 중에 복사하면 DB 와
-WAL 의 시점이 어긋난 사본이 생기고, 그건 열리긴 하면서 내용이 틀린 쪽이라 더
-나쁩니다.
+**경로만 바꾸면 안 됩니다.** 그리고 **배포된 `docker-compose.yml` 이 이 변수를
+읽는지 먼저 확인하세요** — 볼륨이 고정된 옛 compose 파일이면 `.env` 에 넣어도
+아무 일도 일어나지 않고, 앱은 조용히 옛 디스크를 계속 씁니다:
 
-순서:
+```bash
+grep -n 'var/lib/louver' docker-compose.yml
+#   - ${LOUVER_DATA_PATH:-louver-data}:/var/lib/louver   ← 이래야 읽습니다
+#   - louver-data:/var/lib/louver                        ← 이러면 무시됩니다
+```
+
+데이터는 **두 단계로** 옮깁니다. 영상 파일은 한 번 쓰면 바뀌지 않으니 1차는
+컨테이너를 켠 채로 해도 안전합니다 — 읽기는 원본, 쓰기는 목적지뿐이라 송출이
+끊기지 않습니다. 수십 GB 가 여기서 넘어가고, 2차에서는 차이분과 DB 만 넘기므로
+1~2분이면 끝납니다.
+
+| 단계 | 하는 일 | 끊김 |
+| --- | --- | --- |
+| **1차** | 컨테이너 **켠 채로** `media/` 를 rsync. 몇 번 돌려도 됩니다 | **없음** |
+| **2차** | 멈추고 차이분 + DB 를 rsync, `.env` 적고 올리기 | **1~2분** |
+
+DB 는 2차에서만 의미가 있습니다. SQLite 의 WAL 때문입니다: 쓰는 중에 복사하면
+DB 와 WAL 의 시점이 어긋난 사본이 생기고, 그건 열리긴 하면서 내용이 틀린 쪽이라
+더 나쁩니다. 1차가 만든 DB 사본은 쓰레기로 보고 2차에서 멈춘 상태로 새로 받습니다.
+
+스크립트가 이 순서와 프로필 처리, 확인까지 다 합니다:
+
+```bash
+bash scripts/move-data-to-volume.sh                       # 보기만 (안 바꿈)
+bash scripts/move-data-to-volume.sh --presync --dest <목적지>   # 1차, 안 끊김
+bash scripts/move-data-to-volume.sh --go      --dest <목적지>   # 2차, 1~2분
+```
+
+손으로 할 때 빠뜨리기 쉬운 것:
 
 1. 목적지에 이미 무엇이 있는지 **본다**. 모르는 것을 덮어쓰지 않습니다.
-2. `docker compose stop` — 여기서 송출이 끊깁니다.
-3. `rsync -aH <볼륨경로>/ <목적지>/` (원본은 지우지 않습니다)
-4. 파일 수와 용량, `cloud.db` 존재를 확인한다.
-5. `.env` 에 `LOUVER_DATA_PATH` 를 넣고 `docker compose up -d`.
-6. `docker compose exec louver df -h /var/lib/louver` 로 새 디스크가 보이는지 확인.
+2. `--profile https` — 위의 경고를 보세요. 이걸 빠뜨리면 사이트가 내려갑니다.
+3. 1차는 `nice -n 19 ionice -c3` 를 붙여 방송의 디스크 입출력을 빼앗지 않게.
+4. 2차 뒤 `cloud.db` 가 목적지에 **있고 크기가 0 이 아닌지** 확인하고 올립니다.
+5. 올린 뒤 `docker inspect` 로 마운트가 `bind <목적지>` 인지 확인합니다.
+   컨테이너 안의 `df` 만 보면 전환이 안 됐는데도 그럴듯해 보일 수 있습니다.
+6. **caddy 가 돌아왔는지** 확인합니다. 앱이 `healthy` 여도 사이트는 죽어 있을
+   수 있습니다.
 
 **옛 데이터는 바로 지우지 않습니다.** 며칠 돌려보고 멀쩡한 뒤에
 `docker volume rm louver-live_louver-data` 로 되찾습니다. 되돌리려면 `.env` 의
@@ -190,7 +248,7 @@ docker compose restart louver
 ```bash
 # 1. 코드와 컨테이너를 올린다 (아직 시작하지 않는다)
 ./scripts/deploy-vps.sh <새-서버>        # 로컬 저장소에서
-ssh <새-서버> 'cd louver-live && docker compose stop louver'
+ssh <새-서버> 'cd louver-live && docker compose --profile https stop louver'
 
 # 2. master key 를 원래 것으로 되돌린다  ← 이것을 빠뜨리면 스트림 키가 전부 깨집니다
 scp ~/247streams-backup/env-<날짜> <새-서버>:louver-live/.env
@@ -205,7 +263,7 @@ ssh <새-서버> 'cd louver-live && docker compose run --rm -T --entrypoint sh l
   -c "tar -xf - -C /var/lib/louver"' < ~/247streams-backup/media-<날짜>.tar
 
 # 5. 시작하고 확인한다
-ssh <새-서버> 'cd louver-live && docker compose up -d'
+ssh <새-서버> 'cd louver-live && docker compose --profile https up -d'
 ssh <새-서버> 'cd louver-live && curl -s localhost:8080/health'
 ssh <새-서버> 'cd louver-live && docker compose exec louver louver-server --diagnose'
 ```
