@@ -26,9 +26,13 @@
 # THE ONE THING TO VERIFY BEFORE PAYING FOR THIS BOX
 #
 # ITS is known to block foreign IPs. Whether it also blocks a Korean *cloud*
-# provider's range has not been measured. So the last thing this script does is
-# fetch the list for real and tell you whether it worked. If it did not, the
-# box is the wrong box and nothing else here matters.
+# provider's range has not been measured. So this script fetches the list for
+# real, from this box, and tells you whether it worked. If it did not, the box
+# is the wrong box and nothing else here matters.
+#
+# That check runs BEFORE the admin password is asked for, because it needs no
+# session of its own. So a box that turns out to be useless never receives
+# full admin access to the account on its way to being discarded.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -55,7 +59,7 @@ for f in cctv-daily-kr.sh cctv-import.py cctv-check.py cctv-report.py; do
 done
 [ -r "$SRC/systemd/cctv-daily-kr.service" ] || die "$SRC/systemd/ 가 없습니다."
 
-say "1/6  필요한 꾸러미"
+say "1/7  필요한 꾸러미"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq python3 curl ca-certificates tzdata >/dev/null
@@ -64,22 +68,25 @@ apt-get install -y -qq python3 curl ca-certificates tzdata >/dev/null
 timedatectl set-timezone Asia/Seoul
 printf '     시간대: %s\n' "$(timedatectl show -p Timezone --value)"
 
-say "2/6  서비스 사용자"
+say "2/7  서비스 사용자"
 # A system user: no login shell, no password, no home full of dotfiles. Its
 # whole purpose is to own two files and run one script.
 if ! id -u "$SVC_USER" >/dev/null 2>&1; then
-  useradd --system --home-dir "$STATE" --create-home --shell /usr/sbin/nologin "$SVC_USER"
+  # --no-create-home, because `install -d` below makes the directory with the
+  # mode we actually want. --create-home would copy /etc/skel in and leave a
+  # .bashrc and a .profile in the home of an account that has no shell.
+  useradd --system --home-dir "$STATE" --no-create-home --shell /usr/sbin/nologin "$SVC_USER"
 fi
 install -d -m 700 -o "$SVC_USER" -g "$SVC_USER" "$STATE"
 
-say "3/6  스크립트"
+say "3/7  스크립트"
 install -d -m 755 "$DEST"
 for f in cctv-daily-kr.sh cctv-import.py cctv-check.py cctv-report.py; do
   install -m 755 "$SRC/$f" "$DEST/$f"
 done
 printf '     %s\n' "$DEST"
 
-say "4/6  비밀 두 개"
+say "4/7  ITS 인증키"
 # read -rs: not echoed, and not in the shell's history either, because it never
 # becomes part of a command line. `cat >` would have printed the key as it was
 # pasted — that happened once in this project already.
@@ -101,6 +108,35 @@ secret() { # secret <file> <prompt>
 
 secret "$STATE/.its-key" "ITS 인증키"
 
+say "5/7  이 IP 에서 ITS 가 응답하는지 — 이게 핵심입니다"
+# Before the admin password, not after.
+#
+# `--dry-run` fetches from ITS for real, registers nothing, and needs no
+# session — so this answers exactly one question: does ITS answer from this
+# box's address? If the answer is no, the box is the wrong box, and nobody has
+# yet written full admin access to the account onto a box that is about to be
+# thrown away.
+if [ "$NO_PREFLIGHT" = 1 ]; then
+  printf '     --no-preflight 이므로 건너뜁니다.\n'
+elif runuser -u "$SVC_USER" -- env HOME="$STATE" "$DEST/cctv-daily-kr.sh" --dry-run; then
+  printf '\n     ITS 가 이 IP 에 응답합니다. 이 박스는 쓸 수 있습니다.\n'
+else
+  cat <<'FAIL'
+
+   ITS 가 이 IP 에 응답하지 않습니다. 위의 사유를 보세요.
+
+     HTTP 000       이 IP 가 막혀 있습니다. 한국 안이라도 클라우드 대역은 막힐
+                    수 있습니다 — 다른 사업자(국내 호스팅)로 옮기는 게 답입니다.
+     카메라 N 대뿐  인증키가 아직 승인 대기이거나 거부됐습니다.
+
+   관리자 비밀번호는 아직 묻지 않았습니다. 이 박스에는 아무 계정 권한도
+   올라가 있지 않습니다. 원인을 고친 뒤 이 스크립트를 그대로 다시 실행하세요
+   — 같은 상태로 수렴합니다.
+FAIL
+  exit 1
+fi
+
+say "6/7  관리자 로그인 (세션을 매 실행마다 받고 되돌리기 위해)"
 printf '     관리자 메일: '
 read -r ADMIN_EMAIL
 printf '     관리자 비밀번호: '
@@ -119,7 +155,7 @@ fi
 printf '     %s 는 계정 전체 권한입니다. 서버에 범위 제한 키가 없어서 다른 방법이 없습니다.\n' "$STATE/.louver-login"
 printf '     대신 세션은 실행이 끝날 때마다 되돌립니다.\n'
 
-say "5/6  타이머"
+say "7/7  타이머"
 install -m 644 "$SRC/systemd/cctv-daily-kr.service" /etc/systemd/system/
 install -m 644 "$SRC/systemd/cctv-daily-kr.timer" /etc/systemd/system/
 systemd-analyze verify /etc/systemd/system/cctv-daily-kr.timer \
@@ -128,36 +164,12 @@ systemctl daemon-reload
 systemctl enable --now cctv-daily-kr.timer
 systemctl list-timers cctv-daily-kr.timer --no-pager | sed -n '1,2p;$p'
 
-if [ "$NO_PREFLIGHT" = 1 ]; then
-  say "끝. --no-preflight 이므로 ITS 응답은 확인하지 않았습니다."
-  exit 0
-fi
+cat <<'DONE'
 
-say "6/6  이 IP 에서 ITS 가 응답하는지 — 이게 핵심입니다"
-# --dry-run fetches for real and registers nothing. If this fails, the box's
-# address is blocked and the box is useless, which is worth knowing in the
-# first five minutes rather than after the first silent night.
-if runuser -u "$SVC_USER" -- env HOME="$STATE" "$DEST/cctv-daily-kr.sh" --dry-run; then
-  cat <<'DONE'
-
-   ITS 가 이 IP 에 응답합니다. 이 박스는 쓸 수 있습니다.
+   끝났습니다.
 
    다음:
      systemctl start cctv-daily-kr      # 지금 한 바퀴 (약 세 시간)
      journalctl -u cctv-daily-kr -f     # 진행 보기
      systemctl list-timers cctv-daily-kr.timer
 DONE
-else
-  cat <<'FAIL'
-
-   ITS 가 응답하지 않았습니다. 위의 사유를 보세요.
-
-     HTTP 000  이 IP 가 막혀 있습니다. 한국 안이라도 클라우드 대역은 막힐 수
-               있습니다 — 다른 사업자(국내 호스팅)로 옮기는 게 답입니다.
-     카메라 N 대뿐  인증키가 아직 승인 대기이거나 거부됐습니다.
-
-   타이머는 설치돼 있으니, 원인을 고친 뒤 다시 확인하면 됩니다:
-     runuser -u louver -- env HOME=/var/lib/louver /opt/louver/cctv-daily-kr.sh --dry-run
-FAIL
-  exit 1
-fi

@@ -138,7 +138,17 @@ KEY="$(tr -d '[:space:]' < "$KEY_FILE")"
 # full admin access. The password's exposure is that it cannot be revoked
 # without changing it; the cookie's is that it must be replaced by hand every
 # month. On an unattended box the shorter-lived secret wins.
-if [ -r "$LOGIN_FILE" ]; then
+if [ "$DRY" = 1 ]; then
+  # --dry-run fetches from ITS and transmits nothing, so it needs no session at
+  # all: `cctv-import.py` reads its cookie only after the --dry-run return.
+  #
+  # Not a tidy-up. This is the preflight `cctv-vps-setup.sh` runs to answer one
+  # question — does ITS answer from this box's address? — before any more money
+  # is spent on the box. Asking for an admin password to answer it meant a
+  # mistyped password failed the check and told you nothing about the address,
+  # which is the one thing it exists to tell you.
+  say "--dry-run 이므로 세션은 받지 않습니다 (전송하지 않습니다)."
+elif [ -r "$LOGIN_FILE" ]; then
   [ -r "$CHECK" ] || die "로그인 방식은 세션을 되돌리기 위해 $CHECK 가 필요합니다."
 
   # The body is built by python from the file, so the password is never an
