@@ -387,7 +387,17 @@ fn audit_storage(args: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    let gb = |b: i64| format!("{:.0}GB", b as f64 / 1_073_741_824.0);
+    // "무제한" rather than the number, for a plan whose ceiling is not a
+    // ceiling. 1048576GB is a true answer that tells an operator nothing, and
+    // reading it as a real figure is how somebody ends up believing the box has
+    // a petabyte on it.
+    let gb = |b: i64| {
+        if b >= louver_cloud::entitlement::UNLIMITED_BYTES {
+            "무제한".to_string()
+        } else {
+            format!("{:.0}GB", b as f64 / 1_073_741_824.0)
+        }
+    };
 
     println!(
         "{:<10} {:>9} {:>6}  {:>16}  {:>16}",

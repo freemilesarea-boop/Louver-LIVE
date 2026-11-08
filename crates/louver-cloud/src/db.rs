@@ -251,6 +251,13 @@ CREATE INDEX IF NOT EXISTS idx_event_broadcast ON broadcast_events(broadcast_id,
 /// subscription still cannot start a broadcast, because the limit it reads is 0.
 pub const UNSUBSCRIBED_PLAN: &str = "none";
 
+/// The account that runs the service, rather than buys it.
+///
+/// Not on the pricing page and not purchasable: `active: false`, and no billing
+/// record can ever name it, which is also what keeps it out of
+/// [`CloudDb::billing_mismatches`].
+pub const OWNER_PLAN: &str = "owner";
+
 /// `subscriptions.status`, spelt once.
 pub const SUBSCRIPTION_ACTIVE: &str = "active";
 pub const SUBSCRIPTION_UNSUBSCRIBED: &str = "unsubscribed";
@@ -368,6 +375,35 @@ const SEED_PLANS: &[SeedPlan] = &[
             // Live video from a CCTV address. Business only, and only when it
             // is paid for — `CloudDb::paid_flag` is what reads this.
             ("cctv_enabled", 1),
+        ],
+    },
+    SeedPlan {
+        id: OWNER_PLAN,
+        label: "운영자",
+        monthly_price_krw: 0,
+        description: "서비스를 운영하는 계정. 판매하지 않습니다.",
+        // Never on the pricing page. `/api/plans` filters on this, so the
+        // public endpoint keeps showing exactly the three plans that are sold.
+        active: false,
+        // Before the paid plans wherever an operator lists them, so the one
+        // account that is not a customer reads as the exception it is.
+        sort_order: 0,
+        limits: &[
+            // Every number here is "no policy ceiling". What remains is the
+            // machine: a stream copy costs almost nothing, but an encode costs
+            // a core, and the encoder budget that rations those is global and
+            // deliberately untouched by this plan. See `UNLIMITED_COUNT`.
+            ("max_concurrent_streams", crate::entitlement::UNLIMITED_COUNT),
+            ("max_broadcasts", crate::entitlement::UNLIMITED_COUNT),
+            ("max_storage_bytes", crate::entitlement::UNLIMITED_BYTES),
+            ("max_upload_bytes", crate::entitlement::UNLIMITED_BYTES),
+            ("scheduling_enabled", 1),
+            ("priority_recovery", 1),
+            ("cctv_enabled", 1),
+            // Read by `subscription()`. Without it the operator's own account
+            // would be switched off by a `subscriptions` row nobody is going to
+            // renew for it.
+            ("billing_exempt", 1),
         ],
     },
     SeedPlan {
@@ -1257,7 +1293,13 @@ impl CloudDb {
             .optional()?
             .unwrap_or_else(|| SUBSCRIPTION_ACTIVE.into());
 
-        let paid_active = status == SUBSCRIPTION_ACTIVE && paid.can_broadcast();
+        // A plan may declare that its entitlements do not come from a payment.
+        // Only the operator's own plan does; absent is zero is "bill it", so
+        // every customer plan behaves exactly as it did.
+        let billing_exempt =
+            paid.limits.get(crate::entitlement::BILLING_EXEMPT).copied().unwrap_or(0) != 0;
+        let paid_active =
+            (status == SUBSCRIPTION_ACTIVE || billing_exempt) && paid.can_broadcast();
         // Taken here, while `paid` is still the plan that was paid for: the
         // match below may replace it with a granted one, and this must not
         // follow it there. Same answer as `paid_flag`, which is what the save

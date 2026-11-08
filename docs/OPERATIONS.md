@@ -327,6 +327,40 @@ docker compose exec louver louver-server --audit-plans --revoke-unpaid-grants --
 
 자세한 배경은 [CLOUD.md](CLOUD.md) 의 "Why a new account might show Basic".
 
+### 4-7. 운영자 계정을 한도 없이 쓰기 — `owner` 요금제
+
+서비스를 **운영하는** 계정은 사는 계정이 아닙니다. 그런데 요금제 표가 하나뿐이라,
+서버비를 내는 계정이 상품을 매기기 위해 존재하는 천장(동시 3개, 저장 60GB)에 같이
+걸려 있었습니다. `owner` 요금제가 그 계정 몫입니다.
+
+```bash
+# 지금 누가 무엇인지 먼저 본다
+docker compose exec louver louver-server --audit-plans
+
+# 운영자 계정에 적용 (기존 계정이면 요금제만 바뀝니다 — 비밀번호를 묻지 않습니다)
+docker compose exec louver louver-server --create-user <운영자-메일> --plan owner
+
+# 확인
+docker compose exec louver louver-server --audit-storage
+```
+
+`--audit-storage` 에서 `owner` 줄의 저장·한파일은 **`무제한`** 으로 나옵니다.
+
+| 열리는 것 | 열리지 않는 것 |
+|---|---|
+| 동시 송출, 방송 수, 저장 용량, 파일 크기 — 정책 천장 없음 | **기계의 인코딩 예산.** CCTV 방송은 CPU 코어를 먹으므로 전체 공용 한도가 그대로 적용됩니다 (2코어 = 동시 1개). 이 한도는 유료 고객까지 함께 지키는 것이라 의도적으로 건드리지 않았습니다 |
+| 예약 송출, 우선 복구, CCTV | **디스크 바닥(`DISK_FLOOR_BYTES`, 5GB).** 요금제가 무제한이어도 서버에 자리가 없으면 업로드는 거부됩니다. 디스크는 모두가 함께 씁니다 |
+| 결제 상태와 무관 (`billing_exempt`) — 운영자 계정은 `subscriptions` 행 때문에 꺼지지 않습니다 | 계정 연결·YouTube 채널 수는 **원래 한도가 없었습니다**. 바뀐 것이 없습니다 |
+
+주의할 점 두 가지.
+
+* **판매되지 않습니다.** `active: false` 이므로 `/api/plans` 와 요금제 페이지에는 계속
+  파는 셋(Basic·Pro·Business)만 나옵니다. 고객이 고를 수 있는 선택지가 되지 않습니다.
+* **동시 송출을 실제로 많이 켜면 기계가 먼저 죽습니다.** 정책 천장이 없어진 것이지
+  2코어가 늘어난 것이 아닙니다. 스트림 복사는 싸지만 공짜가 아니고, 운영 서버에는
+  이미 FFmpeg 이 여러 개 돌고 있습니다. 한 번에 올릴 때는 `--diagnose` 로 보면서
+  올리세요 — 여기서 넘어지면 **유료 고객 방송까지 같이 넘어집니다.**
+
 ---
 
 ## 5. 자주 있는 장애

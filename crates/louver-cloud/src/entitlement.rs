@@ -32,6 +32,43 @@ pub const SCHEDULING_ENABLED: &str = "scheduling_enabled";
 /// which a grant may raise; this one is not, because a free trial is a trial of
 /// the service and not of a feature a plan is sold for.
 pub const CCTV_ENABLED: &str = "cctv_enabled";
+/// This plan's entitlements do not depend on a payment.
+///
+/// Every customer plan is switched off when the `subscriptions` row stops
+/// saying `active` — that is what makes a month of service a month of service.
+/// The account that runs the service is not a customer of it: nobody is going
+/// to renew a subscription on its behalf, and a billing state quietly capping
+/// the operator's own account is a failure nobody would think to look for.
+///
+/// Absent from every other plan, and absent means zero means "bill it", so no
+/// existing account's behaviour moves.
+pub const BILLING_EXEMPT: &str = "billing_exempt";
+
+/// A byte limit that is not a limit.
+///
+/// 1 PiB. Not `i64::MAX`, for two reasons. These values are summed —
+/// [`CloudDb::check_upload_allowed`] adds what is stored to what is arriving —
+/// and a number at the top of the range makes that arithmetic a question about
+/// overflow rather than about storage. And they are printed as GB, where
+/// `i64::MAX` reads as nine billion of them.
+///
+/// A petabyte is two thousand times the disk this runs on, so what actually
+/// stops an upload is [`crate::ingest::DISK_FLOOR_BYTES`] — the physical floor,
+/// counted across every account. That is the honest shape of "unlimited": there
+/// is no policy ceiling, there is only a disk.
+pub const UNLIMITED_BYTES: i64 = 1 << 50;
+
+/// A count limit that is not a limit.
+///
+/// Large enough that nothing reaches it, small enough to add to another number
+/// without thinking about it.
+///
+/// It does **not** lift the machine's encoder ceiling. That ceiling is counted
+/// across every account, because the CPU is not divided between them, and it is
+/// what stops one account's cameras from stuttering everybody else's
+/// broadcasts — including the paying ones. A plan says what an account is
+/// *entitled* to; it cannot say what the hardware can do.
+pub const UNLIMITED_COUNT: i64 = 100_000;
 
 /// Overrides how many broadcasts this machine will encode at once.
 pub const ENCODING_BUDGET_ENV: &str = "LOUVER_MAX_ENCODING_STREAMS";
