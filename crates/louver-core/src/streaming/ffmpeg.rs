@@ -442,15 +442,48 @@ pub struct FfmpegCommandBuilder {
     tools: FfmpegTools,
     profile: OutputProfile,
     encoder: String,
+    prepare_threads: usize,
+}
+
+/// How many threads a *preparation* encode may use.
+///
+/// One fewer than the machine has, and never zero.
+///
+/// `ingest::MAX_PREPARING_AT_ONCE` is 1 so that converting an upload cannot
+/// take the machine away from the broadcasts that are on air, and its comment
+/// says that one at a time "keeps a core free". It did not. x264 sizes its own
+/// thread pool from the core count and ignores how many of its siblings exist,
+/// so a single conversion was measured at **154% CPU on the two-core server** —
+/// three quarters of the machine, with fourteen live broadcasts sharing what
+/// was left. Limiting one conversion to one thread is what makes the promise
+/// true, and it is one argument.
+///
+/// Only preparation is limited. A live CCTV broadcast encodes in real time and
+/// has to keep up with the clock; starving it would turn a throughput problem
+/// into a dropped stream.
+pub fn preparation_threads() -> usize {
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(2).saturating_sub(1).max(1)
 }
 
 impl FfmpegCommandBuilder {
     pub fn new(tools: FfmpegTools, profile: OutputProfile) -> Self {
-        Self { tools, profile, encoder: "libx264".to_string() }
+        Self {
+            tools,
+            profile,
+            encoder: "libx264".to_string(),
+            prepare_threads: preparation_threads(),
+        }
     }
 
     pub fn with_encoder(mut self, encoder: impl Into<String>) -> Self {
         self.encoder = encoder.into();
+        self
+    }
+
+    /// Override the preparation thread cap. For tests, which must not depend on
+    /// how many cores the machine running them happens to have.
+    pub fn with_prepare_threads(mut self, n: usize) -> Self {
+        self.prepare_threads = n.max(1);
         self
     }
 
@@ -616,6 +649,8 @@ impl FfmpegCommandBuilder {
         if encode_video {
             a.extend(self.video_encode_args());
             a.extend(["-r".into(), p.fps().to_string(), "-fps_mode".into(), "cfr".into()]);
+            // The one thing that keeps this off the broadcasts' cores.
+            a.extend(["-threads".into(), self.prepare_threads.to_string()]);
         } else {
             a.extend(["-c:v".into(), "copy".into()]);
         }
@@ -744,6 +779,9 @@ impl FfmpegCommandBuilder {
             "-fps_mode".into(),
             "passthrough".into(),
         ]);
+        // Also a preparation, so also capped: this runs while other people's
+        // broadcasts are on air, and nothing about it is urgent.
+        a.extend(["-threads".into(), self.prepare_threads.to_string()]);
         a.extend(["-video_track_timescale".into(), p.video_timescale().to_string()]);
         if encode_audio {
             a.extend([
@@ -1114,6 +1152,74 @@ mod tests {
 
     fn pairs(args: &[String]) -> Vec<(String, String)> {
         args.windows(2).map(|w| (w[0].clone(), w[1].clone())).collect()
+    }
+
+    /// A preparation encode is capped; a live one is not.
+    ///
+    /// The two are the same encoder behind the same builder, so the only thing
+    /// keeping them apart is this. Getting it backwards would either starve the
+    /// broadcasts (no cap on preparation) or make a live CCTV encode miss the
+    /// clock (a cap on the live path), and both read as "video is broken" from
+    /// the outside.
+    #[test]
+    fn a_preparation_encode_leaves_a_core_for_the_broadcasts() {
+        let b = builder().with_prepare_threads(1);
+        let a = b.build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/out.mp4"),
+            12.0,
+            true,
+            &plan(StreamPlan::Encode, StreamPlan::Encode),
+        );
+        assert!(
+            pairs(&a).contains(&("-threads".into(), "1".into())),
+            "변환 인코딩은 코어를 다 가져가면 안 됩니다: {a:?}"
+        );
+    }
+
+    #[test]
+    fn a_remux_has_nothing_to_limit() {
+        let a = builder().with_prepare_threads(1).build_normalize_args(
+            Path::new("/in.mp4"),
+            Path::new("/out.mp4"),
+            12.0,
+            true,
+            &plan(StreamPlan::Copy, StreamPlan::Copy),
+        );
+        assert!(
+            !a.iter().any(|x| x == "-threads"),
+            "복사에는 인코더가 없으므로 스레드 제한도 의미가 없습니다: {a:?}"
+        );
+    }
+
+    #[test]
+    fn a_live_broadcast_is_never_capped() {
+        let b = builder().with_prepare_threads(1);
+        for a in [
+            b.build_stream_args(
+                Path::new("/m.txt"),
+                "rtmps://x/live2/k",
+                StreamMode::CompatibilityEncode,
+                true,
+            ),
+            b.build_live_video_stream_args(
+                Path::new("/m.txt"),
+                "https://example.com/cam.m3u8",
+                "rtmps://x/live2/k",
+                true,
+            ),
+        ] {
+            assert!(
+                !a.iter().any(|x| x == "-threads"),
+                "라이브 인코딩은 시계를 따라가야 합니다. 제한하면 끊깁니다: {a:?}"
+            );
+        }
+    }
+
+    /// Never zero, whatever the machine says.
+    #[test]
+    fn the_cap_is_at_least_one_thread() {
+        assert!(preparation_threads() >= 1);
     }
 
     #[test]

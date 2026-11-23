@@ -44,9 +44,15 @@ pub const DISK_FLOOR_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// profile, a full encode. On the two-core server this runs on, an unbounded
 /// thread per upload means a user who selects ten files starts ten encoders and
 /// takes the CPU away from the broadcasts that are on air — the one thing that
-/// must not happen, because those are what the service is. One at a time keeps
-/// a core free; the queue is the price, and it is paid at upload rather than on
-/// air.
+/// must not happen, because those are what the service is. The queue is the
+/// price, and it is paid at upload rather than on air.
+///
+/// One at a time is **half** of keeping a core free, and for a long time this
+/// comment claimed it was all of it. It is not: x264 sizes its own thread pool
+/// from the core count, so one conversion took 154% CPU on the two-core server
+/// while fourteen broadcasts shared the rest. The other half is
+/// `ffmpeg::preparation_threads`, which caps a preparation encode at one fewer
+/// thread than the machine has. Both are needed; neither works alone.
 pub const MAX_PREPARING_AT_ONCE: usize = 1;
 
 /// How much of a live-normalized file to read back when checking its keyframes.
