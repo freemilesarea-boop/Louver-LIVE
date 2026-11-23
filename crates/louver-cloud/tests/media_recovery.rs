@@ -130,6 +130,100 @@ fn a_playlist_whose_conversion_failed_says_that_instead() {
     }
 }
 
+// -- the message names the file that has to go ---------------------------
+
+#[test]
+fn the_one_file_that_does_not_fit_is_named() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let u = user(&db);
+    // Four that agree exactly, and one that does not — the shape of the real
+    // case: five exports of the same material, one of them at another frame
+    // rate.
+    let same = "h264/1280x720/yuv420p/2/1/1/16384/CRC32:ea0f274c/aac/2ch@44100";
+    let mut items = Vec::new();
+    for i in 1..=4 {
+        let id = media_in(&db, &u, &format!("모음{i}.mp4"), MediaState::Ready);
+        shape(&db, &id, "direct", Some(same));
+        items.push(id);
+    }
+    let odd = media_in(&db, &u, "15프레임짜리.mp4", MediaState::Ready);
+    shape(&db, &odd, "direct", Some("h264/1280x720/yuv420p/15/1/1/16384/CRC32:ffffffff/aac/2ch@44100"));
+    items.push(odd);
+
+    let dest = db.create_destination(&u, "채널", "rtmps://a/live2", "••••").unwrap();
+    let b = db.create_broadcast(&u, "LIVE", &items[0], &dest.id, true).unwrap();
+    db.replace_items(
+        &u,
+        &b.id,
+        &items
+            .iter()
+            .map(|id| louver_cloud::db::NewItem {
+                media_id: id.clone(),
+                enabled: true,
+                repeat_count: 1,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    match db.check_playlist_joinable(&b.id) {
+        Err(CloudError::Invalid(m)) => {
+            assert!(
+                m.contains("15프레임짜리.mp4"),
+                "어느 영상이 문제인지 이름으로 말해야 합니다: {m}"
+            );
+            assert!(m.contains("빼면"), "뺄 수 있다는 걸 알려야 합니다: {m}");
+            assert!(
+                !m.contains("모음1.mp4"),
+                "멀쩡한 영상을 범인으로 지목하면 안 됩니다: {m}"
+            );
+        }
+        other => panic!("형식이 섞였으므로 거부되어야 합니다: {other:?}"),
+    }
+}
+
+#[test]
+fn a_playlist_where_everything_differs_does_not_blame_one_file() {
+    let db = CloudDb::open_in_memory().unwrap();
+    let u = user(&db);
+    let mut items = Vec::new();
+    for i in 1..=3 {
+        let id = media_in(&db, &u, &format!("제각각{i}.mp4"), MediaState::Ready);
+        shape(&db, &id, "direct", Some(&format!("h264/1280x720/{i}fps")));
+        items.push(id);
+    }
+    let dest = db.create_destination(&u, "채널", "rtmps://a/live2", "••••").unwrap();
+    let b = db.create_broadcast(&u, "LIVE", &items[0], &dest.id, true).unwrap();
+    db.replace_items(
+        &u,
+        &b.id,
+        &items
+            .iter()
+            .map(|id| louver_cloud::db::NewItem {
+                media_id: id.clone(),
+                enabled: true,
+                repeat_count: 1,
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+
+    match db.check_playlist_joinable(&b.id) {
+        Err(CloudError::Invalid(m)) => {
+            // There is no odd one out when they are all odd. Naming any of them
+            // would send the customer to delete a file that fixes nothing.
+            assert!(!m.contains("빼면"), "뺄 파일이 없는데 빼라고 하면 안 됩니다: {m}");
+            assert!(m.contains("형식이 모두 달라"), "{m}");
+            // Nothing is converting in this test, so nothing may claim to be.
+            assert!(
+                !m.contains("맞추는 중"),
+                "변환이 돌고 있지 않은데 돌고 있다고 하면 안 됩니다: {m}"
+            );
+        }
+        other => panic!("형식이 섞였으므로 거부되어야 합니다: {other:?}"),
+    }
+}
+
 #[test]
 fn a_joinable_playlist_is_still_allowed() {
     let db = CloudDb::open_in_memory().unwrap();

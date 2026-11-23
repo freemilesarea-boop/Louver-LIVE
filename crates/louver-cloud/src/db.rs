@@ -2093,10 +2093,125 @@ impl CloudDb {
         if all_canonical || all_same_native {
             return Ok(());
         }
-        Err(CloudError::Invalid(
-            "플레이리스트의 영상 형식이 서로 달라 아직 방송할 수 없습니다.              영상을 방송 형식으로 맞추는 중이며, 끝나면 시작할 수 있습니다."
-                .into(),
+        Err(CloudError::Invalid(self.explain_unjoinable(&shapes)?))
+    }
+
+    /// Say which file is the odd one out, by name.
+    ///
+    /// The message this replaces said only that the formats differed and that
+    /// something was being done about it. Both true, and together useless: the
+    /// customer could not tell which of their five videos caused it, so the
+    /// only move left was to wait hours for every one of them to be re-encoded.
+    ///
+    /// In the case that prompted this, four of the five files were byte for
+    /// byte compatible and the fifth was the same video at a different frame
+    /// rate. Removing that one file would have started the broadcast at once,
+    /// with nothing converted and nothing added to their storage. Nobody could
+    /// have known that, because nothing said it.
+    ///
+    /// So: group the items by what they can join with, take the largest group
+    /// as the playlist's format, and name what falls outside it.
+    fn explain_unjoinable(&self, shapes: &[(String, String, Option<String>)]) -> Result<String> {
+        // Both facts matter and neither replaces the other: a conversion really
+        // is under way, and the customer really can skip the whole wait by
+        // removing one file. Saying only the first is what left somebody
+        // waiting days; saying only the second would hide work they have
+        // already started paying for.
+        let converting = self.any_item_preparing(shapes)?;
+        let head = if converting { "영상을 방송 형식으로 맞추는 중입니다. " } else { "" };
+        // What an item can be joined with. Canonical files are interchangeable
+        // with each other; a native file only with one of exactly its own
+        // shape, and one whose shape was never recorded with nothing at all.
+        let key = |(id, mode, sig): &(String, String, Option<String>)| -> String {
+            if mode == "canonical" {
+                "canonical".to_string()
+            } else {
+                sig.clone().unwrap_or_else(|| format!("알 수 없음:{id}"))
+            }
+        };
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for sh in shapes {
+            *counts.entry(key(sh)).or_insert(0) += 1;
+        }
+        let biggest = counts.iter().max_by_key(|(_, n)| **n).map(|(k, n)| (k.clone(), *n));
+        let Some((majority, majority_n)) = biggest else {
+            return Ok("플레이리스트의 영상 형식을 확인할 수 없습니다.".into());
+        };
+
+        let odd: Vec<&(String, String, Option<String>)> =
+            shapes.iter().filter(|sh| key(sh) != majority).collect();
+
+        // Two items that disagree have no majority, but they do have a cure:
+        // either one of them. Worth saying, because it is still one click
+        // rather than hours of re-encoding.
+        if shapes.len() == 2 && majority_n == 1 {
+            return Ok(format!(
+                "{head}두 영상의 형식이 서로 달라 이어서 방송할 수 없습니다. \
+                 둘 중 하나를 플레이리스트에서 빼면 기다리지 않고 바로 방송할 수 있습니다."
+            ));
+        }
+
+        // No majority worth naming: every file differs from every other, so
+        // there is no single one to remove and the only way through is the
+        // conversion.
+        if majority_n == 1 || odd.is_empty() {
+            return Ok(format!(
+                "플레이리스트의 영상 {}개가 서로 형식이 모두 달라 이어서 방송할 수 없습니다. \
+                 {}",
+                shapes.len(),
+                if converting {
+                    "영상을 방송 형식으로 맞추는 중이며, 끝나면 시작할 수 있습니다."
+                } else {
+                    "영상을 방송 형식으로 맞춰야 시작할 수 있습니다."
+                }
+            ));
+        }
+
+        let names = self.filenames_of(odd.iter().map(|(id, _, _)| id.as_str()))?;
+        let shown = names.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+        let more = if names.len() > 3 { format!(" 외 {}개", names.len() - 3) } else { String::new() };
+        Ok(format!(
+            "{head}영상 {}개 중 {}개만 형식이 다릅니다 ({shown}{more}). \
+             그 영상을 플레이리스트에서 빼면 기다리지 않고 바로 방송할 수 있습니다. \
+             그대로 두려면 영상 {}개를 모두 변환해야 하고, 오래 걸리며 저장 공간도 더 씁니다.",
+            shapes.len(),
+            odd.len(),
+            shapes.len()
         ))
+    }
+
+    /// Is any item in this playlist being converted right now?
+    fn any_item_preparing(&self, shapes: &[(String, String, Option<String>)]) -> Result<bool> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        for (id, _, _) in shapes {
+            let state: Option<String> = guard
+                .query_row("SELECT state FROM media WHERE id=?1", [id], |r| r.get(0))
+                .optional()?;
+            if matches!(state.as_deref(), Some(s)
+                if s == crate::MediaState::Preparing.id() || s == crate::MediaState::Analysing.id())
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Filenames for a set of media ids, in the order given, skipping any that
+    /// no longer exist.
+    fn filenames_of<'a>(&self, ids: impl Iterator<Item = &'a str>) -> Result<Vec<String>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(name) = guard
+                .query_row("SELECT filename FROM media WHERE id=?1", [id], |r| r.get::<_, String>(0))
+                .optional()?
+            {
+                out.push(name);
+            }
+        }
+        Ok(out)
     }
 
     /// The first item in a playlist whose preparation failed, and why.

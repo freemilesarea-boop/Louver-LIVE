@@ -910,7 +910,12 @@ fn a_playlist_whose_items_cannot_be_joined_never_reaches_ffmpeg() {
     let id = e.broadcast("섞인 방송", &[a, b], true);
 
     let refused = e.mgr.start(&e.user, &id).unwrap_err();
-    assert!(refused.to_string().contains("영상 형식이 서로 달라"), "{refused}");
+    // The wording is the message's own business — it now names the file that
+    // has to go, which it did not before. What this test is about is that the
+    // refusal happens and says it is about formats.
+    let said = refused.to_string();
+    assert!(said.contains("형식"), "거부 사유는 형식 불일치여야 합니다: {said}");
+    assert!(said.contains("방송할 수 없습니다"), "{said}");
     assert_eq!(e.rec.launches(), 0, "an unjoinable playlist reached FFmpeg");
 
     // And recovery holds the same line, where nobody is watching.
