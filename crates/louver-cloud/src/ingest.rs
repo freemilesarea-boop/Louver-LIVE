@@ -673,6 +673,40 @@ impl Ingest {
         Ok(queued)
     }
 
+    /// Pick up preparations that a restart interrupted.
+    ///
+    /// `in_flight` lives in memory. A deploy, a crash or a reboot throws it
+    /// away, but `media.state` is in the database and still says `preparing` —
+    /// so the row reads as work in progress that nobody is doing. Nothing ever
+    /// looked at it again: `prepare` is called by the upload that created the
+    /// row and by `ensure_playlist_compatible` when a playlist is saved, and
+    /// neither happens on its own. The file sat there, and the customer's
+    /// screen went on saying 맞추는 중 for ever.
+    ///
+    /// That is what this fixes. Called once at startup, beside the broadcast
+    /// recovery that already existed for the same reason.
+    ///
+    /// `MAX_PREPARING_AT_ONCE` still applies, so a server that comes up with
+    /// twenty interrupted files does not start twenty encoders: they queue on
+    /// the slot exactly as uploads do, and the broadcasts on air keep their
+    /// core.
+    ///
+    /// Returns how many were re-queued.
+    pub fn resume_interrupted(&self) -> Result<usize> {
+        let ids = self.db.media_needing_preparation()?;
+        for id in &ids {
+            println!("[louver] media {}: 중단된 준비를 이어서 합니다", &id[..8.min(id.len())]);
+            let this = self.clone();
+            let id = id.clone();
+            std::thread::spawn(move || {
+                if let Err(e) = this.prepare(&id) {
+                    let _ = this.db.record_media_failed(&id, &e.to_string());
+                }
+            });
+        }
+        Ok(ids.len())
+    }
+
     /// What was done, for the log and for §22's costing.
     pub fn describe_plan(&self, media_id: &str) -> Result<String> {
         let m = self

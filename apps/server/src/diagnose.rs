@@ -53,6 +53,7 @@ pub fn run() -> std::process::ExitCode {
         "디스크   : 여유 {free}MB (업로드 차단 기준 {floor}MB){}",
         if free != 0 && free < floor { "  ← 업로드가 거부됩니다" } else { "" }
     );
+    preparations(&db);
     cameras(&db);
     youtube_configuration();
     accounts(&db, keys.as_ref());
@@ -170,6 +171,27 @@ pub fn run() -> std::process::ExitCode {
 /// Presence only. §15: the client secret is never printed, and the line says so
 /// explicitly rather than leaving a reader to wonder whether it was omitted or
 /// simply missing.
+/// Uploads being converted, and how long they have been at it.
+///
+/// Worth its own line because the work is slow and serialized:
+/// `MAX_PREPARING_AT_ONCE` is 1, so every customer's conversions share one
+/// slot, and a single long file blocks the queue for over an hour. A row that
+/// has sat for many hours is either a very long video or a conversion that was
+/// interrupted and never picked up — and before `resume_interrupted` existed,
+/// the second kind stayed that way for ever while the customer's screen said
+/// 맞추는 중.
+fn preparations(db: &CloudDb) {
+    let Ok(rows) = db.preparations_in_progress() else { return };
+    if rows.is_empty() {
+        return;
+    }
+    println!("영상 준비 : {}개 대기/진행 중 (한 번에 1개씩만 돕니다)", rows.len());
+    for (email, filename, state, mins) in rows.iter().take(10) {
+        let note = if *mins > 360 { "  ← 6시간 넘음, 확인 필요" } else { "" };
+        println!("           {email}  {filename}  [{state}]  {mins}분째{note}");
+    }
+}
+
 /// The camera catalogue, and how much of it has gone stale.
 ///
 /// Worth a line of its own because the failure is silent. A Korean address

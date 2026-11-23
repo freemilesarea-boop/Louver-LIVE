@@ -909,6 +909,18 @@ async fn main() -> std::process::ExitCode {
         Err(e) => eprintln!("[louver] 복구 실패: {e}"),
     }
 
+    // The same reason, one layer down. A broadcast is recovered from
+    // `desired_state`; a half-finished conversion has no equivalent, because
+    // the only record that it was running lived in this process's memory. So a
+    // deploy in the middle of a two-hour encode left the file as 준비 중 with
+    // nobody preparing it, and the customer waited for something that was never
+    // going to happen.
+    match app.ingest.resume_interrupted() {
+        Ok(n) if n > 0 => println!("[louver] 중단된 영상 준비 {n}개를 이어서 합니다"),
+        Ok(_) => {}
+        Err(e) => eprintln!("[louver] 중단된 영상 준비를 확인하지 못했습니다: {e}"),
+    }
+
     // §8: the clock is watched by the server, not by a browser. It holds no
     // state, so it needs nothing from recovery.
     let _scheduler = app.mgr.spawn_scheduler();

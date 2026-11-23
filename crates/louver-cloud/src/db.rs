@@ -2069,6 +2069,19 @@ impl CloudDb {
         if shapes.len() < 2 {
             return Ok(());
         }
+        // Say which of the two it is before saying the playlist cannot be
+        // joined. The message below promises that something is being done, and
+        // for a file whose conversion *failed* that promise is false: the
+        // customer reads 맞추는 중 and waits for an encode that already gave up.
+        // One of them waited days.
+        if let Some((id, why)) = self.first_failed_item(&shapes)? {
+            return Err(CloudError::Invalid(format!(
+                "영상 하나를 방송 형식으로 바꾸지 못했습니다. 그 영상을 빼거나 다시 올려 주세요. \
+                 (영상 {}: {})",
+                &id[..8.min(id.len())],
+                why
+            )));
+        }
         // Only the canonical conversion makes files that are interchangeable
         // with each other. `direct`, `hybrid` and `live_normalize` all keep
         // something of the source, so two of those agree only when their
@@ -2084,6 +2097,79 @@ impl CloudDb {
             "플레이리스트의 영상 형식이 서로 달라 아직 방송할 수 없습니다.              영상을 방송 형식으로 맞추는 중이며, 끝나면 시작할 수 있습니다."
                 .into(),
         ))
+    }
+
+    /// The first item in a playlist whose preparation failed, and why.
+    ///
+    /// `None` when every item is either ready or still being worked on, which
+    /// is the case the "being converted" message is honest about.
+    fn first_failed_item(
+        &self,
+        shapes: &[(String, String, Option<String>)],
+    ) -> Result<Option<(String, String)>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        for (id, _, _) in shapes {
+            let row: Option<(String, Option<String>)> = guard
+                .query_row("SELECT state, last_error FROM media WHERE id=?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .optional()?;
+            if let Some((state, err)) = row {
+                if state == crate::MediaState::Failed.id() {
+                    return Ok(Some((
+                        id.clone(),
+                        err.unwrap_or_else(|| "원인이 기록되지 않았습니다".into()),
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Media the database says is being worked on, when nothing is.
+    ///
+    /// `preparing` and `analysing` are both "a thread is on this" — and the
+    /// only record of that thread is `Ingest::in_flight`, which is memory. A
+    /// restart throws it away and leaves these rows with nobody behind them.
+    /// Read at startup by `Ingest::resume_interrupted`.
+    ///
+    /// Oldest first, so a file that has been waiting longest goes first through
+    /// the one preparation slot.
+    pub fn media_needing_preparation(&self) -> Result<Vec<String>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard
+            .prepare("SELECT id FROM media WHERE state IN (?1, ?2) ORDER BY created_at, id")?;
+        let rows = st.query_map(
+            params![crate::MediaState::Preparing.id(), crate::MediaState::Analysing.id()],
+            |r| r.get::<_, String>(0),
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Media that is being prepared, with who owns it and how long it has sat.
+    ///
+    /// `(email, filename, state, minutes_waiting)`. For `--diagnose`: a
+    /// conversion is hours of work behind a single slot, so "is anything stuck"
+    /// is a question an operator has to be able to ask without opening the
+    /// database — it is how the one customer who waited days would have been
+    /// found on the first day.
+    pub fn preparations_in_progress(&self) -> Result<Vec<(String, String, String, i64)>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare(
+            "SELECT u.email, m.filename, m.state,
+                    CAST((julianday('now') - julianday(m.created_at)) * 1440 AS INTEGER)
+               FROM media m JOIN users u ON u.id = m.user_id
+              WHERE m.state IN (?1, ?2)
+              ORDER BY m.created_at, m.id",
+        )?;
+        let rows = st.query_map(
+            params![crate::MediaState::Preparing.id(), crate::MediaState::Analysing.id()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     pub fn record_media_failed(&self, id: &str, why: &str) -> Result<()> {
