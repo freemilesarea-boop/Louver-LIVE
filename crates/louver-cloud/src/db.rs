@@ -2127,6 +2127,29 @@ impl CloudDb {
         Ok(None)
     }
 
+    /// How many media are in each prepared shape.
+    ///
+    /// `(mode, count)` with the rows that have no mode recorded counted as
+    /// `기록 없음`. That bucket is the whole story behind "why only new users":
+    /// `prepared_mode` arrived as an added column, every row older than it is
+    /// NULL, and `playlist_shapes` reads NULL as canonical — so an old
+    /// account's playlist is uniformly canonical and always joinable, while a
+    /// new account's is whatever each file actually is and joins only when
+    /// every one of them matches byte for byte.
+    ///
+    /// Printed by `--diagnose` so that question is answered by counting rather
+    /// than by argument.
+    pub fn media_shape_counts(&self) -> Result<Vec<(String, i64)>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare(
+            "SELECT COALESCE(prepared_mode, '기록 없음'), COUNT(*)
+               FROM media GROUP BY 1 ORDER BY 2 DESC",
+        )?;
+        let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     /// Media the database says is being worked on, when nothing is.
     ///
     /// `preparing` and `analysing` are both "a thread is on this" — and the

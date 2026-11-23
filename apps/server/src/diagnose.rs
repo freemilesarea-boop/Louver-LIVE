@@ -53,6 +53,7 @@ pub fn run() -> std::process::ExitCode {
         "디스크   : 여유 {free}MB (업로드 차단 기준 {floor}MB){}",
         if free != 0 && free < floor { "  ← 업로드가 거부됩니다" } else { "" }
     );
+    media_shapes(&db);
     preparations(&db);
     cameras(&db);
     youtube_configuration();
@@ -180,6 +181,22 @@ pub fn run() -> std::process::ExitCode {
 /// interrupted and never picked up — and before `resume_interrupted` existed,
 /// the second kind stayed that way for ever while the customer's screen said
 /// 맞추는 중.
+fn media_shapes(db: &CloudDb) {
+    let Ok(rows) = db.media_shape_counts() else { return };
+    if rows.is_empty() {
+        return;
+    }
+    let total: i64 = rows.iter().map(|(_, n)| n).sum();
+    let line =
+        rows.iter().map(|(m, n)| format!("{m} {n}")).collect::<Vec<_>>().join(", ");
+    println!("영상 형식 : {total}개 — {line}");
+    // The legacy rows are the ones that never hit the mixed-playlist wall, and
+    // saying so here saves the next person the investigation.
+    if rows.iter().any(|(m, _)| m == "기록 없음") {
+        println!("           (기록 없음 = canonical 로 간주되어 서로 항상 이어붙습니다)");
+    }
+}
+
 fn preparations(db: &CloudDb) {
     let Ok(rows) = db.preparations_in_progress() else { return };
     if rows.is_empty() {
