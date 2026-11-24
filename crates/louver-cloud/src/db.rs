@@ -713,6 +713,21 @@ impl CloudDb {
             // NULL means the URL was typed by hand and is nobody else's to
             // change, which is how every row from the previous release reads.
             ("cctv_source_id", "TEXT"),
+            // Set when a file this broadcast plays has been prepared again and
+            // now lives at a different path.
+            //
+            // A running broadcast holds the paths it was started with: the
+            // manifest is written once at START and FFmpeg has the files open.
+            // Re-preparing a file underneath it therefore changes nothing on
+            // air — the old file keeps playing, for ever, because nothing asks
+            // the question again. This column is how the preparation tells the
+            // scheduler to restart it, which is the only way the new file gets
+            // on air.
+            //
+            // A flag and not a timestamp because it is a one-shot: the
+            // scheduler clears it as it takes it, so a restart that fails is
+            // not retried in a loop every thirty seconds.
+            ("needs_restart", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             ensure_column(&conn, "broadcasts", column, decl)?;
         }
@@ -2316,6 +2331,82 @@ impl CloudDb {
             params![id, MediaState::Failed.id(), why],
         )?;
         Ok(())
+    }
+
+    /// Ready media on a stream-copy path, with the file a broadcast would send.
+    ///
+    /// `(media_id, email, filename, prepared_path)`.
+    ///
+    /// Only the copy paths. Those are the files whose own keyframe spacing
+    /// reaches YouTube untouched, because `-c copy` passes it through; anything
+    /// that went through an encode came out with a regular spacing by
+    /// construction. A row with no recorded mode is *not* included: it predates
+    /// the column, and every such file came out of the one canonical encode —
+    /// the same reading [`Self::playlist_shapes`] takes.
+    pub fn copy_path_media(&self) -> Result<Vec<(String, String, String, String)>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let mut st = guard.prepare(
+            "SELECT m.id, u.email, m.filename, m.prepared_path
+               FROM media m JOIN users u ON u.id = m.user_id
+              WHERE m.state = ?1
+                AND m.prepared_path IS NOT NULL
+                AND m.prepared_mode IN ('direct', 'hybrid')
+              ORDER BY m.created_at, m.id",
+        )?;
+        let rows = st.query_map(params![MediaState::Ready.id()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Ask the scheduler to restart every broadcast that plays this media.
+    ///
+    /// Returns the broadcast ids flagged, for the log line.
+    ///
+    /// Both ways a broadcast names a file are covered: the playlist rows, and
+    /// the single `broadcasts.media_id` of one that never had a playlist.
+    pub fn flag_broadcasts_for_restart(&self, media_id: &str) -> Result<Vec<String>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let ids: Vec<String> = {
+            let mut st = guard.prepare(
+                "SELECT DISTINCT b.id
+                   FROM broadcasts b
+                   LEFT JOIN broadcast_items i ON i.broadcast_id = b.id
+                  WHERE i.media_id = ?1 OR b.media_id = ?1
+                  ORDER BY b.id",
+            )?;
+            let found =
+                st.query_map([media_id], |r| r.get(0))?.collect::<std::result::Result<Vec<_>, _>>()?;
+            found
+        };
+        for id in &ids {
+            guard.execute("UPDATE broadcasts SET needs_restart=1 WHERE id=?1", [id])?;
+        }
+        Ok(ids)
+    }
+
+    /// Broadcasts that asked to be restarted, clearing the flag as they are taken.
+    ///
+    /// `(broadcast_id, user_id)`. Cleared on the way out, so a restart that
+    /// fails is reported once instead of being attempted again every thirty
+    /// seconds for the life of the process.
+    pub fn take_broadcasts_needing_restart(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.raw();
+        let guard = conn.lock().unwrap();
+        let rows: Vec<(String, String)> = {
+            let mut st = guard
+                .prepare("SELECT id, user_id FROM broadcasts WHERE needs_restart = 1 ORDER BY id")?;
+            let found = st
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            found
+        };
+        if !rows.is_empty() {
+            guard.execute("UPDATE broadcasts SET needs_restart=0 WHERE needs_restart=1", [])?;
+        }
+        Ok(rows)
     }
 
     pub fn set_media_state(&self, id: &str, state: MediaState) -> Result<()> {

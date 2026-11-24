@@ -159,7 +159,18 @@ pub fn parse_probe_json(json: &str) -> Result<MediaInfo> {
 /// Lines look like `1.234000,K__` — the timestamp, then the flags, where `K`
 /// marks a keyframe. Returns `None` when fewer than two keyframes were seen,
 /// which says nothing either way and must not be held against the file.
-pub fn max_keyframe_gap(csv: &str) -> Option<f64> {
+/// `covered_secs` is how much of the file this CSV covers: the probe window,
+/// or the whole file when it is shorter.
+///
+/// One keyframe inside a window that was read in full is not a failed
+/// measurement — it is the strongest evidence there is that the gap is at least
+/// as wide as the window, so it is reported as that lower bound. Treating it as
+/// "unmeasured" let exactly the worst sources through the guard: the longer a
+/// file's keyframe interval, the fewer keyframes the window holds, and past one
+/// window there is only ever the first.
+///
+/// `None` still means nothing was measured — no keyframe parsed at all.
+pub fn max_keyframe_gap(csv: &str, covered_secs: f64) -> Option<f64> {
     let mut keys: Vec<f64> = Vec::new();
     for line in csv.lines() {
         let mut parts = line.trim().split(',');
@@ -171,24 +182,54 @@ pub fn max_keyframe_gap(csv: &str) -> Option<f64> {
             keys.push(t);
         }
     }
-    if keys.len() < 2 {
-        return None;
+    match keys.len() {
+        0 => None,
+        1 => Some(covered_secs.max(0.0)),
+        _ => {
+            keys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            keys.windows(2)
+                .map(|w| w[1] - w[0])
+                .fold(None, |m: Option<f64>, g| Some(m.map_or(g, |m| m.max(g))))
+        }
     }
-    keys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    keys.windows(2).map(|w| w[1] - w[0]).fold(None, |m: Option<f64>, g| Some(m.map_or(g, |m| m.max(g))))
+}
+
+/// How much of the file a `window_secs` keyframe probe actually saw.
+///
+/// A file shorter than the window is covered in full, and for a file that loops
+/// its own duration is the real gap between one keyframe and the next: the loop
+/// returns to the opening keyframe.
+fn covered_window_secs(window_secs: u32, duration_secs: f64) -> f64 {
+    let window = f64::from(window_secs);
+    if duration_secs.is_finite() && duration_secs > 0.0 {
+        window.min(duration_secs)
+    } else {
+        window
+    }
 }
 
 /// Measure the source's keyframe spacing over its opening seconds.
 ///
+/// `duration_secs` bounds the window, so that a file shorter than it is not
+/// reported as having a gap wider than the file.
+///
 /// Errors are not failures: an unreadable index means "not measured", and the
-/// planner treats that as no objection rather than inventing one.
-pub fn probe_max_keyframe_gap(builder: &FfmpegCommandBuilder, path: &Path, window_secs: u32) -> Option<f64> {
+/// planner treats that as no objection rather than inventing one. A window read
+/// successfully but holding a single keyframe is measured, not unreadable — see
+/// [`max_keyframe_gap`].
+pub fn probe_max_keyframe_gap(
+    builder: &FfmpegCommandBuilder,
+    path: &Path,
+    window_secs: u32,
+    duration_secs: f64,
+) -> Option<f64> {
     let args = builder.build_keyframe_probe_args(path, window_secs);
     let out = builder.probe_command(&args).output().ok()?;
     if !out.status.success() {
         return None;
     }
-    max_keyframe_gap(&String::from_utf8_lossy(&out.stdout))
+    let covered = covered_window_secs(window_secs, duration_secs);
+    max_keyframe_gap(&String::from_utf8_lossy(&out.stdout), covered)
 }
 
 /// What a prepared file actually *is*, in exactly the detail that decides
@@ -837,14 +878,40 @@ mod tests {
     fn keyframe_gaps_are_read_out_of_ffprobe_packet_output() {
         // Real shape: pts_time,flags — K marks a keyframe.
         let csv = "0.000000,K__\n0.033333,__\n2.000000,K__\n2.033333,__\n7.000000,K__\n";
-        assert_eq!(max_keyframe_gap(csv), Some(5.0));
+        assert_eq!(max_keyframe_gap(csv, 60.0), Some(5.0));
+    }
+
+    /// The case that took two days of a customer's broadcast to find: a 2 fps
+    /// slideshow exported at the encoder's default 250-frame keyint has one
+    /// keyframe every 125 seconds, so a 60-second window holds exactly one.
+    /// Reported as nothing measured, it was stream-copied straight to YouTube.
+    #[test]
+    fn one_keyframe_in_a_full_window_is_a_gap_at_least_that_wide() {
+        assert_eq!(max_keyframe_gap("0.023010,K__\n0.523010,__\n", 60.0), Some(60.0));
+        assert!(max_keyframe_gap("0.023010,K__\n", 60.0).is_some_and(|g| g > OutputProfile::P1080p30.max_copy_gop_secs()));
     }
 
     #[test]
-    fn one_keyframe_alone_says_nothing_about_spacing() {
-        assert_eq!(max_keyframe_gap("0.000000,K__\n0.033333,__\n"), None);
-        assert_eq!(max_keyframe_gap(""), None);
-        assert_eq!(max_keyframe_gap("garbage\nlines\n"), None);
+    fn a_file_shorter_than_the_window_is_only_blamed_for_its_own_length() {
+        // One keyframe in a 3-second file loops to a keyframe every 3 seconds,
+        // which is inside the limit. Nothing to re-encode.
+        assert_eq!(max_keyframe_gap("0.000000,K__\n", 3.0), Some(3.0));
+        assert!(max_keyframe_gap("0.000000,K__\n", 3.0).is_some_and(|g| g <= OutputProfile::P1080p30.max_copy_gop_secs()));
+    }
+
+    #[test]
+    fn the_window_is_bounded_by_the_file_but_survives_a_missing_duration() {
+        assert_eq!(covered_window_secs(60, 3.5), 3.5);
+        assert_eq!(covered_window_secs(60, 900.0), 60.0);
+        assert_eq!(covered_window_secs(60, 0.0), 60.0);
+        assert_eq!(covered_window_secs(60, f64::NAN), 60.0);
+    }
+
+    #[test]
+    fn no_keyframe_at_all_is_still_unmeasured() {
+        assert_eq!(max_keyframe_gap("", 60.0), None);
+        assert_eq!(max_keyframe_gap("garbage\nlines\n", 60.0), None);
+        assert_eq!(max_keyframe_gap("0.000000,__\n0.033333,__\n", 60.0), None);
     }
 
     /// A file already produced by our own normalizer.

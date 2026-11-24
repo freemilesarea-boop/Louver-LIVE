@@ -56,7 +56,9 @@ pub fn plan_native(
 ) -> TranscodePlan {
     let mut video_reasons = crate::media::probe::video_native_copy_reasons(info, profile);
     if video_reasons.is_empty() {
-        if let Some(gop) = probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS) {
+        if let Some(gop) =
+            probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS, info.duration_secs)
+        {
             let limit = profile.max_copy_gop_secs();
             if gop > limit {
                 video_reasons.push(format!("키프레임 간격이 너무 깁니다 ({gop:.1}초 > {limit:.1}초)"));
@@ -323,7 +325,8 @@ pub fn plan_preparation(
     let audio = if audio_reasons.is_empty() { StreamPlan::Copy } else { StreamPlan::Encode };
 
     let limit = profile.max_copy_gop_secs();
-    let measured = probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS);
+    let measured =
+        probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS, info.duration_secs);
     if let Some(gop) = measured {
         if gop > limit {
             // The one thing a copy cannot fix that is not about the format: an
@@ -389,7 +392,7 @@ fn measured_gop(
     profile: OutputProfile,
 ) -> Option<f64> {
     if plan_transcode(info, profile, None).video.is_copy() {
-        probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS)
+        probe_max_keyframe_gap(builder, source, KEYFRAME_WINDOW_SECS, info.duration_secs)
     } else {
         None
     }

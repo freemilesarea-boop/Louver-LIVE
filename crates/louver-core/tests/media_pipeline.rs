@@ -15,7 +15,9 @@ mod common;
 use common::*;
 use louver_core::config::{OutputProfile, StreamMode};
 use louver_core::media::cache::MediaCache;
-use louver_core::media::normalize::{normalize_one, readiness_for, CancelToken};
+use louver_core::media::normalize::{
+    normalize_one, plan_preparation, readiness_for, CancelToken, PrepareMode,
+};
 use louver_core::media::probe::{
     check_compatibility, plan_transcode, probe, probe_max_keyframe_gap, Readiness,
 };
@@ -784,7 +786,11 @@ fn a_copied_file_and_an_encoded_one_concatenate_and_stream_copy_together() {
     let ready_info = probe(&b, &ready).unwrap();
     let odd_info = probe(&b, &odd).unwrap();
 
-    let ready_plan = plan_transcode(&ready_info, PROFILE, probe_max_keyframe_gap(&b, &ready, 60));
+    let ready_plan = plan_transcode(
+        &ready_info,
+        PROFILE,
+        probe_max_keyframe_gap(&b, &ready, 60, ready_info.duration_secs),
+    );
     assert!(ready_plan.is_remux(), "the conformant fixture should not be encoded: {ready_plan:?}");
     let odd_plan = plan_transcode(&odd_info, PROFILE, None);
     assert!(!odd_plan.video.is_copy(), "the odd fixture must still be encoded: {odd_plan:?}");
@@ -979,4 +985,98 @@ fn a_source_file_used_untouched_breaks_the_loop() {
 
     let remuxed = faults_for("remuxed", &prepared_raw.output_path);
     assert!(remuxed.is_empty(), "a remuxed conformant source must join cleanly:\n{}", remuxed.join("\n"),);
+}
+
+// ---------------------------------------------------------------------------
+// A 2 fps slideshow exported at the encoder's default keyint
+// ---------------------------------------------------------------------------
+
+/// The file that took two customers off the air: 1280x720 at two frames a
+/// second, `keyint=250`, so one keyframe every 125 seconds.
+///
+/// Everything else about it is copyable, which makes the keyframe measurement
+/// the only thing between it and a stream copy straight to YouTube. The
+/// measurement used to answer "not measured" for exactly this file, because a
+/// 60-second window holds a single keyframe and the gap finder needed two — so
+/// the longer a file's keyframe interval, the more certainly it escaped the
+/// guard. YouTube cuts HLS segments on keyframes; 125 seconds apart, a viewer
+/// gets a stream that plays, stalls, buffers, plays.
+#[test]
+fn a_two_fps_file_whose_only_keyframe_is_the_first_is_not_stream_copied() {
+    let tools = require_ffmpeg!();
+    let b = builder(tools.clone(), PROFILE);
+    let work = tempfile::tempdir().unwrap();
+
+    // Longer than the 60-second measuring window, and with no second keyframe
+    // anywhere in it: `-g` past the frame count, scene cuts switched off.
+    let src = work.path().join("slideshow.mp4");
+    let (code, err) = run_ffmpeg(
+        &tools,
+        &[
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=1280x720:rate=2:duration=70",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=70",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-profile:v",
+            "high",
+            "-level",
+            "3.1",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "1000",
+            "-keyint_min",
+            "1000",
+            "-sc_threshold",
+            "0",
+            "-r",
+            "2",
+            "-fps_mode",
+            "cfr",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-ar",
+            "48000",
+            "-ac",
+            "2",
+            "-movflags",
+            "+faststart",
+            src.to_str().unwrap(),
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect::<Vec<_>>(),
+    );
+    assert_eq!(code, 0, "fixture build failed: {err}");
+
+    let info = probe(&b, &src).expect("probe");
+    assert!((info.fps - 2.0).abs() < 0.01, "the fixture should be 2 fps, got {}", info.fps);
+
+    // One keyframe in a window read in full is a measurement, not a blank: the
+    // gap is at least as wide as the window.
+    assert_eq!(
+        probe_max_keyframe_gap(&b, &src, 60, info.duration_secs),
+        Some(60.0),
+        "one keyframe in a full window must report the window as the floor",
+    );
+
+    // And the planner has to act on it rather than copy the picture.
+    let prep = plan_preparation(&b, &src, &info, PROFILE, false);
+    assert_eq!(
+        prep.mode,
+        PrepareMode::LiveNormalize,
+        "planned as {:?}, which stream-copies 125-second keyframe spacing to YouTube",
+        prep.mode,
+    );
 }

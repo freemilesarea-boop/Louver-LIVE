@@ -742,7 +742,12 @@ fn media_check(args: &[String]) -> std::process::ExitCode {
         match out {
             Ok(o) => {
                 let shape = louver_core::media::probe::probe(&builder, &o.output_path).ok();
-                let gop = louver_core::media::probe::probe_max_keyframe_gap(&builder, &o.output_path, 60);
+                let gop = louver_core::media::probe::probe_max_keyframe_gap(
+                    &builder,
+                    &o.output_path,
+                    60,
+                    info.duration_secs,
+                );
                 println!(
                     "{:<12} {:>8.1}s {:>8.1}x {:>10} {:>8} {:>8}  {}",
                     name,
@@ -915,6 +920,22 @@ async fn main() -> std::process::ExitCode {
     // deploy in the middle of a two-hour encode left the file as 준비 중 with
     // nobody preparing it, and the customer waited for something that was never
     // going to happen.
+    // Files that were already Ready when the keyframe measurement could not see
+    // them. One keyframe inside the probe window used to read as "not
+    // measured", which the planner took as no objection, so the worst files
+    // were stream-copied to YouTube exactly as they arrived — a keyframe every
+    // two minutes, which YouTube cannot cut HLS segments out of, and a viewer
+    // sees play, stall, buffer, play. Those files are on air right now and
+    // nothing asks about them again, so this asks once per start.
+    //
+    // Before `resume_interrupted`, deliberately: this only sets the state, and
+    // that is the sweep which picks the rows up and does the work one at a time.
+    match app.ingest.resweep_keyframes() {
+        Ok(n) if n > 0 => println!("[louver] 키프레임이 어긋난 영상 {n}개를 다시 준비 대기에 넣었습니다"),
+        Ok(_) => {}
+        Err(e) => eprintln!("[louver] 키프레임 점검을 하지 못했습니다: {e}"),
+    }
+
     match app.ingest.resume_interrupted() {
         Ok(n) if n > 0 => println!("[louver] 중단된 영상 준비 {n}개를 이어서 합니다"),
         Ok(_) => {}

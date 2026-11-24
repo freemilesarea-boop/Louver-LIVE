@@ -410,6 +410,7 @@ impl Ingest {
             // no special case, the manifest names the file that is there, and
             // nothing was written to the disk by getting here.
             self.retire_replaced_prepared(media_id, &user_id, &key)?;
+            self.restart_broadcasts_if_file_moved(media_id, &key)?;
             self.db.record_media_prepared(media_id, &key, info.duration_secs, bytes, 0)?;
             return Ok(());
         }
@@ -477,7 +478,12 @@ impl Ingest {
         // still falls short is redone the canonical way rather than sent.
         if prep.mode == PrepareMode::LiveNormalize {
             let limit = CLOUD_PROFILE.max_copy_gop_secs();
-            let got = probe_max_keyframe_gap(&builder, &out.output_path, KEYFRAME_CHECK_SECS);
+            let got = probe_max_keyframe_gap(
+                &builder,
+                &out.output_path,
+                KEYFRAME_CHECK_SECS,
+                info.duration_secs,
+            );
             if got.is_some_and(|g| g > limit) {
                 eprintln!(
                     "[louver] media {}: 키프레임 간격이 여전히 {:.1}초입니다. 표준 변환으로 다시 만듭니다",
@@ -557,8 +563,106 @@ impl Ingest {
         // pointer moves. Nothing is unlinked at any point. A crash between any
         // two of these steps leaves the row pointing at a file that exists.
         self.retire_replaced_prepared(media_id, user_id, &prepared_key)?;
+        self.restart_broadcasts_if_file_moved(media_id, &prepared_key)?;
         self.db.record_media_prepared(media_id, &prepared_key, out.duration_secs, original, prepared)?;
         Ok(())
+    }
+
+    /// Ask the scheduler to restart whatever is on air with this media, when
+    /// the file it plays has just moved.
+    ///
+    /// A running broadcast holds the paths it started with — the manifest is
+    /// written once at START and FFmpeg has the files open — so re-preparing a
+    /// file changes nothing on air by itself. Without this, a customer whose
+    /// video was fixed keeps broadcasting the broken one until something else
+    /// happens to restart them, which for a 24/7 stream is never.
+    ///
+    /// Called before the pointer moves, because the old pointer is what decides
+    /// whether anything moved at all. Its own early returns are deliberately
+    /// not the ones in [`Self::retire_replaced_prepared`]: that one leaves the
+    /// source alone because the source is not rubbish, while here a pointer
+    /// going from the source to a prepared file is precisely the change that
+    /// has to reach the air.
+    fn restart_broadcasts_if_file_moved(
+        &self,
+        media_id: &str,
+        new_key: &crate::storage::ObjectKey,
+    ) -> Result<()> {
+        let old: Option<String> = match self.db.raw().lock().unwrap().query_row(
+            "SELECT prepared_path FROM media WHERE id=?1",
+            [media_id],
+            |r| r.get(0),
+        ) {
+            Ok(v) => v,
+            Err(_) => return Ok(()),
+        };
+        // A first preparation has nothing on air to disturb, and an unchanged
+        // pointer needs nothing: the running manifest already names this file.
+        let Some(old) = old else { return Ok(()) };
+        if old == *new_key {
+            return Ok(());
+        }
+        let ids = self.db.flag_broadcasts_for_restart(media_id)?;
+        if !ids.is_empty() {
+            println!(
+                "[louver] media {}: 재생 파일이 바뀌었습니다 — 방송 {}개를 재시작 대기로 표시합니다",
+                &media_id[..8.min(media_id.len())],
+                ids.len(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Re-prepare Ready files whose keyframes are too far apart to broadcast.
+    ///
+    /// The guard that rejects such a file runs at import, and it only started
+    /// seeing the worst of them when the measurement was fixed: a file with one
+    /// keyframe in the probe window used to read as "not measured", which the
+    /// planner took as no objection. Those files are already Ready, already in
+    /// playlists and already on air, and nothing asks again.
+    ///
+    /// So this asks, once, at startup. Every file on a stream-copy path is
+    /// measured — the row records the mode, never the spacing, so there is no
+    /// way to tell but to look — and one outside the limit goes back in the
+    /// queue. `prepare` re-decides from scratch and now answers
+    /// `live_normalize`: the picture is encoded again at its own size and frame
+    /// rate, purely to put keyframes into it.
+    ///
+    /// Nothing is started here. Setting the state is the whole action, and
+    /// [`Self::resume_interrupted`] picks the rows up — which means the work
+    /// goes through the one-at-a-time queue and the thread cap, instead of
+    /// twenty encodes starting at once on two cores.
+    pub fn resweep_keyframes(&self) -> Result<usize> {
+        let builder = FfmpegCommandBuilder::new(self.tools.clone(), CLOUD_PROFILE)
+            .with_encoder(self.encoder.clone());
+        let limit = CLOUD_PROFILE.max_copy_gop_secs();
+        let mut queued = 0usize;
+        for (id, email, filename, prepared) in self.db.copy_path_media()? {
+            let Ok(local) = self.storage.localize(&prepared) else { continue };
+            let Ok(info) = probe(&builder, &local) else { continue };
+            let Some(gap) =
+                probe_max_keyframe_gap(&builder, &local, KEYFRAME_CHECK_SECS, info.duration_secs)
+            else {
+                continue;
+            };
+            if gap <= limit {
+                continue;
+            }
+            println!(
+                "[louver] media {}: 키프레임 간격이 {:.1}초입니다 (한도 {:.1}초) — 다시 준비합니다 / {} / {}",
+                &id[..8.min(id.len())],
+                gap,
+                limit,
+                email,
+                filename,
+            );
+            self.db.set_media_state(&id, crate::MediaState::Preparing)?;
+            queued += 1;
+        }
+        if queued > 0 {
+            println!("[louver] 키프레임이 어긋난 영상 {queued}개를 다시 준비합니다");
+        }
+        Ok(queued)
     }
 
     /// Write off the file this media used to be broadcast from.

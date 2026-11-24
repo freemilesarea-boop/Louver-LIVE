@@ -227,7 +227,8 @@ fn before_and_after() {
         );
         let old = time_ffmpeg(&b, &old_args);
 
-        let plan = plan_transcode(&info, PROFILE, probe_max_keyframe_gap(&b, &path, 60));
+        let plan =
+            plan_transcode(&info, PROFILE, probe_max_keyframe_gap(&b, &path, 60, info.duration_secs));
         let new_args =
             b.build_normalize_args(&path, &dir.path().join("new.mp4"), target, info.has_audio, &plan);
         let new = time_ffmpeg(&b, &new_args);

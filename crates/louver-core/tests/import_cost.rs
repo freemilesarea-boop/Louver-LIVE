@@ -90,7 +90,7 @@ fn what_adding_one_video_costs() {
     println!("{:<44} {:>9.1} ms", "3. media_hash (head+tail 256 KB)", hash_ms);
 
     let t = Instant::now();
-    let gap = probe_max_keyframe_gap(&b, &path, 60);
+    let gap = probe_max_keyframe_gap(&b, &path, 60, info.duration_secs);
     let gap_ms = ms(t);
     println!(
         "{:<44} {:>9.1} ms  (gap {:?})",

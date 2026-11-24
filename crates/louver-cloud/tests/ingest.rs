@@ -471,7 +471,8 @@ fn keyframe_gap(e: &Env, tools: &FfmpegTools, m: &louver_cloud::CloudMedia) -> f
         tools.clone(),
         louver_cloud::ingest::CLOUD_PROFILE,
     );
-    louver_core::media::probe::probe_max_keyframe_gap(&builder, &path, 60).expect("keyframes")
+    let dur = louver_core::media::probe::probe(&builder, &path).expect("probe").duration_secs;
+    louver_core::media::probe::probe_max_keyframe_gap(&builder, &path, 60, dur).expect("keyframes")
 }
 
 /// The production file in miniature: everything is right except the keyframes.

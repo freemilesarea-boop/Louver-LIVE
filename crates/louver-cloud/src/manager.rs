@@ -849,6 +849,71 @@ impl BroadcastManager {
         moved
     }
 
+    /// Restart broadcasts whose files have been prepared again.
+    ///
+    /// A running broadcast sends from the manifest it was started with, and
+    /// FFmpeg holds those files open. Re-preparing one therefore fixes the file
+    /// and changes nothing on air: the customer's stream keeps going out from
+    /// the version that was broken. For a 24/7 broadcast there is no next start
+    /// to pick the new file up at, so the preparation flags the broadcast and
+    /// this tick is what acts on it.
+    ///
+    /// The flag is taken, not read — cleared as it is picked up — so a restart
+    /// that fails is reported once instead of retried every thirty seconds.
+    /// Only what is actually running is restarted; a stopped broadcast will
+    /// build a fresh manifest when it next starts, which needs nothing from
+    /// here.
+    ///
+    /// A broadcast is never taken down by this. `start` refuses a playlist
+    /// whose items cannot be joined, and re-preparing one item of a mixed
+    /// playlist is a way to produce exactly that: the fixed item no longer
+    /// matches the ones beside it. Restarting into that refusal would turn a
+    /// stream that was merely buffering into one that is off the air, so the
+    /// playlist is checked here first and a broadcast that would be refused is
+    /// left running on the files it has. It keeps the old keyframes — the
+    /// problem this is trying to fix — but it keeps broadcasting, and the log
+    /// line names it so the playlist can be converged deliberately.
+    pub fn restart_for_new_files(&self) -> usize {
+        // The process with the workers is the only one that may restart one.
+        if self.remote.is_some() {
+            return 0;
+        }
+        let Ok(flagged) = self.db.take_broadcasts_needing_restart() else { return 0 };
+        let live = self.running_ids();
+        let mut moved = 0usize;
+        for (id, user_id) in flagged {
+            if !live.contains(&id) {
+                continue;
+            }
+            // The whole reason this check is here rather than left to `start`:
+            // by the time `start` says no, the broadcast is already stopped.
+            if let Err(e) = self.db.check_playlist_joinable(&id) {
+                say(
+                    &id,
+                    "warn",
+                    &format!(
+                        "영상을 다시 준비했지만 플레이리스트를 이어붙일 수 없어 \
+                         기존 파일로 계속 송출합니다 (형식을 맞춰야 합니다): {e}"
+                    ),
+                );
+                continue;
+            }
+            let _ = self.db.append_event(
+                &id,
+                EventLevel::Info,
+                "영상이 방송용으로 다시 준비되어 새 파일로 다시 시작합니다",
+            );
+            match self.restart(&user_id, &id) {
+                Ok(()) => {
+                    say(&id, "info", "새로 준비된 영상으로 다시 시작했습니다");
+                    moved += 1;
+                }
+                Err(e) => say(&id, "warn", &format!("새 영상으로 다시 시작하지 못했습니다: {e}")),
+            }
+        }
+        moved
+    }
+
     pub fn spawn_scheduler(&self) -> std::thread::JoinHandle<()> {
         let mgr = self.clone();
         std::thread::spawn(move || {
@@ -881,6 +946,12 @@ impl BroadcastManager {
                 // dark, because the reconnect that is meant to save it relaunches
                 // the same dead address every sixty seconds for ever.
                 mgr.refresh_cctv_urls();
+                // A file being re-prepared under a running broadcast calls
+                // nothing either. The manifest was written at START and FFmpeg
+                // holds the files open, so a fixed video never reaches the air
+                // until something restarts the broadcast — and on a 24/7 stream
+                // nothing ever does.
+                mgr.restart_for_new_files();
                 std::thread::sleep(SCHEDULE_TICK);
             }
         })
