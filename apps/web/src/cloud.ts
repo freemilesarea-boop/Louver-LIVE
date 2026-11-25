@@ -65,6 +65,38 @@ export interface Plan {
   sort_order: number;
 }
 
+/**
+ * Anything carrying the server's bag of limit names: a `Plan`, or an
+ * {@link EnterpriseQuote} — a plan that does not exist yet. The readers below
+ * take this rather than `Plan`, so a quote renders through the same helpers and
+ * neither type has to borrow the other's fields.
+ */
+export interface Entitled {
+  limits: Record<string, number>;
+}
+
+/**
+ * What Enterprise would cost for a given channel count. `GET /api/plans/enterprise`.
+ *
+ * Enterprise is priced per channel, so there is a plan row per count and
+ * `/api/plans` deliberately does not list them — a card per count is not a price
+ * list. This is how the page shows a price for a number somebody typed, and it
+ * is a *quote*, not a calculation: the figures come from the server, which
+ * writes the same ones into the row a checkout then charges.
+ */
+export interface EnterpriseQuote {
+  channels: number;
+  /** The plan id a checkout for this count would buy. Not shown. */
+  plan_id: string;
+  label: string;
+  monthly_price_krw: number;
+  price_per_channel_krw: number;
+  /** Where Enterprise begins. The input's floor, so the minimum is not
+   *  something the customer learns by being refused. */
+  min_channels: number;
+  limits: Record<string, number>;
+}
+
 export interface Subscription {
   user_id: string;
   plan_id: string;
@@ -140,7 +172,7 @@ export function regionName(code: string): string {
 export const MAX_CONCURRENT_STREAMS = "max_concurrent_streams";
 
 /** How many broadcasts a plan may run at once. */
-export function concurrentStreams(plan: Plan): number {
+export function concurrentStreams(plan: Entitled): number {
   return plan.limits[MAX_CONCURRENT_STREAMS] ?? 0;
 }
 
@@ -149,12 +181,12 @@ export const MAX_STORAGE_BYTES = "max_storage_bytes";
 export const MAX_UPLOAD_BYTES = "max_upload_bytes";
 
 /** This account's storage allowance. Per account; plans do not share a pool. */
-export function storageLimit(plan: Plan): number {
+export function storageLimit(plan: Entitled): number {
   return plan.limits[MAX_STORAGE_BYTES] ?? 0;
 }
 
 /** The largest single file this plan accepts. */
-export function uploadLimit(plan: Plan): number {
+export function uploadLimit(plan: Entitled): number {
   return plan.limits[MAX_UPLOAD_BYTES] ?? 0;
 }
 
@@ -170,7 +202,7 @@ export const CCTV_ENABLED = "cctv_enabled";
  * grant does not open it — which is why a card that says this is a statement
  * about the plan rather than about any one account.
  */
-export function cctvEnabled(plan: Plan): boolean {
+export function cctvEnabled(plan: Entitled): boolean {
   return (plan.limits[CCTV_ENABLED] ?? 0) > 0;
 }
 

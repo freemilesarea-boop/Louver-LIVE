@@ -13,7 +13,7 @@
 use crate::auth::Caller;
 use crate::error::ApiError;
 use crate::state::App;
-use axum::extract::{Form, State};
+use axum::extract::{Form, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -40,6 +40,85 @@ pub struct CheckoutRequest {
     pub plan_id: String,
     /// PayApp requires it, and it is where the buyer is sent the payment link.
     pub recvphone: String,
+}
+
+/// What Enterprise costs for this many channels, and what it allows.
+///
+/// Public, like `/api/plans`: a price a visitor cannot read before signing up is
+/// not a price. Reads nothing and writes nothing — the figures come from
+/// `louver_cloud::enterprise`, which is also what
+/// `CloudDb::ensure_enterprise_plan` writes into the row a checkout charges
+/// against. One source, so the page and the charge cannot disagree.
+#[derive(Serialize)]
+pub struct EnterpriseQuote {
+    pub channels: i64,
+    /// The plan id a checkout for this count would buy. Shown nowhere; useful
+    /// in a support conversation and in a test.
+    pub plan_id: String,
+    pub label: String,
+    pub monthly_price_krw: i64,
+    pub price_per_channel_krw: i64,
+    /// Enterprise begins here. The form uses it as the input's floor so the
+    /// minimum is not something the server teaches by refusing.
+    pub min_channels: i64,
+    /// The same bag of names `Plan` carries, so the card can render storage and
+    /// the rest with the helpers it already has.
+    pub limits: BTreeMap<String, i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QuoteQuery {
+    /// Absent means "quote the entry level", which is what the card shows before
+    /// anybody has typed a number.
+    pub channels: Option<i64>,
+}
+
+pub async fn enterprise_quote(Query(q): Query<QuoteQuery>) -> Out<EnterpriseQuote> {
+    use louver_cloud::enterprise as ent;
+    let channels = ent::validate(q.channels.unwrap_or(ent::MIN_CHANNELS)).map_err(ApiError)?;
+    Ok(Json(EnterpriseQuote {
+        channels,
+        plan_id: ent::plan_id(channels),
+        label: ent::label(channels),
+        monthly_price_krw: ent::monthly_price_krw(channels),
+        price_per_channel_krw: ent::PRICE_PER_CHANNEL_KRW,
+        min_channels: ent::MIN_CHANNELS,
+        limits: ent::limits(channels).into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnterpriseCheckoutRequest {
+    /// How many channels. **Not** a price: the count makes a plan row, and
+    /// `checkout` charges that row.
+    pub channels: i64,
+    pub recvphone: String,
+}
+
+/// Start a recurring payment for an Enterprise plan sized to `channels`.
+///
+/// Two steps, and the order matters. `ensure_enterprise_plan` writes the row —
+/// price included, from the server's own constants — and only then does the same
+/// `checkout` every other plan goes through read the price back out of it. So
+/// this route sends no amount to the provider that it did not first compute
+/// itself, and the callback check in `Payapp::handle_feedback` is the one that
+/// was already there.
+pub async fn enterprise_checkout(
+    State(app): State<App>,
+    Caller(uid): Caller,
+    Json(body): Json<EnterpriseCheckoutRequest>,
+) -> Out<billing::Checkout> {
+    let payapp = provider(&app)?;
+    let db = app.db.clone();
+    Ok(Json(
+        crate::blocking(move || {
+            let plan = db.ensure_enterprise_plan(body.channels)?;
+            payapp.checkout(&uid, &plan.id, &body.recvphone)
+        })
+        .await?,
+    ))
 }
 
 /// Start a recurring payment. §4.

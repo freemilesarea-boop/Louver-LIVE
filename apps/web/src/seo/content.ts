@@ -121,6 +121,35 @@ export const PUBLIC_PLANS: PublicPlan[] = [
 ];
 
 /** What every plan includes. Each line is a feature that exists today. */
+/**
+ * Enterprise, which is a rate rather than a price.
+ *
+ * It has no row in `SEED_PLANS` and no card above, because it has no single
+ * figure: from {@link PublicEnterprise.minChannels} channels up it is
+ * {@link PublicEnterprise.pricePerChannelKrw} per channel per month, and the
+ * customer chooses the count. The plan rows are written one per count as people
+ * buy them, which is why the page carries the terms and not a price.
+ *
+ * Copied from `crates/louver-cloud/src/enterprise.rs`, and checked against it by
+ * the same kind of test that checks the cards — the file is parsed, so changing
+ * the rate there and not here fails the build.
+ */
+export interface PublicEnterprise {
+  minChannels: number;
+  pricePerChannelKrw: number;
+  storageGbPerChannel: number;
+  uploadGb: number;
+  broadcastsPerChannel: number;
+}
+
+export const PUBLIC_ENTERPRISE: PublicEnterprise = {
+  minChannels: 4,
+  pricePerChannelKrw: 19_000,
+  storageGbPerChannel: 20,
+  uploadGb: 20,
+  broadcastsPerChannel: 10,
+};
+
 export const PLAN_INCLUDES = [
   "24시간 연속 송출",
   "YouTube 계정 연결 (OAuth)",
@@ -192,7 +221,7 @@ const HOME: PublicPage = {
     },
     {
       q: "무료로 써볼 수 있나요?",
-      a: "현재는 무료 요금제가 없습니다. 월 구독 요금제 세 가지를 제공하며, 가장 낮은 요금제는 월 19,900원입니다.",
+      a: "현재는 무료 요금제가 없습니다. 월 구독 요금제를 제공하며, 가장 낮은 요금제는 월 19,900원입니다.",
     },
   ],
   related: ["/youtube-24-live/", "/playlist-live/", "/pricing/"],
@@ -368,14 +397,21 @@ const PRICING: PublicPage = {
   path: "/pricing/",
   title: "요금제 — 247streams 24시간 송출 플랜",
   description:
-    "Basic 월 19,900원, Pro 월 39,900원, Business 월 59,900원. 동시 송출 수와 저장 용량이 다르고, 모든 요금제에서 24시간 송출·플레이리스트·예약을 사용할 수 있습니다.",
+    "Basic 월 19,900원, Pro 월 39,900원, Business 월 59,900원. 채널 4개 이상은 Enterprise로 채널당 월 19,000원입니다. 모든 요금제에서 24시간 송출·플레이리스트·예약을 사용할 수 있습니다.",
   h1: "요금제",
-  lead: "세 요금제의 차이는 동시에 송출할 수 있는 방송 수와 저장 용량입니다. 송출 기능 자체는 모든 요금제에서 같습니다.",
+  lead: "요금제의 차이는 동시에 송출할 수 있는 방송 수와 저장 용량입니다. 송출 기능 자체는 모든 요금제에서 같습니다. 채널 4개 이상은 필요한 갯수를 직접 입력하는 Enterprise로 운영합니다.",
   sections: [
     {
       heading: "모든 요금제에 포함된 기능",
       body: [],
       points: [...PLAN_INCLUDES],
+    },
+    {
+      heading: "채널 4개 이상 — Enterprise",
+      body: [
+        "채널 4개부터는 채널당 월 19,000원입니다. 필요한 채널 갯수를 입력하면 그 갯수만큼 금액이 정해지고, 매월 같은 날 자동으로 결제됩니다. 운영자 승인을 기다릴 필요 없이 바로 시작할 수 있습니다.",
+        "채널당 동시 송출 1개와 저장 용량 20GB가 함께 늘어나며, CCTV 트래픽을 포함해 Business 요금제의 기능을 모두 사용할 수 있습니다. 별도 구성이 필요하면 문의해주세요.",
+      ],
     },
     {
       heading: "결제와 해지",
@@ -388,7 +424,11 @@ const PRICING: PublicPage = {
   faq: [
     {
       q: "요금제별로 무엇이 다른가요?",
-      a: "동시에 송출할 수 있는 방송 수(1~3개), 총 저장 용량(15~60GB), 파일 하나의 최대 크기(10~20GB), 저장할 수 있는 방송 수(3~30개)가 다릅니다.",
+      a: "동시에 송출할 수 있는 방송 수(1~3개), 총 저장 용량(15~60GB), 파일 하나의 최대 크기(10~20GB), 저장할 수 있는 방송 수(3~30개)가 다릅니다. 채널 4개 이상은 Enterprise로 채널당 월 19,000원입니다.",
+    },
+    {
+      q: "채널을 4개 이상 운영하려면 어떻게 하나요?",
+      a: "Enterprise로 필요한 채널 갯수를 입력하면 채널당 월 19,000원으로 금액이 정해지고 매월 자동 결제됩니다. 채널 수에 상한은 없으며, 채널당 저장 용량 20GB가 함께 늘어납니다.",
     },
     {
       q: "결제 수단은 무엇인가요?",

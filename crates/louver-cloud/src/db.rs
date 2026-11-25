@@ -1164,6 +1164,74 @@ impl CloudDb {
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    /// A plan this account may actually buy, by id.
+    ///
+    /// `plans_for_sale` answers "what does the pricing page show"; this answers
+    /// "may a checkout name this one". They are not the same question, because
+    /// Enterprise rows are sold but not listed: there is one per channel count,
+    /// and a page showing every count is a page nobody reads.
+    ///
+    /// Everything else that is not `active` stays unbuyable — the unsubscribed
+    /// plan and the operator's own. The test for Enterprise is
+    /// [`crate::enterprise::is_enterprise_plan`], which accepts only an id this
+    /// server generates, so "ends up buyable" cannot be reached by inventing a
+    /// name.
+    ///
+    /// A plan that does not exist and a plan that is not for sale give the same
+    /// error, so a checkout cannot be used to ask which plan ids exist.
+    pub fn purchasable_plan(&self, id: &str) -> Result<Plan> {
+        let refused = || CloudError::Invalid("선택할 수 없는 요금제입니다.".into());
+        let plan = self.plan(id).map_err(|_| refused())?;
+        if plan.active || crate::enterprise::is_enterprise_plan(&plan.id) {
+            Ok(plan)
+        } else {
+            Err(refused())
+        }
+    }
+
+    /// The Enterprise plan for this many channels, creating the row if this is
+    /// the first time anybody has bought that count.
+    ///
+    /// Idempotent, and safe to call before every checkout: the row is the plan,
+    /// so a customer who buys five channels twice buys the same plan twice.
+    ///
+    /// Price, label and description are restated from
+    /// [`crate::enterprise`]; limits are left alone on conflict. See that
+    /// module's docs for why that split is the right one and why restating a
+    /// price reprices nobody.
+    ///
+    /// `active = 0`: bought by id, never listed. `/api/plans` filters on
+    /// `active`, so adding Enterprise does not put a hundred cards on the
+    /// pricing page.
+    pub fn ensure_enterprise_plan(&self, channels: i64) -> Result<Plan> {
+        let channels = crate::enterprise::validate(channels)?;
+        let id = crate::enterprise::plan_id(channels);
+        let map: BTreeMap<&str, i64> = crate::enterprise::limits(channels).into_iter().collect();
+        let json = serde_json::to_string(&map).unwrap_or_else(|_| "{}".into());
+        {
+            let c = self.conn.lock().unwrap();
+            c.execute(
+                "INSERT INTO plans (id, label, limits, monthly_price_krw, description, active, sort_order)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                     label             = excluded.label,
+                     monthly_price_krw = excluded.monthly_price_krw,
+                     description       = excluded.description,
+                     active            = excluded.active,
+                     sort_order        = excluded.sort_order",
+                params![
+                    id,
+                    crate::enterprise::label(channels),
+                    json,
+                    crate::enterprise::monthly_price_krw(channels),
+                    crate::enterprise::description(channels),
+                    crate::enterprise::SORT_ORDER
+                ],
+            )?;
+        }
+        self.plan(&id)
+    }
+
     // --- users ------------------------------------------------------------
 
     /// An account with no display name and no recorded consent.

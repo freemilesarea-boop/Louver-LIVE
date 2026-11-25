@@ -18,6 +18,7 @@ pub mod billing;
 pub mod cctv;
 pub mod credentials;
 pub mod db;
+pub mod enterprise;
 pub mod entitlement;
 pub mod grants;
 pub mod ingest;

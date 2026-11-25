@@ -24,6 +24,7 @@ import { LEGAL_CONTENT } from "../pages/legal-content";
 import {
   PATH_LABELS,
   PLAN_INCLUDES,
+  PUBLIC_ENTERPRISE,
   PUBLIC_PAGES,
   PUBLIC_PLANS,
   formatKrw,
@@ -182,6 +183,27 @@ export function PlanCards() {
           </dl>
         </section>
       ))}
+      {/* Not a fourth card: Enterprise has a rate, not a price, so it says the
+          rate and the minimum. The figures are `PUBLIC_ENTERPRISE`, which a test
+          checks against the Rust module that charges them. */}
+      <section className="rounded-lg border border-ink-700 bg-ink-850 p-4 sm:col-span-3">
+        <h3 className="text-sm font-semibold uppercase tracking-widest text-ink-400">
+          Enterprise
+        </h3>
+        <p className="mt-2 text-xl font-semibold text-ink-100">
+          {formatKrw(PUBLIC_ENTERPRISE.pricePerChannelKrw)}
+          <span className="text-sm font-normal text-ink-400"> / 채널 / 월</span>
+        </p>
+        <p className="mt-1 text-xs text-ink-500">
+          채널 {PUBLIC_ENTERPRISE.minChannels}개 이상, 필요한 갯수를 입력하면 자동
+          월결제
+        </p>
+        <p className="mt-3 text-sm text-ink-300">
+          채널당 동시 송출 1개 · 저장 용량 {PUBLIC_ENTERPRISE.storageGbPerChannel}
+          GB · 저장 방송 {PUBLIC_ENTERPRISE.broadcastsPerChannel}개가 함께
+          늘어납니다.
+        </p>
+      </section>
     </div>
   );
 }
@@ -191,7 +213,7 @@ function PlanSummary() {
     <section className="mt-10">
       <h2 className="text-lg font-semibold text-ink-100">요금제</h2>
       <p className="mt-2 text-sm text-ink-400">
-        세 요금제의 차이는 동시 송출 수와 저장 용량입니다. 송출 기능은 모든
+        요금제의 차이는 동시 송출 수와 저장 용량입니다. 송출 기능은 모든
         요금제에서 같습니다.
       </p>
       <PlanCards />

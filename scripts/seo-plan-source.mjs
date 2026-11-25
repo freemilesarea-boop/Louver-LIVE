@@ -70,4 +70,33 @@ export async function seedPlans(root = defaultRoot()) {
   return plans
 }
 
+export const ENTERPRISE_SOURCE = 'crates/louver-cloud/src/enterprise.rs'
+
+/**
+ * Enterprise's terms, from the module that defines them.
+ *
+ * Enterprise has no row in `SEED_PLANS`, because it has no single price: it is
+ * a rate per channel and a minimum, and the rows are written one per channel
+ * count as customers buy them. So the public page carries the rate and the
+ * minimum, and this is what keeps that copy honest — the same arrangement as
+ * `seedPlans`, against a different file.
+ */
+export async function enterpriseTerms(root = defaultRoot()) {
+  const rust = await readFile(resolve(root, ENTERPRISE_SOURCE), 'utf8')
+  const read = (name) => {
+    const m = rust.match(new RegExp(`pub const ${name}: i64 = ([^;]+);`))
+    if (!m) throw new Error(`no ${name} in ${ENTERPRISE_SOURCE}`)
+    const n = evaluateNumber(m[1])
+    if (n === null) throw new Error(`${name} in ${ENTERPRISE_SOURCE} is not a number: ${m[1]}`)
+    return n
+  }
+  return {
+    min_channels: read('MIN_CHANNELS'),
+    price_per_channel_krw: read('PRICE_PER_CHANNEL_KRW'),
+    storage_per_channel_bytes: read('STORAGE_PER_CHANNEL_BYTES'),
+    upload_bytes: read('UPLOAD_BYTES'),
+    broadcasts_per_channel: read('BROADCASTS_PER_CHANNEL'),
+  }
+}
+
 export const GIB = 1024 * 1024 * 1024

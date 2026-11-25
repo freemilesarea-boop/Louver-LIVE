@@ -16,4 +16,14 @@ declare module "*/seo-plan-source.mjs" {
   }
   /** Every seeded plan, by id. `root` is the repository root. */
   export function seedPlans(root?: string): Promise<Record<string, SeededPlan>>;
+  export const ENTERPRISE_SOURCE: string;
+  export interface EnterpriseTerms {
+    min_channels: number;
+    price_per_channel_krw: number;
+    storage_per_channel_bytes: number;
+    upload_bytes: number;
+    broadcasts_per_channel: number;
+  }
+  /** Enterprise's rate and minimum, from `crates/louver-cloud/src/enterprise.rs`. */
+  export function enterpriseTerms(root?: string): Promise<EnterpriseTerms>;
 }

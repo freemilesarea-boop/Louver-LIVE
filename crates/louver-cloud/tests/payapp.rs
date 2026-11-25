@@ -232,6 +232,72 @@ fn each_plan_is_registered_at_the_price_the_server_holds() {
 }
 
 #[test]
+fn an_enterprise_plan_is_registered_at_the_count_times_the_rate() {
+    // Enterprise is priced per channel, and this is where that has to not become
+    // a hole: the count makes a plan row, `checkout` reads the price out of the
+    // row, and what reaches PayApp is a figure the server computed. No amount
+    // crosses the wire from a browser, exactly as for the three listed plans.
+    for (channels, price) in [(4, "76000"), (7, "133000"), (25, "475000")] {
+        let e = env();
+        let plan = e.db.ensure_enterprise_plan(channels).unwrap();
+        let out = e.pay.checkout(&e.user, &plan.id, "01012345678").unwrap();
+
+        let req = e.api.call("rebillRegist");
+        assert_eq!(req.get("goodprice").unwrap(), price, "{channels}채널");
+        assert_eq!(req.get("goodname").unwrap(), &format!("247streams Enterprise {channels}채널"));
+        // Monthly, like every other plan: this is a subscription, not one charge.
+        assert_eq!(req.get("rebillCycleType").unwrap(), "Month");
+        assert_eq!(out.amount_krw.to_string(), price);
+        assert_eq!(e.billing().amount_krw.to_string(), price);
+    }
+}
+
+#[test]
+fn an_enterprise_registration_grants_nothing_either() {
+    let e = env();
+    let plan = e.db.ensure_enterprise_plan(10).unwrap();
+    e.pay.checkout(&e.user, &plan.id, "01012345678").unwrap();
+
+    let sub = e.db.subscription(&e.user).unwrap();
+    assert!(!sub.active, "a payment URL is not a payment");
+    assert_eq!(e.db.limit(&e.user, louver_cloud::entitlement::MAX_CONCURRENT_STREAMS).unwrap(), 0);
+}
+
+#[test]
+fn a_paid_enterprise_notification_activates_the_size_that_was_bought() {
+    let e = env();
+    let plan = e.db.ensure_enterprise_plan(8).unwrap();
+    let out = e.pay.checkout(&e.user, &plan.id, "01012345678").unwrap();
+
+    // The price must match the record or the notification is refused, which is
+    // the same check every plan goes through — there is nothing per-plan about it.
+    let paid = e.feedback(&[
+        ("var1", &out.billing_id),
+        ("price", "152000"),
+        ("goodname", "247streams Enterprise 8채널"),
+    ]);
+    assert_eq!(e.pay.handle_feedback(&paid), FeedbackOutcome::Activated("enterprise_8".into()));
+
+    let sub = e.db.subscription(&e.user).unwrap();
+    assert!(sub.active);
+    assert_eq!(e.db.limit(&e.user, louver_cloud::entitlement::MAX_CONCURRENT_STREAMS).unwrap(), 8);
+    assert_eq!(e.billing().status, BillingStatus::Active);
+}
+
+#[test]
+fn an_enterprise_notification_claiming_a_smaller_price_is_refused() {
+    // 8 channels were registered; 4 channels' money does not buy them.
+    let e = env();
+    let plan = e.db.ensure_enterprise_plan(8).unwrap();
+    let out = e.pay.checkout(&e.user, &plan.id, "01012345678").unwrap();
+
+    let short = e.feedback(&[("var1", &out.billing_id), ("price", "76000")]);
+    let outcome = e.pay.handle_feedback(&short);
+    assert!(!outcome.is_accepted(), "{outcome:?}");
+    assert!(!e.db.subscription(&e.user).unwrap().active);
+}
+
+#[test]
 fn a_plan_that_is_not_on_sale_cannot_be_checked_out() {
     let e = env();
     for plan in ["none", "", "enterprise", "NONE", "desktop"] {

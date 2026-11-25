@@ -1,0 +1,255 @@
+//! Enterprise: a plan priced per channel, sold by the channel count.
+//!
+//! The three shipped plans are rows with a fixed price. Enterprise is the same
+//! thing — a row — but there is one row per channel count, created the first
+//! time somebody buys that count. `enterprise_7` is as ordinary a plan as
+//! `business`: it has a price, a bag of limits, and `entitlement` reads it by
+//! name without knowing it is special.
+//!
+//! # Why rows and not an amount in the request
+//!
+//! [`crate::billing`] reads the price from the plan row and checks the
+//! provider's callback against what it stored. That is the one thing standing
+//! between a recurring payment and a browser that says what it would like to be
+//! charged. A `channels` parameter that reached the price would take that away.
+//!
+//! So the browser sends a **count**, the server turns the count into a row, and
+//! the price comes from the row exactly as it does for Business. The checkout
+//! and the callback are untouched.
+//!
+//! # The ladder
+//!
+//! Basic 1채널 19,900 · Pro 2채널 39,900 · Business 3채널 59,900 · Enterprise
+//! 4채널부터 채널당 19,000. At four channels that is 76,000 — more than
+//! Business, and cheaper per channel than Business's ~19,967, so buying more
+//! never costs less in total and never costs more per channel.
+//!
+//! # What is not capped here
+//!
+//! The channel count has no policy ceiling: a customer who wants 40 channels
+//! types 40. [`validate`] refuses only what is not a number of channels at all,
+//! and a value so large that the limit system stops meaning anything.
+//!
+//! The real ceilings are physical and are enforced where they are felt, not
+//! here: [`crate::ingest::DISK_FLOOR_BYTES`] is checked on every upload against
+//! the whole machine, and [`crate::entitlement::encoding_budget`] rations
+//! real-time encodes across every account. A plan says what an account is
+//! entitled to; it cannot say what the disk and the CPU can do.
+//!
+//! # Changing the per-channel price
+//!
+//! [`crate::db::CloudDb::ensure_enterprise_plan`] restates an existing row's
+//! price, label and description from these constants, and leaves its limits
+//! alone — the same split `seed_plans` makes, for the same two reasons. What the
+//! service charges is the service's to state; a limit may have been raised by
+//! hand for one customer and a restart must not undo that.
+//!
+//! Restating the price does not reprice anybody. A recurring payment is
+//! registered with the provider at the amount stored in that account's
+//! `billing_subscriptions` row, and [`crate::billing::Payapp::handle_feedback`]
+//! checks each charge against *that* row, never against the plan. So an account
+//! on `enterprise_5` keeps paying what it agreed to, and the next buyer of five
+//! channels pays the new rate.
+
+use crate::entitlement::{UNLIMITED_BYTES, UNLIMITED_COUNT};
+use crate::{CloudError, Result};
+
+/// Enterprise begins where Business ends. Three channels is a Business plan.
+pub const MIN_CHANNELS: i64 = 4;
+
+/// Won per channel per month. Whole won; money is never a float.
+pub const PRICE_PER_CHANNEL_KRW: i64 = 19_000;
+
+/// Plan ids are `enterprise_{channels}`. The prefix is what tells a plan row
+/// that is sold by count from one that is sold by name.
+pub const PLAN_PREFIX: &str = "enterprise_";
+
+/// Per channel, matching Business (3채널 60GB).
+pub const STORAGE_PER_CHANNEL_BYTES: i64 = 20 * 1024 * 1024 * 1024;
+
+/// Per channel, matching Business (3채널 30개).
+pub const BROADCASTS_PER_CHANNEL: i64 = 10;
+
+/// A per-**file** ceiling, so it does not grow with the channel count: buying
+/// more channels does not make one upload bigger. Business's figure.
+pub const UPLOAD_BYTES: i64 = 20 * 1024 * 1024 * 1024;
+
+/// Above this a count is not a contract, and the limit values stop being
+/// numbers anybody reasons about. Not a policy ceiling — see the module docs.
+pub const MAX_CHANNELS: i64 = UNLIMITED_COUNT;
+
+/// Sorted after the three named plans wherever plans are listed.
+pub const SORT_ORDER: i64 = 4;
+
+/// The channel count, or why it is not one.
+///
+/// Messages are what the customer reads, so they say the number that is wrong
+/// and the number that would be right.
+pub fn validate(channels: i64) -> Result<i64> {
+    if channels < MIN_CHANNELS {
+        return Err(CloudError::Invalid(format!(
+            "엔터프라이즈는 {MIN_CHANNELS}채널부터입니다. {channels}채널이 필요하시면 \
+             Basic·Pro·Business 요금제를 확인해주세요."
+        )));
+    }
+    if channels > MAX_CHANNELS {
+        return Err(CloudError::Invalid(format!(
+            "채널 수가 너무 큽니다 (최대 {MAX_CHANNELS}). 문의해주세요."
+        )));
+    }
+    Ok(channels)
+}
+
+/// `enterprise_7`.
+pub fn plan_id(channels: i64) -> String {
+    format!("{PLAN_PREFIX}{channels}")
+}
+
+/// The channel count an enterprise plan id carries, if it is one.
+///
+/// Rejects anything that is not exactly the prefix and a plain positive integer,
+/// so `enterprise_007` and `enterprise_4x` are not enterprise plans. An id is
+/// generated by [`plan_id`] and read back here; nothing else should match.
+pub fn channels_from_plan_id(id: &str) -> Option<i64> {
+    let rest = id.strip_prefix(PLAN_PREFIX)?;
+    if rest.is_empty() || rest.starts_with('0') || !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let n: i64 = rest.parse().ok()?;
+    (MIN_CHANNELS..=MAX_CHANNELS).contains(&n).then_some(n)
+}
+
+/// Is this the id of a plan sold by channel count?
+pub fn is_enterprise_plan(id: &str) -> bool {
+    channels_from_plan_id(id).is_some()
+}
+
+/// 채널당 가격 × 채널 수.
+pub fn monthly_price_krw(channels: i64) -> i64 {
+    channels.saturating_mul(PRICE_PER_CHANNEL_KRW)
+}
+
+pub fn label(channels: i64) -> String {
+    format!("Enterprise {channels}채널")
+}
+
+pub fn description(channels: i64) -> String {
+    format!("동시 송출 {channels}개 · 채널당 {PRICE_PER_CHANNEL_KRW}원")
+}
+
+/// The limits an enterprise row carries.
+///
+/// Scaled from Business per channel, except the per-file upload ceiling. Both
+/// totals are clamped to the values `entitlement` already uses for "no policy
+/// ceiling", so an absurd count produces a large plan rather than arithmetic
+/// nobody can read.
+pub fn limits(channels: i64) -> Vec<(&'static str, i64)> {
+    use crate::entitlement as e;
+    vec![
+        (e::MAX_CONCURRENT_STREAMS, channels.min(UNLIMITED_COUNT)),
+        (e::MAX_BROADCASTS, channels.saturating_mul(BROADCASTS_PER_CHANNEL).min(UNLIMITED_COUNT)),
+        (e::MAX_STORAGE_BYTES, channels.saturating_mul(STORAGE_PER_CHANNEL_BYTES).min(UNLIMITED_BYTES)),
+        (e::MAX_UPLOAD_BYTES, UPLOAD_BYTES),
+        (e::SCHEDULING_ENABLED, 1),
+        ("priority_recovery", 1),
+        // Business's feature, and Enterprise costs more than Business. What
+        // rations it is `encoding_budget`, which is global and counts encodes
+        // rather than plans: the entitlement is here, the capacity is not.
+        (e::CCTV_ENABLED, 1),
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enterprise_starts_where_business_ends() {
+        assert!(validate(3).is_err(), "3채널은 Business");
+        assert_eq!(validate(4).unwrap(), 4);
+    }
+
+    #[test]
+    fn a_count_that_is_not_a_count_is_refused() {
+        assert!(validate(0).is_err());
+        assert!(validate(-1).is_err());
+        assert!(validate(MAX_CHANNELS + 1).is_err());
+        // No policy ceiling below that: a big contract is allowed.
+        assert!(validate(40).is_ok());
+        assert!(validate(MAX_CHANNELS).is_ok());
+    }
+
+    #[test]
+    fn the_price_is_the_count_times_the_rate() {
+        assert_eq!(monthly_price_krw(4), 76_000);
+        assert_eq!(monthly_price_krw(5), 95_000);
+        assert_eq!(monthly_price_krw(10), 190_000);
+    }
+
+    // The two assertions that belong here but cannot: that four channels cost
+    // more than Business, and that a channel costs less than it does on
+    // Business. Both need Business's price, and writing 59,900 into this file
+    // would be a second place that price lives. They are
+    // `the_ladder_still_goes_up_in_total_and_down_per_channel` in
+    // `tests/enterprise_plan.rs`, which reads it from the plan row.
+
+    #[test]
+    fn an_id_round_trips() {
+        for n in [4, 5, 40, MAX_CHANNELS] {
+            assert_eq!(channels_from_plan_id(&plan_id(n)), Some(n));
+        }
+    }
+
+    #[test]
+    fn only_a_generated_id_is_an_enterprise_plan() {
+        for id in [
+            "business",
+            "owner",
+            "enterprise",
+            "enterprise_",
+            "enterprise_0",
+            "enterprise_04",
+            "enterprise_3",
+            "enterprise_4x",
+            "enterprise_-4",
+            "enterprise_ 4",
+            "Enterprise_4",
+        ] {
+            assert!(!is_enterprise_plan(id), "{id} must not read as enterprise");
+        }
+        assert!(is_enterprise_plan("enterprise_4"));
+    }
+
+    #[test]
+    fn limits_scale_with_the_count() {
+        let four: std::collections::BTreeMap<_, _> = limits(4).into_iter().collect();
+        let eight: std::collections::BTreeMap<_, _> = limits(8).into_iter().collect();
+        assert_eq!(four[crate::entitlement::MAX_CONCURRENT_STREAMS], 4);
+        assert_eq!(eight[crate::entitlement::MAX_CONCURRENT_STREAMS], 8);
+        assert_eq!(
+            eight[crate::entitlement::MAX_STORAGE_BYTES],
+            2 * four[crate::entitlement::MAX_STORAGE_BYTES]
+        );
+        // A per-file ceiling does not grow with the number of channels.
+        assert_eq!(four[crate::entitlement::MAX_UPLOAD_BYTES], eight[crate::entitlement::MAX_UPLOAD_BYTES]);
+    }
+
+    /// Business sells CCTV; a plan that costs more cannot sell less.
+    #[test]
+    fn enterprise_carries_business_features() {
+        let l: std::collections::BTreeMap<_, _> = limits(4).into_iter().collect();
+        assert_eq!(l[crate::entitlement::CCTV_ENABLED], 1);
+        assert_eq!(l[crate::entitlement::SCHEDULING_ENABLED], 1);
+        assert_eq!(l["priority_recovery"], 1);
+    }
+
+    /// An absurd count must not produce numbers that overflow or that read as
+    /// nine billion gigabytes.
+    #[test]
+    fn a_huge_count_stays_within_the_unlimited_markers() {
+        let l: std::collections::BTreeMap<_, _> = limits(MAX_CHANNELS).into_iter().collect();
+        assert!(l[crate::entitlement::MAX_STORAGE_BYTES] <= UNLIMITED_BYTES);
+        assert!(l[crate::entitlement::MAX_BROADCASTS] <= UNLIMITED_COUNT);
+        assert!(monthly_price_krw(MAX_CHANNELS) > 0);
+    }
+}

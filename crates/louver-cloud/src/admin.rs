@@ -479,17 +479,31 @@ impl CloudDb {
     }
 
     /// Who is paying for what, counted from the entitlement the service honours.
+    ///
+    /// A plan is in the breakdown if it is on sale **or** somebody is on it.
+    /// Being on sale is not the same question as having subscribers, and this
+    /// counts subscribers: a plan an operator has taken down still has the
+    /// accounts that bought it, and Enterprise is never on sale at all — it is
+    /// one inactive row per channel count, because an active row per count would
+    /// put a card on the pricing page for every number anybody ever typed. Asking
+    /// only for `active = 1` would therefore have left every Enterprise customer
+    /// out of this list *and* out of `paid_total`, which is the dashboard's count
+    /// of who is paying.
+    ///
+    /// The two plans deliberately left out are the unsubscribed one, which is
+    /// `unsubscribed` below, and the operator's own, which nobody pays for.
     pub fn subscription_counts(&self) -> Result<SubscriptionCounts> {
         let conn = self.raw();
         let guard = conn.lock().unwrap();
         let mut st = guard.prepare(
             "SELECT p.id, p.label, p.monthly_price_krw, COUNT(u.id)
              FROM plans p LEFT JOIN users u ON u.plan_id = p.id
-             WHERE p.active = 1
+             WHERE p.id <> ?1 AND p.id <> ?2
+               AND (p.active = 1 OR EXISTS (SELECT 1 FROM users x WHERE x.plan_id = p.id))
              GROUP BY p.id ORDER BY p.sort_order, p.id",
         )?;
         let by_plan: Vec<PlanCount> = st
-            .query_map([], |r| {
+            .query_map([crate::db::UNSUBSCRIBED_PLAN, crate::db::OWNER_PLAN], |r| {
                 Ok(PlanCount {
                     plan_id: r.get(0)?,
                     label: r.get(1)?,

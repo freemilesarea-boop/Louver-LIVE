@@ -123,6 +123,34 @@ const PLANS = [
   },
 ];
 
+/**
+ * What `GET /api/plans/enterprise` answers, as the server computes it.
+ *
+ * A fixture, not a rule: the tests that matter are the ones where this returns a
+ * figure no formula would produce, which is how we know the page is rendering
+ * the server's answer rather than its own arithmetic.
+ */
+function quote(channels = 4, over: Record<string, unknown> = {}) {
+  return {
+    channels,
+    plan_id: `enterprise_${channels}`,
+    label: `Enterprise ${channels}채널`,
+    monthly_price_krw: channels * 19000,
+    price_per_channel_krw: 19000,
+    min_channels: 4,
+    limits: {
+      max_concurrent_streams: channels,
+      max_broadcasts: channels * 10,
+      max_storage_bytes: channels * 20 * 1024 ** 3,
+      max_upload_bytes: 20 * 1024 ** 3,
+      scheduling_enabled: 1,
+      priority_recovery: 1,
+      cctv_enabled: 1,
+    },
+    ...over,
+  };
+}
+
 /** No subscription, PayApp configured — the state a new account is in. */
 const NO_BILLING = {
   subscription: null,
@@ -218,6 +246,10 @@ function fake(over: Partial<Transport> = {}): Transport {
     listCctvSources: vi.fn().mockResolvedValue([]),
     billingStatus: vi.fn().mockResolvedValue(NO_BILLING),
     startCheckout: vi.fn(),
+    enterpriseQuote: vi.fn((channels?: number) =>
+      Promise.resolve(quote(channels ?? 4)),
+    ),
+    startEnterpriseCheckout: vi.fn(),
     cancelBilling: vi.fn(),
     youtubeAvailability: vi
       .fn()
@@ -2176,15 +2208,23 @@ describe("the price list", () => {
     );
     expect(screen.getByLabelText("휴대폰 번호")).toBeInTheDocument();
 
-    // The page reads the price list and the billing status, and calls nothing
-    // else — counted, so that a day when none of them is a mock cannot make this
-    // pass by checking nothing. `startCheckout` is only reached once the form is
-    // filled in and submitted, which the checkout tests cover.
+    // The page reads the price list, the billing status and the Enterprise
+    // quote, and calls nothing else — counted, so that a day when none of them
+    // is a mock cannot make this pass by checking nothing. All three only read;
+    // `/api/plans/enterprise` writes no row, which is why it belongs in this
+    // list rather than being something the page has to earn. `startCheckout` is
+    // only reached once the form is filled in and submitted, which the checkout
+    // tests cover.
     expect(t.plans).toHaveBeenCalledTimes(1);
     expect(t.billingStatus).toHaveBeenCalledTimes(1);
     let checked = 0;
     for (const method of Object.keys(t) as (keyof typeof t)[]) {
-      if (method === "plans" || method === "billingStatus" || method === "kind")
+      if (
+        method === "plans" ||
+        method === "billingStatus" ||
+        method === "enterpriseQuote" ||
+        method === "kind"
+      )
         continue;
       const fn = t[method];
       if (typeof fn === "function" && "mock" in fn) {
@@ -2203,6 +2243,118 @@ describe("the price list", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "요금제를 불러오지 못했습니다",
     );
+  });
+});
+
+describe("the enterprise card", () => {
+  it("shows the entry-level quote, every figure from the server", async () => {
+    show(<Pricing />, fake());
+
+    const card = await screen.findByTestId("enterprise-card");
+    // The minimum and the rate are the server's, said before anybody types.
+    expect(card).toHaveTextContent("4채널 이상 · 채널당 ₩19,000 / 월");
+    expect(screen.getByTestId("enterprise-price")).toHaveTextContent("₩76,000");
+    // And what 4 channels actually allows, read out of the quote's limits.
+    expect(screen.getByTestId("enterprise-concurrency")).toHaveTextContent(
+      "동시 송출 4개",
+    );
+    expect(screen.getByTestId("enterprise-storage")).toHaveTextContent(
+      "저장공간 80GB · 파일당 최대 20GB",
+    );
+    expect(screen.getByTestId("enterprise-cctv")).toBeInTheDocument();
+  });
+
+  it("re-asks the server for the price when the count changes", async () => {
+    // The figure is deliberately not 7 × 19,000. Nothing on the page is allowed
+    // to know the rate, so whatever the server answers is what must appear —
+    // and a formula would get this wrong.
+    const t = fake({
+      enterpriseQuote: vi.fn((channels?: number) =>
+        Promise.resolve(
+          channels === 7
+            ? quote(7, { monthly_price_krw: 123456 })
+            : quote(channels ?? 4),
+        ),
+      ),
+    });
+    show(<Pricing />, t);
+    await screen.findByTestId("enterprise-card");
+
+    const input = screen.getByLabelText("채널 갯수");
+    await userEvent.clear(input);
+    await userEvent.type(input, "7");
+
+    await waitFor(() =>
+      expect(screen.getByTestId("enterprise-price")).toHaveTextContent(
+        "₩123,456",
+      ),
+    );
+    expect(t.enterpriseQuote).toHaveBeenCalledWith(7);
+  });
+
+  it("will not quote below the minimum, and does not ask", async () => {
+    const t = fake();
+    show(<Pricing />, t);
+    await screen.findByTestId("enterprise-card");
+    (t.enterpriseQuote as ReturnType<typeof vi.fn>).mockClear();
+
+    const input = screen.getByLabelText("채널 갯수");
+    await userEvent.clear(input);
+    await userEvent.type(input, "3");
+
+    expect(await screen.findByTestId("enterprise-note")).toHaveTextContent(
+      "엔터프라이즈는 4채널부터입니다",
+    );
+    expect(screen.getByTestId("enterprise-price")).toHaveTextContent("—");
+    expect(
+      screen.getByRole("button", { name: "엔터프라이즈 시작하기" }),
+    ).toBeDisabled();
+    // The server is the one that refuses; this is only so the customer is not
+    // refused to find out. No request for a size that cannot be bought.
+    await waitFor(() => expect(t.enterpriseQuote).not.toHaveBeenCalled());
+  });
+
+  it("sends the count, and no amount, to start the payment", async () => {
+    const t = fake({
+      startEnterpriseCheckout: vi
+        .fn()
+        .mockResolvedValue({ payurl: "https://payapp.example/x" }),
+    });
+    show(<Pricing />, t);
+    await screen.findByTestId("enterprise-card");
+
+    const input = screen.getByLabelText("채널 갯수");
+    await userEvent.clear(input);
+    await userEvent.type(input, "6");
+    await waitFor(() =>
+      expect(screen.getByTestId("enterprise-price")).toHaveTextContent(
+        "₩114,000",
+      ),
+    );
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "엔터프라이즈 시작하기" }),
+    );
+    // The same checkout as any plan: it collects a phone number and nothing else.
+    expect(await screen.findByTestId("checkout-summary")).toHaveTextContent(
+      "₩114,000 / 월",
+    );
+    await userEvent.type(screen.getByLabelText("휴대폰 번호"), "01012345678");
+    await userEvent.click(screen.getByRole("button", { name: "정기결제 시작" }));
+
+    await waitFor(() =>
+      expect(t.startEnterpriseCheckout).toHaveBeenCalledWith(6, "01012345678"),
+    );
+  });
+
+  it("is simply not there when there is no quote to be had", async () => {
+    // The desktop build, where nothing is on sale, arrives here as a rejection.
+    show(
+      <Pricing />,
+      fake({ enterpriseQuote: vi.fn().mockRejectedValue(new Error("nope")) }),
+    );
+    await screen.findAllByTestId("plan-card");
+    expect(screen.queryByTestId("enterprise-card")).not.toBeInTheDocument();
   });
 });
 

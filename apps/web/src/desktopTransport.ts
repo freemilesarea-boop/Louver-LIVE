@@ -21,6 +21,7 @@ import type {
   CloudMedia,
   Dashboard,
   DesiredState,
+  EnterpriseQuote,
   Health,
   Me,
   MediaState,
@@ -104,6 +105,14 @@ export class DesktopTransport implements Transport {
   }
 
   async startCheckout(): Promise<Checkout> {
+    throw ONLY_ON_THE_WEB("결제");
+  }
+
+  async enterpriseQuote(): Promise<EnterpriseQuote> {
+    throw ONLY_ON_THE_WEB("엔터프라이즈 요금제");
+  }
+
+  async startEnterpriseCheckout(): Promise<Checkout> {
     throw ONLY_ON_THE_WEB("결제");
   }
 

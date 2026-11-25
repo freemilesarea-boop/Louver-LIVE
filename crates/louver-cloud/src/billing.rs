@@ -339,14 +339,12 @@ impl Payapp {
     pub fn checkout(&self, user_id: &str, plan_id: &str, recvphone: &str) -> Result<Checkout> {
         let user = self.db.user(user_id)?;
 
-        // The plan has to be one that is actually on sale. Reading the price from
-        // here rather than from the request is the whole reason this lookup exists.
-        let plan = self
-            .db
-            .plans_for_sale()?
-            .into_iter()
-            .find(|p| p.id == plan_id)
-            .ok_or_else(|| CloudError::Invalid("선택할 수 없는 요금제입니다.".into()))?;
+        // The plan has to be one that is actually for sale. Reading the price from
+        // here rather than from the request is the whole reason this lookup
+        // exists, and it is what lets Enterprise — priced per channel — be sold
+        // without a `channels` parameter ever reaching an amount: the count makes
+        // a plan row, and the row's price is charged. See `crate::enterprise`.
+        let plan = self.db.purchasable_plan(plan_id)?;
 
         // §14: one recurring registration per account. Two would mean two charges
         // a month, for ever, and PayApp has no idea the first one exists.

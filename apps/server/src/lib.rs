@@ -64,6 +64,11 @@ pub fn router(app: App) -> Router {
         // not a price list. There is deliberately **no** route that writes a
         // plan — see `CloudDb::activate_subscription`.
         .route("/api/plans", get(auth::plans))
+        // Enterprise is priced per channel, so there is one plan row per
+        // count and `/api/plans` deliberately does not list them. This is
+        // how the card gets the price for a count the visitor types.
+        // Public for the same reason the list is, and it reads nothing.
+        .route("/api/plans/enterprise", get(billing::enterprise_quote))
         // Billing. `checkout` and `cancel` need a session; the two notification
         // routes do not, because PayApp posts to them server-to-server and what
         // authenticates those is the link keys in the body. There is still no
@@ -71,6 +76,7 @@ pub fn router(app: App) -> Router {
         // the provider has verified what it was sent.
         .route("/api/billing/status", get(billing::status))
         .route("/api/billing/checkout", post(billing::checkout))
+        .route("/api/billing/enterprise/checkout", post(billing::enterprise_checkout))
         .route("/api/billing/cancel", post(billing::cancel))
         .route("/api/billing/payapp/feedback", post(billing::feedback))
         .route("/api/billing/payapp/failure", post(billing::failure))

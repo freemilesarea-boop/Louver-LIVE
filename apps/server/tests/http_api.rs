@@ -1018,6 +1018,131 @@ async fn a_plan_an_operator_takes_off_sale_disappears_from_the_public_list() {
 }
 
 #[tokio::test]
+async fn the_enterprise_quote_is_public_and_the_price_comes_from_the_server() {
+    let s = server();
+    // No session, like the price list: Enterprise's price is not a secret, it is
+    // just not a card on a list.
+    let r = send(&s, Method::GET, "/api/plans/enterprise", None, None).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+
+    let q = r.json();
+    // With no count asked for, the entry level — which is where the form starts.
+    assert_eq!(q["channels"], 4);
+    assert_eq!(q["min_channels"], 4);
+    assert_eq!(q["price_per_channel_krw"], 19_000);
+    assert_eq!(q["monthly_price_krw"], 76_000);
+    assert_eq!(q["plan_id"], "enterprise_4");
+    assert_eq!(q["limits"]["max_concurrent_streams"], 4);
+    assert_eq!(q["limits"]["max_storage_bytes"], 80i64 * 1024 * 1024 * 1024);
+    assert_eq!(q["limits"]["cctv_enabled"], 1);
+    assert!(q["monthly_price_krw"].is_i64(), "money must not be a float: {}", r.body);
+}
+
+#[tokio::test]
+async fn a_quote_is_for_the_count_that_was_asked_for() {
+    let s = server();
+    for (channels, price) in [(4, 76_000), (5, 95_000), (12, 228_000), (120, 2_280_000)] {
+        let r = send(&s, Method::GET, &format!("/api/plans/enterprise?channels={channels}"), None, None)
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{channels}: {}", r.body);
+        assert_eq!(r.json()["monthly_price_krw"], price, "{channels}");
+        assert_eq!(r.json()["limits"]["max_concurrent_streams"], channels);
+    }
+}
+
+#[tokio::test]
+async fn a_quote_for_a_size_that_is_not_enterprise_is_refused() {
+    let s = server();
+    for bad in ["0", "3", "-4", "abc", "4.5", "", "4x"] {
+        let r = send(&s, Method::GET, &format!("/api/plans/enterprise?channels={bad}"), None, None).await;
+        assert_ne!(r.status, StatusCode::OK, "channels={bad} was quoted: {}", r.body);
+    }
+    // And the refusal for a real-but-too-small count says what to do instead,
+    // rather than only that it is wrong.
+    let r = send(&s, Method::GET, "/api/plans/enterprise?channels=3", None, None).await;
+    assert_eq!(r.status, StatusCode::BAD_REQUEST, "{}", r.body);
+    assert!(r.body.contains("4채널"), "{}", r.body);
+}
+
+#[tokio::test]
+async fn quoting_writes_nothing() {
+    // A public endpoint that created a row would be a public endpoint that fills
+    // the plans table for anybody with a loop.
+    let s = server();
+    for channels in [4, 9, 99] {
+        let r = send(&s, Method::GET, &format!("/api/plans/enterprise?channels={channels}"), None, None)
+            .await;
+        assert_eq!(r.status, StatusCode::OK, "{}", r.body);
+    }
+    let rows: i64 = s
+        .app
+        .db
+        .raw()
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM plans WHERE id LIKE 'enterprise_%'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "a quote created a plan row");
+}
+
+#[tokio::test]
+async fn an_enterprise_row_never_reaches_the_public_price_list() {
+    // Once somebody has bought 7 channels the row exists forever. `/api/plans`
+    // filters on `active`, and these are written inactive precisely so that the
+    // pricing page does not grow a card per channel count anybody ever chose.
+    let s = server();
+    s.app.db.ensure_enterprise_plan(7).unwrap();
+    s.app.db.ensure_enterprise_plan(31).unwrap();
+
+    let r = send(&s, Method::GET, "/api/plans", None, None).await;
+    let json = r.json();
+    let ids: Vec<&str> = json.as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["basic", "pro", "business"], "{}", r.body);
+    assert!(!r.body.contains("enterprise"), "{}", r.body);
+}
+
+#[tokio::test]
+async fn starting_an_enterprise_payment_needs_a_session_and_writes_nothing_without_one() {
+    let s = server();
+    let r = send(
+        &s,
+        Method::POST,
+        "/api/billing/enterprise/checkout",
+        None,
+        Some(serde_json::json!({ "channels": 6, "recvphone": "01012345678" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+
+    let rows: i64 = s
+        .app
+        .db
+        .raw()
+        .lock()
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM plans WHERE id LIKE 'enterprise_%'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "an unauthenticated request created a plan row");
+}
+
+#[tokio::test]
+async fn an_enterprise_checkout_sends_no_amount_and_cannot_be_told_one() {
+    // The field does not exist. `deny_unknown_fields` is what makes that a
+    // refusal rather than a silently ignored field, which is the difference
+    // between "cannot name a price" and "names one that happens to be dropped".
+    let s = server();
+    let a = account(&s, "ent@example.com").await;
+    for body in [
+        serde_json::json!({ "channels": 6, "recvphone": "01012345678", "amount_krw": 100 }),
+        serde_json::json!({ "channels": 6, "recvphone": "01012345678", "monthly_price_krw": 100 }),
+        serde_json::json!({ "channels": 6, "recvphone": "01012345678", "plan_id": "business" }),
+    ] {
+        let r = post(&s, "/api/billing/enterprise/checkout", &a, Some(body.clone())).await;
+        assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{body} was accepted: {}", r.body);
+    }
+}
+
+#[tokio::test]
 async fn a_new_account_is_unsubscribed_and_is_told_so() {
     let s = server();
     let a = account(&s, "dj@example.com").await;
@@ -1144,6 +1269,10 @@ async fn there_is_no_route_through_which_a_user_can_give_themselves_a_plan() {
         (Method::POST, "/api/me/plan"),
         (Method::PUT, "/api/me/plan"),
         (Method::POST, "/api/plans"),
+        // The Enterprise quote reads; there is no method on it that writes. A
+        // plan row is only ever made by a checkout, which goes through PayApp.
+        (Method::POST, "/api/plans/enterprise"),
+        (Method::PUT, "/api/plans/enterprise"),
         (Method::POST, "/api/subscriptions"),
         (Method::POST, "/api/set-plan"),
         (Method::POST, "/api/billing/activate"),
@@ -1356,6 +1485,16 @@ async fn the_billing_routes_need_a_caller_except_the_two_payapp_posts_to() {
         "/api/billing/checkout",
         None,
         Some(serde_json::json!({ "plan_id": "pro", "recvphone": "01012345678" })),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);
+
+    let r = send(
+        &s,
+        Method::POST,
+        "/api/billing/enterprise/checkout",
+        None,
+        Some(serde_json::json!({ "channels": 4, "recvphone": "01012345678" })),
     )
     .await;
     assert_eq!(r.status, StatusCode::UNAUTHORIZED, "{}", r.body);

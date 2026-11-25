@@ -19,12 +19,17 @@ import { TransportProvider } from "../TransportContext";
 import type { Transport } from "../transport";
 import { DEPLOYMENT_LABELS } from "../cloud";
 import type { Me } from "../cloud";
-import { GIB, seedPlans } from "../../../../scripts/seo-plan-source.mjs";
+import {
+  GIB,
+  enterpriseTerms,
+  seedPlans,
+} from "../../../../scripts/seo-plan-source.mjs";
 import {
   LEGAL_PAGES,
   PATH_LABELS,
   PRIVATE_PATHS,
   PUBLIC_PAGES,
+  PUBLIC_ENTERPRISE,
   PUBLIC_PLANS,
   SITE_ORIGIN,
   normalisePath,
@@ -98,6 +103,31 @@ describe("the prices on the public pages", () => {
       expect(plan.storageGb * GIB).toBe(seeded!.limits.max_storage_bytes);
       expect(plan.uploadGb * GIB).toBe(seeded!.limits.max_upload_bytes);
     }
+  });
+
+  it("quote Enterprise's rate and minimum as the server holds them", async () => {
+    // Enterprise has no seeded row: it is a rate and a minimum, and the rows are
+    // written per channel count as people buy them. So the public page carries
+    // the terms, and this is the check that keeps them honest.
+    const terms = await enterpriseTerms();
+    expect(PUBLIC_ENTERPRISE.minChannels).toBe(terms.min_channels);
+    expect(PUBLIC_ENTERPRISE.pricePerChannelKrw).toBe(terms.price_per_channel_krw);
+    expect(PUBLIC_ENTERPRISE.storageGbPerChannel * GIB).toBe(terms.storage_per_channel_bytes);
+    expect(PUBLIC_ENTERPRISE.uploadGb * GIB).toBe(terms.upload_bytes);
+    expect(PUBLIC_ENTERPRISE.broadcastsPerChannel).toBe(terms.broadcasts_per_channel);
+  });
+
+  it("start Enterprise above the plan Business tops out at", async () => {
+    // The reason the minimum is where it is: three channels are cheaper on
+    // Business, and the fourth is where paying per channel starts to win.
+    const plans = await seedPlans();
+    const business = plans["business"]!;
+    const four = PUBLIC_ENTERPRISE.minChannels * PUBLIC_ENTERPRISE.pricePerChannelKrw;
+    expect(four).toBeGreaterThan(business.monthly_price_krw);
+    expect(PUBLIC_ENTERPRISE.pricePerChannelKrw).toBeLessThan(
+      business.monthly_price_krw / business.limits.max_concurrent_streams!,
+    );
+    expect(PUBLIC_ENTERPRISE.minChannels).toBe(business.limits.max_concurrent_streams! + 1);
   });
 
   it("covers every plan that is on sale, and nothing that is not", async () => {

@@ -16,6 +16,7 @@ import type {
   CctvSource,
   CloudMedia,
   Dashboard,
+  EnterpriseQuote,
   Health,
   Me,
   Metrics,
@@ -55,6 +56,24 @@ export interface Transport {
    * there is no field through which a browser could name one.
    */
   startCheckout(planId: string, recvphone: string): Promise<Checkout>;
+  /**
+   * What Enterprise costs for this many channels, and what it allows.
+   *
+   * Public, like {@link plans}. Omitting the count asks for the entry level,
+   * which is what the card shows before anybody has typed a number.
+   */
+  enterpriseQuote(channels?: number): Promise<EnterpriseQuote>;
+  /**
+   * Start a recurring payment for an Enterprise plan of this size.
+   *
+   * A count, not an amount — the same rule as {@link startCheckout}. The server
+   * turns the count into a plan row and charges that row's price, so there is
+   * still no field through which a browser could name what it pays.
+   */
+  startEnterpriseCheckout(
+    channels: number,
+    recvphone: string,
+  ): Promise<Checkout>;
   /** Stop the next charge. Does not end the period already paid for. */
   cancelBilling(): Promise<BillingSubscription>;
 
@@ -236,6 +255,18 @@ export class WebTransport implements Transport {
     return this.json<Checkout>("/api/billing/checkout", {
       method: "POST",
       body: JSON.stringify({ plan_id: planId, recvphone }),
+    });
+  }
+
+  enterpriseQuote(channels?: number) {
+    const q = channels === undefined ? "" : `?channels=${channels}`;
+    return this.json<EnterpriseQuote>(`/api/plans/enterprise${q}`);
+  }
+
+  startEnterpriseCheckout(channels: number, recvphone: string) {
+    return this.json<Checkout>("/api/billing/enterprise/checkout", {
+      method: "POST",
+      body: JSON.stringify({ channels, recvphone }),
     });
   }
 
