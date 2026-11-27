@@ -21,6 +21,7 @@
 import type { ReactNode } from "react";
 import { Wordmark } from "../brand";
 import { LEGAL_CONTENT } from "../pages/legal-content";
+import { LegalBody } from "../pages/LegalBody";
 import {
   PATH_LABELS,
   PLAN_INCLUDES,
@@ -328,19 +329,9 @@ export function LegalArticle({ page }: { page: LegalSeo }) {
   return (
     <PublicShell active={page.path}>
       <h1 className="text-2xl font-semibold text-ink-100">{doc.title}</h1>
-      <p
-        role="note"
-        className="mt-4 rounded-md border border-warn/40 bg-warn/10 px-3 py-2 text-sm text-warn"
-      >
-        이 페이지는 준비 중인 초안입니다. 아직 법률 검토를 거친 정식 문서가
-        아니며, 정식 문서가 공개되면 이 페이지를 대체합니다.
-      </p>
-      <p className="mt-4 text-sm leading-relaxed text-ink-300">{doc.summary}</p>
-      <ul className="mt-3 list-disc space-y-1.5 pl-5 text-sm text-ink-100">
-        {doc.points.map((p) => (
-          <li key={p}>{p}</li>
-        ))}
-      </ul>
+      <div className="mt-4">
+        <LegalBody which={page.which} />
+      </div>
     </PublicShell>
   );
 }

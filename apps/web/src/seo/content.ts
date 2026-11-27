@@ -516,14 +516,14 @@ export const LEGAL_PAGES: LegalSeo[] = [
     which: "terms",
     title: "이용약관 | 247streams",
     description:
-      "247streams 서비스 이용약관 페이지입니다. 정식 약관은 준비 중이며, 약관에 포함될 항목과 현재의 서비스 범위를 밝힙니다.",
+      "247streams 이용약관. 서비스 내용, YouTube 연동, 요금과 자동결제, 해지·환불, 이용자의 의무를 정합니다.",
   },
   {
     path: "/privacy/",
     which: "privacy",
     title: "개인정보처리방침 | 247streams",
     description:
-      "247streams가 실제로 저장하는 정보와 보관 방식을 정리한 개인정보처리방침 페이지입니다. 스트림 키와 연동 토큰은 암호화해 보관합니다.",
+      "247streams 개인정보처리방침. 수집 항목과 보유 기간, YouTube API 데이터 처리, 연동 해제와 권한 철회 방법을 안내합니다.",
   },
 ];
 

@@ -2069,20 +2069,19 @@ describe("the documents signup links to", () => {
     expect(legalPageFor("/termsandconditions")).toBeNull();
   });
 
-  it("says it is a draft rather than pretending to be an agreement", () => {
+  it("shows the full terms, with its effective date", () => {
     render(<LegalPage which="terms" />);
-    expect(screen.getByRole("note")).toHaveTextContent(/준비 중인 초안/);
-    expect(screen.getByRole("note")).toHaveTextContent(
-      /법률 검토를 거친 정식 문서가 아니며/,
-    );
+    expect(screen.getByText(/시행일:/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "제7조 (해지와 환불)" })).toBeInTheDocument();
+    // No operator detail is invented: only the fields that are filled in print.
+    expect(screen.queryByText("null")).toBeNull();
   });
 
   it("tells the truth about what is stored", () => {
     render(<LegalPage which="privacy" />);
-    expect(
-      screen.getByText(/비밀번호 자체는 저장하지 않습니다/),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/스트림 키는 암호화하여 보관/)).toBeInTheDocument();
+    expect(screen.getByText(/복원할 수 없는 해시 값으로만 저장/)).toBeInTheDocument();
+    expect(screen.getByText(/스트림 키\(암호화하여 저장\)/)).toBeInTheDocument();
+    expect(screen.getAllByText(/youtube\.force-ssl/).length).toBeGreaterThan(0);
   });
 });
 

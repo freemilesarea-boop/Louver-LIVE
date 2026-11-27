@@ -323,7 +323,23 @@ describe("a rendered public page", () => {
   it("renders a legal document from the same words the app shows", () => {
     render(<LegalArticle page={LEGAL_PAGES[0]!} />);
     expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("이용약관");
-    expect(screen.getByRole("note")).toHaveTextContent("준비 중인 초안");
+    expect(screen.getByRole("heading", { name: "제5조 (YouTube 연동)" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "YouTube 서비스 약관" })).toHaveAttribute(
+      "href",
+      "https://www.youtube.com/t/terms",
+    );
+  });
+
+  it("the privacy policy carries what the YouTube API audit asks for", () => {
+    render(<LegalArticle page={LEGAL_PAGES[1]!} />);
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent("개인정보처리방침");
+    for (const href of [
+      "https://www.youtube.com/t/terms",
+      "https://policies.google.com/privacy",
+      "https://myaccount.google.com/permissions",
+    ]) {
+      expect(screen.getAllByRole("link").some((a) => a.getAttribute("href") === href)).toBe(true);
+    }
   });
 
   it("says a URL does not exist rather than pretending it does", () => {
